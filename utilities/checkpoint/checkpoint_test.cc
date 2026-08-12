@@ -473,6 +473,52 @@ TEST_F(CheckpointTest, CheckpointSelectedColumnFamilies) {
   ASSERT_EQ("excluded value", Get(2, "excluded"));
 }
 
+TEST_F(CheckpointTest, CheckpointSelectedColumnFamiliesWithWAL) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"included", "excluded"}, options);
+
+  ASSERT_OK(Put(0, "default", "default value"));
+  ASSERT_OK(Put(1, "included", "included value"));
+  ASSERT_OK(Put(2, "excluded", "excluded value"));
+
+  std::string current_contents;
+  ASSERT_OK(ReadFileToString(env_, CurrentFileName(dbname_), &current_contents));
+  std::string manifest_name = current_contents;
+  manifest_name.pop_back();
+  std::string source_manifest;
+  ASSERT_OK(ReadFileToString(
+      env_, dbname_ + kFilePathSeparator + manifest_name, &source_manifest));
+
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint_guard(checkpoint);
+  ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_, {handles_[1]}));
+
+  std::string source_manifest_after;
+  ASSERT_OK(
+      ReadFileToString(env_, dbname_ + kFilePathSeparator + manifest_name,
+                       &source_manifest_after));
+  ASSERT_EQ(source_manifest, source_manifest_after);
+
+  options.create_if_missing = false;
+  std::vector<ColumnFamilyDescriptor> included_column_families{
+      {kDefaultColumnFamilyName, options}, {"included", options}};
+  std::vector<ColumnFamilyHandle*> snapshot_handles;
+  std::unique_ptr<DB> snapshot_db;
+  ASSERT_OK(DB::Open(options, snapshot_name_, included_column_families,
+                     &snapshot_handles, &snapshot_db));
+  std::string value;
+  ASSERT_OK(
+      snapshot_db->Get(ReadOptions(), snapshot_handles[0], "default", &value));
+  ASSERT_EQ("default value", value);
+  ASSERT_OK(
+      snapshot_db->Get(ReadOptions(), snapshot_handles[1], "included", &value));
+  ASSERT_EQ("included value", value);
+  for (ColumnFamilyHandle* handle : snapshot_handles) {
+    delete handle;
+  }
+}
+
 TEST_F(CheckpointTest, CheckpointSelectedColumnFamiliesValidation) {
   Options options = CurrentOptions();
   CreateAndReopenWithCF({"included", "dropped"}, options);
