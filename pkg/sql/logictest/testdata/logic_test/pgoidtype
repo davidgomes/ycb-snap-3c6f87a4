@@ -816,6 +816,9 @@ subtest end
 subtest reg_name_visibility
 
 statement ok
+SET serial_normalization = 'sql_sequence'
+
+statement ok
 CREATE SCHEMA reg_first;
 CREATE SCHEMA reg_second;
 CREATE SCHEMA "Odd Schema";
