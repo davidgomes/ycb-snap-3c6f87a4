@@ -5,9 +5,13 @@
 #include "envoy/stats/stats_macros.h"
 #include "envoy/thread_local/thread_local.h"
 
+#include "source/common/access_log/access_log_impl.h"
 #include "source/common/common/logger.h"
+#include "source/common/protobuf/protobuf.h"
 #include "source/common/stats/symbol_table.h"
 #include "source/common/stats/utility.h"
+#include "source/common/stream_info/stream_info_impl.h"
+#include "source/server/generic_factory_context.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -280,6 +284,50 @@ absl::flat_hash_map<std::string, uint64_t> ReverseTunnelInitiatorExtension::getP
             dispatcher_name);
 
   return stats_map;
+}
+
+void ReverseTunnelInitiatorExtension::initializeAccessLogs() {
+  if (config_.access_log().empty()) {
+    return;
+  }
+
+  Server::GenericFactoryContextImpl generic_context(context_, context_.messageValidationVisitor());
+  for (const auto& access_log_config : config_.access_log()) {
+    access_logs_.push_back(
+        AccessLog::AccessLogFactory::fromProto(access_log_config, generic_context));
+  }
+}
+
+void ReverseTunnelInitiatorExtension::emitAccessLog(
+    TimeSource& time_source, const std::string& event, const std::string& node_id,
+    const std::string& cluster_id, const std::string& tenant_id,
+    const std::string& upstream_cluster, const std::string& host_address,
+    const std::string& connection_key, const std::string& error_message) {
+  if (access_logs_.empty()) {
+    return;
+  }
+
+  StreamInfo::StreamInfoImpl stream_info(time_source, nullptr,
+                                         StreamInfo::FilterState::LifeSpan::Connection);
+
+  Protobuf::Struct metadata;
+  auto& fields = *metadata.mutable_fields();
+  fields["event"].set_string_value(event);
+  fields["node_id"].set_string_value(node_id);
+  fields["cluster_id"].set_string_value(cluster_id);
+  fields["tenant_id"].set_string_value(tenant_id);
+  fields["upstream_cluster"].set_string_value(upstream_cluster);
+  fields["host_address"].set_string_value(host_address);
+  fields["connection_key"].set_string_value(connection_key);
+  fields["error"].set_string_value(error_message);
+
+  stream_info.setDynamicMetadata(std::string(kInitiatorAccessLogNamespace), metadata);
+  stream_info.onRequestComplete();
+
+  const Formatter::Context log_context;
+  for (const auto& access_log : access_logs_) {
+    access_log->log(log_context, stream_info);
+  }
 }
 
 void ReverseTunnelInitiatorExtension::incrementHandshakeStats(const std::string& cluster_id,

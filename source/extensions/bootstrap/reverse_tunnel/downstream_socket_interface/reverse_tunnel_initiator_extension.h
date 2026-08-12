@@ -3,6 +3,8 @@
 #include <memory>
 #include <string>
 
+#include "envoy/access_log/access_log.h"
+#include "envoy/common/time.h"
 #include "envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3/downstream_reverse_connection_socket_interface.pb.h"
 #include "envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3/downstream_reverse_connection_socket_interface.pb.validate.h"
 #include "envoy/server/bootstrap_extension_config.h"
@@ -12,11 +14,17 @@
 #include "source/extensions/bootstrap/reverse_tunnel/common/reverse_connection_utility.h"
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace Bootstrap {
 namespace ReverseConnection {
+
+inline constexpr absl::string_view kInitiatorAccessLogNamespace = "envoy.reverse_tunnel.initiator";
+inline constexpr absl::string_view kInitiatorEventHandshakeSuccess = "handshake_success";
+inline constexpr absl::string_view kInitiatorEventHandshakeFailure = "handshake_failure";
+inline constexpr absl::string_view kInitiatorEventConnectionClosed = "connection_closed";
 
 // Forward declarations
 class DownstreamSocketThreadLocal;
@@ -49,10 +57,11 @@ public:
                              config.http_handshake().additional_headers().end()};
       use_http_upgrade_ = config.http_handshake().use_http_upgrade();
     }
+    initializeAccessLogs();
     ENVOY_LOG(debug,
               "ReverseTunnelInitiatorExtension: creating downstream reverse connection "
-              "socket interface with stat_prefix: {}",
-              stat_prefix_);
+              "socket interface with stat_prefix: {}, access_logs: {}",
+              stat_prefix_, access_logs_.size());
   }
 
   void onServerInitialized(Server::Instance&) override;
@@ -134,6 +143,20 @@ public:
                                const std::string& failure_reason = "");
 
   /**
+   * @return the configured initiator access loggers.
+   */
+  const AccessLog::InstanceSharedPtrVector& accessLogs() const { return access_logs_; }
+
+  /**
+   * Emit a reverse-tunnel initiator access log using a synthetic StreamInfo whose dynamic metadata
+   * is populated under envoy.reverse_tunnel.initiator. No-op when no access logs are configured.
+   */
+  void emitAccessLog(TimeSource& time_source, const std::string& event, const std::string& node_id,
+                     const std::string& cluster_id, const std::string& tenant_id,
+                     const std::string& upstream_cluster, const std::string& host_address,
+                     const std::string& connection_key, const std::string& error_message);
+
+  /**
    * Test-only method to set the thread local slot for testing purposes.
    * This allows tests to inject a custom thread local registry and is used
    * in unit tests to simulate different worker threads.
@@ -154,6 +177,12 @@ private:
   std::string handshake_request_path_;
   std::vector<envoy::config::core::v3::HeaderValueOption> additional_headers_;
   bool use_http_upgrade_{false};
+  AccessLog::InstanceSharedPtrVector access_logs_;
+
+  /**
+   * Instantiate access loggers from the bootstrap config. No-op when none are configured.
+   */
+  void initializeAccessLogs();
 
   /**
    * Update per-worker connection stats for debugging purposes.

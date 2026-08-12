@@ -2,12 +2,15 @@
 
 #include "envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3/downstream_reverse_connection_socket_interface.pb.h"
 #include "envoy/server/factory_context.h"
+#include "envoy/stream_info/stream_info.h"
 #include "envoy/thread_local/thread_local.h"
 
+#include "source/common/protobuf/protobuf.h"
 #include "source/extensions/bootstrap/reverse_tunnel/common/reverse_connection_utility.h"
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator.h"
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator_extension.h"
 
+#include "test/mocks/access_log/mocks.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/thread_local/mocks.h"
@@ -687,6 +690,109 @@ TEST_F(ConfigValidationTest, EmptyStatPrefix) {
 
   // Should not throw and should use default prefix.
   EXPECT_NO_THROW(initiator.createBootstrapExtension(config_, context_));
+}
+
+namespace {
+
+const Protobuf::Struct& initiatorMetadata(const StreamInfo::StreamInfo& stream_info) {
+  return stream_info.dynamicMetadata().filter_metadata().at(
+      std::string(kInitiatorAccessLogNamespace));
+}
+
+std::string metadataString(const Protobuf::Struct& metadata, const std::string& key) {
+  return metadata.fields().at(key).string_value();
+}
+
+} // namespace
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmptyConfigHasNoAccessLogs) {
+  envoy::extensions::bootstrap::reverse_tunnel::downstream_socket_interface::v3::
+      DownstreamReverseConnectionSocketInterface empty_config;
+
+  auto extension_with_default =
+      std::make_unique<ReverseTunnelInitiatorExtension>(context_, empty_config);
+
+  EXPECT_TRUE(extension_with_default->accessLogs().empty());
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogNoOpWhenEmpty) {
+  EXPECT_TRUE(extension_->accessLogs().empty());
+  EXPECT_NO_THROW(extension_->emitAccessLog(dispatcher_.timeSource(), "handshake_success", "node-1",
+                                            "cluster-1", "tenant-1", "upstream-1", "10.0.0.1:9000",
+                                            "127.0.0.1:12345", ""));
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogPopulatesMetadataIncludingError) {
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  extension_->access_logs_ = {access_log};
+
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([&](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& metadata = initiatorMetadata(stream_info);
+        EXPECT_EQ(metadataString(metadata, "event"), "handshake_failure");
+        EXPECT_EQ(metadataString(metadata, "node_id"), "node-1");
+        EXPECT_EQ(metadataString(metadata, "cluster_id"), "cluster-1");
+        EXPECT_EQ(metadataString(metadata, "tenant_id"), "tenant-1");
+        EXPECT_EQ(metadataString(metadata, "upstream_cluster"), "upstream-1");
+        EXPECT_EQ(metadataString(metadata, "host_address"), "10.0.0.1:9000");
+        EXPECT_EQ(metadataString(metadata, "connection_key"), "127.0.0.1:12345");
+        EXPECT_EQ(metadataString(metadata, "error"), "HTTP handshake failed with status 401");
+      }));
+
+  extension_->emitAccessLog(dispatcher_.timeSource(), "handshake_failure", "node-1", "cluster-1",
+                            "tenant-1", "upstream-1", "10.0.0.1:9000", "127.0.0.1:12345",
+                            "HTTP handshake failed with status 401");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogEmptyOptionalFieldsStillPresent) {
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  extension_->access_logs_ = {access_log};
+
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([&](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& metadata = initiatorMetadata(stream_info);
+        EXPECT_EQ(metadataString(metadata, "event"), "handshake_success");
+        EXPECT_EQ(metadataString(metadata, "node_id"), "node-1");
+        EXPECT_EQ(metadataString(metadata, "cluster_id"), "cluster-1");
+        EXPECT_EQ(metadataString(metadata, "tenant_id"), "");
+        EXPECT_EQ(metadataString(metadata, "upstream_cluster"), "upstream-1");
+        EXPECT_EQ(metadataString(metadata, "host_address"), "");
+        EXPECT_EQ(metadataString(metadata, "connection_key"), "127.0.0.1:12345");
+        EXPECT_EQ(metadataString(metadata, "error"), "");
+      }));
+
+  extension_->emitAccessLog(dispatcher_.timeSource(), "handshake_success", "node-1", "cluster-1",
+                            "", "upstream-1", "", "127.0.0.1:12345", "");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogMultipleLoggers) {
+  auto access_log1 = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  auto access_log2 = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  extension_->access_logs_ = {access_log1, access_log2};
+
+  EXPECT_CALL(*access_log1, log(_, _));
+  EXPECT_CALL(*access_log2, log(_, _));
+
+  extension_->emitAccessLog(dispatcher_.timeSource(), "connection_closed", "node-1", "cluster-1",
+                            "tenant-1", "upstream-1", "10.0.0.1:9000", "127.0.0.1:12345", "");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogUsesInitiatorNamespace) {
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  extension_->access_logs_ = {access_log};
+
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([&](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& filter_metadata = stream_info.dynamicMetadata().filter_metadata();
+        ASSERT_EQ(filter_metadata.size(), 1);
+        ASSERT_EQ(filter_metadata.count(std::string(kInitiatorAccessLogNamespace)), 1);
+        EXPECT_EQ(
+            metadataString(filter_metadata.at(std::string(kInitiatorAccessLogNamespace)), "event"),
+            "connection_closed");
+      }));
+
+  extension_->emitAccessLog(dispatcher_.timeSource(), "connection_closed", "node-1", "cluster-1",
+                            "tenant-1", "upstream-1", "10.0.0.1:9000", "127.0.0.1:12345", "");
 }
 
 } // namespace ReverseConnection

@@ -794,6 +794,12 @@ void ReverseConnectionIOHandle::onDownstreamConnectionClosed(const std::string& 
   ENVOY_LOG(debug, "Found connection {} belongs to host {} in cluster {}", connection_key,
             host_address, cluster_name);
 
+  if (extension_ != nullptr && !extension_->accessLogs().empty()) {
+    extension_->emitAccessLog(getTimeSource(), std::string(kInitiatorEventConnectionClosed),
+                              config_.src_node_id, config_.src_cluster_id, config_.src_tenant_id,
+                              cluster_name, host_address, connection_key, "");
+  }
+
   // Remove the connection key from the host's connection set.
   auto host_it = host_to_conn_info_map_.find(host_address);
   if (host_it != host_to_conn_info_map_.end()) {
@@ -1106,6 +1112,12 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
     ENVOY_LOG(error, "reverse_tunnel: Connection failed - error '{}', cleaning up host {}", error,
               host_address);
 
+    if (extension_ != nullptr && !extension_->accessLogs().empty()) {
+      extension_->emitAccessLog(getTimeSource(), std::string(kInitiatorEventHandshakeFailure),
+                                config_.src_node_id, config_.src_cluster_id, config_.src_tenant_id,
+                                cluster_name, host_address, connection_key, error);
+    }
+
     updateConnectionState(host_address, cluster_name, connection_key,
                           ReverseConnectionState::Failed);
 
@@ -1122,6 +1134,12 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
   } else {
     // Handle connection success.
     ENVOY_LOG(debug, "reverse_tunnel: Connection succeeded for host {}", host_address);
+
+    if (extension_ != nullptr && !extension_->accessLogs().empty()) {
+      extension_->emitAccessLog(getTimeSource(), std::string(kInitiatorEventHandshakeSuccess),
+                                config_.src_node_id, config_.src_cluster_id, config_.src_tenant_id,
+                                cluster_name, host_address, connection_key, "");
+    }
 
     resetHostBackoff(host_address);
     updateConnectionState(host_address, cluster_name, connection_key,
