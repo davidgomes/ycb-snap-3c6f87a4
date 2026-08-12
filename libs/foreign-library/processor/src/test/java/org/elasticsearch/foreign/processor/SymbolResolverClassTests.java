@@ -11,7 +11,12 @@ package org.elasticsearch.foreign.processor;
 
 import org.elasticsearch.core.SuppressForbidden;
 
+import java.lang.classfile.ClassFile;
+import java.lang.classfile.instruction.InvokeInstruction;
+import java.lang.constant.ClassDesc;
 import java.lang.invoke.MethodHandle;
+import java.nio.file.Files;
+import java.util.List;
 
 /**
  * Tests for the {@code symbolResolver} parameter on {@code @LibrarySpecification}.
@@ -226,6 +231,56 @@ public class SymbolResolverClassTests extends ProcessorTestCase {
         assertNotNull(result.loadClass("test.ResolverLib$Impl"));
         Class<?> resolverClass = result.loadClass("test.ResolverLib$RecordingMethodHandleResolver");
         assertTrue(resolverClass.getField("invoked").getBoolean(null));
+    }
+
+    /**
+     * Generated class initialization must route every downcall through the method-handle resolver,
+     * rather than directly invoking {@code Linker.downcallHandle}.
+     */
+    public void testGeneratedClinitRoutesThroughMethodHandleResolver() throws Exception {
+        String source = """
+            package test;
+            import org.elasticsearch.foreign.Function;
+            import org.elasticsearch.foreign.LibrarySpecification;
+            @LibrarySpecification(name = "testlib")
+            public interface MyLib {
+                @Function("native_add")
+                int add(int a, int b);
+            }
+            """;
+
+        CompilationResult result = compile("test.MyLib", source);
+        assertTrue("Expected compilation to succeed but got errors: " + result.errors(), result.success());
+        assertNotNull(result.loadClassNoInit("test.MyLib$Impl"));
+
+        byte[] classBytes = Files.readAllBytes(result.outputDir().resolve("test/MyLib$Impl.class"));
+        var clinit = ClassFile.of()
+            .parse(classBytes)
+            .methods()
+            .stream()
+            .filter(method -> method.methodName().equalsString("<clinit>"))
+            .findFirst();
+        assertTrue("<clinit> not found", clinit.isPresent());
+
+        List<InvokeInstruction> invokes = clinit.get()
+            .code()
+            .stream()
+            .flatMap(code -> code.elementStream())
+            .filter(element -> element instanceof InvokeInstruction)
+            .map(element -> (InvokeInstruction) element)
+            .toList();
+
+        ClassDesc methodHandleResolver = ClassDesc.of("org.elasticsearch.foreign.MethodHandleResolver");
+        assertTrue(
+            "Generated <clinit> must invoke MethodHandleResolver.resolve",
+            invokes.stream().anyMatch(invoke -> invoke.name().equalsString("resolve") && invoke.owner().asSymbol().equals(methodHandleResolver))
+        );
+
+        ClassDesc linker = ClassDesc.of("java.lang.foreign.Linker");
+        assertFalse(
+            "Generated <clinit> must not invoke Linker.downcallHandle directly",
+            invokes.stream().anyMatch(invoke -> invoke.name().equalsString("downcallHandle") && invoke.owner().asSymbol().equals(linker))
+        );
     }
 
     /**
