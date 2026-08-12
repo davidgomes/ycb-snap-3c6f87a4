@@ -59,6 +59,8 @@ public:
 
   absl::optional<uint32_t> maxVerifyDepth() const override { return max_verify_depth_; }
 
+  bool suppressClientCaList() const override { return suppress_client_ca_list_; }
+
   bool autoSniSanMatch() const override { return auto_sni_san_match_; }
 
 protected:
@@ -87,6 +89,7 @@ private:
   Api::Api& api_;
   const bool only_verify_leaf_cert_crl_;
   absl::optional<uint32_t> max_verify_depth_;
+  const bool suppress_client_ca_list_;
   const bool auto_sni_san_match_;
 };
 

@@ -1322,6 +1322,7 @@ protected:
   void testClientSessionResumption(const std::string& server_ctx_yaml,
                                    const std::string& client_ctx_yaml, bool expect_reuse,
                                    const Network::Address::IpVersion version);
+  void testClientAuthMultipleCAs(bool suppress_client_ca_list);
 
   Network::ListenerPtr createListener(Network::SocketSharedPtr&& socket,
                                       Network::TcpListenerCallbacks& cb, Runtime::Loader& runtime,
@@ -4239,7 +4240,7 @@ TEST_P(SslSocketTest, ShutdownWithoutCloseNotify) {
   dispatcher_->run(Event::Dispatcher::RunType::Block);
 }
 
-TEST_P(SslSocketTest, ClientAuthMultipleCAs) {
+void SslSocketTest::testClientAuthMultipleCAs(bool suppress_client_ca_list) {
   const std::string server_ctx_yaml = R"EOF(
   common_tls_context:
     tls_certificates:
@@ -4254,6 +4255,10 @@ TEST_P(SslSocketTest, ClientAuthMultipleCAs) {
 
   envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext server_tls_context;
   TestUtility::loadFromYaml(TestEnvironment::substitute(server_ctx_yaml), server_tls_context);
+  server_tls_context.set_require_client_certificate(true);
+  server_tls_context.mutable_common_tls_context()
+      ->mutable_validation_context()
+      ->set_suppress_client_ca_list(suppress_client_ca_list);
   auto server_cfg =
       *ServerContextConfigImpl::create(server_tls_context, factory_context_, {}, false);
   NiceMock<Server::Configuration::MockServerFactoryContext> server_factory_context;
@@ -4289,18 +4294,25 @@ TEST_P(SslSocketTest, ClientAuthMultipleCAs) {
       socket->connectionInfoProvider().localAddress(), Network::Address::InstanceConstSharedPtr(),
       ssl_socket_factory->createTransportSocket(nullptr, nullptr), nullptr, nullptr);
 
-  // Verify that server sent list with 2 acceptable client certificate CA names.
+  // Verify the acceptable client certificate CA names sent by the server.
   const SslHandshakerImpl* ssl_socket =
       dynamic_cast<const SslHandshakerImpl*>(client_connection->ssl().get());
   SSL_set_cert_cb(
       ssl_socket->ssl(),
-      [](SSL* ssl, void*) -> int {
+      [](SSL* ssl, void* arg) -> int {
+        const bool suppress_client_ca_list = *static_cast<bool*>(arg);
         STACK_OF(X509_NAME)* list = SSL_get_client_CA_list(ssl);
-        EXPECT_NE(nullptr, list);
-        EXPECT_EQ(2U, sk_X509_NAME_num(list));
+        if (suppress_client_ca_list) {
+          EXPECT_TRUE(list == nullptr || sk_X509_NAME_num(list) == 0);
+        } else {
+          EXPECT_NE(nullptr, list);
+          if (list != nullptr) {
+            EXPECT_EQ(2U, sk_X509_NAME_num(list));
+          }
+        }
         return 1;
       },
-      nullptr);
+      &suppress_client_ca_list);
 
   client_connection->connect();
 
@@ -4327,6 +4339,10 @@ TEST_P(SslSocketTest, ClientAuthMultipleCAs) {
 
   EXPECT_EQ(1UL, server_stats_store.counter("ssl.handshake").value());
 }
+
+TEST_P(SslSocketTest, ClientAuthMultipleCAs) { testClientAuthMultipleCAs(false); }
+
+TEST_P(SslSocketTest, ClientAuthSuppressesCAList) { testClientAuthMultipleCAs(true); }
 
 namespace {
 
@@ -4649,6 +4665,41 @@ TEST_P(SslSocketTest, TicketSessionResumptionWithClientCA) {
   session_ticket_keys:
     keys:
       filename: "{{ test_rundir }}/test/common/tls/test_data/ticket_key_a"
+  require_client_certificate: true
+)EOF";
+
+  const std::string server_ctx_yaml_explicit_false = R"EOF(
+  common_tls_context:
+    tls_certificates:
+      certificate_chain:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_cert.pem"
+      private_key:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_key.pem"
+    validation_context:
+      trusted_ca:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/ca_cert.pem"
+      suppress_client_ca_list: false
+  session_ticket_keys:
+    keys:
+      filename: "{{ test_rundir }}/test/common/tls/test_data/ticket_key_a"
+  require_client_certificate: true
+)EOF";
+
+  const std::string server_ctx_yaml_suppressed = R"EOF(
+  common_tls_context:
+    tls_certificates:
+      certificate_chain:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_cert.pem"
+      private_key:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_key.pem"
+    validation_context:
+      trusted_ca:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/ca_cert.pem"
+      suppress_client_ca_list: true
+  session_ticket_keys:
+    keys:
+      filename: "{{ test_rundir }}/test/common/tls/test_data/ticket_key_a"
+  require_client_certificate: true
 )EOF";
 
   const std::string client_ctx_yaml = R"EOF(
@@ -4662,6 +4713,10 @@ TEST_P(SslSocketTest, TicketSessionResumptionWithClientCA) {
 
   testTicketSessionResumption(server_ctx_yaml, {}, server_ctx_yaml, {}, client_ctx_yaml, true,
                               version_);
+  testTicketSessionResumption(server_ctx_yaml, {}, server_ctx_yaml_explicit_false, {},
+                              client_ctx_yaml, true, version_);
+  testTicketSessionResumption(server_ctx_yaml, {}, server_ctx_yaml_suppressed, {}, client_ctx_yaml,
+                              false, version_);
 }
 
 TEST_P(SslSocketTest, TicketSessionResumptionRotateKey) {

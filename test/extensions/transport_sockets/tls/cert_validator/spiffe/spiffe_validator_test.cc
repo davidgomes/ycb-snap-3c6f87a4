@@ -59,7 +59,8 @@ public:
     envoy::config::core::v3::TypedExtensionConfig typed_conf;
     TestUtility::loadFromYaml(yaml, typed_conf);
     config_ = std::make_unique<TestCertificateValidationContextConfig>(
-        typed_conf, allow_expired_certificate_, san_matchers_);
+        typed_conf, allow_expired_certificate_, san_matchers_, "", absl::nullopt,
+        suppress_client_ca_list_);
 
     // Mocking time source
     ON_CALL(factory_context_, timeSource()).WillByDefault(testing::ReturnRef(time_source));
@@ -104,7 +105,8 @@ public:
     envoy::config::core::v3::TypedExtensionConfig typed_conf;
     TestUtility::loadFromYaml(yaml, typed_conf);
     config_ = std::make_unique<TestCertificateValidationContextConfig>(
-        typed_conf, allow_expired_certificate_, san_matchers_);
+        typed_conf, allow_expired_certificate_, san_matchers_, "", absl::nullopt,
+        suppress_client_ca_list_);
 
     if (!trust_bundle_file.empty()) {
       EXPECT_CALL(factory_context_.dispatcher_, createFilesystemWatcher_())
@@ -138,6 +140,7 @@ public:
 
   // Setter.
   void setAllowExpiredCertificate(bool val) { allow_expired_certificate_ = val; }
+  void setSuppressClientCaList(bool val) { suppress_client_ca_list_ = val; }
   void setSanMatchers(std::vector<envoy::type::matcher::v3::StringMatcher> san_matchers) {
     san_matchers_.clear();
     for (auto& matcher : san_matchers) {
@@ -173,6 +176,7 @@ public:
 
 private:
   bool allow_expired_certificate_{false};
+  bool suppress_client_ca_list_{false};
   TestCertificateValidationContextConfigPtr config_;
   std::vector<envoy::extensions::transport_sockets::tls::v3::SubjectAltNameMatcher> san_matchers_;
   Stats::TestUtil::TestStore store_;
@@ -860,7 +864,7 @@ typed_config:
 
 TEST_F(TestSPIFFEValidator, TestAddClientValidationContext) {
   Event::TestRealTimeSystem time_system;
-  ASSERT_OK(initialize(TestEnvironment::substitute(R"EOF(
+  const std::string config = TestEnvironment::substitute(R"EOF(
 name: envoy.tls.cert_validator.spiffe
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.SPIFFECertValidatorConfig
@@ -874,8 +878,8 @@ typed_config:
     - name: foo.com
       trust_bundle:
         filename: "{{ test_rundir }}/test/common/tls/test_data/ca_cert.pem"
-  )EOF"),
-                       time_system));
+  )EOF");
+  ASSERT_OK(initialize(config, time_system));
 
   bool foundTestServer = false;
   bool foundTestCA = false;
@@ -900,11 +904,18 @@ typed_config:
 
   EXPECT_TRUE(foundTestServer);
   EXPECT_TRUE(foundTestCA);
+
+  setSuppressClientCaList(true);
+  ASSERT_OK(initialize(config, time_system));
+  SSLContextPtr suppressed_ctx = SSL_CTX_new(TLS_method());
+  ASSERT_TRUE(validator().addClientValidationContext(suppressed_ctx.get(), false).ok());
+  const STACK_OF(X509_NAME)* client_ca_list = SSL_CTX_get_client_CA_list(suppressed_ctx.get());
+  EXPECT_TRUE(client_ca_list == nullptr || sk_X509_NAME_num(client_ca_list) == 0);
 }
 
 TEST_F(TestSPIFFEValidator, TestUpdateDigestForSessionId) {
   Event::TestRealTimeSystem time_system;
-  ASSERT_OK(initialize(TestEnvironment::substitute(R"EOF(
+  const std::string config = TestEnvironment::substitute(R"EOF(
 name: envoy.tls.cert_validator.spiffe
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.SPIFFECertValidatorConfig
@@ -915,12 +926,25 @@ typed_config:
     - name: example.com
       trust_bundle:
         filename: "{{ test_rundir }}/test/common/tls/test_data/ca_cert.pem"
-  )EOF"),
-                       time_system));
-  uint8_t hash_buffer[EVP_MAX_MD_SIZE];
-  bssl::ScopedEVP_MD_CTX md;
-  EVP_DigestInit(md.get(), EVP_sha256());
-  validator().updateDigestForSessionId(md, hash_buffer, SHA256_DIGEST_LENGTH);
+  )EOF");
+  ASSERT_OK(initialize(config, time_system));
+
+  auto session_id_digest = [this]() {
+    uint8_t hash_buffer[EVP_MAX_MD_SIZE];
+    std::array<uint8_t, SHA256_DIGEST_LENGTH> digest;
+    unsigned digest_length = 0;
+    bssl::ScopedEVP_MD_CTX md;
+    EXPECT_EQ(1, EVP_DigestInit(md.get(), EVP_sha256()));
+    validator().updateDigestForSessionId(md, hash_buffer, SHA256_DIGEST_LENGTH);
+    EXPECT_EQ(1, EVP_DigestFinal(md.get(), digest.data(), &digest_length));
+    EXPECT_EQ(SHA256_DIGEST_LENGTH, digest_length);
+    return digest;
+  };
+
+  const auto default_digest = session_id_digest();
+  setSuppressClientCaList(true);
+  ASSERT_OK(initialize(config, time_system));
+  EXPECT_NE(default_digest, session_id_digest());
 }
 
 TEST_F(TestSPIFFEValidator, InvalidTrustBundleMapConfig) {

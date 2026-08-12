@@ -101,6 +101,11 @@ public:
   virtual absl::optional<uint32_t> maxVerifyDepth() const PURE;
 
   /**
+   * @return whether to omit trusted CA names from downstream CertificateRequest messages.
+   */
+  virtual bool suppressClientCaList() const PURE;
+
+  /**
    * @return true if the SAN validation rules should be replaced with a rule to validate that the
    * certificate matches the transmitted SNI.
    */

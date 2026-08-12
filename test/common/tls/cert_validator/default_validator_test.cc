@@ -711,6 +711,7 @@ public:
   MOCK_METHOD(Api::Api&, api, (), (const override));
   bool onlyVerifyLeafCertificateCrl() const override { return false; }
   absl::optional<uint32_t> maxVerifyDepth() const override { return absl::nullopt; }
+  bool suppressClientCaList() const override { return false; }
   bool autoSniSanMatch() const override { return false; }
 
 private:
@@ -787,6 +788,7 @@ public:
   Api::Api& api() const override { return *api_; }
   bool onlyVerifyLeafCertificateCrl() const override { return false; }
   absl::optional<uint32_t> maxVerifyDepth() const override { return absl::nullopt; }
+  bool suppressClientCaList() const override { return false; }
   bool autoSniSanMatch() const override { return false; }
 
 private:
