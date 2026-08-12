@@ -96,6 +96,11 @@ class PhyExistsFilterExpr : public SegmentExpr {
     void
     DetermineExecPath() override;
 
+    bool
+    CanUseJsonFlatIndex() const override {
+        return true;
+    }
+
  private:
     VectorPtr
     EvalJsonExistsForDataSegment(EvalCtx& context);

@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include "ExprTestBase.h"
+#include "index/JsonFlatIndex.h"
 
 template <typename T>
 class JsonIndexTestFixture : public testing::Test {
@@ -294,6 +295,83 @@ TEST(JsonIndexTest, TestJsonNotEqualExpr) {
         auto row = i % json_strs.size();
         EXPECT_EQ(col_vec->ValidAt(i), row == 0 || row == 2) << "row " << i;
     }
+}
+
+TEST(JsonIndexTest, FlatIndexFallsBackForShapeSensitivePredicates) {
+    auto schema = std::make_shared<Schema>();
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    auto segment = CreateSealedSegment(schema);
+
+    std::vector<std::string> json_strings = {
+        R"({"a":"x"})",
+        R"({"a":["x"]})",
+        R"({})",
+        R"({"a":"y"})",
+    };
+    std::vector<milvus::Json> jsons;
+    for (const auto& value : json_strings) {
+        jsons.emplace_back(simdjson::padded_string(value));
+    }
+    auto json_field =
+        std::make_shared<FieldData<milvus::Json>>(DataType::JSON, false);
+    json_field->add_json_data(jsons);
+
+    auto file_manager_ctx = storage::FileManagerContext();
+    file_manager_ctx.fieldDataMeta.field_schema.set_data_type(
+        milvus::proto::schema::JSON);
+    file_manager_ctx.fieldDataMeta.field_schema.set_fieldid(json_fid.get());
+    file_manager_ctx.fieldDataMeta.field_id = json_fid.get();
+    auto flat_index = std::make_unique<index::JsonFlatIndex>(file_manager_ctx,
+                                                             std::string(""));
+    flat_index->BuildWithFieldData({json_field});
+    flat_index->finish();
+    flat_index->create_reader(milvus::index::SetBitsetSealed);
+
+    segcore::LoadIndexInfo load_index_info;
+    load_index_info.field_id = json_fid.get();
+    load_index_info.field_type = DataType::JSON;
+    load_index_info.index_params = {{JSON_PATH, ""}, {JSON_CAST_TYPE, "JSON"}};
+    load_index_info.cache_index =
+        CreateTestCacheIndex("flat-json", std::move(flat_index));
+    segment->LoadIndex(load_index_info);
+
+    auto cm = milvus::storage::RemoteChunkManagerSingleton::GetInstance()
+                  .GetRemoteChunkManager();
+    auto load_info = PrepareSingleFieldInsertBinlog(
+        1, 1, 1, json_fid.get(), {json_field}, cm);
+    segment->LoadFieldData(load_info);
+
+    proto::plan::GenericValue x;
+    x.set_string_val("x");
+    auto not_equal = std::make_shared<expr::UnaryRangeFilterExpr>(
+        expr::ColumnInfo(json_fid, DataType::JSON, {"a"}),
+        proto::plan::OpType::NotEqual,
+        x,
+        std::vector<proto::plan::GenericValue>());
+    auto not_equal_plan =
+        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, not_equal);
+    auto not_equal_result = milvus::test::gen_filter_res(
+        not_equal_plan.get(), segment.get(), jsons.size(), MAX_TIMESTAMP);
+    ASSERT_NE(not_equal_result, nullptr);
+    EXPECT_TRUE(not_equal_result->ValidAt(0));
+    EXPECT_FALSE(not_equal_result->ValidAt(1));
+    EXPECT_FALSE(not_equal_result->ValidAt(2));
+    EXPECT_TRUE(not_equal_result->ValidAt(3));
+
+    auto contains = std::make_shared<expr::JsonContainsExpr>(
+        expr::ColumnInfo(json_fid, DataType::JSON, {"a"}),
+        proto::plan::JSONContainsExpr_JSONOp_Contains,
+        true,
+        std::vector<proto::plan::GenericValue>{x});
+    auto contains_plan =
+        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, contains);
+    auto contains_result = milvus::test::gen_filter_res(
+        contains_plan.get(), segment.get(), jsons.size(), MAX_TIMESTAMP);
+    ASSERT_NE(contains_result, nullptr);
+    EXPECT_FALSE(contains_result->ValidAt(0));
+    EXPECT_TRUE(contains_result->ValidAt(1));
+    EXPECT_FALSE(contains_result->ValidAt(2));
+    EXPECT_FALSE(contains_result->ValidAt(3));
 }
 
 class JsonIndexExistsTest : public ::testing::TestWithParam<std::string> {};

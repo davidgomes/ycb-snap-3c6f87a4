@@ -136,23 +136,17 @@ PhyJsonContainsFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
     auto input = context.get_offset_input();
     SetHasOffsetInput((input != nullptr));
     if (expr_->vals_.empty()) {
-        auto real_batch_size = has_offset_input_
-                                   ? context.get_offset_input()->size()
-                                   : GetNextBatchSize();
-        if (real_batch_size == 0) {
-            result = nullptr;
-            return;
-        }
-        if (expr_->op_ == proto::plan::JSONContainsExpr_JSONOp_ContainsAll) {
-            result = std::make_shared<ColumnVector>(
-                TargetBitmap(real_batch_size, true),
-                TargetBitmap(real_batch_size, true));
+        if (expr_->column_.data_type_ == DataType::JSON) {
+            result =
+                expr_->op_ == proto::plan::JSONContainsExpr_JSONOp_ContainsAll
+                    ? ExecJsonContainsAll<bool>(context)
+                    : ExecJsonContains<bool>(context);
         } else {
-            result = std::make_shared<ColumnVector>(
-                TargetBitmap(real_batch_size, false),
-                TargetBitmap(real_batch_size, true));
+            result =
+                expr_->op_ == proto::plan::JSONContainsExpr_JSONOp_ContainsAll
+                    ? ExecArrayContainsAll<bool>(context)
+                    : ExecArrayContains<bool>(context);
         }
-        MoveCursor();
         return;
     }
 
@@ -374,6 +368,9 @@ PhyJsonContainsFilterExpr::ExecArrayContains(EvalCtx& context) {
             return;
         }
         auto executor = [&](size_t i) {
+            if (elements.empty()) {
+                return false;
+            }
             const auto& array = data[i];
             for (int j = 0; j < array.length(); ++j) {
                 if (elements.find(array.template get_data<GetType>(j)) !=
@@ -585,13 +582,6 @@ PhyJsonContainsFilterExpr::ExecJsonContainsByStats() {
             arg_set_double_ = arg_set_;
         }
         arg_inited_ = true;
-    }
-
-    if (arg_set_->Empty()) {
-        MoveCursor();
-        return std::make_shared<ColumnVector>(
-            TargetBitmap(real_batch_size, false),
-            TargetBitmap(real_batch_size, true));
     }
 
     if (cached_index_chunk_id_ != 0 && TryCacheGet()) {
@@ -973,6 +963,9 @@ PhyJsonContainsFilterExpr::ExecArrayContainsAll(EvalCtx& context) {
             return;
         }
         auto executor = [&](size_t i) {
+            if (matcher.target_count() == 0) {
+                return true;
+            }
             if (static_cast<size_t>(data[i].length()) <
                 matcher.target_count()) {
                 return false;
@@ -1237,13 +1230,6 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
 
     auto elements =
         std::static_pointer_cast<std::set<GetType>>(arg_cached_set_);
-    if (elements->empty()) {
-        MoveCursor();
-        return std::make_shared<ColumnVector>(
-            TargetBitmap(real_batch_size, false),
-            TargetBitmap(real_batch_size, true));
-    }
-
     if (cached_index_chunk_id_ != 0 && TryCacheGet()) {
         // Cache hit — skip Stats computation.
     } else if (cached_index_chunk_id_ != 0 &&

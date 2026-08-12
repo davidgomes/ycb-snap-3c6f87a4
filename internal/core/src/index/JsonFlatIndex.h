@@ -11,7 +11,6 @@
 
 #pragma once
 #include <algorithm>
-#include <limits>
 #include <memory>
 #include "common/EasyAssert.h"
 #include "common/JsonCastType.h"
@@ -50,39 +49,6 @@ class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
                               tracer::GetRootSpan());
         TargetBitmap bitset(this->Count());
         this->wrapper_->json_exist_query(json_path_, &bitset);
-        return bitset;
-    }
-
-    TargetBitmap
-    IsNotNull() override {
-        TargetBitmap bitset(this->Count());
-        if constexpr (std::is_same_v<T, bool>) {
-            this->wrapper_->json_range_query(
-                json_path_, false, true, false, false, true, true, &bitset);
-        } else if constexpr (std::is_arithmetic_v<T>) {
-            this->wrapper_->json_range_query(
-                json_path_,
-                std::numeric_limits<int64_t>::min(),
-                std::numeric_limits<int64_t>::max(),
-                false,
-                false,
-                true,
-                true,
-                &bitset);
-            this->wrapper_->json_range_query(
-                json_path_,
-                -std::numeric_limits<double>::infinity(),
-                std::numeric_limits<double>::infinity(),
-                false,
-                false,
-                true,
-                true,
-                &bitset);
-        } else if constexpr (std::is_same_v<T, std::string>) {
-            this->wrapper_->json_regex_query(json_path_, "(.|\n)*", &bitset);
-        } else {
-            return InvertedIndexTantivy<T>::IsNotNull();
-        }
         return bitset;
     }
 

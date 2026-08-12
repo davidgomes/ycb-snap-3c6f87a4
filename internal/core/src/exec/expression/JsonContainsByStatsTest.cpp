@@ -283,6 +283,31 @@ TEST(JsonContainsByStatsTest, BasicContainsAnyOnArray) {
     for (int i = 0; i < N; ++i) {
         EXPECT_EQ(col_vec->ValidAt(i), i % 7 != 4) << "row " << i;
     }
+
+    for (auto op : {proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+                    proto::plan::JSONContainsExpr_JSONOp_ContainsAll}) {
+        auto empty_expr = std::make_shared<expr::JsonContainsExpr>(
+            expr::ColumnInfo(
+                json_fid, DataType::JSON, std::vector<std::string>{"a"}, true),
+            op,
+            true,
+            std::vector<proto::plan::GenericValue>());
+        auto empty_plan = std::make_shared<plan::FilterBitsNode>(
+            DEFAULT_PLANNODE_ID, empty_expr);
+        auto empty_result = milvus::test::gen_filter_res(
+            empty_plan.get(), segment.get(), N, MAX_TIMESTAMP);
+        ASSERT_NE(empty_result, nullptr);
+        TargetBitmapView empty_data(empty_result->GetRawData(),
+                                    empty_result->size());
+        for (int i = 0; i < N; ++i) {
+            auto valid = i % 7 != 4;
+            EXPECT_EQ(empty_result->ValidAt(i), valid) << "row " << i;
+            EXPECT_EQ(
+                empty_data[i],
+                valid && op == proto::plan::JSONContainsExpr_JSONOp_ContainsAll)
+                << "row " << i;
+        }
+    }
 }
 
 TEST(JsonStatsUnaryRangeTest, NotEqualPreservesUnknownJsonPaths) {

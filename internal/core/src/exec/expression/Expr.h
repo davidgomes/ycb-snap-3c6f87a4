@@ -1796,6 +1796,27 @@ class SegmentExpr : public Expr {
                     TargetBitmap valid_res;
                     if (cached_is_nested_index_ && func_returns_row_level) {
                         valid_res = TargetBitmap(active_count_, true);
+                        TargetBitmapView valid_view(valid_res);
+                        int64_t processed = 0;
+                        for (size_t i = 0;
+                             i < num_data_chunk_ && processed < active_count_;
+                             ++i) {
+                            auto size = segment_->is_chunked()
+                                            ? segment_->chunk_size(field_id_, i)
+                                            : (i == num_data_chunk_ - 1
+                                                   ? active_count_ - processed
+                                                   : size_per_chunk_);
+                            size = std::min<int64_t>(size,
+                                                     active_count_ - processed);
+                            segment_->ApplyFieldValidData(
+                                op_ctx_,
+                                field_id_,
+                                i,
+                                0,
+                                size,
+                                valid_view + processed);
+                            processed += size;
+                        }
                     } else {
                         valid_res = index_ptr->IsNotNull();
                     }
@@ -2163,14 +2184,21 @@ class SegmentExpr : public Expr {
         }
 
         auto query_path = milvus::Json::pointer(nested_path_);
-        auto index_path =
+        auto matched_index_path =
             segment_->GetJsonFlatIndexNestedPath(field_id_, query_path);
-        if (index_path.empty()) {
+        if (!matched_index_path.has_value()) {
             // No JsonFlatIndex covers this path; nothing JSON-specific to
             // reject here. The caller will decide between ScalarIndex and
             // RawData based on HasCompatibleScalarIndex() alone.
             return true;
         }
+        if (!CanUseJsonFlatIndex()) {
+            // Flattened JSON terms do not retain whether a value came from a
+            // scalar or an array. Predicates that depend on value shape must
+            // use raw data to preserve UNKNOWN for incompatible paths.
+            return false;
+        }
+        const auto& index_path = matched_index_path.value();
 
         // Exact match - safe to use index
         if (index_path == query_path) {
@@ -2281,6 +2309,11 @@ class SegmentExpr : public Expr {
     CanUseNgramIndex() const {
         return false;
     };
+
+    virtual bool
+    CanUseJsonFlatIndex() const {
+        return false;
+    }
 
     // check if this expression can be executed all at once without batch iteration.
     bool

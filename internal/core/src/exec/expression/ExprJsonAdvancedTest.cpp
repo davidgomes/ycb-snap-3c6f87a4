@@ -918,6 +918,24 @@ TEST(JsonUnknownTest, RawPredicatesPreserveUnknown) {
            {true, false, false, false, false, false, true, false, false},
            {true, false, false, false, true, true, true, true, false});
 
+    auto empty_contains_any = std::make_shared<expr::JsonContainsExpr>(
+        expr::ColumnInfo(json_fid, DataType::JSON, {"arr"}),
+        proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+        true,
+        std::vector<proto::plan::GenericValue>());
+    expect(eval(empty_contains_any),
+           {false, false, false, false, false, false, false, false, false},
+           {true, false, false, false, true, true, true, true, false});
+
+    auto empty_contains_all = std::make_shared<expr::JsonContainsExpr>(
+        expr::ColumnInfo(json_fid, DataType::JSON, {"arr"}),
+        proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+        true,
+        std::vector<proto::plan::GenericValue>());
+    expect(eval(empty_contains_all),
+           {true, false, false, false, true, true, true, true, false},
+           {true, false, false, false, true, true, true, true, false});
+
     auto array_index_not_equal = std::make_shared<expr::UnaryRangeFilterExpr>(
         expr::ColumnInfo(json_fid, DataType::JSON, {"arr", "1"}),
         proto::plan::OpType::NotEqual,
