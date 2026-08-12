@@ -4,10 +4,13 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+
 #include <algorithm>
 #include <cmath>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "core/search/base.h"
@@ -29,6 +32,50 @@ struct ScoringTermInfo {
 struct ScoringContext {
   size_t num_docs = 0;  // Total documents in index
 };
+
+// Per-shard statistics needed to build a cross-shard GlobalScoringStats. Collected via
+// SearchAlgorithm::CollectLocalScoringStats() on every shard and merged on the coordinator
+// with MergeGlobalScoringStats() before the actual (scored) search runs. This makes
+// BM25STD/TFIDF/TFIDF.DOCNORM independent of how the corpus happens to be split across
+// shards/proactor threads: without it, IDF and average field length are computed from
+// whatever subset of documents lives on a single shard.
+struct LocalScoringStats {
+  size_t num_docs = 0;  // Local document count (N on this shard)
+
+  struct TermStat {
+    std::string field;    // Field identifier the term was matched in
+    std::string term;     // Normalized term (post-stemming/synonym resolution)
+    size_t doc_freq = 0;  // Local document frequency for `term` in `field`
+  };
+  std::vector<TermStat> term_stats;
+
+  struct FieldStat {
+    std::string field;
+    size_t total_len = 0;  // Sum of per-doc lengths for `field` on this shard
+    size_t num_docs = 0;   // Docs with non-empty `field` content on this shard
+  };
+  std::vector<FieldStat> field_stats;
+};
+
+// Corpus-wide scoring statistics, merged from every shard's LocalScoringStats. Passed back
+// down to each shard so the actual scoring pass uses the same IDF/avg-length values
+// regardless of the shard/proactor count.
+struct GlobalScoringStats {
+  size_t num_docs = 0;  // Total documents across all shards
+
+  // (field, term) -> total document frequency across all shards
+  absl::flat_hash_map<std::pair<std::string, std::string>, size_t> term_doc_freq;
+
+  // field -> average document length across all shards
+  absl::flat_hash_map<std::string, double> field_avg_len;
+
+  size_t TermDocFreq(std::string_view field, std::string_view term) const;
+  double FieldAvgLen(std::string_view field) const;
+};
+
+// Merge per-shard LocalScoringStats (one per shard, collected in shard-id order) into
+// corpus-wide statistics.
+GlobalScoringStats MergeGlobalScoringStats(const std::vector<LocalScoringStats>& local_stats);
 
 // Scorer function signature: computes the score for a single (term, document) pair.
 // Register new scorers by adding a function with this signature and exposing it via

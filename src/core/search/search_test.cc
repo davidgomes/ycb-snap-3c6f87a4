@@ -3238,6 +3238,66 @@ TEST_F(ScoringTest, ScorerTopKCutoff) {
   }
 }
 
+// Regression test: BM25STD/TFIDF/TFIDF.DOCNORM must be independent of how the corpus is
+// split across shards. Without cross-shard GlobalScoringStats, IDF and average field length
+// are computed from whatever subset of documents lives on a single shard, so the same corpus
+// split across N shards yields different scores than a single shard holding everything.
+TEST_F(ScoringTest, GlobalScoringStatsMatchesSingleShard) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+
+  // Baseline: all docs on a single "shard" (as if proactor_threads=1).
+  FieldIndices single_shard{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  MockedDocument doc1("hello world hello");  // "hello" TF=2
+  MockedDocument doc2("hello there");        // "hello" TF=1
+  MockedDocument doc3("goodbye world");      // no "hello"
+  single_shard.Add(0, doc1);
+  single_shard.Add(1, doc2);
+  single_shard.Add(2, doc3);
+  single_shard.FinalizeInitialization();
+
+  QueryParams params;
+  SearchAlgorithm baseline_algo;
+  ASSERT_TRUE(baseline_algo.Init("hello", &params));
+  baseline_algo.SetScorer(&BM25Std);
+  auto baseline = baseline_algo.Search(&single_shard);
+  ASSERT_EQ(baseline.text_scores.size(), 2u);
+  absl::flat_hash_map<DocId, float> baseline_scores(baseline.text_scores.begin(),
+                                                    baseline.text_scores.end());
+
+  // Split the same corpus across two shards (as if proactor_threads=2): shard A gets doc1 and
+  // doc3 (as local ids 0 and 1), shard B gets doc2 (as local id 0).
+  FieldIndices shard_a{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  shard_a.Add(0, doc1);
+  shard_a.Add(1, doc3);
+  shard_a.FinalizeInitialization();
+
+  FieldIndices shard_b{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  shard_b.Add(0, doc2);
+  shard_b.FinalizeInitialization();
+
+  SearchAlgorithm sharded_algo;
+  ASSERT_TRUE(sharded_algo.Init("hello", &params));
+  sharded_algo.SetScorer(&BM25Std);
+
+  // Hop 1 (coordinator): collect + merge per-shard stats, as search_family.cc does.
+  GlobalScoringStats global_stats =
+      MergeGlobalScoringStats({sharded_algo.CollectLocalScoringStats(&shard_a),
+                               sharded_algo.CollectLocalScoringStats(&shard_b)});
+  sharded_algo.SetGlobalScoringStats(&global_stats);
+
+  // Hop 2 (per shard): real scored search using the aggregated stats.
+  auto result_a = sharded_algo.Search(&shard_a);
+  auto result_b = sharded_algo.Search(&shard_b);
+
+  ASSERT_EQ(result_a.text_scores.size(), 1u);  // only doc1 (local id 0) matches on shard A
+  ASSERT_EQ(result_b.text_scores.size(), 1u);  // doc2 (local id 0) matches on shard B
+
+  EXPECT_FLOAT_EQ(result_a.text_scores[0].second, baseline_scores.at(0))
+      << "Shard A's score for doc1 should match the single-shard score";
+  EXPECT_FLOAT_EQ(result_b.text_scores[0].second, baseline_scores.at(1))
+      << "Shard B's score for doc2 should match the single-shard score";
+}
+
 TEST_F(SearchTest, MatchOptional) {
   // ~term returns ALL documents, not just matching ones
   PrepareQuery("~hello");
