@@ -331,14 +331,12 @@ func Test_tlsPassthroughFilterChains_Backends(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			filterChains := tlsPassthroughFilterChains(&model.Model{
-				TLSPassthrough: []model.TLSPassthroughListener{
-					{
-						Routes: []model.TLSPassthroughRoute{
-							{
-								Hostnames: []string{"test.example.com"},
-								Backends:  tt.backends,
-							},
+			filterChains := tlsPassthroughFilterChains([]model.TLSPassthroughListener{
+				{
+					Routes: []model.TLSPassthroughRoute{
+						{
+							Hostnames: []string{"test.example.com"},
+							Backends:  tt.backends,
 						},
 					},
 				},
@@ -365,21 +363,19 @@ func Test_tlsPassthroughFilterChains_Backends(t *testing.T) {
 }
 
 func Test_tlsPassthroughFilterChains_DuplicateSNIRoutesPreserveCurrentBehavior(t *testing.T) {
-	filterChains := tlsPassthroughFilterChains(&model.Model{
-		TLSPassthrough: []model.TLSPassthroughListener{
-			{
-				Routes: []model.TLSPassthroughRoute{
-					{
-						Hostnames: []string{"test.example.com"},
-						Backends: []model.Backend{
-							tlsBackend("one", "backend-v1", 443, nil),
-						},
+	filterChains := tlsPassthroughFilterChains([]model.TLSPassthroughListener{
+		{
+			Routes: []model.TLSPassthroughRoute{
+				{
+					Hostnames: []string{"test.example.com"},
+					Backends: []model.Backend{
+						tlsBackend("one", "backend-v1", 443, nil),
 					},
-					{
-						Hostnames: []string{"test.example.com"},
-						Backends: []model.Backend{
-							tlsBackend("one", "backend-v2", 443, nil),
-						},
+				},
+				{
+					Hostnames: []string{"test.example.com"},
+					Backends: []model.Backend{
+						tlsBackend("one", "backend-v2", 443, nil),
 					},
 				},
 			},
@@ -471,8 +467,8 @@ func Test_tlsPassthroughFilterChains_DeterministicOrder(t *testing.T) {
 		},
 	}
 
-	filterChainsA := tlsPassthroughFilterChains(modelA)
-	filterChainsB := tlsPassthroughFilterChains(modelB)
+	filterChainsA := tlsPassthroughFilterChains(modelA.TLSPassthrough)
+	filterChainsB := tlsPassthroughFilterChains(modelB.TLSPassthrough)
 
 	diffOutput := cmp.Diff(filterChainsA, filterChainsB, protocmp.Transform())
 	if len(diffOutput) != 0 {
