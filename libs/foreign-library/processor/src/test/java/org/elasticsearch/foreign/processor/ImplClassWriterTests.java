@@ -201,10 +201,11 @@ public class ImplClassWriterTests extends ProcessorTestCase {
      * API, catching descriptor mismatches that {@code loadClassNoInit} would miss.
      *
      * <p>The custom {@link org.elasticsearch.foreign.SymbolResolver} returns a fake non-null
-     * address so {@code linker.downcallHandle} succeeds at class-init time without needing a
-     * real native symbol on the classpath. Any linkage error from the descriptor construction
-     * (e.g. {@code captureCallState} declared as varargs but emitted as a single {@code String})
-     * still surfaces here because it fires before {@code downcallHandle} is even called.
+     * address so {@code MethodHandleResolver.resolve} / {@code linker.downcallHandle} succeeds at
+     * class-init time without needing a real native symbol on the classpath. Any linkage error
+     * from the descriptor construction (e.g. {@code captureCallState} declared as varargs but
+     * emitted as a single {@code String}) still surfaces here because it fires before
+     * {@code downcallHandle} is even called.
      */
     public void testCaptureErrnoAndVariadicInitializeAgainstFfmApi() throws Exception {
         String source = """
@@ -214,6 +215,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import org.elasticsearch.foreign.CaptureErrno;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.SymbolResolver;
             import org.elasticsearch.foreign.Variadic;
             @LibrarySpecification(symbolResolver = ErrnoLib.FakeResolver.class)
@@ -229,9 +231,9 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
                         // downcallHandle validates the address is non-NULL; any positive value works.
-                        return MemorySegment.ofAddress(1L);
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }
@@ -241,7 +243,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
         assertTrue("Expected compilation to succeed but got errors: " + result.errors(), result.success());
 
         // Loading with init runs the whole downcall-handle build path for both methods:
-        // Linker.nativeLinker().downcallHandle(FakeResolver.resolve(...), descriptor,
+        // methodHandleResolver.resolve(FakeResolver.resolve(...), descriptor, linker,
         // [captureCallState("errno"), firstVariadicArg(1)])
         // A descriptor mismatch (e.g. captureCallState declared as varargs but emitted as
         // (String)) throws NoSuchMethodError from <clinit>.
@@ -442,6 +444,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import java.lang.foreign.SymbolLookup;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.StructSpecification;
             import org.elasticsearch.foreign.SymbolResolver;
             @LibrarySpecification(symbolResolver = StructParamLib.FakeResolver.class)
@@ -457,8 +460,8 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
-                        return MemorySegment.ofAddress(1L);
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }
@@ -484,7 +487,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
         CompilationResult result = compile(sources);
         assertTrue("Expected compilation to succeed but got errors: " + result.errors(), result.success());
 
-        // Load with init: <clinit> of $Impl runs downcallHandle (FakeResolver returns non-null)
+        // Load with init: <clinit> of $Impl runs MethodHandleResolver.resolve (FakeResolver returns non-null)
         assertNotNull("Generated StructParamLib$Impl not found", result.loadClass("test.StructParamLib$Impl"));
         assertNotNull("Generated StructParamLib$Point$Impl not found", result.loadClass("test.StructParamLib$Point$Impl"));
 
@@ -870,6 +873,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import org.elasticsearch.foreign.CaptureErrno;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.SymbolResolver;
             import org.elasticsearch.foreign.Variadic;
             @LibrarySpecification(symbolResolver = OpenLib.FakeResolver.class)
@@ -882,8 +886,8 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
-                        return MemorySegment.ofAddress(1L);
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }
