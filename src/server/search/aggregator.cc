@@ -116,6 +116,17 @@ void Aggregator::DoSort(const SortParams& sort_params) {
         continue;
       return order == SortOrder::ASC ? *lv < *rv : *lv > *rv;
     }
+
+    // Deterministic tie-break using the hidden "__key" field (set when ADDSCORES is active —
+    // see LoadDocEntriesWithScores), so docs that compare equal on every sort field (e.g. a
+    // tied __score) still sort identically regardless of shard count/iteration order, instead
+    // of falling back to (shard-count-dependent) input order.
+    auto lk = l.find("__key");
+    auto rk = r.find("__key");
+    if (lk != l.end() && rk != r.end() && std::holds_alternative<std::string>(lk->second) &&
+        std::holds_alternative<std::string>(rk->second)) {
+      return std::get<std::string>(lk->second) < std::get<std::string>(rk->second);
+    }
     return false;
   };
 
