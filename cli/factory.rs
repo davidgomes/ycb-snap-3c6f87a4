@@ -1532,6 +1532,12 @@ fn new_workspace_factory_options(
       .internal
       .root_node_modules_dir_override
       .clone(),
+    // For a local `deno install` without a lockfile, seed the resolution
+    // from a sibling package-lock.json (npm migration) when one exists.
+    seed_lockfile_from_npm_package_lock: matches!(
+      flags.subcommand,
+      DenoSubcommand::Install(InstallFlags::Local(..))
+    ),
     vendor: flags.vendor,
   }
 }

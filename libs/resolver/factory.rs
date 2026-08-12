@@ -219,6 +219,11 @@ pub struct WorkspaceFactoryOptions {
   pub npm_process_state: Option<NpmProcessStateOptions>,
   /// Override the path to the root node_modules directory.
   pub root_node_modules_dir_override: Option<PathBuf>,
+  /// When the lockfile doesn't exist, whether to seed it from a sibling
+  /// npm `package-lock.json` in order to preserve the versions and
+  /// integrity hashes pinned by npm. This should only be set for local
+  /// `deno install` runs.
+  pub seed_lockfile_from_npm_package_lock: bool,
   pub vendor: Option<bool>,
 }
 
@@ -547,6 +552,15 @@ impl<TSys: WorkspaceFactorySys> WorkspaceFactory<TSys> {
               ConfigDiscoveryOption::Disabled
             ),
             no_npm: self.options.no_npm,
+            seed_npm_package_lock_registry_urls: if self
+              .options
+              .seed_lockfile_from_npm_package_lock
+              && !self.options.no_npm
+            {
+              Some(self.npmrc()?.get_all_known_registries_urls())
+            } else {
+              None
+            },
           },
           &workspace_directory.workspace,
           maybe_external_import_map.as_ref().map(|v| &v.value),

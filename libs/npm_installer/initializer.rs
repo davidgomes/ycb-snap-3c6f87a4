@@ -190,6 +190,13 @@ fn snapshot_from_lockfile<TSys: LockfileSys>(
   link_packages: &WorkspaceNpmLinkPackagesRc,
   dedup_equivalent_peer_variants: bool,
 ) -> Result<SnapshotWithPending, SnapshotFromLockfileError> {
+  // A lockfile seeded from an npm package-lock.json is flagged as changed
+  // only so the new deno.lock gets written to disk. Don't treat that as a
+  // pending resolution—re-resolving would re-derive the integrity hashes
+  // from the registry instead of preserving the ones pinned in the npm
+  // lockfile. If some requirement isn't satisfied by the seeded snapshot,
+  // a resolution still runs through the usual unresolved-requirement path.
+  let seeded_from_npm_package_lock = lockfile.seeded_from_npm_package_lock();
   let lockfile = lockfile.lock();
   let snapshot = deno_npm::resolution::snapshot_from_lockfile(
     deno_npm::resolution::SnapshotFromLockfileParams {
@@ -202,6 +209,6 @@ fn snapshot_from_lockfile<TSys: LockfileSys>(
 
   Ok(SnapshotWithPending {
     snapshot,
-    is_pending: lockfile.has_content_changed,
+    is_pending: lockfile.has_content_changed && !seeded_from_npm_package_lock,
   })
 }

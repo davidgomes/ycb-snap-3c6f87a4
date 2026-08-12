@@ -1,6 +1,7 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -28,6 +29,7 @@ use indexmap::IndexMap;
 use node_resolver::PackageJson;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
+use url::Url;
 
 use crate::workspace::WorkspaceNpmLinkPackagesRc;
 
@@ -144,6 +146,11 @@ pub struct LockfileReadFromPathOptions {
   pub frozen: bool,
   /// Causes the lockfile to only be read from, but not written to.
   pub skip_write: bool,
+  /// When set, a non-existent lockfile will be seeded from a sibling npm
+  /// `package-lock.json` (lockfileVersion 2 or 3) if present. The urls
+  /// are the configured npm registries, which are used to identify
+  /// registry-resolved packages (non-registry dependencies are skipped).
+  pub seed_npm_package_lock_registry_urls: Option<Vec<Url>>,
 }
 
 #[sys_traits::auto_impl]
@@ -181,6 +188,8 @@ pub struct LockfileFlags {
   pub skip_write: bool,
   pub no_config: bool,
   pub no_npm: bool,
+  /// See [`LockfileReadFromPathOptions::seed_npm_package_lock_registry_urls`].
+  pub seed_npm_package_lock_registry_urls: Option<Vec<Url>>,
 }
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
@@ -203,6 +212,7 @@ pub struct LockfileLock<TSys: LockfileSys> {
   pub filename: PathBuf,
   frozen: bool,
   skip_write: bool,
+  seeded_from_npm_package_lock: bool,
 }
 
 impl<TSys: LockfileSys> LockfileLock<TSys> {
@@ -246,6 +256,12 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
 
   pub fn overwrite(&self) -> bool {
     self.lockfile.lock().overwrite
+  }
+
+  /// Whether the lockfile didn't exist and its content was seeded from a
+  /// sibling npm `package-lock.json`.
+  pub fn seeded_from_npm_package_lock(&self) -> bool {
+    self.seeded_from_npm_package_lock
   }
 
   pub fn write_if_changed(&self) -> Result<(), LockfileWriteError> {
@@ -349,6 +365,8 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
         file_path,
         frozen,
         skip_write: flags.skip_write,
+        seed_npm_package_lock_registry_urls: flags
+          .seed_npm_package_lock_registry_urls,
       },
       api,
     )
@@ -500,6 +518,7 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
     opts: LockfileReadFromPathOptions,
     api: &dyn deno_lockfile::NpmPackageInfoProvider,
   ) -> Result<LockfileLock<TSys>, AnyError> {
+    let mut seeded_from_npm_package_lock = false;
     let lockfile = match sys.fs_read_to_string(&opts.file_path) {
       Ok(text) => {
         Lockfile::new(
@@ -513,7 +532,19 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
         .await?
       }
       Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-        Lockfile::new_empty(opts.file_path, false)
+        let maybe_seeded_lockfile = opts
+          .seed_npm_package_lock_registry_urls
+          .as_deref()
+          .and_then(|registry_urls| {
+            try_seed_lockfile_from_npm_package_lock(
+              &sys,
+              &opts.file_path,
+              registry_urls,
+            )
+          });
+        seeded_from_npm_package_lock = maybe_seeded_lockfile.is_some();
+        maybe_seeded_lockfile
+          .unwrap_or_else(|| Lockfile::new_empty(opts.file_path, false))
       }
       Err(err) => {
         return Err(err).with_context(|| {
@@ -527,6 +558,7 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
       lockfile: Mutex::new(lockfile),
       frozen: opts.frozen,
       skip_write: opts.skip_write,
+      seeded_from_npm_package_lock,
     })
   }
 
@@ -560,6 +592,54 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
       )))
     } else {
       Ok(())
+    }
+  }
+}
+
+/// Attempts creating lockfile content from a sibling npm
+/// `package-lock.json` so that the versions and integrity hashes pinned
+/// by npm are preserved when migrating a project to deno. Returns `None`
+/// when the npm lockfile is missing or unusable so the caller can fall
+/// back to an empty lockfile.
+fn try_seed_lockfile_from_npm_package_lock<TSys: LockfileSys>(
+  sys: &TSys,
+  lockfile_path: &Path,
+  registry_urls: &[Url],
+) -> Option<Lockfile> {
+  let npm_lockfile_path = lockfile_path.parent()?.join("package-lock.json");
+  let text = match sys.fs_read_to_string(&npm_lockfile_path) {
+    Ok(text) => text,
+    Err(err) => {
+      if err.kind() != std::io::ErrorKind::NotFound {
+        log::debug!(
+          "Failed reading '{}': {:#}",
+          npm_lockfile_path.display(),
+          err
+        );
+      }
+      return None;
+    }
+  };
+  match crate::npm_package_lock::packages_content_from_npm_package_lock(
+    &text,
+    registry_urls,
+  ) {
+    Ok(packages) if !packages.specifiers.is_empty() || !packages.npm.is_empty() => {
+      log::info!("Initialized lockfile from 'package-lock.json'");
+      let mut lockfile = Lockfile::new_empty(lockfile_path.to_path_buf(), false);
+      lockfile.content.packages = packages;
+      // mark the content as changed so the new lockfile gets written
+      lockfile.has_content_changed = true;
+      Some(lockfile)
+    }
+    Ok(_) => None,
+    Err(err) => {
+      log::debug!(
+        "Failed creating lockfile from '{}': {:#}",
+        npm_lockfile_path.display(),
+        err
+      );
+      None
     }
   }
 }
