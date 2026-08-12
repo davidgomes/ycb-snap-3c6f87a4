@@ -1121,6 +1121,29 @@ uint64_t hllCount(struct hllhdr *hdr, int *invalid) {
     return (uint64_t) E;
 }
 
+/* Create an empty raw HLL for cardinality estimation by other data types.
+ * Raw HLLs use one byte per register and are never exposed as Redis values. */
+void *hllRawCreate(void) {
+    struct hllhdr *hdr = zcalloc(HLL_HDR_SIZE + HLL_REGISTERS);
+    hdr->encoding = HLL_RAW;
+    return hdr;
+}
+
+/* Add an element to a raw HLL. Returns 1 when a register changed. */
+int hllRawAdd(void *raw, unsigned char *ele, size_t elesize) {
+    struct hllhdr *hdr = raw;
+    long index;
+    uint8_t count = hllPatLen(ele, elesize, &index);
+
+    if (count <= hdr->registers[index]) return 0;
+    hdr->registers[index] = count;
+    return 1;
+}
+
+uint64_t hllRawCount(void *raw) {
+    return hllCount(raw, NULL);
+}
+
 /* Call hllDenseAdd() or hllSparseAdd() according to the HLL encoding. */
 int hllAdd(robj *o, unsigned char *ele, size_t elesize) {
     struct hllhdr *hdr = o->ptr;

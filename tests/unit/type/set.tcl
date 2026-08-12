@@ -247,6 +247,40 @@ foreach type {single multiple single_multiple} {
         assert_error "ERR LIMIT*" {r sintercard 1 myset{t} LIMIT a}
     }
 
+    test "SUNIONCARD with illegal arguments" {
+        assert_error "ERR wrong number of arguments for 'sunioncard' command" {r sunioncard}
+        assert_error "ERR wrong number of arguments for 'sunioncard' command" {r sunioncard 1}
+
+        assert_error "ERR numkeys*" {r sunioncard 0 myset{t}}
+        assert_error "ERR numkeys*" {r sunioncard a myset{t}}
+
+        assert_error "ERR Number of keys*" {r sunioncard 2 myset{t}}
+        assert_error "ERR Number of keys*" {r sunioncard 3 myset{t} myset2{t}}
+
+        assert_error "ERR syntax error*" {r sunioncard 1 myset{t} bar_arg}
+        assert_error "ERR syntax error*" {r sunioncard 1 myset{t} LIMIT}
+        assert_error "ERR syntax error*" {r sunioncard 1 myset{t} APPROX bar_arg}
+
+        assert_error "ERR LIMIT*" {r sunioncard 1 myset{t} LIMIT -1}
+        assert_error "ERR LIMIT*" {r sunioncard 1 myset{t} LIMIT a}
+    }
+
+    test "SUNIONCARD against non-set should throw error" {
+        r del set{t}
+        r sadd set{t} a b c
+        r set key1{t} x
+
+        assert_error "WRONGTYPE*" {r sunioncard 1 key1{t}}
+        assert_error "WRONGTYPE*" {r sunioncard 2 set{t} key1{t} LIMIT 1}
+        assert_error "WRONGTYPE*" {r sunioncard 2 key1{t} noset{t} APPROX}
+    }
+
+    test "SUNIONCARD against non-existing key" {
+        assert_equal 0 [r sunioncard 1 non-existing-key]
+        assert_equal 0 [r sunioncard 1 non-existing-key APPROX]
+        assert_equal 0 [r sunioncard 1 non-existing-key LIMIT 10]
+    }
+
     test "SINTERCARD against non-set should throw error" {
         r del set{t}
         r sadd set{t} a b c
@@ -336,6 +370,23 @@ foreach type {single multiple single_multiple} {
         test "SUNION with two sets - $type" {
             set expected [lsort -uniq "[r smembers set1{t}] [r smembers set2{t}]"]
             assert_equal $expected [lsort [r sunion set1{t} set2{t}]]
+        }
+
+        test "SUNIONCARD with two sets - $type" {
+            set expected [lsort -uniq "[r smembers set1{t}] [r smembers set2{t}]"]
+            set cardinality [llength $expected]
+            assert_equal $cardinality [r sunioncard 2 set1{t} set2{t}]
+            assert_equal $cardinality [r sunioncard 3 set1{t} set2{t} set1{t} LIMIT 0]
+            assert_equal 100 [r sunioncard 2 set1{t} set2{t} LIMIT 100]
+            assert_equal $cardinality [r sunioncard 4 nokey1{t} set1{t} nokey2{t} set2{t}]
+        }
+
+        test "SUNIONCARD approximate with two sets - $type" {
+            set exact [r sunioncard 2 set1{t} set2{t}]
+            set estimate [r sunioncard 2 set1{t} set2{t} APPROX]
+            assert {[expr abs($estimate - $exact)] < ($exact * 0.05)}
+            assert_equal 100 [r sunioncard 2 set1{t} set2{t} APPROX LIMIT 100]
+            assert_equal 100 [r sunioncard 2 set1{t} set2{t} LIMIT 100 APPROX]
         }
 
         test "SUNIONSTORE with two sets - $type" {

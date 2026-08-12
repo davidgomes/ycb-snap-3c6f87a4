@@ -1627,6 +1627,105 @@ void sinterCardCommand(client *c) {
     sinterGenericCommand(c, c->argv+2, numkeys, NULL, 1, limit);
 }
 
+/* SUNIONCARD numkeys key [key ...] [APPROX] [LIMIT limit] */
+void sunionCardCommand(client *c) {
+    long numkeys = 0;
+    long limit = 0;
+    int approximate = 0;
+
+    if (getRangeLongFromObjectOrReply(c, c->argv[1], 1, LONG_MAX,
+                                      &numkeys, "numkeys should be greater than 0") != C_OK)
+        return;
+    if (numkeys > (c->argc - 2)) {
+        addReplyError(c, "Number of keys can't be greater than number of args");
+        return;
+    }
+
+    for (long j = 2 + numkeys; j < c->argc; j++) {
+        char *opt = c->argv[j]->ptr;
+        int moreargs = (c->argc - 1) - j;
+
+        if (!strcasecmp(opt, "APPROX")) {
+            approximate = 1;
+        } else if (!strcasecmp(opt, "LIMIT") && moreargs) {
+            j++;
+            if (getPositiveLongFromObjectOrReply(c, c->argv[j], &limit,
+                                                 "LIMIT can't be negative") != C_OK)
+                return;
+        } else {
+            addReplyErrorObject(c, shared.syntaxerr);
+            return;
+        }
+    }
+
+    setopsrc *sets = zmalloc(sizeof(setopsrc) * numkeys);
+    for (long j = 0; j < numkeys; j++) {
+        kvobj *setobj = lookupKeyRead(c->db, c->argv[j + 2]);
+        if (setobj && checkType(c, setobj, OBJ_SET)) {
+            zfree(sets);
+            return;
+        }
+        sets[j].set = setobj;
+        if (server.memory_tracking_enabled)
+            sets[j].oldsize = setobj ? kvobjAllocSize(setobj) : 0;
+    }
+
+    robj *dstset = approximate ? NULL : createSetObject();
+    void *hll = approximate ? hllRawCreate() : NULL;
+    unsigned long cardinality = 0;
+    int reached_limit = 0;
+
+    for (long j = 0; j < numkeys && !reached_limit; j++) {
+        if (!sets[j].set) continue;
+
+        setTypeIterator si;
+        char *str;
+        size_t len;
+        int64_t llval;
+        int encoding;
+
+        setTypeInitIterator(&si, sets[j].set);
+        while ((encoding = setTypeNext(&si, &str, &len, &llval)) != -1) {
+            if (approximate) {
+                char buf[LONG_STR_SIZE];
+                if (!str) {
+                    len = ll2string(buf, sizeof(buf), llval);
+                    str = buf;
+                }
+                if (hllRawAdd(hll, (unsigned char *)str, len) && limit) {
+                    cardinality = hllRawCount(hll);
+                    reached_limit = cardinality >= (unsigned long)limit;
+                }
+            } else {
+                cardinality += setTypeAddAux(dstset, str, len, llval,
+                                             encoding == OBJ_ENCODING_HT);
+                reached_limit = limit && cardinality >= (unsigned long)limit;
+            }
+            if (reached_limit) break;
+        }
+        setTypeResetIterator(&si);
+    }
+
+    if (approximate && !reached_limit)
+        cardinality = hllRawCount(hll);
+    if (limit && cardinality > (unsigned long)limit)
+        cardinality = limit;
+
+    if (server.memory_tracking_enabled) {
+        for (long j = 0; j < numkeys; j++) {
+            if (!sets[j].set) continue;
+            updateSlotAllocSize(c->db, getKeySlot(c->argv[j + 2]->ptr),
+                                sets[j].set, sets[j].oldsize,
+                                kvobjAllocSize(sets[j].set));
+        }
+    }
+
+    if (dstset) decrRefCount(dstset);
+    zfree(hll);
+    zfree(sets);
+    addReplyLongLong(c, cardinality);
+}
+
 /* SINTERSTORE destination key [key ...] */
 void sinterstoreCommand(client *c) {
     sinterGenericCommand(c, c->argv+2, c->argc-2, c->argv[1], 0, 0);
