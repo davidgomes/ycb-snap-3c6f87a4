@@ -201,10 +201,10 @@ public class ImplClassWriterTests extends ProcessorTestCase {
      * API, catching descriptor mismatches that {@code loadClassNoInit} would miss.
      *
      * <p>The custom {@link org.elasticsearch.foreign.SymbolResolver} returns a fake non-null
-     * address so {@code linker.downcallHandle} succeeds at class-init time without needing a
-     * real native symbol on the classpath. Any linkage error from the descriptor construction
+     * address so the default method handle resolver succeeds at class-init time without needing
+     * a real native symbol on the classpath. Any linkage error from the descriptor construction
      * (e.g. {@code captureCallState} declared as varargs but emitted as a single {@code String})
-     * still surfaces here because it fires before {@code downcallHandle} is even called.
+     * still surfaces here because it fires before the method handle resolver is called.
      */
     public void testCaptureErrnoAndVariadicInitializeAgainstFfmApi() throws Exception {
         String source = """
@@ -214,6 +214,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import org.elasticsearch.foreign.CaptureErrno;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.SymbolResolver;
             import org.elasticsearch.foreign.Variadic;
             @LibrarySpecification(symbolResolver = ErrnoLib.FakeResolver.class)
@@ -229,9 +230,9 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
                         // downcallHandle validates the address is non-NULL; any positive value works.
-                        return MemorySegment.ofAddress(1L);
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }
@@ -241,8 +242,8 @@ public class ImplClassWriterTests extends ProcessorTestCase {
         assertTrue("Expected compilation to succeed but got errors: " + result.errors(), result.success());
 
         // Loading with init runs the whole downcall-handle build path for both methods:
-        // Linker.nativeLinker().downcallHandle(FakeResolver.resolve(...), descriptor,
-        // [captureCallState("errno"), firstVariadicArg(1)])
+        // DefaultMethodHandleResolver.resolve(FakeResolver.resolve(...), descriptor,
+        // Linker.nativeLinker(), [captureCallState("errno"), firstVariadicArg(1)])
         // A descriptor mismatch (e.g. captureCallState declared as varargs but emitted as
         // (String)) throws NoSuchMethodError from <clinit>.
         Class<?> implClass = result.loadClass("test.ErrnoLib$Impl");
@@ -259,6 +260,80 @@ public class ImplClassWriterTests extends ProcessorTestCase {
         // Both MethodHandle fields must exist.
         assertEquals(MethodHandle.class, implClass.getDeclaredField("foo$mh").getType());
         assertEquals(MethodHandle.class, implClass.getDeclaredField("bar$mh").getType());
+    }
+
+    /**
+     * A configured MethodHandleResolver must receive the symbol name selected by SymbolResolver
+     * and supply the handle used by the generated method.
+     */
+    public void testMethodHandleResolverReceivesResolvedSymbol() throws Exception {
+        String librarySource = """
+            package test;
+            import java.lang.foreign.FunctionDescriptor;
+            import java.lang.foreign.Linker;
+            import java.lang.foreign.MemorySegment;
+            import java.lang.foreign.SymbolLookup;
+            import java.lang.invoke.MethodHandle;
+            import java.lang.invoke.MethodHandles;
+            import org.elasticsearch.foreign.Function;
+            import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.MethodHandleResolver;
+            import org.elasticsearch.foreign.ResolvedSymbol;
+            import org.elasticsearch.foreign.SymbolResolver;
+            @LibrarySpecification(
+                symbolResolver = MethodHandleLib.Symbols.class,
+                methodHandleResolver = MethodHandleLib.Handles.class
+            )
+            public interface MethodHandleLib {
+                @Function("original_name")
+                int call(int value);
+
+                class Symbols implements SymbolResolver {
+                    public Symbols() {}
+                    @Override
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
+                        return new ResolvedSymbol("selected_variant", MemorySegment.ofAddress(1L));
+                    }
+                }
+
+                class Handles implements MethodHandleResolver {
+                    public static String resolvedName;
+
+                    public Handles() {}
+
+                    @Override
+                    public MethodHandle resolve(
+                        ResolvedSymbol symbol,
+                        FunctionDescriptor descriptor,
+                        Linker linker,
+                        Linker.Option... options
+                    ) {
+                        resolvedName = symbol.name();
+                        return MethodHandles.dropArguments(MethodHandles.constant(int.class, 42), 0, int.class);
+                    }
+                }
+            }
+            """;
+        String driverSource = """
+            package test;
+            public final class MethodHandleDriver {
+                public static int call() {
+                    return new MethodHandleLib$Impl().call(1);
+                }
+            }
+            """;
+        var sources = new java.util.LinkedHashMap<String, String>();
+        sources.put("test.MethodHandleLib", librarySource);
+        sources.put("test.MethodHandleDriver", driverSource);
+
+        CompilationResult result = compile(sources);
+        assertTrue("Expected compilation to succeed but got errors: " + result.errors(), result.success());
+
+        Class<?> driver = result.loadClass("test.MethodHandleDriver");
+        assertEquals(42, driver.getMethod("call").invoke(null));
+
+        Class<?> resolverClass = Class.forName("test.MethodHandleLib$Handles", false, driver.getClassLoader());
+        assertEquals("selected_variant", resolverClass.getField("resolvedName").get(null));
     }
 
     /**
@@ -442,6 +517,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import java.lang.foreign.SymbolLookup;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.StructSpecification;
             import org.elasticsearch.foreign.SymbolResolver;
             @LibrarySpecification(symbolResolver = StructParamLib.FakeResolver.class)
@@ -457,8 +533,8 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
-                        return MemorySegment.ofAddress(1L);
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }
@@ -870,6 +946,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import org.elasticsearch.foreign.CaptureErrno;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.SymbolResolver;
             import org.elasticsearch.foreign.Variadic;
             @LibrarySpecification(symbolResolver = OpenLib.FakeResolver.class)
@@ -882,8 +959,8 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
-                        return MemorySegment.ofAddress(1L);
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }
