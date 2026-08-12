@@ -21,6 +21,22 @@ decompression is needed, even for multi-column orderby.
                         └──────────────────┘      └────────────────┘
 ```
 
+## Bounding work with max_batches
+
+`max_batches` caps how many batches Phase 2 will decompress before returning,
+so a chunk with many overlapping batches can be compacted incrementally across
+several calls instead of doing unbounded work in one. Zero (the default) means
+unlimited.
+
+The cap is only checked between merge groups, right after a group has been
+fully flushed — never while a group is partially rewritten. A single group of
+chained overlaps can therefore decompress more batches than the cap allows;
+the cap simply stops the scan from starting further groups once it's been
+reached. Any overlaps left over are picked up by the next call: Phase 1 always
+rescans from the start of the chunk, so already-fixed batches are skipped and
+the scan resumes at the first remaining overlap. The chunk stays UNORDERED
+until a call finishes with no overlaps left.
+
 ## Handling specific compression and batch configurations
 
 ### 1. No overlaps (no-op)
