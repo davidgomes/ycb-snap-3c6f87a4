@@ -6,6 +6,7 @@
 
 #include <absl/container/flat_hash_set.h>
 
+#include <cstdint>
 #include <string_view>
 
 namespace facade {
