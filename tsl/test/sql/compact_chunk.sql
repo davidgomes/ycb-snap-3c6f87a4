@@ -1052,3 +1052,131 @@ FROM :NO_FL_CHUNK ORDER BY _ts_meta_min_1;
 SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_no_firstlast') chunk;
 
 DROP TABLE metrics_no_firstlast;
+
+-- compact_chunk max_batches: bound the batch-decompression work of a single call
+-- max_batches is negative: rejected outright, regardless of chunk state.
+\set ON_ERROR_STOP 0
+SELECT _timescaledb_functions.compact_chunk(0::regclass, -1);
+\set ON_ERROR_STOP 1
+
+-- compact_chunk is STRICT: an explicit NULL max_batches short-circuits to NULL,
+-- just like a NULL chunk argument does.
+SELECT _timescaledb_functions.compact_chunk(NULL::regclass, NULL::integer);
+
+CREATE TABLE metrics_max_batches (time TIMESTAMPTZ NOT NULL, device TEXT, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time');
+
+SET timescaledb.enable_direct_compress_insert = true;
+SET timescaledb.enable_direct_compress_insert_sort_batches = true;
+SET timescaledb.enable_direct_compress_insert_client_sorted = false;
+
+-- Build 6 batches in one chunk, forming two separate overlapping groups with a
+-- non-overlapping batch (B) in between:
+--   Group A: batches A1, A2, A3 -- a single chain of 3 overlapping batches.
+--   Batch B: does not overlap anything.
+--   Group C: batches C1, C2 -- a separate chain of 2 overlapping batches.
+-- A1 [1..500]
+INSERT INTO metrics_max_batches
+SELECT '2025-06-26'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(1,500) i;
+-- A2 [400..900], overlaps A1
+INSERT INTO metrics_max_batches
+SELECT '2025-06-26'::timestamptz + ((399 + i) || ' minute')::interval, 'd1', (399 + i)::float
+FROM generate_series(1,500) i;
+-- A3 [800..1300], overlaps A2
+INSERT INTO metrics_max_batches
+SELECT '2025-06-26'::timestamptz + ((799 + i) || ' minute')::interval, 'd1', (799 + i)::float
+FROM generate_series(1,500) i;
+-- B [2000..2500], does not overlap A3 or C1
+INSERT INTO metrics_max_batches
+SELECT '2025-06-26'::timestamptz + ((1999 + i) || ' minute')::interval, 'd1', (1999 + i)::float
+FROM generate_series(1,500) i;
+-- C1 [3000..3500]
+INSERT INTO metrics_max_batches
+SELECT '2025-06-26'::timestamptz + ((2999 + i) || ' minute')::interval, 'd1', (2999 + i)::float
+FROM generate_series(1,500) i;
+-- C2 [3400..3900], overlaps C1
+INSERT INTO metrics_max_batches
+SELECT '2025-06-26'::timestamptz + ((3399 + i) || ' minute')::interval, 'd1', (3399 + i)::float
+FROM generate_series(1,500) i;
+
+SELECT cs.compress_relid::regclass::text AS "MAX_BATCHES_CHUNK"
+FROM _timescaledb_catalog.chunk ch
+    JOIN _timescaledb_catalog.compression_settings cs
+        ON cs.relid = ch.relid
+    JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+WHERE ht.table_name = 'metrics_max_batches'
+ORDER BY ch.id LIMIT 1 \gset
+
+-- 6 batches: {A1,A2,A3} overlap, B is standalone, {C1,C2} overlap.
+SELECT ctid, _ts_meta_count, _ts_meta_min_1, _ts_meta_max_1
+FROM :MAX_BATCHES_CHUNK ORDER BY _ts_meta_min_1;
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_max_batches') chunk;
+
+-- First call with max_batches = 1: the cap is smaller than group A alone, but a
+-- merge group is never left partially rewritten, so all of A1/A2/A3 are merged
+-- in this call. The cap is only checked once that group is fully flushed, and by
+-- then the budget is already spent, so the scan stops there -- B is left alone
+-- and group C is untouched.
+SELECT _timescaledb_functions.compact_chunk(chunk, 1) FROM show_chunks('metrics_max_batches') chunk;
+
+-- Group A collapsed into one new batch (new ctid); B keeps its original ctid
+-- (untouched); C1/C2 are still separate and still overlapping.
+SELECT ctid, _ts_meta_count, _ts_meta_min_1, _ts_meta_max_1
+FROM :MAX_BATCHES_CHUNK ORDER BY _ts_meta_min_1;
+
+-- Still UNORDERED: group C's overlap was left for a future call.
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_max_batches') chunk;
+
+-- Second call with the same max_batches = 1 picks up where the first left off:
+-- group C is the only remaining overlap, so it is found and merged, and the
+-- scan reaches the end of the chunk with nothing left to bound.
+SELECT _timescaledb_functions.compact_chunk(chunk, 1) FROM show_chunks('metrics_max_batches') chunk;
+
+-- Group C collapsed into one new batch; B is still untouched from the first call.
+SELECT ctid, _ts_meta_count, _ts_meta_min_1, _ts_meta_max_1
+FROM :MAX_BATCHES_CHUNK ORDER BY _ts_meta_min_1;
+
+-- Fully compacted now: UNORDERED cleared.
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_max_batches') chunk;
+
+-- Data integrity preserved across the two incremental calls.
+SELECT count(*), min(time), max(time) FROM metrics_max_batches;
+
+DROP TABLE metrics_max_batches;
+
+-- compact_chunk max_batches = 0 means unlimited: rebuild the same overlap
+-- pattern and confirm a single call merges both groups A and C in one shot.
+CREATE TABLE metrics_max_batches_unlimited (time TIMESTAMPTZ NOT NULL, device TEXT, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time');
+
+SET timescaledb.enable_direct_compress_insert = true;
+SET timescaledb.enable_direct_compress_insert_sort_batches = true;
+SET timescaledb.enable_direct_compress_insert_client_sorted = false;
+
+INSERT INTO metrics_max_batches_unlimited
+SELECT '2025-06-26'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(1,500) i;
+INSERT INTO metrics_max_batches_unlimited
+SELECT '2025-06-26'::timestamptz + ((399 + i) || ' minute')::interval, 'd1', (399 + i)::float
+FROM generate_series(1,500) i;
+INSERT INTO metrics_max_batches_unlimited
+SELECT '2025-06-26'::timestamptz + ((799 + i) || ' minute')::interval, 'd1', (799 + i)::float
+FROM generate_series(1,500) i;
+INSERT INTO metrics_max_batches_unlimited
+SELECT '2025-06-26'::timestamptz + ((1999 + i) || ' minute')::interval, 'd1', (1999 + i)::float
+FROM generate_series(1,500) i;
+INSERT INTO metrics_max_batches_unlimited
+SELECT '2025-06-26'::timestamptz + ((2999 + i) || ' minute')::interval, 'd1', (2999 + i)::float
+FROM generate_series(1,500) i;
+INSERT INTO metrics_max_batches_unlimited
+SELECT '2025-06-26'::timestamptz + ((3399 + i) || ' minute')::interval, 'd1', (3399 + i)::float
+FROM generate_series(1,500) i;
+
+-- Explicit 0 (the default) is unlimited: both overlapping groups are merged in
+-- one call, leaving only the standalone batch B and the two merged batches.
+SELECT _timescaledb_functions.compact_chunk(chunk, 0) FROM show_chunks('metrics_max_batches_unlimited') chunk;
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_max_batches_unlimited') chunk;
+SELECT count(*), min(time), max(time) FROM metrics_max_batches_unlimited;
+
+DROP TABLE metrics_max_batches_unlimited;

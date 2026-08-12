@@ -29,6 +29,9 @@ ERROR:  compaction policy requires compression to be enabled on hypertable "plai
 -- Negative max_chunks is rejected.
 SELECT add_compaction_policy('metrics', max_chunks => -1);
 ERROR:  max_chunks must be greater than or equal to 0
+-- Negative max_batches is rejected.
+SELECT add_compaction_policy('metrics', max_batches => -1);
+ERROR:  max_batches must be greater than or equal to 0
 \set ON_ERROR_STOP 1
 DROP TABLE plain;
 -- The config check rejects bad configuration.
@@ -37,11 +40,24 @@ SELECT _timescaledb_functions.policy_compaction_check('{"max_chunks": 1}');
 ERROR:  could not find hypertable_id in config for job
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_chunks": -1}');
 ERROR:  max_chunks must be greater than or equal to 0
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": -1}');
+ERROR:  max_batches must be greater than or equal to 0
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "-1 hour"}');
 ERROR:  inactive_for must not be negative
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "not an interval"}');
 ERROR:  invalid input syntax for type interval: "not an interval"
 \set ON_ERROR_STOP 1
+-- A non-negative max_batches is accepted.
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": 0}');
+ policy_compaction_check 
+-------------------------
+ 
+
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": 5}');
+ policy_compaction_check 
+-------------------------
+ 
+
 -- Add the policy and inspect the resulting job. Default schedule is 5 minutes.
 SELECT add_compaction_policy('metrics') AS job_id \gset
 SELECT application_name, schedule_interval, proc_schema, proc_name, config
@@ -73,6 +89,48 @@ SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
 ---------------------------------------
  {"max_chunks": 2, "hypertable_id": 1}
 
+-- max_batches is stored in the config only when greater than 0.
+SELECT remove_compaction_policy('metrics');
+ remove_compaction_policy 
+--------------------------
+ 
+
+SELECT add_compaction_policy('metrics', max_batches => 0) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+        config        
+----------------------
+ {"hypertable_id": 1}
+
+SELECT remove_compaction_policy('metrics');
+ remove_compaction_policy 
+--------------------------
+ 
+
+SELECT add_compaction_policy('metrics', max_batches => 3) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+                 config                 
+----------------------------------------
+ {"max_batches": 3, "hypertable_id": 1}
+
+-- Both max_chunks and max_batches are stored together when provided.
+SELECT remove_compaction_policy('metrics');
+ remove_compaction_policy 
+--------------------------
+ 
+
+SELECT add_compaction_policy('metrics', max_chunks => 2, max_batches => 3) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+                         config                          
+---------------------------------------------------------
+ {"max_chunks": 2, "max_batches": 3, "hypertable_id": 1}
+
+SELECT remove_compaction_policy('metrics');
+ remove_compaction_policy 
+--------------------------
+ 
+
+-- Re-add with just max_chunks for the tests below.
+SELECT add_compaction_policy('metrics', max_chunks => 2) AS job_id \gset
 ----------------------------------------------------------------------
 -- multi-chunk loop and max_chunks cap
 ----------------------------------------------------------------------
@@ -118,6 +176,53 @@ SELECT remove_compaction_policy('metrics');
  
 
 DROP TABLE metrics;
+----------------------------------------------------------------------
+-- max_batches bounds the work compact_chunk does per policy run
+----------------------------------------------------------------------
+CREATE TABLE batches (time TIMESTAMPTZ NOT NULL, device TEXT, value float) WITH (tsdb.hypertable, tsdb.orderby='time');
+NOTICE:  using column "time" as partitioning column
+-- One chunk with two separate overlapping groups, A (3 chained batches) and C
+-- (2 chained batches), and a standalone batch B in between that never overlaps.
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + (i || ' minute')::interval, 'd1', i::float FROM generate_series(1,500) i;
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + ((399 + i) || ' minute')::interval, 'd1', (399 + i)::float FROM generate_series(1,500) i;
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + ((799 + i) || ' minute')::interval, 'd1', (799 + i)::float FROM generate_series(1,500) i;
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + ((1999 + i) || ' minute')::interval, 'd1', (1999 + i)::float FROM generate_series(1,500) i;
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + ((2999 + i) || ' minute')::interval, 'd1', (2999 + i)::float FROM generate_series(1,500) i;
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + ((3399 + i) || ' minute')::interval, 'd1', (3399 + i)::float FROM generate_series(1,500) i;
+SELECT unordered_count('batches');
+ unordered_count 
+-----------------
+               1
+
+-- max_batches = 1 is smaller than either overlapping group, but a merge group
+-- is always fully flushed, so one run only gets through group A before the
+-- budget stops the scan; the chunk is still unordered because group C remains.
+SELECT add_compaction_policy('batches', max_batches => 1) AS job_id \gset
+CALL run_job(:job_id);
+SELECT unordered_count('batches');
+ unordered_count 
+-----------------
+               1
+
+-- A second run picks up where the first left off and finishes group C.
+CALL run_job(:job_id);
+SELECT unordered_count('batches');
+ unordered_count 
+-----------------
+               0
+
+-- Data is preserved across both incremental runs.
+SELECT count(*), min(time), max(time) FROM batches;
+ count |             min              |             max              
+-------+------------------------------+------------------------------
+  3000 | Fri Aug 01 00:01:00 2025 PDT | Sun Aug 03 16:59:00 2025 PDT
+
+SELECT remove_compaction_policy('batches');
+ remove_compaction_policy 
+--------------------------
+ 
+
+DROP TABLE batches;
 ----------------------------------------------------------------------
 -- partial and frozen chunks are skipped
 ----------------------------------------------------------------------
@@ -210,7 +315,7 @@ DROP INDEX :doomed_index;
 SELECT add_compaction_policy('fail') AS job_id \gset
 -- The run warns about the failed chunk but compacts the other one and finishes.
 CALL run_job(:job_id);
-WARNING:  compaction policy failed to compact chunk "_timescaledb_internal._hyper_5_7_chunk"
+WARNING:  compaction policy failed to compact chunk "_timescaledb_internal._hyper_6_8_chunk"
 WARNING:  compaction policy completed with some failures
 SELECT unordered_count('fail');
  unordered_count 
@@ -258,7 +363,7 @@ NOTICE:  using column "time" as partitioning column
 SELECT add_compaction_policy('m2');
  add_compaction_policy 
 -----------------------
-                  1012
+                  1018
 
 SELECT remove_compaction_policy('m2');
  remove_compaction_policy 

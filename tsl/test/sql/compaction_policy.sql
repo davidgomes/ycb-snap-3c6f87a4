@@ -28,6 +28,8 @@ SELECT create_hypertable('plain', 'time');
 SELECT add_compaction_policy('plain');
 -- Negative max_chunks is rejected.
 SELECT add_compaction_policy('metrics', max_chunks => -1);
+-- Negative max_batches is rejected.
+SELECT add_compaction_policy('metrics', max_batches => -1);
 \set ON_ERROR_STOP 1
 DROP TABLE plain;
 
@@ -35,9 +37,13 @@ DROP TABLE plain;
 \set ON_ERROR_STOP 0
 SELECT _timescaledb_functions.policy_compaction_check('{"max_chunks": 1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_chunks": -1}');
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": -1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "-1 hour"}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "not an interval"}');
 \set ON_ERROR_STOP 1
+-- A non-negative max_batches is accepted.
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": 0}');
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": 5}');
 
 -- Add the policy and inspect the resulting job. Default schedule is 5 minutes.
 SELECT add_compaction_policy('metrics') AS job_id \gset
@@ -54,6 +60,23 @@ SELECT add_compaction_policy('metrics', if_not_exists => true);
 SELECT remove_compaction_policy('metrics');
 SELECT add_compaction_policy('metrics', max_chunks => 2) AS job_id \gset
 SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+
+-- max_batches is stored in the config only when greater than 0.
+SELECT remove_compaction_policy('metrics');
+SELECT add_compaction_policy('metrics', max_batches => 0) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+SELECT remove_compaction_policy('metrics');
+SELECT add_compaction_policy('metrics', max_batches => 3) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+
+-- Both max_chunks and max_batches are stored together when provided.
+SELECT remove_compaction_policy('metrics');
+SELECT add_compaction_policy('metrics', max_chunks => 2, max_batches => 3) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+SELECT remove_compaction_policy('metrics');
+
+-- Re-add with just max_chunks for the tests below.
+SELECT add_compaction_policy('metrics', max_chunks => 2) AS job_id \gset
 
 ----------------------------------------------------------------------
 -- multi-chunk loop and max_chunks cap
@@ -81,6 +104,38 @@ SELECT unordered_count('metrics');
 SELECT count(*), min(time), max(time) FROM metrics;
 SELECT remove_compaction_policy('metrics');
 DROP TABLE metrics;
+
+----------------------------------------------------------------------
+-- max_batches bounds the work compact_chunk does per policy run
+----------------------------------------------------------------------
+
+CREATE TABLE batches (time TIMESTAMPTZ NOT NULL, device TEXT, value float) WITH (tsdb.hypertable, tsdb.orderby='time');
+
+-- One chunk with two separate overlapping groups, A (3 chained batches) and C
+-- (2 chained batches), and a standalone batch B in between that never overlaps.
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + (i || ' minute')::interval, 'd1', i::float FROM generate_series(1,500) i;
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + ((399 + i) || ' minute')::interval, 'd1', (399 + i)::float FROM generate_series(1,500) i;
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + ((799 + i) || ' minute')::interval, 'd1', (799 + i)::float FROM generate_series(1,500) i;
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + ((1999 + i) || ' minute')::interval, 'd1', (1999 + i)::float FROM generate_series(1,500) i;
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + ((2999 + i) || ' minute')::interval, 'd1', (2999 + i)::float FROM generate_series(1,500) i;
+INSERT INTO batches SELECT '2025-08-01'::timestamptz + ((3399 + i) || ' minute')::interval, 'd1', (3399 + i)::float FROM generate_series(1,500) i;
+SELECT unordered_count('batches');
+
+-- max_batches = 1 is smaller than either overlapping group, but a merge group
+-- is always fully flushed, so one run only gets through group A before the
+-- budget stops the scan; the chunk is still unordered because group C remains.
+SELECT add_compaction_policy('batches', max_batches => 1) AS job_id \gset
+CALL run_job(:job_id);
+SELECT unordered_count('batches');
+
+-- A second run picks up where the first left off and finishes group C.
+CALL run_job(:job_id);
+SELECT unordered_count('batches');
+
+-- Data is preserved across both incremental runs.
+SELECT count(*), min(time), max(time) FROM batches;
+SELECT remove_compaction_policy('batches');
+DROP TABLE batches;
 
 ----------------------------------------------------------------------
 -- partial and frozen chunks are skipped
