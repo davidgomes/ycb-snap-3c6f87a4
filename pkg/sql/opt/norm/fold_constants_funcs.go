@@ -413,9 +413,17 @@ func (c *CustomFuncs) foldOIDFamilyCast(
 					c.f.evalCtx.SessionData().PgDumpCompatibility,
 				),
 			)
-			dOid = tree.NewDOidWithTypeAndName(
-				resolvedOid, types.RegClass, string(tn.ObjectName),
+			resolvedDatum, err := eval.PerformCast(
+				c.f.ctx, c.f.evalCtx, tree.NewDOid(resolvedOid), types.RegClass,
 			)
+			if err != nil {
+				return nil, false, err
+			}
+			var isDOid bool
+			dOid, isDOid = resolvedDatum.(*tree.DOid)
+			if !isDOid {
+				return nil, false, nil
+			}
 
 		default:
 			return nil, false, nil
