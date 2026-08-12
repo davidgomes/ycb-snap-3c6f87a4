@@ -214,6 +214,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import org.elasticsearch.foreign.CaptureErrno;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.SymbolResolver;
             import org.elasticsearch.foreign.Variadic;
             @LibrarySpecification(symbolResolver = ErrnoLib.FakeResolver.class)
@@ -229,9 +230,9 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
                         // downcallHandle validates the address is non-NULL; any positive value works.
-                        return MemorySegment.ofAddress(1L);
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }
@@ -442,6 +443,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import java.lang.foreign.SymbolLookup;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.StructSpecification;
             import org.elasticsearch.foreign.SymbolResolver;
             @LibrarySpecification(symbolResolver = StructParamLib.FakeResolver.class)
@@ -457,8 +459,8 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
-                        return MemorySegment.ofAddress(1L);
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }
@@ -870,6 +872,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import org.elasticsearch.foreign.CaptureErrno;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.SymbolResolver;
             import org.elasticsearch.foreign.Variadic;
             @LibrarySpecification(symbolResolver = OpenLib.FakeResolver.class)
@@ -882,8 +885,8 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
-                        return MemorySegment.ofAddress(1L);
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }
