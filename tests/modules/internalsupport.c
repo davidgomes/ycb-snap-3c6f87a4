@@ -9,6 +9,7 @@ static int internalCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int ar
 }
 
 static int callInternalCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    REDISMODULE_NOT_USED(argv);
     if (argc > 2) return RedisModule_WrongArity(ctx);
 
     const char *format = argc == 2 ? "CE" : "E";
