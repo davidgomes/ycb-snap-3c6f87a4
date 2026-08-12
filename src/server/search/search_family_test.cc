@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <string_view>
 
 #include "base/flags.h"
@@ -55,6 +56,23 @@ namespace dfly {
 
 class SearchFamilyTest : public BaseFamilyTest {
  protected:
+  void PopulateDiverseTextCorpus() {
+    EXPECT_EQ(Run({"ft.create", "score_idx", "ON", "HASH", "SCHEMA", "body", "TEXT", "rank",
+                   "NUMERIC", "SORTABLE"}),
+              "OK");
+    for (int i = 0; i < 200; i++) {
+      std::string body;
+      if (i % 3 == 0) {
+        int tf = (i % 5) + 1;
+        for (int t = 0; t < tf; t++)
+          body += "needle ";
+      }
+      int filler = (i % 11) + 1;
+      for (int t = 0; t < filler; t++)
+        body += "zzzz ";
+      Run({"hset", absl::StrFormat("doc:%03d", i), "body", body, "rank", absl::StrCat(i)});
+    }
+  }
 };
 
 const auto kNoResults = IntArg(0);  // tests auto destruct single element arrays
@@ -5840,6 +5858,90 @@ TEST_F(SearchFamilyTest, AggregateAddScoresAutoVisible) {
     }
   }
   EXPECT_TRUE(found_score) << "__score should be visible with ADDSCORES even without LOAD/pipeline";
+}
+
+namespace {
+
+struct ScoredHit {
+  std::string key;
+  double score;
+};
+
+std::vector<ScoredHit> ParseSearchWithScores(const RespExpr& resp) {
+  std::vector<ScoredHit> hits;
+  auto results = resp.GetVec();
+  for (size_t i = 1; i + 1 < results.size(); i += 3)
+    hits.push_back({results[i].GetString(), std::stod(results[i + 1].GetString())});
+  return hits;
+}
+
+}  // namespace
+
+// Text scores and top-K order must use corpus-wide IDF / avgdl, not per-shard stats.
+TEST_F(SearchFamilyTest, SearchScoresInvariantAcrossShards) {
+  PopulateDiverseTextCorpus();
+
+  const char* scorers[] = {"BM25STD", "TFIDF", "TFIDF.DOCNORM"};
+  for (const char* scorer : scorers) {
+    auto resp = Run(
+        {"ft.search", "score_idx", "needle", "WITHSCORES", "SCORER", scorer, "LIMIT", "0", "20"});
+    auto hits = ParseSearchWithScores(resp);
+    ASSERT_FALSE(hits.empty()) << scorer;
+    EXPECT_THAT(resp.GetVec()[0], IntArg(67));  // i % 3 == 0 for i in [0, 199]
+
+    for (size_t i = 1; i < hits.size(); i++) {
+      EXPECT_GE(hits[i - 1].score, hits[i].score) << scorer << " not sorted by score";
+      if (hits[i - 1].score == hits[i].score) {
+        EXPECT_LT(hits[i - 1].key, hits[i].key) << scorer << " equal scores must tie-break by key";
+      }
+    }
+  }
+
+  auto agg = Run({"ft.aggregate", "score_idx", "needle", "SCORER", "BM25STD", "ADDSCORES", "SORTBY",
+                  "2", "@__score", "DESC", "LIMIT", "0", "20"});
+  auto agg_vec = agg.GetVec();
+  ASSERT_GE(agg_vec.size(), 3u);
+
+  std::vector<double> agg_scores;
+  for (size_t g = 1; g < agg_vec.size(); g++) {
+    auto row = agg_vec[g].GetVec();
+    for (size_t j = 0; j + 1 < row.size(); j += 2) {
+      if (row[j].GetString() == "__score")
+        agg_scores.push_back(std::stod(row[j + 1].GetString()));
+    }
+  }
+  ASSERT_GE(agg_scores.size(), 2u);
+  for (size_t i = 1; i < agg_scores.size(); i++)
+    EXPECT_GE(agg_scores[i - 1], agg_scores[i]);
+}
+
+// SORTBY on a sortable field must keep that order even when WITHSCORES is set.
+TEST_F(SearchFamilyTest, SearchSortByWithScoresKeepsSortOrder) {
+  PopulateDiverseTextCorpus();
+
+  auto scored = Run(
+      {"ft.search", "score_idx", "needle", "WITHSCORES", "SCORER", "BM25STD", "LIMIT", "0", "67"});
+  auto by_score = ParseSearchWithScores(scored);
+  std::map<std::string, double> score_by_key;
+  for (auto& h : by_score)
+    score_by_key[h.key] = h.score;
+
+  auto resp = Run({"ft.search", "score_idx", "needle", "SORTBY", "rank", "WITHSCORES", "SCORER",
+                   "BM25STD", "LIMIT", "0", "10"});
+  auto hits = ParseSearchWithScores(resp);
+  ASSERT_EQ(hits.size(), 10u);
+
+  for (size_t i = 0; i < hits.size(); i++) {
+    int rank = std::stoi(hits[i].key.substr(4));
+    EXPECT_EQ(rank % 3, 0);
+    if (i > 0) {
+      int prev = std::stoi(hits[i - 1].key.substr(4));
+      EXPECT_LT(prev, rank) << "SORTBY rank must not be reordered by text score";
+    }
+    auto it = score_by_key.find(hits[i].key);
+    ASSERT_TRUE(it != score_by_key.end());
+    EXPECT_NEAR(hits[i].score, it->second, 1e-5);
+  }
 }
 
 // DocKeyIndex: empty-key documents must survive Serialize/Restore and not be

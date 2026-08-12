@@ -117,8 +117,9 @@ struct ProfileBuilder {
 struct BasicSearch {
   using LogicOp = AstLogicalNode::LogicOp;
 
-  BasicSearch(const FieldIndices* indices, ScorerFn scorer = nullptr)
-      : indices_{indices}, scorer_{scorer} {
+  BasicSearch(const FieldIndices* indices, ScorerFn scorer = nullptr,
+              const ScoringCorpusStats* corpus_stats = nullptr)
+      : indices_{indices}, scorer_{scorer}, corpus_stats_{corpus_stats} {
   }
 
   void EnableProfiling() {
@@ -697,12 +698,37 @@ struct BasicSearch {
                         {},         std::move(profile), std::move(error_)};
   }
 
+  ScoringCorpusStats BuildLocalStats(const AstNode& query) {
+    ScoringCorpusStats stats;
+    stats.num_docs = indices_->GetAllDocs().size();
+
+    for (const auto& [field_ident, field_info] : indices_->GetSchema().fields) {
+      if (field_info.type != SchemaField::TEXT || (field_info.flags & SchemaField::NOINDEX) > 0)
+        continue;
+      auto* ti = dynamic_cast<TextIndex*>(indices_->GetIndex(field_ident));
+      if (!ti)
+        continue;
+      stats.fields[string(field_ident)] = {ti->GetFieldTotalDocsLen(), ti->GetFieldNumDocs()};
+    }
+
+    CollectMatchedTerms(query);
+    for (auto& [ti, term] : matched_text_terms_) {
+      auto* container = ti->Matching(term, /*strip_whitespace=*/false);
+      size_t df = container ? container->Size() : 0;
+      if (df == 0)
+        continue;
+      stats.term_df[string(indices_->GetFieldIdent(ti))][term] += df;
+    }
+    return stats;
+  }
+
  private:
   // Cursor for sequential freq lookup in a posting list.
   // Advances forward only - amortized O(1) per doc when docs are sorted.
   struct TermCursor {
     TextIndex* index;
     size_t term_docs;
+    double field_avg_doc_len = 0;
     TextIndex::Container::BlockListIterator it;
     TextIndex::Container::BlockListIterator end;
   };
@@ -733,10 +759,17 @@ struct BasicSearch {
       auto* container = index->Matching(term, /*strip_whitespace=*/false);
       if (!container)
         continue;
-      cursors.push_back({index, container->Size(), container->begin(), container->end()});
+      size_t df = container->Size();
+      double avgdl = index->GetFieldAvgDocLen();
+      if (corpus_stats_) {
+        std::string_view field = indices_->GetFieldIdent(index);
+        df = corpus_stats_->TermDf(field, term);
+        avgdl = corpus_stats_->FieldAvgDocLen(field);
+      }
+      cursors.push_back({index, df, avgdl, container->begin(), container->end()});
     }
 
-    ScoringContext ctx{indices_->GetAllDocs().size()};
+    ScoringContext ctx{corpus_stats_ ? corpus_stats_->num_docs : indices_->GetAllDocs().size()};
 
     // Score all docs - reuse term_infos buffer across iterations
     vector<pair<float, DocId>> scored;
@@ -749,7 +782,7 @@ struct BasicSearch {
         term_infos[t].term_freq = SeekCursor(cursors[t], doc);
         if (cursors[t].index) {
           term_infos[t].field_doc_len = cursors[t].index->GetFieldDocLength(doc);
-          term_infos[t].field_avg_doc_len = cursors[t].index->GetFieldAvgDocLen();
+          term_infos[t].field_avg_doc_len = cursors[t].field_avg_doc_len;
         }
       }
       scored.emplace_back(static_cast<float>(ScoreDocument(scorer_, ctx, term_infos)), doc);
@@ -780,8 +813,121 @@ struct BasicSearch {
       matched_text_terms_.emplace_back(index, std::move(term));
   }
 
+  // Register query terms (and prefix/suffix/infix expansions) for DF collection
+  // without intersecting posting lists.
+  void CollectMatchedTerms(const AstNode& node, string_view active_field = "") {
+    visit([this, active_field](const auto& inner) { CollectTerms(inner, active_field); },
+          node.Variant());
+  }
+
+  void CollectTerms(monostate, string_view) {
+  }
+  void CollectTerms(const AstStarNode&, string_view) {
+  }
+  void CollectTerms(const AstStarFieldNode&, string_view) {
+  }
+  void CollectTerms(const AstRangeNode&, string_view) {
+  }
+  void CollectTerms(const AstGeoNode&, string_view) {
+  }
+  void CollectTerms(const AstTagsNode&, string_view) {
+  }
+  void CollectTerms(const AstVectorRangeNode&, string_view) {
+  }
+
+  void RegisterExactTerm(const string& term, string_view active_field) {
+    optional<string> group_id;
+    if (auto synonyms = indices_->GetSynonyms(); synonyms)
+      group_id = synonyms->GetGroupToken(term);
+
+    auto add_in = [&](TextIndex* index) {
+      AddMatchedTerm(index, term);
+      if (group_id)
+        AddMatchedTerm(index, *group_id);
+    };
+
+    if (!active_field.empty()) {
+      if (auto* index = GetIndex<TextIndex>(active_field); index)
+        add_in(index);
+      return;
+    }
+    for (auto* index : indices_->GetAllTextIndices())
+      add_in(index);
+  }
+
+  template <TagType T> void CollectTerms(const AstAffixNode<T>& node, string_view active_field) {
+    if constexpr (T == TagType::REGULAR) {
+      RegisterExactTerm(node.affix, active_field);
+      return;
+    }
+
+    vector<TextIndex*> text_indices;
+    if (!active_field.empty()) {
+      if (auto* index = GetIndex<TextIndex>(active_field); index)
+        text_indices = {index};
+      else
+        return;
+    } else {
+      text_indices = indices_->GetAllTextIndices();
+    }
+
+    for (auto* index : text_indices) {
+      auto term_cb = [this, index](string_view term, const auto*) {
+        string resolved{term};
+        if (auto synonyms = indices_->GetSynonyms(); synonyms) {
+          if (auto group_id = synonyms->GetGroupToken(resolved); group_id)
+            resolved = std::move(*group_id);
+        }
+        AddMatchedTerm(index, std::move(resolved));
+      };
+      if constexpr (T == TagType::PREFIX)
+        index->MatchPrefixWithTerm(node.affix, term_cb);
+      else if constexpr (T == TagType::SUFFIX)
+        index->MatchSuffixWithTerm(node.affix, term_cb);
+      else if constexpr (T == TagType::INFIX)
+        index->MatchInfixWithTerm(node.affix, term_cb);
+    }
+  }
+
+  void CollectTerms(const AstPhraseNode& node, string_view active_field) {
+    auto add_phrase = [&](TextIndex* index) {
+      for (const auto& t : index->TokenizePhraseQuery(node.raw))
+        AddMatchedTerm(index, t);
+    };
+    if (!active_field.empty()) {
+      if (auto* index = GetIndex<TextIndex>(active_field); index)
+        add_phrase(index);
+      return;
+    }
+    for (auto* index : indices_->GetAllTextIndices())
+      add_phrase(index);
+  }
+
+  void CollectTerms(const AstLogicalNode& node, string_view active_field) {
+    for (const auto& n : node.nodes)
+      CollectMatchedTerms(n, active_field);
+  }
+
+  void CollectTerms(const AstFieldNode& node, string_view) {
+    CollectMatchedTerms(*node.node, node.field);
+  }
+
+  void CollectTerms(const AstOptionalNode& node, string_view active_field) {
+    CollectMatchedTerms(*node.node, active_field);
+  }
+
+  void CollectTerms(const AstNegateNode& node, string_view active_field) {
+    CollectMatchedTerms(*node.node, active_field);
+  }
+
+  void CollectTerms(const AstKnnNode& node, string_view active_field) {
+    if (node.filter)
+      CollectMatchedTerms(*node.filter, active_field);
+  }
+
   const FieldIndices* indices_;
   ScorerFn scorer_ = nullptr;
+  const ScoringCorpusStats* corpus_stats_ = nullptr;
 
   string error_;
   optional<ProfileBuilder> profile_builder_ = ProfileBuilder{};
@@ -972,6 +1118,14 @@ std::vector<TextIndex*> FieldIndices::GetAllTextIndices() const {
   return out;
 }
 
+string_view FieldIndices::GetFieldIdent(const BaseIndex* index) const {
+  for (const auto& [ident, ptr] : indices_) {
+    if (ptr.get() == index)
+      return ident;
+  }
+  return {};
+}
+
 const vector<DocId>& FieldIndices::GetAllDocs() const {
   return all_ids_;
 }
@@ -1046,10 +1200,16 @@ bool SearchAlgorithm::Init(string_view query, const QueryParams* params,
 SearchResult SearchAlgorithm::Search(const FieldIndices* index, size_t cuttoff_limit) const {
   DCHECK(query_);
 
-  auto bs = BasicSearch{index, scorer_};
+  auto bs = BasicSearch{index, scorer_, corpus_stats_};
   if (profiling_enabled_)
     bs.EnableProfiling();
   return bs.Search(*query_, cuttoff_limit);
+}
+
+ScoringCorpusStats SearchAlgorithm::CollectLocalStats(const FieldIndices* index) const {
+  DCHECK(query_);
+  BasicSearch bs{index, scorer_, corpus_stats_};
+  return bs.BuildLocalStats(*query_);
 }
 
 std::optional<KnnScoreSortOption> SearchAlgorithm::GetKnnScoreSortOption() const {

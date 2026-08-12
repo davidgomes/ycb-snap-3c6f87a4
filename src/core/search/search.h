@@ -150,6 +150,9 @@ class FieldIndices {
   BaseSortIndex* GetSortIndex(std::string_view field) const;
   std::vector<TextIndex*> GetAllTextIndices() const;
 
+  // Identifier of `index` as stored in the schema, or empty if not found.
+  std::string_view GetFieldIdent(const BaseIndex* index) const;
+
   const std::vector<DocId>& GetAllDocs() const;
   const Schema& GetSchema() const;
 
@@ -245,9 +248,22 @@ class SearchAlgorithm {
 
   void SetScorer(ScorerFn scorer);
 
+  bool HasScorer() const {
+    return scorer_ != nullptr;
+  }
+
+  // Non-owning. Must outlive subsequent Search() / CollectLocalStats() calls.
+  void SetCorpusStats(const ScoringCorpusStats* stats) {
+    corpus_stats_ = stats;
+  }
+
+  // Local IDF / avgdl contribution of this shard for the current query.
+  ScoringCorpusStats CollectLocalStats(const FieldIndices* index) const;
+
  private:
   bool profiling_enabled_ = false;
   ScorerFn scorer_ = nullptr;
+  const ScoringCorpusStats* corpus_stats_ = nullptr;
   std::unique_ptr<AstNode> query_;
   std::optional<KnnScoreSortOption> knn_hnsw_score_sort_option_;
 };

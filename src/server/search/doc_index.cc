@@ -6,6 +6,7 @@
 
 #include <absl/strings/str_join.h>
 
+#include <algorithm>
 #include <memory>
 #include <queue>
 #include <ranges>
@@ -854,6 +855,11 @@ vector<search::SortableValue> ShardDocIndex::KeepTopKSorted(vector<DocId>* ids, 
   return out;
 }
 
+search::ScoringCorpusStats ShardDocIndex::CollectScoringStats(
+    const search::SearchAlgorithm& search_algo) const {
+  return search_algo.CollectLocalStats(&*indices_);
+}
+
 SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& params,
                                    search::SearchAlgorithm* search_algo,
                                    bool is_knn_prefilter) const {
@@ -861,7 +867,9 @@ SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& pa
 
   // If we don't sort the documents, we don't need to copy more ids than are requested
   // Also for HNSW KNN search we don't cut results at the search stage.
-  bool can_cut = !params.sort_option && !search_algo->GetKnnScoreSortOption() && !is_knn_prefilter;
+  // Scorers postpone cutoff until keys are available so equal scores tie-break by key.
+  bool can_cut = !params.sort_option && !search_algo->GetKnnScoreSortOption() &&
+                 !is_knn_prefilter && !search_algo->HasScorer();
   size_t id_cutoff_limit = can_cut ? limit : numeric_limits<size_t>::max();
 
   auto result = search_algo->Search(&*indices_, id_cutoff_limit);
@@ -890,6 +898,23 @@ SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& pa
   }
 
   auto return_fields = params.return_fields.value_or(vector<FieldReference>{});
+
+  // Rank by text score with key tie-break before applying LIMIT, unless SORTBY/KNN
+  // owns the order. Coordinator SearchReply merges shards with the same comparator.
+  if (search_algo->HasScorer() && !params.sort_option && !skip_sort &&
+      !result.text_scores.empty()) {
+    absl::flat_hash_map<DocId, float> scores;
+    scores.reserve(result.text_scores.size());
+    for (const auto& [doc, score] : result.text_scores)
+      scores[doc] = score;
+
+    std::stable_sort(result.ids.begin(), result.ids.end(), [&](DocId a, DocId b) {
+      float sa = scores[a], sb = scores[b];
+      if (sa != sb)
+        return sa > sb;
+      return key_index_.Get(a) < key_index_.Get(b);
+    });
+  }
 
   // Apply SORTBY
   // TODO(vlad): Write profiling up to here
@@ -1026,7 +1051,7 @@ vector<SearchDocData> ShardDocIndex::LoadDocEntriesWithScores(
     auto entry = LoadEntry(doc, op_args);
     if (!entry)
       continue;
-    auto& [_, accessor] = *entry;
+    auto& [key, accessor] = *entry;
 
     SearchDocData extracted_sort_indicies;
     extracted_sort_indicies.reserve(sort_indicies.size());
@@ -1048,6 +1073,10 @@ vector<SearchDocData> ShardDocIndex::LoadDocEntriesWithScores(
       if (auto it = text_score_map.find(doc); it != text_score_map.end())
         out.back()["__score"] = static_cast<double>(it->second);
     }
+
+    // Hidden tie-breaker for SORTBY @__score so equal scores are shard-independent.
+    if (params.add_scores)
+      out.back()["__key"] = string{key};
   }
   return out;
 }

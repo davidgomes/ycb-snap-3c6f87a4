@@ -3238,6 +3238,109 @@ TEST_F(ScoringTest, ScorerTopKCutoff) {
   }
 }
 
+TEST_F(ScoringTest, CorpusStatsOverrideLocalIdf) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  index.Add(0, MockedDocument("hello world"));
+  index.Add(1, MockedDocument("hello there"));
+  index.FinalizeInitialization();
+
+  QueryParams params;
+  SearchAlgorithm local_algo;
+  ASSERT_TRUE(local_algo.Init("hello", &params));
+  local_algo.SetScorer(&BM25Std);
+  auto local = local_algo.Search(&index);
+  ASSERT_EQ(local.text_scores.size(), 2u);
+
+  ScoringCorpusStats global;
+  global.num_docs = 100;
+  global.fields["field"] = {.total_len = 400, .num_docs = 100};
+  global.term_df["field"]["hello"] = 10;
+
+  SearchAlgorithm global_algo;
+  ASSERT_TRUE(global_algo.Init("hello", &params));
+  global_algo.SetScorer(&BM25Std);
+  global_algo.SetCorpusStats(&global);
+  auto scored = global_algo.Search(&index);
+  ASSERT_EQ(scored.text_scores.size(), 2u);
+
+  // Different corpus N / df / avgdl must change the score versus shard-local stats.
+  EXPECT_NE(local.text_scores[0].second, scored.text_scores[0].second);
+}
+
+TEST_F(ScoringTest, MergedShardStatsMatchCombinedIndex) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices shard_a{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  FieldIndices shard_b{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  FieldIndices combined{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  vector<string> docs_a = {"hello hello world", "hello there", "unrelated text"};
+  vector<string> docs_b = {"hello", "hello hello hello extra words here", "goodbye"};
+
+  for (size_t i = 0; i < docs_a.size(); i++) {
+    shard_a.Add(i, MockedDocument(docs_a[i]));
+    combined.Add(i, MockedDocument(docs_a[i]));
+  }
+  for (size_t i = 0; i < docs_b.size(); i++) {
+    shard_b.Add(i, MockedDocument(docs_b[i]));
+    combined.Add(docs_a.size() + i, MockedDocument(docs_b[i]));
+  }
+  shard_a.FinalizeInitialization();
+  shard_b.FinalizeInitialization();
+  combined.FinalizeInitialization();
+
+  QueryParams params;
+  SearchAlgorithm collect_a, collect_b;
+  ASSERT_TRUE(collect_a.Init("hello", &params));
+  ASSERT_TRUE(collect_b.Init("hello", &params));
+  ScoringCorpusStats merged = collect_a.CollectLocalStats(&shard_a);
+  merged.Merge(collect_b.CollectLocalStats(&shard_b));
+
+  EXPECT_EQ(merged.num_docs, combined.GetAllDocs().size());
+
+  SearchAlgorithm shard_a_algo, combined_algo;
+  ASSERT_TRUE(shard_a_algo.Init("hello", &params));
+  ASSERT_TRUE(combined_algo.Init("hello", &params));
+  shard_a_algo.SetScorer(&BM25Std);
+  combined_algo.SetScorer(&BM25Std);
+  shard_a_algo.SetCorpusStats(&merged);
+
+  // Compare BM25 on shard A (with merged stats) against the combined index.
+  auto a_res = shard_a_algo.Search(&shard_a);
+  auto c_res = combined_algo.Search(&combined);
+
+  absl::flat_hash_map<string, float> combined_by_text;
+  for (auto& [doc, score] : c_res.text_scores) {
+    if (doc < docs_a.size())
+      combined_by_text[docs_a[doc]] = score;
+  }
+  for (auto& [doc, score] : a_res.text_scores) {
+    ASSERT_TRUE(combined_by_text.contains(docs_a[doc]));
+    EXPECT_NEAR(score, combined_by_text[docs_a[doc]], 1e-5)
+        << "shard-local BM25 with merged stats should match the combined index";
+  }
+
+  // TFIDF.DOCNORM on shard B with the same merged corpus stats.
+  SearchAlgorithm b_tfidf, c_tfidf;
+  ASSERT_TRUE(b_tfidf.Init("hello", &params));
+  ASSERT_TRUE(c_tfidf.Init("hello", &params));
+  b_tfidf.SetScorer(&TfIdfDocNorm);
+  c_tfidf.SetScorer(&TfIdfDocNorm);
+  b_tfidf.SetCorpusStats(&merged);
+  auto b_res = b_tfidf.Search(&shard_b);
+  auto c_tfidf_res = c_tfidf.Search(&combined);
+  absl::flat_hash_map<string, float> combined_tfidf;
+  for (auto& [doc, score] : c_tfidf_res.text_scores) {
+    if (doc >= docs_a.size())
+      combined_tfidf[docs_b[doc - docs_a.size()]] = score;
+  }
+  for (auto& [doc, score] : b_res.text_scores) {
+    ASSERT_TRUE(combined_tfidf.contains(docs_b[doc]));
+    EXPECT_NEAR(score, combined_tfidf[docs_b[doc]], 1e-5);
+  }
+}
+
 TEST_F(SearchTest, MatchOptional) {
   // ~term returns ALL documents, not just matching ones
   PrepareQuery("~hello");

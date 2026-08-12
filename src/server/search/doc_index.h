@@ -355,6 +355,9 @@ class ShardDocIndex {
   SearchResult Search(const OpArgs& op_args, const SearchParams& params,
                       search::SearchAlgorithm* search_algo, bool is_knn_prefilter) const;
 
+  // Local IDF / avgdl contribution of this shard for the current query.
+  search::ScoringCorpusStats CollectScoringStats(const search::SearchAlgorithm& search_algo) const;
+
   // Perform search and load requested values - note params might be interpreted differently.
   std::vector<SearchDocData> SearchForAggregator(const OpArgs& op_args,
                                                  const AggregateParams& params,

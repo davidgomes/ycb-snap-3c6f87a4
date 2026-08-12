@@ -116,6 +116,11 @@ void Aggregator::DoSort(const SortParams& sort_params) {
         continue;
       return order == SortOrder::ASC ? *lv < *rv : *lv > *rv;
     }
+    // Deterministic tie-break by document key when present (injected for ADDSCORES).
+    const Value* lk = sortable(l.find("__key"), l.end());
+    const Value* rk = sortable(r.find("__key"), r.end());
+    if (lk && rk && *lk != *rk)
+      return *lk < *rk;
     return false;
   };
 

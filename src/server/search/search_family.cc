@@ -1105,6 +1105,35 @@ auto SortableValueSender(RedisReplyBuilder* rb) {
   };
 }
 
+// Fan out a hop that sums per-shard IDF / avgdl stats into `stats` and installs them
+// on `algo`. Uses Execute(..., false); the caller must conclude the transaction.
+// Returns false if no shard has the index (transaction still open).
+bool CollectCorpusScoringStats(Transaction* tx, string_view index_name,
+                               search::SearchAlgorithm* algo, search::ScoringCorpusStats* stats) {
+  if (!algo->HasScorer() || shard_set->size() <= 1)
+    return true;
+
+  vector<search::ScoringCorpusStats> shard_stats(shard_set->size());
+  atomic<bool> found{false};
+  tx->Execute(
+      [&](Transaction* t, EngineShard* es) {
+        if (auto* index = es->search_indices()->GetIndex(index_name); index) {
+          found.store(true, memory_order_relaxed);
+          shard_stats[es->shard_id()] = index->CollectScoringStats(*algo);
+        }
+        return OpStatus::OK;
+      },
+      false);
+
+  if (!found.load(memory_order_relaxed))
+    return false;
+
+  for (auto& s : shard_stats)
+    stats->Merge(s);
+  algo->SetCorpusStats(stats);
+  return true;
+}
+
 void SendSerializedDoc(const SerializedSearchDoc& doc, SinkReplyBuilder* builder) {
   auto* rb = static_cast<RedisReplyBuilder*>(builder);
   auto sortable_value_sender = SortableValueSender(rb);
@@ -1166,11 +1195,27 @@ void SearchReply(const SearchParams& params,
     limit = std::min(docs.size() - offset, params.limit_total);
   }
   const size_t end = limit + offset;
+  const size_t sort_n = min(end, docs.size());
 
-  // Apply SORTBY if its different from the KNN sort
-  if (params.sort_option && !ignore_sort)
-    PartialSort(absl::MakeSpan(docs), end, params.sort_option->order,
-                &SerializedSearchDoc::sort_score);
+  // Apply SORTBY if its different from the KNN sort. Tie-break by key so ranks
+  // do not depend on shard concatenation order.
+  if (params.sort_option && !ignore_sort) {
+    auto cb = [order = params.sort_option->order](SerializedSearchDoc* l, SerializedSearchDoc* r) {
+      if (l->sort_score != r->sort_score)
+        return order == SortOrder::ASC ? l->sort_score < r->sort_score
+                                       : r->sort_score < l->sort_score;
+      return l->key < r->key;
+    };
+    partial_sort(docs.begin(), docs.begin() + sort_n, docs.end(), cb);
+  } else if (!knn_sort_option && (params.with_scores || params.scorer)) {
+    // Merge per-shard results into a global top-K by text score, then key.
+    auto cb = [](SerializedSearchDoc* l, SerializedSearchDoc* r) {
+      if (l->text_score != r->text_score)
+        return l->text_score > r->text_score;
+      return l->key < r->key;
+    };
+    partial_sort(docs.begin(), docs.begin() + sort_n, docs.end(), cb);
+  }
 
   const bool reply_with_ids_only = params.IdsOnly();
   auto* rb = static_cast<RedisReplyBuilder*>(builder);
@@ -2018,14 +2063,28 @@ void CmdFtSearch(CmdArgList args, CommandContext* cmd_cntx) {
   // If the query does not contain knn component, or it is a hybrid query.
   // HNSW vector range has no prefilter, so skip per-shard search entirely.
   if ((!knn || knn_has_prefilter) && !hnsw_range) {
-    cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
+    search::ScoringCorpusStats corpus_stats;
+    bool tx_open = false;
+    if (search_algo.HasScorer() && shard_set->size() > 1) {
+      if (!CollectCorpusScoringStats(cmd_cntx->tx(), index_name, &search_algo, &corpus_stats)) {
+        cmd_cntx->tx()->Conclude();
+        return cmd_cntx->SendError(string{index_name} + ": no such index");
+      }
+      tx_open = true;
+    }
+
+    auto search_cb = [&](Transaction* t, EngineShard* es) {
       if (auto* index = es->search_indices()->GetIndex(index_name); index)
         docs[es->shard_id()] =
             index->Search(t->GetOpArgs(es), *params, &search_algo, knn_has_prefilter);
       else
         index_not_found.store(true, memory_order_relaxed);
       return OpStatus::OK;
-    });
+    };
+    if (tx_open)
+      cmd_cntx->tx()->Execute(search_cb, true);
+    else
+      cmd_cntx->tx()->ScheduleSingleHop(search_cb);
 
     if (index_not_found.load(memory_order_relaxed))
       return cmd_cntx->SendError(string{index_name} + ": no such index");
@@ -2122,7 +2181,17 @@ void CmdFtProfile(CmdArgList args, CommandContext* cmd_cntx) {
   std::vector<SearchResult> search_results(shards_count);
   std::vector<absl::Duration> profile_results(shards_count);
 
-  cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
+  search::ScoringCorpusStats corpus_stats;
+  bool tx_open = false;
+  if (search_algo.HasScorer() && shard_set->size() > 1) {
+    if (!CollectCorpusScoringStats(cmd_cntx->tx(), index_name, &search_algo, &corpus_stats)) {
+      cmd_cntx->tx()->Conclude();
+      return rb->SendError(std::string{index_name} + ": no such index");
+    }
+    tx_open = true;
+  }
+
+  auto profile_cb = [&](Transaction* t, EngineShard* es) {
     auto* index = es->search_indices()->GetIndex(index_name);
     if (!index) {
       index_not_found.store(true, memory_order_relaxed);
@@ -2136,7 +2205,11 @@ void CmdFtProfile(CmdArgList args, CommandContext* cmd_cntx) {
     profile_results[shard_id] = {absl::Now() - shard_start};
 
     return OpStatus::OK;
-  });
+  };
+  if (tx_open)
+    cmd_cntx->tx()->Execute(profile_cb, true);
+  else
+    cmd_cntx->tx()->ScheduleSingleHop(profile_cb);
 
   if (index_not_found.load())
     return rb->SendError(std::string{index_name} + ": no such index");
@@ -2322,6 +2395,8 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
           };
         };
 
+    search::ScoringCorpusStats corpus_stats;
+
     if (knn) {
       auto hnsw_index = GlobalHnswIndexRegistry::Instance().Get(params->index, knn->field);
       if (!hnsw_index) {
@@ -2333,6 +2408,12 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
       std::optional<std::vector<search::GlobalDocId>> prefilter_global_ids;
 
       if (knn_has_prefilter) {
+        if (search_algo.HasScorer() && shard_set->size() > 1 &&
+            !CollectCorpusScoringStats(cmd_cntx->tx(), params->index, &search_algo,
+                                       &corpus_stats)) {
+          cmd_cntx->tx()->Conclude();
+          return builder->SendError(string{params->index} + ": no such index");
+        }
         vector<SearchResult> prefilter_docs(shard_set->size());
         cmd_cntx->tx()->Execute(
             [&](Transaction* t, EngineShard* es) {
@@ -2388,13 +2469,26 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
       cmd_cntx->tx()->ScheduleSingleHop(
           make_load_cb(shard_docs, hnsw_range->score_alias, prefilter_text_scores));
     } else {
-      cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
+      bool tx_open = false;
+      if (search_algo.HasScorer() && shard_set->size() > 1) {
+        if (!CollectCorpusScoringStats(cmd_cntx->tx(), params->index, &search_algo,
+                                       &corpus_stats)) {
+          cmd_cntx->tx()->Conclude();
+          return builder->SendError(string{params->index} + ": no such index");
+        }
+        tx_open = true;
+      }
+      auto agg_search_cb = [&](Transaction* t, EngineShard* es) {
         if (auto* index = es->search_indices()->GetIndex(params->index); index) {
           query_results[es->shard_id()] =
               index->SearchForAggregator(t->GetOpArgs(es), params.value(), &search_algo);
         }
         return OpStatus::OK;
-      });
+      };
+      if (tx_open)
+        cmd_cntx->tx()->Execute(agg_search_cb, true);
+      else
+        cmd_cntx->tx()->ScheduleSingleHop(agg_search_cb);
     }
 
     // ResultContainer is absl::flat_hash_map<std::string, search::SortableValue>

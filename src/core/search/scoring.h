@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+
 #include <algorithm>
 #include <cmath>
 #include <string>
@@ -91,5 +93,24 @@ inline double TfIdfDocNorm(const ScoringContext& ctx, const ScoringTermInfo& ter
 // Returns sum of per-term scores produced by the given scorer function.
 double ScoreDocument(ScorerFn scorer, const ScoringContext& ctx,
                      const std::vector<ScoringTermInfo>& terms);
+
+// Corpus-level IDF / average-length statistics used so BM25STD, TFIDF, and
+// TFIDF.DOCNORM produce the same scores regardless of how documents are sharded.
+struct ScoringCorpusStats {
+  struct FieldStats {
+    size_t total_len = 0;  // sum of per-doc field lengths
+    size_t num_docs = 0;   // docs with non-empty content in this field
+  };
+
+  size_t num_docs = 0;  // total documents in the index (N)
+  absl::flat_hash_map<std::string, FieldStats> fields;
+  // field identifier -> (term -> document frequency)
+  absl::flat_hash_map<std::string, absl::flat_hash_map<std::string, size_t>> term_df;
+
+  void Merge(const ScoringCorpusStats& other);
+
+  double FieldAvgDocLen(std::string_view field) const;
+  size_t TermDf(std::string_view field, std::string_view term) const;
+};
 
 }  // namespace dfly::search

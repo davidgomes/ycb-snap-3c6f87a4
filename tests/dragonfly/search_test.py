@@ -1299,3 +1299,132 @@ async def test_ft_aggregate_addscores(async_client: aioredis.Redis):
         assert float(results[0]["__score"]) >= float(results[1]["__score"])
 
     await async_client.execute_command("FT.DROPINDEX", "agg_score_idx")
+
+
+def _parse_search_withscores(res):
+    """Parse FT.SEARCH WITHSCORES reply into (total, [(key, score), ...])."""
+    total = res[0]
+    hits = []
+    i = 1
+    while i + 1 < len(res):
+        key = res[i].decode() if isinstance(res[i], bytes) else res[i]
+        score = float(res[i + 1])
+        hits.append((key, score))
+        i += 3  # key, score, fields
+    return total, hits
+
+
+def _parse_aggregate_scores(res):
+    rows = []
+    for row in res[1:]:
+        entry = {}
+        for j in range(0, len(row), 2):
+            k = row[j].decode() if isinstance(row[j], bytes) else row[j]
+            v = row[j + 1].decode() if isinstance(row[j + 1], bytes) else row[j + 1]
+            entry[k] = v
+        rows.append(entry)
+    return rows
+
+
+async def _index_diverse_corpus(client):
+    await client.execute_command(
+        "FT.CREATE", "score_idx", "ON", "HASH", "SCHEMA", "body", "TEXT", "rank", "NUMERIC",
+        "SORTABLE",
+    )
+    pipe = client.pipeline(transaction=False)
+    for i in range(200):
+        parts = []
+        if i % 3 == 0:
+            parts.extend(["needle"] * ((i % 5) + 1))
+        parts.extend(["zzzz"] * ((i % 11) + 1))
+        pipe.hset(f"doc:{i:03d}", mapping={"body": " ".join(parts), "rank": str(i)})
+    await pipe.execute()
+
+
+async def _collect_scorer_snapshot(client):
+    snapshot = {}
+    for scorer in ("BM25STD", "TFIDF", "TFIDF.DOCNORM"):
+        res = await client.execute_command(
+            "FT.SEARCH", "score_idx", "needle", "WITHSCORES", "SCORER", scorer, "LIMIT", "0", "20"
+        )
+        total, hits = _parse_search_withscores(res)
+        snapshot[scorer] = (total, hits)
+
+    agg = await client.execute_command(
+        "FT.AGGREGATE",
+        "score_idx",
+        "needle",
+        "SCORER",
+        "BM25STD",
+        "ADDSCORES",
+        "SORTBY",
+        "2",
+        "@__score",
+        "DESC",
+        "LIMIT",
+        "0",
+        "20",
+    )
+    snapshot["aggregate"] = _parse_aggregate_scores(agg)
+
+    sortby = await client.execute_command(
+        "FT.SEARCH",
+        "score_idx",
+        "needle",
+        "SORTBY",
+        "rank",
+        "WITHSCORES",
+        "SCORER",
+        "BM25STD",
+        "LIMIT",
+        "0",
+        "10",
+    )
+    _, sort_hits = _parse_search_withscores(sortby)
+    snapshot["sortby"] = sort_hits
+    return snapshot
+
+
+def _assert_score_snapshots_equal(one, four, tol=1e-5):
+    for scorer in ("BM25STD", "TFIDF", "TFIDF.DOCNORM"):
+        t1, h1 = one[scorer]
+        t4, h4 = four[scorer]
+        assert t1 == t4, f"{scorer}: total {t1} vs {t4}"
+        assert [k for k, _ in h1] == [k for k, _ in h4], f"{scorer}: key order differs"
+        for (k1, s1), (k2, s2) in zip(h1, h4):
+            assert abs(s1 - s2) <= tol, f"{scorer}: {k1} score {s1} vs {s2}"
+
+    a1 = one["aggregate"]
+    a4 = four["aggregate"]
+    assert len(a1) == len(a4)
+    for r1, r4 in zip(a1, a4):
+        assert abs(float(r1["__score"]) - float(r4["__score"])) <= tol
+    # Rank by score; keys must match when scores are unique, and stay sorted on ties.
+    s1 = [float(r["__score"]) for r in a1]
+    s4 = [float(r["__score"]) for r in a4]
+    assert all(s1[i] >= s1[i + 1] - tol for i in range(len(s1) - 1))
+    assert all(abs(a - b) <= tol for a, b in zip(s1, s4))
+
+    assert [k for k, _ in one["sortby"]] == [k for k, _ in four["sortby"]]
+    ranks = [int(k.split(":")[1]) for k, _ in one["sortby"]]
+    assert ranks == sorted(ranks), "SORTBY rank must keep rank order"
+    for (k1, s1), (k2, s2) in zip(one["sortby"], four["sortby"]):
+        assert abs(s1 - s2) <= tol, f"SORTBY+WITHSCORES {k1} score {s1} vs {s2}"
+
+
+@pytest.mark.asyncio
+async def test_text_scores_invariant_across_proactor_threads(df_factory: DflyInstanceFactory):
+    """FT.SEARCH / FT.AGGREGATE text scores must not depend on proactor/shard count."""
+    snapshots = {}
+    for threads in (1, 4):
+        server = df_factory.create(proactor_threads=threads)
+        server.start()
+        client = server.client()
+        try:
+            await _index_diverse_corpus(client)
+            snapshots[threads] = await _collect_scorer_snapshot(client)
+        finally:
+            await client.aclose()
+            server.stop()
+
+    _assert_score_snapshots_equal(snapshots[1], snapshots[4])
