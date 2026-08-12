@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -182,5 +183,40 @@ func alterDomainRename(
 func alterDomainSetSchema(
 	b BuildCtx, tn *tree.TypeName, domainType *scpb.DomainType, t *tree.AlterDomainSetSchema,
 ) {
-	panic(pgerror.Newf(pgcode.FeatureNotSupported, "ALTER DOMAIN SET SCHEMA is not supported"))
+	typeID := domainType.TypeID
+
+	currNamespace := mustRetrieveNamespaceElem(b, typeID)
+	currSchemaID := currNamespace.SchemaID
+	panicIfSchemaIsTemporaryOrVirtual(t.Schema)
+	newSchema := resolveSchemaByName(b, t.Schema, currNamespace.DatabaseID)
+	newSchemaID := newSchema.SchemaID
+
+	if currSchemaID == newSchemaID {
+		return
+	}
+
+	currName := tree.MakeTableNameFromPrefix(b.NamePrefix(domainType), tree.Name(currNamespace.Name))
+	newName := currName
+	newName.SchemaName = t.Schema
+
+	checkTableNameConflicts(b, currName, newName, currNamespace)
+
+	// The implicit array type moves along with the domain, so make sure its
+	// name is free in the target schema too.
+	arrayNamespace := mustRetrieveNamespaceElem(b, domainType.ArrayTypeID)
+	arrayName := tree.MakeTableNameFromPrefix(
+		b.NamePrefix(domainType), tree.Name(arrayNamespace.Name),
+	)
+	newArrayName := arrayName
+	newArrayName.SchemaName = t.Schema
+	checkTableNameConflicts(b, arrayName, newArrayName, arrayNamespace)
+
+	newNS, _ := moveDescriptorToSchema(b, typeID, currNamespace, newSchemaID)
+	moveDescriptorToSchema(b, domainType.ArrayTypeID, arrayNamespace, newSchemaID)
+
+	b.LogEventForExistingPayload(newNS, &eventpb.SetSchema{
+		DescriptorName:    currName.FQString(),
+		NewDescriptorName: newName.FQString(),
+		DescriptorType:    "domain",
+	})
 }

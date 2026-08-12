@@ -224,8 +224,119 @@ subtest end
 
 subtest set_schema
 
-statement error pgcode 0A000 ALTER DOMAIN SET SCHEMA is not supported
-ALTER DOMAIN d SET SCHEMA public
+statement ok
+CREATE SCHEMA sc1;
+CREATE SCHEMA sc2;
+CREATE DOMAIN d_sc AS INT CHECK (VALUE > 0)
+
+# Setting the domain to its current schema is a no-op.
+statement ok
+ALTER DOMAIN d_sc SET SCHEMA public
+
+# Cannot move to a schema that does not exist.
+statement error pq: unknown schema "does_not_exist"
+ALTER DOMAIN d_sc SET SCHEMA does_not_exist
+
+# Cannot move to a virtual schema.
+statement error pgcode 0A000 cannot move objects into or out of virtual schemas
+ALTER DOMAIN d_sc SET SCHEMA information_schema
+
+# Cannot move to a temporary schema.
+statement ok
+SET experimental_enable_temp_tables = 'on'
+
+statement ok
+CREATE TEMPORARY TABLE temp_tbl ()
+
+let $temp_schema
+SELECT schema_name FROM [show schemas] WHERE schema_name LIKE '%pg_temp%'
+
+statement error pgcode 0A000 cannot move objects into or out of temporary schemas
+ALTER DOMAIN d_sc SET SCHEMA $temp_schema
+
+# Move the domain from public to sc1.
+statement ok
+ALTER DOMAIN d_sc SET SCHEMA sc1
+
+# The domain should be resolvable in the new schema.
+query I
+SELECT 5::sc1.d_sc
+----
+5
+
+# The domain should no longer exist in the public schema.
+statement error pgcode 42704 type "public.d_sc" does not exist
+SELECT 5::public.d_sc
+
+# The implicit array type should have moved to the new schema as well.
+query TT
+SELECT nsp.nspname, typ.typname
+FROM pg_type typ JOIN pg_namespace nsp ON typ.typnamespace = nsp.oid
+WHERE typ.typname IN ('d_sc', '_d_sc') ORDER BY typ.typname
+----
+sc1  _d_sc
+sc1  d_sc
+
+# Setting the same schema again is a no-op.
+statement ok
+ALTER DOMAIN sc1.d_sc SET SCHEMA sc1
+
+# Move from one user-defined schema to another.
+statement ok
+ALTER DOMAIN sc1.d_sc SET SCHEMA sc2
+
+query I
+SELECT 7::sc2.d_sc
+----
+7
+
+statement error pgcode 42704 type "sc1.d_sc" does not exist
+SELECT 5::sc1.d_sc
+
+# Name conflict with an existing type in the target schema.
+statement ok
+CREATE DOMAIN sc1.d_sc AS TEXT
+
+statement error pgcode 42710 type "test.sc1.d_sc" already exists
+ALTER DOMAIN sc2.d_sc SET SCHEMA sc1
+
+# Name conflict between the implicit array type and an existing type in the
+# target schema.
+statement ok
+CREATE TYPE sc1._d_sc2 AS ENUM ('a');
+CREATE DOMAIN d_sc2 AS INT
+
+statement error pgcode 42710 type "test.sc1._d_sc2" already exists
+ALTER DOMAIN d_sc2 SET SCHEMA sc1
+
+# A domain referenced by a table column stays usable after the move, because
+# column references are by descriptor ID.
+statement ok
+CREATE TABLE t_dom_ref (x sc2.d_sc)
+
+statement ok
+INSERT INTO t_dom_ref VALUES (1)
+
+statement ok
+ALTER DOMAIN sc2.d_sc SET SCHEMA public
+
+query I
+SELECT x FROM t_dom_ref
+----
+1
+
+statement ok
+INSERT INTO t_dom_ref VALUES (2)
+
+# The domain CHECK constraint is still enforced after the move.
+statement error pgcode 23514 value for domain d_sc violates check constraint
+INSERT INTO t_dom_ref VALUES (-1)
+
+query I rowsort
+SELECT x FROM t_dom_ref
+----
+1
+2
 
 subtest end
 
