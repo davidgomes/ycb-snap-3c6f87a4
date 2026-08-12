@@ -5817,6 +5817,65 @@ TEST_F(SearchFamilyTest, SearchWithScoresPerField) {
       << "Per-field scoring: body length should not affect title-only query score";
 }
 
+// Text scoring must be shard-independent: IDF and average field length come from merged
+// corpus-wide statistics, so exact scores match the single-shard formulas even though the
+// fixture spreads documents over multiple shards. Equal scores tie-break by key.
+TEST_F(SearchFamilyTest, SearchScoresShardIndependent) {
+  EXPECT_EQ(Run({"ft.create", "i1", "ON", "HASH", "PREFIX", "1", "d:", "SCHEMA", "title", "TEXT"}),
+            "OK");
+
+  // 8 docs with 2 tokens each (fillers are their own stems); 4 docs contain "hello".
+  const char* fillers[] = {"fox", "dog", "cat", "sun", "moon", "star", "tree", "rock"};
+  for (int i = 0; i < 8; i++) {
+    string title = absl::StrCat(i < 4 ? "hello" : "bye", " ", fillers[i]);
+    Run({"hset", absl::StrCat("d:", i), "title", title});
+  }
+
+  const double kLn2 = std::log(2.0);
+
+  auto check_scores = [&](const char* scorer, double expected) {
+    auto resp = Run({"ft.search", "i1", "hello", "WITHSCORES", "SCORER", scorer});
+    ASSERT_THAT(resp, ArgType(RespExpr::ARRAY));
+    auto results = resp.GetVec();
+    ASSERT_EQ(results.size(), 1 + 3 * 4u) << scorer;
+    EXPECT_THAT(results[0], IntArg(4));
+
+    vector<string> keys;
+    for (size_t i = 1; i < results.size(); i += 3) {
+      keys.push_back(results[i].GetString());
+      EXPECT_NEAR(std::stod(results[i + 1].GetString()), expected, 1e-4) << scorer;
+    }
+    // All scores are equal -> deterministic tie-break by key, independent of sharding
+    EXPECT_THAT(keys, ElementsAre("d:0", "d:1", "d:2", "d:3")) << scorer;
+  };
+
+  // TFIDF: tf * ln(N / n) = 1 * ln(8 / 4)
+  check_scores("TFIDF", kLn2);
+  // TFIDF.DOCNORM: TFIDF / field_doc_len = ln(2) / 2
+  check_scores("TFIDF.DOCNORM", kLn2 / 2);
+  // BM25STD: idf = ln(1 + (8 - 4 + 0.5) / (4 + 0.5)) = ln(2); the TF factor is exactly 1
+  // because every title length equals the corpus-wide average (2 tokens).
+  check_scores("BM25STD", kLn2);
+
+  // FT.AGGREGATE with SCORER + ADDSCORES must inject the same corpus-wide scores
+  auto resp = Run({"ft.aggregate", "i1", "hello", "SCORER", "TFIDF", "ADDSCORES", "SORTBY", "2",
+                   "@__score", "DESC"});
+  ASSERT_THAT(resp, ArgType(RespExpr::ARRAY));
+  auto results = resp.GetVec();
+  ASSERT_EQ(results.size(), 1 + 4u);
+  for (size_t i = 1; i < results.size(); i++) {
+    auto row = results[i].GetVec();
+    bool found_score = false;
+    for (size_t j = 0; j + 1 < row.size(); j += 2) {
+      if (row[j].GetString() == "__score") {
+        EXPECT_NEAR(std::stod(row[j + 1].GetString()), kLn2, 1e-4);
+        found_score = true;
+      }
+    }
+    EXPECT_TRUE(found_score);
+  }
+}
+
 // Verify ADDSCORES makes __score visible even without explicit LOAD or pipeline steps
 TEST_F(SearchFamilyTest, AggregateAddScoresAutoVisible) {
   EXPECT_EQ(Run({"ft.create", "i1", "ON", "HASH", "PREFIX", "1", "d:", "SCHEMA", "title", "TEXT"}),

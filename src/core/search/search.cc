@@ -842,6 +842,7 @@ struct BasicSearch {
 
   const FieldIndices* indices_;
   ScorerFn scorer_ = nullptr;
+  const GlobalScoringStats* global_stats_ = nullptr;  // not owned
 
   string error_;
   optional<ProfileBuilder> profile_builder_ = ProfileBuilder{};
