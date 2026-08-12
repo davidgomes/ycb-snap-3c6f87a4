@@ -411,6 +411,12 @@ class ShardDocIndex {
     return key_index_;
   }
 
+  // Exposes the shard-local field indices, used to collect per-shard scoring statistics
+  // (see search::SearchAlgorithm::CollectLocalScoringStats) before a scored search runs.
+  const search::FieldIndices* GetFieldIndices() const {
+    return indices_ ? &*indices_ : nullptr;
+  }
+
   void AddDocToGlobalVectorIndex(ShardDocIndex::DocId doc_id, const DbContext& db_cntx,
                                  PrimeValue* pv);
 

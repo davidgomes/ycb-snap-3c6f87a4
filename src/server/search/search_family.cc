@@ -1117,12 +1117,17 @@ void SendSerializedDoc(const SerializedSearchDoc& doc, SinkReplyBuilder* builder
 }
 
 template <typename T>
-void PartialSort(absl::Span<SerializedSearchDoc*> docs, size_t limit, SortOrder order,
+void PartialSort(absl::Span<SerializedSearchDoc*> docs, size_t /*limit*/, SortOrder order,
                  T SerializedSearchDoc::*field) {
   auto cb = [order, field](SerializedSearchDoc* l, SerializedSearchDoc* r) {
     return order == SortOrder::ASC ? l->*field < r->*field : r->*field < l->*field;
   };
-  partial_sort(docs.begin(), docs.begin() + min(limit, docs.size()), docs.end(), cb);
+  // Full stable sort rather than partial_sort: documents with tied keys (e.g. equal
+  // text_score after cross-shard score aggregation - see GlobalScoringStats) get a
+  // deterministic relative order instead of one that depends on the unspecified
+  // tie-breaking of an unstable sort. Callers still slice out the requested window
+  // (offset/limit) from the now fully-sorted `docs` afterwards.
+  stable_sort(docs.begin(), docs.end(), cb);
 }
 
 void SearchReply(const SearchParams& params,
@@ -1168,9 +1173,17 @@ void SearchReply(const SearchParams& params,
   const size_t end = limit + offset;
 
   // Apply SORTBY if its different from the KNN sort
-  if (params.sort_option && !ignore_sort)
+  if (params.sort_option && !ignore_sort) {
     PartialSort(absl::MakeSpan(docs), end, params.sort_option->order,
                 &SerializedSearchDoc::sort_score);
+  } else if (!knn_sort_option && !params.sort_option && (params.with_scores || params.scorer)) {
+    // No explicit SORTBY/KNN ordering was requested: rank by relevance score, matching the
+    // default (RediSearch-compatible) behavior. Each shard only returns its own locally
+    // top-K-sorted docs (see TakeScoredTopK) using now shard-independent scores, but without
+    // this the coordinator would just concatenate per-shard results in shard order instead
+    // of producing a true cross-shard top-K ranked by score.
+    PartialSort(absl::MakeSpan(docs), end, SortOrder::DESC, &SerializedSearchDoc::text_score);
+  }
 
   const bool reply_with_ids_only = params.IdsOnly();
   auto* rb = static_cast<RedisReplyBuilder*>(builder);
@@ -1958,6 +1971,31 @@ static vector<SearchResult> FtSearchCSS(std::string_view idx, std::string_view q
   return results;
 }
 
+// Collects per-shard scoring statistics for `index_name` and merges them into corpus-wide
+// stats, so a subsequent scored search (BM25STD/TFIDF/TFIDF.DOCNORM) is independent of the
+// shard/proactor count. Returns nullopt (and does no work) when `search_algo` has no scorer
+// registered, or when there is only a single shard - local stats are already global there.
+static std::optional<search::GlobalScoringStats> CollectGlobalScoringStats(
+    Transaction* tx, string_view index_name, const search::SearchAlgorithm& search_algo) {
+  if (!search_algo.HasScorer() || shard_set->size() <= 1)
+    return std::nullopt;
+
+  vector<search::LocalScoringStats> local_stats(shard_set->size());
+  // Not the final hop of this command - conclude=false, so the transaction stays scheduled
+  // for the caller's subsequent (concluding) hop that runs the actual scored search.
+  tx->Execute(
+      [&](Transaction* t, EngineShard* es) {
+        if (auto* index = es->search_indices()->GetIndex(index_name); index) {
+          if (auto* field_indices = index->GetFieldIndices(); field_indices)
+            local_stats[es->shard_id()] = search_algo.CollectLocalScoringStats(field_indices);
+        }
+        return OpStatus::OK;
+      },
+      false);
+
+  return search::MergeGlobalScoringStats(local_stats);
+}
+
 void CmdFtSearch(CmdArgList args, CommandContext* cmd_cntx) {
   CmdArgParser parser{args};
   string_view index_name = parser.Next();
@@ -2018,6 +2056,12 @@ void CmdFtSearch(CmdArgList args, CommandContext* cmd_cntx) {
   // If the query does not contain knn component, or it is a hybrid query.
   // HNSW vector range has no prefilter, so skip per-shard search entirely.
   if ((!knn || knn_has_prefilter) && !hnsw_range) {
+    // Aggregate cross-shard scoring stats before the real search runs, so BM25STD/TFIDF/
+    // TFIDF.DOCNORM scores (and any resulting top-K/ordering) don't depend on shard count.
+    auto global_scoring_stats = CollectGlobalScoringStats(cmd_cntx->tx(), index_name, search_algo);
+    if (global_scoring_stats)
+      search_algo.SetGlobalScoringStats(&*global_scoring_stats);
+
     cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
       if (auto* index = es->search_indices()->GetIndex(index_name); index)
         docs[es->shard_id()] =
@@ -2388,6 +2432,14 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
       cmd_cntx->tx()->ScheduleSingleHop(
           make_load_cb(shard_docs, hnsw_range->score_alias, prefilter_text_scores));
     } else {
+      // Aggregate cross-shard scoring stats before the real search runs, so BM25STD/TFIDF/
+      // TFIDF.DOCNORM scores (and ADDSCORES/SORTBY @__score ordering) don't depend on shard
+      // count.
+      auto global_scoring_stats =
+          CollectGlobalScoringStats(cmd_cntx->tx(), params->index, search_algo);
+      if (global_scoring_stats)
+        search_algo.SetGlobalScoringStats(&*global_scoring_stats);
+
       cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
         if (auto* index = es->search_indices()->GetIndex(params->index); index) {
           query_results[es->shard_id()] =
