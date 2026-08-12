@@ -1160,11 +1160,8 @@ static void rd_kafka_share_fetch_reply_handle_partition_error(
          * downstream OP_CONSUMER_ERR being surfaced to the app via
          * consume_batch. */
         /* TODO KIP-932: write test cases for each per-partition error
-         * arm below once the mock cluster exposes a per-partition
-         * error-injection API (e.g.
-         * rd_kafka_mock_partition_push_share_fetch_error). Today only
-         * the leader-change errors are exercised via
-         * rd_kafka_mock_partition_set_leader; the remaining arms
+         * arm below using
+         * rd_kafka_mock_partition_push_request_errors(). The remaining arms
          * (KAFKA_STORAGE_ERROR, OFFSET_NOT_AVAILABLE,
          * REPLICA_NOT_AVAILABLE, UNKNOWN_TOPIC_OR_PART,
          * UNKNOWN_TOPIC_ID, INCONSISTENT_TOPIC_ID,
