@@ -89,6 +89,20 @@ class UserDefinedFunctionTests(object):
         actual = source_sink_utils.results()
         self.assert_equals(actual, ["+I[2, 1, 0, 4, 2, 2, 1, 1]", "+I[4, 0, -1, 12, 4, 4, 1, 3]"])
 
+    def test_task_info_in_function_context(self):
+        task_info_func = udf(TaskInfoValidatingFunction(), result_type=DataTypes.BIGINT())
+
+        sink_table = generate_random_table_name()
+        sink_table_ddl = f"""
+            CREATE TABLE {sink_table}(a BIGINT) WITH ('connector'='test-sink')
+        """
+        self.t_env.execute_sql(sink_table_ddl)
+
+        t = self.t_env.from_elements([(1,), (2,), (3,)], ['a'])
+        t.select(task_info_func(t.a)).execute_insert(sink_table).wait()
+        actual = source_sink_utils.results()
+        self.assert_equals(actual, ["+I[1]", "+I[2]", "+I[3]"])
+
     def test_chaining_scalar_function(self):
         add_one = udf(lambda i: i + 1, result_type=DataTypes.BIGINT())
         subtract_one = udf(SubtractOne(), result_type=DataTypes.BIGINT())
@@ -1099,6 +1113,34 @@ class PyFlinkEmbeddedThreadTests(UserDefinedFunctionTests, PyFlinkBatchTableTest
         self.t_env.get_config().set("python.execution-mode", "thread")
 
 
+class FunctionContextTests(unittest.TestCase):
+
+    def test_task_info_getters_return_none_when_unset(self):
+        function_context = FunctionContext(None, None)
+        self.assertIsNone(function_context.get_task_name())
+        self.assertIsNone(function_context.get_task_name_with_subtasks())
+        self.assertIsNone(function_context.get_number_of_parallel_subtasks())
+        self.assertIsNone(function_context.get_max_number_of_parallel_subtasks())
+        self.assertIsNone(function_context.get_index_of_this_subtask())
+        self.assertIsNone(function_context.get_attempt_number())
+
+    def test_task_info_getters(self):
+        function_context = FunctionContext(
+            None, None,
+            task_name="Test Task",
+            task_name_with_subtasks="Test Task (1/4)#2",
+            number_of_parallel_subtasks=4,
+            max_number_of_parallel_subtasks=128,
+            index_of_this_subtask=0,
+            attempt_number=2)
+        self.assertEqual("Test Task", function_context.get_task_name())
+        self.assertEqual("Test Task (1/4)#2", function_context.get_task_name_with_subtasks())
+        self.assertEqual(4, function_context.get_number_of_parallel_subtasks())
+        self.assertEqual(128, function_context.get_max_number_of_parallel_subtasks())
+        self.assertEqual(0, function_context.get_index_of_this_subtask())
+        self.assertEqual(2, function_context.get_attempt_number())
+
+
 # test specify the input_types
 @udf(input_types=[DataTypes.BIGINT(), DataTypes.BIGINT()], result_type=DataTypes.BIGINT())
 def add(i, j):
@@ -1145,6 +1187,33 @@ class Subtract(ScalarFunction, unittest.TestCase):
         # counter
         self.counter_sum += i
         return i - self.subtracted_value
+
+
+class TaskInfoValidatingFunction(ScalarFunction):
+
+    def open(self, function_context: FunctionContext):
+        task_name = function_context.get_task_name()
+        task_name_with_subtasks = function_context.get_task_name_with_subtasks()
+        parallelism = function_context.get_number_of_parallel_subtasks()
+        max_parallelism = function_context.get_max_number_of_parallel_subtasks()
+        subtask_index = function_context.get_index_of_this_subtask()
+        attempt_number = function_context.get_attempt_number()
+        if not task_name:
+            raise Exception("the task name should be available in FunctionContext")
+        if not task_name_with_subtasks:
+            raise Exception("the task name with subtasks should be available in FunctionContext")
+        if parallelism is None or parallelism < 1:
+            raise Exception("the parallelism should be positive, got %s" % parallelism)
+        if max_parallelism is None or max_parallelism < 1:
+            raise Exception("the max parallelism should be positive, got %s" % max_parallelism)
+        if subtask_index is None or not (0 <= subtask_index < parallelism):
+            raise Exception("the subtask index should be in [0, %s), got %s"
+                            % (parallelism, subtask_index))
+        if attempt_number is None or attempt_number < 0:
+            raise Exception("the attempt number should be non-negative, got %s" % attempt_number)
+
+    def eval(self, i):
+        return i
 
 
 class CallablePlus(object):

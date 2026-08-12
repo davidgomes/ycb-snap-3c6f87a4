@@ -35,6 +35,25 @@ _func_num = 0
 _constant_num = 0
 
 
+def extract_task_info(serialized_fn) -> Dict[str, Any]:
+    """
+    Extracts the runtime task information from the serialized function proto. Returns the
+    keyword arguments used to construct a FunctionContext, which are empty when the task
+    information is not present.
+    """
+    if not serialized_fn.HasField("task_info"):
+        return {}
+    task_info = serialized_fn.task_info
+    return {
+        "task_name": task_info.task_name,
+        "task_name_with_subtasks": task_info.task_name_with_subtasks,
+        "number_of_parallel_subtasks": task_info.number_of_parallel_subtasks,
+        "max_number_of_parallel_subtasks": task_info.max_number_of_parallel_subtasks,
+        "index_of_this_subtask": task_info.index_of_this_subtask,
+        "attempt_number": task_info.attempt_number,
+    }
+
+
 def normalize_table_function_result(it):
     def normalize_one_row(value):
         if isinstance(value, tuple):

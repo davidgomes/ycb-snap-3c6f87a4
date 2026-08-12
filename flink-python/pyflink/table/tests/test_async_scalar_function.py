@@ -37,6 +37,13 @@ class AsyncScalarFunctionTests(PyFlinkStreamTableTestCase):
 
         class AsyncFunctionWithLifecycle(AsyncScalarFunction):
             def open(self, function_context: FunctionContext):
+                # the runtime task information should be available in open()
+                assert function_context.get_task_name()
+                assert function_context.get_task_name_with_subtasks()
+                assert function_context.get_number_of_parallel_subtasks() >= 1
+                assert function_context.get_max_number_of_parallel_subtasks() >= 1
+                assert function_context.get_index_of_this_subtask() >= 0
+                assert function_context.get_attempt_number() >= 0
                 self.prefix = "opened_"
 
             async def eval(self, value):

@@ -19,6 +19,7 @@
 package org.apache.flink.python.util;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.api.common.TaskInfo;
 import org.apache.flink.api.common.functions.RuntimeContext;
 import org.apache.flink.api.common.state.StateTtlConfig;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -154,7 +155,19 @@ public enum ProtoUtils {
                                                 .setValue(entry.getValue())
                                                 .build())
                         .collect(Collectors.toList()));
+        builder.setTaskInfo(createTaskInfoProto(runtimeContext.getTaskInfo()));
         return builder.build();
+    }
+
+    public static FlinkFnApi.TaskInfo createTaskInfoProto(TaskInfo taskInfo) {
+        return FlinkFnApi.TaskInfo.newBuilder()
+                .setTaskName(taskInfo.getTaskName())
+                .setTaskNameWithSubtasks(taskInfo.getTaskNameWithSubtasks())
+                .setNumberOfParallelSubtasks(taskInfo.getNumberOfParallelSubtasks())
+                .setMaxNumberOfParallelSubtasks(taskInfo.getMaxNumberOfParallelSubtasks())
+                .setIndexOfThisSubtask(taskInfo.getIndexOfThisSubtask())
+                .setAttemptNumber(taskInfo.getAttemptNumber())
+                .build();
     }
 
     public static FlinkFnApi.UserDefinedFunction createUserDefinedFunctionProto(

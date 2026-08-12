@@ -85,6 +85,7 @@ class BaseOperation(Operation):
             self.base_metric_group = None
         self.func, self.user_defined_funcs = self.generate_func(serialized_fn)
         self.job_parameters = {p.key: p.value for p in serialized_fn.job_parameters}
+        self.task_info = operation_utils.extract_task_info(serialized_fn)
 
     def finish(self):
         self._update_gauge(self.base_metric_group)
@@ -104,7 +105,9 @@ class BaseOperation(Operation):
     def open(self):
         for user_defined_func in self.user_defined_funcs:
             if hasattr(user_defined_func, 'open'):
-                user_defined_func.open(FunctionContext(self.base_metric_group, self.job_parameters))
+                user_defined_func.open(
+                    FunctionContext(self.base_metric_group, self.job_parameters,
+                                    **self.task_info))
 
     def close(self):
         for user_defined_func in self.user_defined_funcs:
@@ -330,7 +333,8 @@ class AbstractStreamGroupAggregateOperation(BaseStatefulOperation):
             serialized_fn, keyed_state_backend)
 
     def open(self):
-        self.group_agg_function.open(FunctionContext(self.base_metric_group, self.job_parameters))
+        self.group_agg_function.open(
+            FunctionContext(self.base_metric_group, self.job_parameters, **self.task_info))
 
     def close(self):
         self.group_agg_function.close()

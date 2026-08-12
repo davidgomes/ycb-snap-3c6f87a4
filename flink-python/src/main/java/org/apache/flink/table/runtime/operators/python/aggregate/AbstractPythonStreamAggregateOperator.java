@@ -264,6 +264,7 @@ public abstract class AbstractPythonStreamAggregateOperator
                                                 .setValue(entry.getValue())
                                                 .build())
                         .collect(Collectors.toList()));
+        builder.setTaskInfo(ProtoUtils.createTaskInfoProto(getRuntimeContext().getTaskInfo()));
         return builder.build();
     }
 

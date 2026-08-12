@@ -31,6 +31,22 @@ class JobParameter(_message.Message):
     value: str
     def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
 
+class TaskInfo(_message.Message):
+    __slots__ = ("task_name", "task_name_with_subtasks", "number_of_parallel_subtasks", "max_number_of_parallel_subtasks", "index_of_this_subtask", "attempt_number")
+    TASK_NAME_FIELD_NUMBER: _ClassVar[int]
+    TASK_NAME_WITH_SUBTASKS_FIELD_NUMBER: _ClassVar[int]
+    NUMBER_OF_PARALLEL_SUBTASKS_FIELD_NUMBER: _ClassVar[int]
+    MAX_NUMBER_OF_PARALLEL_SUBTASKS_FIELD_NUMBER: _ClassVar[int]
+    INDEX_OF_THIS_SUBTASK_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    task_name: str
+    task_name_with_subtasks: str
+    number_of_parallel_subtasks: int
+    max_number_of_parallel_subtasks: int
+    index_of_this_subtask: int
+    attempt_number: int
+    def __init__(self, task_name: _Optional[str] = ..., task_name_with_subtasks: _Optional[str] = ..., number_of_parallel_subtasks: _Optional[int] = ..., max_number_of_parallel_subtasks: _Optional[int] = ..., index_of_this_subtask: _Optional[int] = ..., attempt_number: _Optional[int] = ...) -> None: ...
+
 class Input(_message.Message):
     __slots__ = ("udf", "inputOffset", "inputConstant")
     UDF_FIELD_NUMBER: _ClassVar[int]
@@ -70,20 +86,22 @@ class AsyncOptions(_message.Message):
     def __init__(self, max_concurrent_operations: _Optional[int] = ..., timeout_ms: _Optional[int] = ..., retry_enabled: bool = ..., retry_max_attempts: _Optional[int] = ..., retry_delay_ms: _Optional[int] = ...) -> None: ...
 
 class UserDefinedFunctions(_message.Message):
-    __slots__ = ("udfs", "metric_enabled", "windows", "profile_enabled", "job_parameters", "async_options")
+    __slots__ = ("udfs", "metric_enabled", "windows", "profile_enabled", "job_parameters", "async_options", "task_info")
     UDFS_FIELD_NUMBER: _ClassVar[int]
     METRIC_ENABLED_FIELD_NUMBER: _ClassVar[int]
     WINDOWS_FIELD_NUMBER: _ClassVar[int]
     PROFILE_ENABLED_FIELD_NUMBER: _ClassVar[int]
     JOB_PARAMETERS_FIELD_NUMBER: _ClassVar[int]
     ASYNC_OPTIONS_FIELD_NUMBER: _ClassVar[int]
+    TASK_INFO_FIELD_NUMBER: _ClassVar[int]
     udfs: _containers.RepeatedCompositeFieldContainer[UserDefinedFunction]
     metric_enabled: bool
     windows: _containers.RepeatedCompositeFieldContainer[OverWindow]
     profile_enabled: bool
     job_parameters: _containers.RepeatedCompositeFieldContainer[JobParameter]
     async_options: AsyncOptions
-    def __init__(self, udfs: _Optional[_Iterable[_Union[UserDefinedFunction, _Mapping]]] = ..., metric_enabled: bool = ..., windows: _Optional[_Iterable[_Union[OverWindow, _Mapping]]] = ..., profile_enabled: bool = ..., job_parameters: _Optional[_Iterable[_Union[JobParameter, _Mapping]]] = ..., async_options: _Optional[_Union[AsyncOptions, _Mapping]] = ...) -> None: ...
+    task_info: TaskInfo
+    def __init__(self, udfs: _Optional[_Iterable[_Union[UserDefinedFunction, _Mapping]]] = ..., metric_enabled: bool = ..., windows: _Optional[_Iterable[_Union[OverWindow, _Mapping]]] = ..., profile_enabled: bool = ..., job_parameters: _Optional[_Iterable[_Union[JobParameter, _Mapping]]] = ..., async_options: _Optional[_Union[AsyncOptions, _Mapping]] = ..., task_info: _Optional[_Union[TaskInfo, _Mapping]] = ...) -> None: ...
 
 class OverWindow(_message.Message):
     __slots__ = ("window_type", "lower_boundary", "upper_boundary")
@@ -195,7 +213,7 @@ class GroupWindow(_message.Message):
     def __init__(self, window_type: _Optional[_Union[GroupWindow.WindowType, str]] = ..., is_time_window: bool = ..., window_slide: _Optional[int] = ..., window_size: _Optional[int] = ..., window_gap: _Optional[int] = ..., is_row_time: bool = ..., time_field_index: _Optional[int] = ..., allowedLateness: _Optional[int] = ..., namedProperties: _Optional[_Iterable[_Union[GroupWindow.WindowProperty, str]]] = ..., shift_timezone: _Optional[str] = ...) -> None: ...
 
 class UserDefinedAggregateFunctions(_message.Message):
-    __slots__ = ("udfs", "metric_enabled", "grouping", "generate_update_before", "key_type", "index_of_count_star", "state_cleaning_enabled", "state_cache_size", "map_state_read_cache_size", "map_state_write_cache_size", "count_star_inserted", "group_window", "profile_enabled", "job_parameters")
+    __slots__ = ("udfs", "metric_enabled", "grouping", "generate_update_before", "key_type", "index_of_count_star", "state_cleaning_enabled", "state_cache_size", "map_state_read_cache_size", "map_state_write_cache_size", "count_star_inserted", "group_window", "profile_enabled", "job_parameters", "task_info")
     UDFS_FIELD_NUMBER: _ClassVar[int]
     METRIC_ENABLED_FIELD_NUMBER: _ClassVar[int]
     GROUPING_FIELD_NUMBER: _ClassVar[int]
@@ -210,6 +228,7 @@ class UserDefinedAggregateFunctions(_message.Message):
     GROUP_WINDOW_FIELD_NUMBER: _ClassVar[int]
     PROFILE_ENABLED_FIELD_NUMBER: _ClassVar[int]
     JOB_PARAMETERS_FIELD_NUMBER: _ClassVar[int]
+    TASK_INFO_FIELD_NUMBER: _ClassVar[int]
     udfs: _containers.RepeatedCompositeFieldContainer[UserDefinedAggregateFunction]
     metric_enabled: bool
     grouping: _containers.RepeatedScalarFieldContainer[int]
@@ -224,7 +243,8 @@ class UserDefinedAggregateFunctions(_message.Message):
     group_window: GroupWindow
     profile_enabled: bool
     job_parameters: _containers.RepeatedCompositeFieldContainer[JobParameter]
-    def __init__(self, udfs: _Optional[_Iterable[_Union[UserDefinedAggregateFunction, _Mapping]]] = ..., metric_enabled: bool = ..., grouping: _Optional[_Iterable[int]] = ..., generate_update_before: bool = ..., key_type: _Optional[_Union[Schema.FieldType, _Mapping]] = ..., index_of_count_star: _Optional[int] = ..., state_cleaning_enabled: bool = ..., state_cache_size: _Optional[int] = ..., map_state_read_cache_size: _Optional[int] = ..., map_state_write_cache_size: _Optional[int] = ..., count_star_inserted: bool = ..., group_window: _Optional[_Union[GroupWindow, _Mapping]] = ..., profile_enabled: bool = ..., job_parameters: _Optional[_Iterable[_Union[JobParameter, _Mapping]]] = ...) -> None: ...
+    task_info: TaskInfo
+    def __init__(self, udfs: _Optional[_Iterable[_Union[UserDefinedAggregateFunction, _Mapping]]] = ..., metric_enabled: bool = ..., grouping: _Optional[_Iterable[int]] = ..., generate_update_before: bool = ..., key_type: _Optional[_Union[Schema.FieldType, _Mapping]] = ..., index_of_count_star: _Optional[int] = ..., state_cleaning_enabled: bool = ..., state_cache_size: _Optional[int] = ..., map_state_read_cache_size: _Optional[int] = ..., map_state_write_cache_size: _Optional[int] = ..., count_star_inserted: bool = ..., group_window: _Optional[_Union[GroupWindow, _Mapping]] = ..., profile_enabled: bool = ..., job_parameters: _Optional[_Iterable[_Union[JobParameter, _Mapping]]] = ..., task_info: _Optional[_Union[TaskInfo, _Mapping]] = ...) -> None: ...
 
 class Schema(_message.Message):
     __slots__ = ("fields",)

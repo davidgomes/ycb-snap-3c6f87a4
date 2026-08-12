@@ -62,6 +62,30 @@ class CountAggregateFunction(AggregateFunction):
         return 'BIGINT'
 
 
+class CountWithTaskInfoAggregateFunction(CountAggregateFunction):
+
+    def open(self, function_context):
+        task_name = function_context.get_task_name()
+        task_name_with_subtasks = function_context.get_task_name_with_subtasks()
+        parallelism = function_context.get_number_of_parallel_subtasks()
+        max_parallelism = function_context.get_max_number_of_parallel_subtasks()
+        subtask_index = function_context.get_index_of_this_subtask()
+        attempt_number = function_context.get_attempt_number()
+        if not task_name:
+            raise Exception("the task name should be available in FunctionContext")
+        if not task_name_with_subtasks:
+            raise Exception("the task name with subtasks should be available in FunctionContext")
+        if parallelism is None or parallelism < 1:
+            raise Exception("the parallelism should be positive, got %s" % parallelism)
+        if max_parallelism is None or max_parallelism < 1:
+            raise Exception("the max parallelism should be positive, got %s" % max_parallelism)
+        if subtask_index is None or not (0 <= subtask_index < parallelism):
+            raise Exception("the subtask index should be in [0, %s), got %s"
+                            % (parallelism, subtask_index))
+        if attempt_number is None or attempt_number < 0:
+            raise Exception("the attempt number should be non-negative, got %s" % attempt_number)
+
+
 class SumAggregateFunction(AggregateFunction):
 
     def get_value(self, accumulator):
@@ -273,6 +297,17 @@ class StreamTableAggregateTests(PyFlinkStreamTableTestCase):
                     call("sum0", col("b").cast(DataTypes.DOUBLE())).alias("d"))
         assert_frame_equal(result.to_pandas(),
                            pd.DataFrame([[3, 12, 12, 12.0]], columns=['a', 'b', 'c', 'd']))
+
+    def test_task_info_in_function_context(self):
+        self.t_env.create_temporary_system_function(
+            "my_count_with_task_info", CountWithTaskInfoAggregateFunction())
+        t = self.t_env.from_elements([(1, 'Hi', 'Hello'),
+                                      (3, 'Hi', 'hi'),
+                                      (2, 'Hi', 'Hello')], ['a', 'b', 'c'])
+        result = t.group_by(t.c) \
+            .select(call("my_count_with_task_info", t.a).alias("a"), t.c) \
+            .select(call("my_count_with_task_info", col("a")).alias("a"))
+        assert_frame_equal(result.to_pandas(), pd.DataFrame([[2]], columns=['a']))
 
     def test_mixed_with_built_in_functions_with_retract(self):
         self.t_env.get_config().set("parallelism.default", "1")
