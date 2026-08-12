@@ -7,6 +7,7 @@ package api
 
 import (
 	"compress/gzip"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -33,6 +34,16 @@ type FakeLogger struct{}
 
 func (fl *FakeLogger) Log(...interface{}) error {
 	return nil
+}
+
+func TestConfigOTLPTranslationHeadersFlag(t *testing.T) {
+	cfg := Config{}
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	cfg.RegisterFlags(flags)
+
+	require.False(t, cfg.OTLPTranslationHeadersEnabled)
+	require.NoError(t, flags.Parse([]string{"-api.otlp-translation-headers-enabled=true"}))
+	require.True(t, cfg.OTLPTranslationHeadersEnabled)
 }
 
 func TestNewApiWithoutSourceIPExtractor(t *testing.T) {

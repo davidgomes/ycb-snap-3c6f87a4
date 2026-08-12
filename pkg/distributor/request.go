@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/prometheus/common/model"
+
 	"github.com/grafana/mimir/pkg/mimirpb"
 )
 
@@ -38,6 +40,9 @@ type Request struct {
 	// uncompressedBodySize is the uncompressed request body size (wire bytes before any conversion).
 	// It may be 0 if unknown.
 	uncompressedBodySize int
+
+	// nameValidationScheme overrides the tenant's validation scheme for this request when set.
+	nameValidationScheme model.ValidationScheme
 }
 
 func newRequest(p supplierFunc) *Request {

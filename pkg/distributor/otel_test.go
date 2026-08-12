@@ -1114,7 +1114,7 @@ func BenchmarkOTLPHandler(b *testing.B) {
 	}
 	limits := validation.MockDefaultOverrides()
 	handler := OTLPHandler(
-		10000000, nil, nil, limits, nil, nil,
+		10000000, nil, nil, false, limits, nil, nil,
 		RetryConfig{}, nil, pushFunc, nil, nil, log.NewNopLogger(),
 	)
 
@@ -1205,7 +1205,7 @@ func BenchmarkOTLPHandlerWithLargeMessage(b *testing.B) {
 	}
 	limits := validation.MockDefaultOverrides()
 	handler := OTLPHandler(
-		200000000, nil, nil, limits, nil, nil,
+		200000000, nil, nil, false, limits, nil, nil,
 		RetryConfig{}, nil, pushFunc, nil, nil, log.NewNopLogger(),
 	)
 
@@ -1764,7 +1764,7 @@ func TestHandlerOTLPPush(t *testing.T) {
 			logs := &concurrency.SyncBuffer{}
 			retryConfig := RetryConfig{Enabled: true, MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second}
 			handler := OTLPHandler(
-				tt.maxMsgSize, nil, nil, limits,
+				tt.maxMsgSize, nil, nil, false, limits,
 				tt.resourceAttributePromotionConfig, tt.keepIdentifyingOTelResourceAttributesConfig,
 				retryConfig, nil, pusher, nil, nil,
 				util_log.MakeLeveledLogger(logs, "info"),
@@ -1859,7 +1859,7 @@ func TestHandler_otlpDroppedMetricsPanic(t *testing.T) {
 	req := createOTLPProtoRequest(t, pmetricotlp.NewExportRequestFromMetrics(md), "")
 	resp := httptest.NewRecorder()
 	handler := OTLPHandler(
-		100000, nil, nil, limits, nil, nil,
+		100000, nil, nil, false, limits, nil, nil,
 		RetryConfig{}, nil, func(_ context.Context, pushReq *Request) error {
 			request, err := pushReq.WriteRequest()
 			assert.NoError(t, err)
@@ -1904,7 +1904,7 @@ func TestHandler_otlpDroppedMetricsPanic2(t *testing.T) {
 	req := createOTLPProtoRequest(t, pmetricotlp.NewExportRequestFromMetrics(md), "")
 	resp := httptest.NewRecorder()
 	handler := OTLPHandler(
-		100000, nil, nil, limits, nil, nil,
+		100000, nil, nil, false, limits, nil, nil,
 		RetryConfig{}, nil, func(_ context.Context, pushReq *Request) error {
 			request, err := pushReq.WriteRequest()
 			t.Cleanup(pushReq.CleanUp)
@@ -1933,7 +1933,7 @@ func TestHandler_otlpDroppedMetricsPanic2(t *testing.T) {
 	req = createOTLPProtoRequest(t, pmetricotlp.NewExportRequestFromMetrics(md), "")
 	resp = httptest.NewRecorder()
 	handler = OTLPHandler(
-		100000, nil, nil, limits, nil, nil,
+		100000, nil, nil, false, limits, nil, nil,
 		RetryConfig{}, nil, func(_ context.Context, pushReq *Request) error {
 			request, err := pushReq.WriteRequest()
 			t.Cleanup(pushReq.CleanUp)
@@ -1964,7 +1964,7 @@ func TestHandler_otlpWriteRequestTooBigWithCompression(t *testing.T) {
 	resp := httptest.NewRecorder()
 
 	handler := OTLPHandler(
-		140, nil, nil, nil, nil, nil,
+		140, nil, nil, false, nil, nil, nil,
 		RetryConfig{}, nil, readBodyPushFunc(t), nil, nil, log.NewNopLogger(),
 	)
 	handler.ServeHTTP(resp, req)
@@ -2287,7 +2287,7 @@ func TestOTLPResponseContentType(t *testing.T) {
 					"test": {NameValidationScheme: model.LegacyValidation, OTelMetricSuffixesEnabled: boolPtr(false)},
 				}),
 			)
-			handler := OTLPHandler(100000, nil, nil, limits, nil, nil, RetryConfig{}, nil, func(_ context.Context, req *Request) error {
+			handler := OTLPHandler(100000, nil, nil, false, limits, nil, nil, RetryConfig{}, nil, func(_ context.Context, req *Request) error {
 				_, err := req.WriteRequest()
 				return err
 			}, nil, nil, log.NewNopLogger())
@@ -2298,6 +2298,145 @@ func TestOTLPResponseContentType(t *testing.T) {
 			require.Equal(t, tc.expectType, resp.Header().Get("Content-Type"))
 		})
 	}
+}
+
+func TestTranslationStrategyFromHeaders(t *testing.T) {
+	tests := map[string]struct {
+		enabled      bool
+		strategy     otlptranslator.TranslationStrategyOption
+		headers      map[string]string
+		wantStrategy otlptranslator.TranslationStrategyOption
+		wantOverride bool
+		wantError    bool
+	}{
+		"disabled ignores headers": {
+			strategy:     otlptranslator.UnderscoreEscapingWithoutSuffixes,
+			headers:      map[string]string{OTLPTranslationStrategyHeader: "invalid"},
+			wantStrategy: otlptranslator.UnderscoreEscapingWithoutSuffixes,
+		},
+		"strategy overrides tenant strategy": {
+			enabled:      true,
+			strategy:     otlptranslator.UnderscoreEscapingWithSuffixes,
+			headers:      map[string]string{OTLPTranslationStrategyHeader: string(otlptranslator.NoTranslation)},
+			wantStrategy: otlptranslator.NoTranslation,
+			wantOverride: true,
+		},
+		"strategy takes precedence over suffixes": {
+			enabled:  true,
+			strategy: otlptranslator.UnderscoreEscapingWithSuffixes,
+			headers: map[string]string{
+				OTLPTranslationStrategyHeader: string(otlptranslator.NoUTF8EscapingWithSuffixes),
+				OTLPAddSuffixesHeader:         "invalid",
+			},
+			wantStrategy: otlptranslator.NoUTF8EscapingWithSuffixes,
+			wantOverride: true,
+		},
+		"add suffixes preserves underscore escaping": {
+			enabled:      true,
+			strategy:     otlptranslator.UnderscoreEscapingWithoutSuffixes,
+			headers:      map[string]string{OTLPAddSuffixesHeader: "true"},
+			wantStrategy: otlptranslator.UnderscoreEscapingWithSuffixes,
+			wantOverride: true,
+		},
+		"remove suffixes preserves underscore escaping": {
+			enabled:      true,
+			strategy:     otlptranslator.UnderscoreEscapingWithSuffixes,
+			headers:      map[string]string{OTLPAddSuffixesHeader: "false"},
+			wantStrategy: otlptranslator.UnderscoreEscapingWithoutSuffixes,
+			wantOverride: true,
+		},
+		"add suffixes preserves UTF-8 names": {
+			enabled:      true,
+			strategy:     otlptranslator.NoTranslation,
+			headers:      map[string]string{OTLPAddSuffixesHeader: "true"},
+			wantStrategy: otlptranslator.NoUTF8EscapingWithSuffixes,
+			wantOverride: true,
+		},
+		"remove suffixes preserves UTF-8 names": {
+			enabled:      true,
+			strategy:     otlptranslator.NoUTF8EscapingWithSuffixes,
+			headers:      map[string]string{OTLPAddSuffixesHeader: "false"},
+			wantStrategy: otlptranslator.NoTranslation,
+			wantOverride: true,
+		},
+		"invalid strategy": {
+			enabled:   true,
+			strategy:  otlptranslator.UnderscoreEscapingWithoutSuffixes,
+			headers:   map[string]string{OTLPTranslationStrategyHeader: "invalid"},
+			wantError: true,
+		},
+		"invalid suffixes": {
+			enabled:   true,
+			strategy:  otlptranslator.UnderscoreEscapingWithoutSuffixes,
+			headers:   map[string]string{OTLPAddSuffixesHeader: "1"},
+			wantError: true,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			for header, value := range tc.headers {
+				req.Header.Set(header, value)
+			}
+
+			got, overridden, err := translationStrategyFromHeaders(req, tc.strategy, tc.enabled)
+			if tc.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantStrategy, got)
+			assert.Equal(t, tc.wantOverride, overridden)
+		})
+	}
+}
+
+func TestOTLPHandlerTranslationHeaders(t *testing.T) {
+	metrics := pmetric.NewMetrics()
+	metric := metrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	metric.SetName("metric.name")
+	dataPoint := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+	dataPoint.SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+	dataPoint.SetDoubleValue(1)
+
+	limits := validation.NewOverrides(
+		validation.Limits{
+			NameValidationScheme:    model.LegacyValidation,
+			OTelTranslationStrategy: validation.OTelTranslationStrategyValue(otlptranslator.UnderscoreEscapingWithoutSuffixes),
+		},
+		nil,
+	)
+
+	t.Run("UTF-8 strategy upgrades request validation", func(t *testing.T) {
+		req := createOTLPProtoRequest(t, pmetricotlp.NewExportRequestFromMetrics(metrics), "")
+		req.Header.Set(OTLPTranslationStrategyHeader, string(otlptranslator.NoTranslation))
+		resp := httptest.NewRecorder()
+		handler := OTLPHandler(100000, nil, nil, true, limits, nil, nil, RetryConfig{}, nil, func(_ context.Context, pushReq *Request) error {
+			writeReq, err := pushReq.WriteRequest()
+			require.NoError(t, err)
+			assert.Equal(t, model.UTF8Validation, pushReq.nameValidationScheme)
+			require.Len(t, writeReq.Timeseries, 1)
+			assert.Equal(t, "metric.name", writeReq.Timeseries[0].Labels[0].Value)
+			return nil
+		}, nil, nil, log.NewNopLogger())
+
+		handler.ServeHTTP(resp, req)
+		assert.Equal(t, http.StatusOK, resp.Code)
+	})
+
+	t.Run("invalid header returns bad request", func(t *testing.T) {
+		req := createOTLPProtoRequest(t, pmetricotlp.NewExportRequestFromMetrics(metrics), "")
+		req.Header.Set(OTLPAddSuffixesHeader, "yes")
+		resp := httptest.NewRecorder()
+		handler := OTLPHandler(100000, nil, nil, true, limits, nil, nil, RetryConfig{}, nil, func(_ context.Context, pushReq *Request) error {
+			_, err := pushReq.WriteRequest()
+			return err
+		}, nil, nil, log.NewNopLogger())
+
+		handler.ServeHTTP(resp, req)
+		assert.Equal(t, http.StatusBadRequest, resp.Code)
+	})
 }
 
 func TestOTLPJSONEnumEncoding(t *testing.T) {

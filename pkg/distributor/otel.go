@@ -51,6 +51,9 @@ const (
 	pbContentType   = "application/x-protobuf"
 	jsonContentType = "application/json"
 
+	OTLPAddSuffixesHeader         = "X-Mimir-OTLP-AddSuffixes"
+	OTLPTranslationStrategyHeader = "X-Mimir-OTLP-TranslationStrategy"
+
 	otelParseError = "otlp_parse_error"
 	maxErrMsgLen   = 1024
 )
@@ -76,6 +79,7 @@ func OTLPHandler(
 	maxRecvMsgSize int,
 	requestBufferPool util.Pool,
 	sourceIPs *middleware.SourceIPExtractor,
+	translationHeadersEnabled bool,
 	limits OTLPHandlerLimits,
 	resourceAttributePromotionConfig OTelResourceAttributePromotionConfig,
 	keepIdentifyingOTelResourceAttributesConfig KeepIdentifyingOTelResourceAttributesConfig,
@@ -100,10 +104,14 @@ func OTLPHandler(
 
 		otlpConverter := newOTLPMimirConverter(otlpappender.NewCombinedAppender())
 
+		var pushReq *Request
 		parser := newOTLPParser(
 			limits, resourceAttributePromotionConfig, keepIdentifyingOTelResourceAttributesConfig,
 			otlpConverter, pushMetrics, discardedDueToOtelParseError,
-			OTLPPushMiddlewares,
+			OTLPPushMiddlewares, translationHeadersEnabled,
+			func(scheme model.ValidationScheme) {
+				pushReq.nameValidationScheme = scheme
+			},
 		)
 
 		supplier := func() (*mimirpb.WriteRequest, func(), int, error) {
@@ -126,10 +134,10 @@ func OTLPHandler(
 			}
 			return &req.WriteRequest, cleanup, uncompressedSize, nil
 		}
-		req := newRequest(supplier)
-		req.contentLength = r.ContentLength
+		pushReq = newRequest(supplier)
+		pushReq.contentLength = r.ContentLength
 
-		pushErr := push(ctx, req)
+		pushErr := push(ctx, pushReq)
 		if pushErr == nil {
 			if otlpErr := otlpConverter.Err(); otlpErr != nil {
 				// Push was successful, but OTLP converter left out some samples. We let the client know about it by replying with 4xx (and an insight log).
@@ -138,7 +146,7 @@ func OTLPHandler(
 				// Respond as per spec:
 				// https://opentelemetry.io/docs/specs/otlp/#otlphttp-response.
 				var expResp colmetricpb.ExportMetricsServiceResponse
-				addSuccessHeaders(w, req.artificialDelay)
+				addSuccessHeaders(w, pushReq.artificialDelay)
 				writeOTLPResponse(r, w, http.StatusOK, &expResp, logger)
 				return
 			}
@@ -174,7 +182,7 @@ func OTLPHandler(
 			var isSoft bool
 			grpcCode, httpCode, isSoft = toOtlpGRPCHTTPStatus(pushErr)
 			if isSoft {
-				handlePartialOTLPPush(pushErr, w, r, req, logger)
+				handlePartialOTLPPush(pushErr, w, r, pushReq, logger)
 				return
 			}
 
@@ -231,6 +239,8 @@ func newOTLPParser(
 	pushMetrics *PushMetrics,
 	discardedDueToOtelParseError *prometheus.CounterVec,
 	OTLPPushMiddlewares []OTLPPushMiddleware,
+	translationHeadersEnabled bool,
+	setNameValidationScheme func(model.ValidationScheme),
 ) parserFunc {
 	if resourceAttributePromotionConfig == nil {
 		resourceAttributePromotionConfig = limits
@@ -365,6 +375,13 @@ func newOTLPParser(
 		limitsKey := tenantMd.WithTenant(tenantID)
 		translationStrategy := limits.OTelTranslationStrategy(limitsKey)
 		validateTranslationStrategy(translationStrategy, limits, limitsKey)
+		translationStrategy, overridden, err := translationStrategyFromHeaders(r, translationStrategy, translationHeadersEnabled)
+		if err != nil {
+			return 0, err
+		}
+		if overridden && !translationStrategy.ShouldEscape() {
+			setNameValidationScheme(model.UTF8Validation)
+		}
 
 		pushMetrics.IncOTLPRequest(tenantID)
 		pushMetrics.ObserveRequestBodySize(tenantID, "otlp", int64(uncompressedBodySize), r.ContentLength)
@@ -423,6 +440,50 @@ func newOTLPParser(
 		req.Metadata = metadata
 		return uncompressedBodySize, nil
 	}
+}
+
+func translationStrategyFromHeaders(r *http.Request, strategy otlptranslator.TranslationStrategyOption, enabled bool) (otlptranslator.TranslationStrategyOption, bool, error) {
+	if !enabled {
+		return strategy, false, nil
+	}
+
+	if _, ok := r.Header[http.CanonicalHeaderKey(OTLPTranslationStrategyHeader)]; ok {
+		value := r.Header.Get(OTLPTranslationStrategyHeader)
+		switch otlptranslator.TranslationStrategyOption(value) {
+		case otlptranslator.UnderscoreEscapingWithSuffixes,
+			otlptranslator.UnderscoreEscapingWithoutSuffixes,
+			otlptranslator.NoUTF8EscapingWithSuffixes,
+			otlptranslator.NoTranslation:
+			return otlptranslator.TranslationStrategyOption(value), true, nil
+		default:
+			return strategy, false, fmt.Errorf("invalid %s header value %q", OTLPTranslationStrategyHeader, value)
+		}
+	}
+
+	if _, ok := r.Header[http.CanonicalHeaderKey(OTLPAddSuffixesHeader)]; !ok {
+		return strategy, false, nil
+	}
+
+	var addSuffixes bool
+	switch value := r.Header.Get(OTLPAddSuffixesHeader); value {
+	case "true":
+		addSuffixes = true
+	case "false":
+		addSuffixes = false
+	default:
+		return strategy, false, fmt.Errorf("invalid %s header value %q", OTLPAddSuffixesHeader, value)
+	}
+
+	if strategy.ShouldEscape() {
+		if addSuffixes {
+			return otlptranslator.UnderscoreEscapingWithSuffixes, true, nil
+		}
+		return otlptranslator.UnderscoreEscapingWithoutSuffixes, true, nil
+	}
+	if addSuffixes {
+		return otlptranslator.NoUTF8EscapingWithSuffixes, true, nil
+	}
+	return otlptranslator.NoTranslation, true, nil
 }
 
 // validateTranslationStrategy ensures consistency between name translation strategy and name validation scheme and metric name suffix enablement.
