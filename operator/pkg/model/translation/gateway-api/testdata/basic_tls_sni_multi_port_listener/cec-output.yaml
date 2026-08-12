@@ -1,0 +1,117 @@
+metadata:
+  annotations:
+    cec.cilium.io/use-original-source-address: "false"
+  labels:
+    gateway.networking.k8s.io/gateway-name: my-gateway
+  name: cilium-gateway-my-gateway
+  namespace: default
+  ownerReferences:
+  - apiVersion: gateway.networking.k8s.io/v1
+    controller: true
+    kind: Gateway
+    name: my-gateway
+    uid: ""
+spec:
+  backendServices:
+  - name: backend-one
+    namespace: default
+    number:
+    - "6443"
+  - name: backend-two
+    namespace: default
+    number:
+    - "8443"
+  resources:
+  - '@type': type.googleapis.com/envoy.config.listener.v3.Listener
+    filterChains:
+    - filterChainMatch:
+        serverNames:
+        - foo.com
+        transportProtocol: tls
+      filters:
+      - name: envoy.filters.network.tcp_proxy
+        typedConfig:
+          '@type': type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          cluster: default:backend-one:6443
+          statPrefix: tls-passthrough:foo.com
+    listenerFilters:
+    - name: envoy.filters.listener.tls_inspector
+      typedConfig:
+        '@type': type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+    name: listener-6443
+    socketOptions:
+    - description: Enable TCP keep-alive (default to enabled)
+      intValue: "1"
+      level: "1"
+      name: "9"
+    - description: TCP keep-alive idle time (in seconds) (defaults to 10s)
+      intValue: "10"
+      level: "6"
+      name: "4"
+    - description: TCP keep-alive probe intervals (in seconds) (defaults to 5s)
+      intValue: "5"
+      level: "6"
+      name: "5"
+    - description: TCP keep-alive probe max failures.
+      intValue: "10"
+      level: "6"
+      name: "6"
+  - '@type': type.googleapis.com/envoy.config.listener.v3.Listener
+    filterChains:
+    - filterChainMatch:
+        serverNames:
+        - foo.com
+        transportProtocol: tls
+      filters:
+      - name: envoy.filters.network.tcp_proxy
+        typedConfig:
+          '@type': type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          cluster: default:backend-two:8443
+          statPrefix: tls-passthrough:foo.com
+    listenerFilters:
+    - name: envoy.filters.listener.tls_inspector
+      typedConfig:
+        '@type': type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+    name: listener-8443
+    socketOptions:
+    - description: Enable TCP keep-alive (default to enabled)
+      intValue: "1"
+      level: "1"
+      name: "9"
+    - description: TCP keep-alive idle time (in seconds) (defaults to 10s)
+      intValue: "10"
+      level: "6"
+      name: "4"
+    - description: TCP keep-alive probe intervals (in seconds) (defaults to 5s)
+      intValue: "5"
+      level: "6"
+      name: "5"
+    - description: TCP keep-alive probe max failures.
+      intValue: "10"
+      level: "6"
+      name: "6"
+  - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+    edsClusterConfig:
+      serviceName: default/backend-one:6443
+    name: default:backend-one:6443
+    outlierDetection:
+      splitExternalLocalOriginErrors: true
+    type: EDS
+  - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+    edsClusterConfig:
+      serviceName: default/backend-two:8443
+    name: default:backend-two:8443
+    outlierDetection:
+      splitExternalLocalOriginErrors: true
+    type: EDS
+  services:
+  - listener: listener-6443
+    name: cilium-gateway-my-gateway
+    namespace: default
+    ports:
+    - 6443
+  - listener: listener-8443
+    name: cilium-gateway-my-gateway
+    namespace: default
+    ports:
+    - 8443
