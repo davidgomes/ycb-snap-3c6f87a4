@@ -152,7 +152,8 @@ Use the [yb_hash_code()](../../../api/ysql/exprs/func_yb_hash_code/) function to
         t.end_hash_code,
         t.leader
     FROM yb_tablet_metadata t
-    WHERE t.relname = 'test_table'
+    WHERE t.db_name = current_database()
+      AND t.relname = 'test_table'
       AND yb_hash_code('k1'::text) >= t.start_hash_code
       AND yb_hash_code('k1'::text) < t.end_hash_code;
     ```

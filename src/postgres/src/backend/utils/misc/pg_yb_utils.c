@@ -131,6 +131,7 @@
 #include "storage/procarray.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -9136,6 +9137,8 @@ string_list_compare(const ListCell *a, const ListCell *b)
 	return strcmp((char *) lfirst(a), (char *) lfirst(b));
 }
 
+#define YB_TABLET_METADATA_PRIVILEGE_PLACEHOLDER "<insufficient privilege>"
+
 /*
  * Returns the metadata for all tablets in the cluster.
  * The returned data structure is a row type with the following columns:
@@ -9188,6 +9191,11 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
 	oldcontext = MemoryContextSwitchTo(per_query_ctx);
 
+	const bool	show_all_sensitive_metadata =
+		superuser() || IsYbDbAdminUser(GetUserId());
+	const char *current_database_name =
+		show_all_sensitive_metadata ? NULL : get_database_name(MyDatabaseId);
+
 	/* Build a tuple descriptor */
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		ereport(ERROR,
@@ -9209,9 +9217,26 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 		YbcPgTabletsDescriptor *tablet_descriptor = &tablet->tablet_descriptor;
 		Datum		values[ncols];
 		bool		nulls[ncols];
+		const bool	is_transactions_table =
+			strcmp(tablet_descriptor->namespace_name, "system") == 0 &&
+			strcmp(tablet_descriptor->table_name, "transactions") == 0;
+		bool		mask_sensitive_metadata =
+			!show_all_sensitive_metadata && !is_transactions_table;
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
+
+		if (mask_sensitive_metadata &&
+			current_database_name != NULL &&
+			strcmp(tablet_descriptor->namespace_name, current_database_name) == 0 &&
+			OidIsValid(tablet->pg_table_oid))
+		{
+			bool		is_missing = false;
+
+			mask_sensitive_metadata =
+				pg_class_aclcheck_ext(tablet->pg_table_oid, GetUserId(),
+									  ACL_SELECT, &is_missing) != ACLCHECK_OK;
+		}
 
 		values[0] = CStringGetTextDatum(tablet_descriptor->tablet_id);
 		values[1] = CStringGetTextDatum(tablet_descriptor->table_id);
@@ -9228,7 +9253,9 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 
 		values[3] = CStringGetTextDatum(tablet_descriptor->namespace_name);
-		values[4] = CStringGetTextDatum(tablet_descriptor->table_name);
+		values[4] = CStringGetTextDatum(
+			mask_sensitive_metadata ? YB_TABLET_METADATA_PRIVILEGE_PLACEHOLDER :
+			tablet_descriptor->table_name);
 		values[5] = CStringGetTextDatum(tablet_descriptor->table_type);
 
 		if (tablet->is_hash_partitioned)
@@ -9274,9 +9301,34 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[9] = true;
 		}
 
-		/* TODO (#28172): start_range, end_range, tablet_attrs are populated in a follow-up change. */
-		nulls[10] = true;
-		nulls[11] = true;
+		if (tablet->is_hash_partitioned)
+		{
+			nulls[10] = true;
+			nulls[11] = true;
+		}
+		else if (mask_sensitive_metadata)
+		{
+			/*
+			 * Mask both bounds, including unbounded edges, so the number and
+			 * position of range partitions cannot be inferred.
+			 */
+			values[10] = CStringGetTextDatum(YB_TABLET_METADATA_PRIVILEGE_PLACEHOLDER);
+			values[11] = CStringGetTextDatum(YB_TABLET_METADATA_PRIVILEGE_PLACEHOLDER);
+		}
+		else
+		{
+			if (tablet->start_range)
+				values[10] = CStringGetTextDatum(tablet->start_range);
+			else
+				nulls[10] = true;
+
+			if (tablet->end_range)
+				values[11] = CStringGetTextDatum(tablet->end_range);
+			else
+				nulls[11] = true;
+		}
+
+		/* TODO (#28172): tablet_attrs is populated in a follow-up change. */
 		nulls[12] = true;
 
 		if (tablet->tablet_state)
@@ -9293,6 +9345,8 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(oldcontext);
 	return (Datum) 0;
 }
+
+#undef YB_TABLET_METADATA_PRIVILEGE_PLACEHOLDER
 
 Datum
 yb_stat_auto_analyze(PG_FUNCTION_ARGS)

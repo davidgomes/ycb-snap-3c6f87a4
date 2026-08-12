@@ -35,6 +35,7 @@
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
+#include "yb/dockv/doc_key.h"
 #include "yb/dockv/pg_key_decoder.h"
 #include "yb/dockv/pg_row.h"
 #include "yb/dockv/reader_projection.h"
@@ -3147,6 +3148,10 @@ YbcStatus YBCTabletsMetadata(YbcPgGlobalTabletsDescriptor** tablets, size_t* cou
 
     for (const auto& tablet_metadata : tablet_metadatas) {
       const char** replicas_array = nullptr;
+      const bool is_hash_partitioned = tablet_metadata.is_hash_partitioned();
+      const auto& partition = tablet_metadata.partition();
+      const char* start_range = nullptr;
+      const char* end_range = nullptr;
 
       if (!tablet_metadata.replicas().empty()) {
         replicas_array = static_cast<const char**>(
@@ -3157,11 +3162,24 @@ YbcStatus YBCTabletsMetadata(YbcPgGlobalTabletsDescriptor** tablets, size_t* cou
         }
       }
 
+      if (!is_hash_partitioned) {
+        if (!partition.partition_key_start().empty()) {
+          start_range = YBCPAllocStdString(
+              dockv::DocKey::DebugSliceToString(partition.partition_key_start()));
+        }
+        if (!partition.partition_key_end().empty()) {
+          end_range = YBCPAllocStdString(
+              dockv::DocKey::DebugSliceToString(partition.partition_key_end()));
+        }
+      }
+
       new (dest) YbcPgGlobalTabletsDescriptor {
         .tablet_descriptor = MakeYbcPgTabletsDescriptor(tablet_metadata),
         .replicas = replicas_array,
         .replicas_count = static_cast<size_t>(tablet_metadata.replicas().size()),
-        .is_hash_partitioned = tablet_metadata.is_hash_partitioned(),
+        .is_hash_partitioned = is_hash_partitioned,
+        .start_range = start_range,
+        .end_range = end_range,
         .tablet_state = tablet_metadata.has_tablet_state()
             ? YBCPAllocStdString(tablet_metadata.tablet_state())
             : nullptr,
