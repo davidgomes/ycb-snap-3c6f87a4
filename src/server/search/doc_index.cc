@@ -859,9 +859,16 @@ SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& pa
                                    bool is_knn_prefilter) const {
   size_t limit = params.limit_offset + params.limit_total;
 
+  // Text scoring needs a cross-shard-consistent top-K: the caller (SearchReply) globally
+  // re-sorts by text_score and re-applies LIMIT once all shards' results are merged, so a
+  // shard-local cut here — by local score or by count — could drop true winners whose score
+  // only looks low from this shard's (possibly stats-incomplete) point of view.
+  bool has_scorer = search_algo->HasScorer();
+
   // If we don't sort the documents, we don't need to copy more ids than are requested
   // Also for HNSW KNN search we don't cut results at the search stage.
-  bool can_cut = !params.sort_option && !search_algo->GetKnnScoreSortOption() && !is_knn_prefilter;
+  bool can_cut = !has_scorer && !params.sort_option && !search_algo->GetKnnScoreSortOption() &&
+                 !is_knn_prefilter;
   size_t id_cutoff_limit = can_cut ? limit : numeric_limits<size_t>::max();
 
   auto result = search_algo->Search(&*indices_, id_cutoff_limit);
@@ -882,6 +889,10 @@ SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& pa
     } else {
       limit = max(limit, ko->limit);
     }
+  } else if (has_scorer && !params.sort_option) {
+    // No SORTBY and no KNN: caller (SearchReply) globally reorders by text_score across all
+    // shards. Don't cut at the shard level for the same reason as above.
+    limit = numeric_limits<size_t>::max();
   }
 
   // We don't apply limit if this is prefilter HNSW KNN search
@@ -967,6 +978,12 @@ SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& pa
   return {result.total - expired_count, std::move(out), std::move(result.profile)};
 }
 
+search::LocalScoringStats ShardDocIndex::CollectScoringStats(
+    search::SearchAlgorithm* search_algo) const {
+  auto result = search_algo->Search(&*indices_);
+  return std::move(result.local_scoring_stats);
+}
+
 vector<SearchDocData> ShardDocIndex::SearchForAggregator(
     const OpArgs& op_args, const AggregateParams& params,
     search::SearchAlgorithm* search_algo) const {
@@ -1026,7 +1043,7 @@ vector<SearchDocData> ShardDocIndex::LoadDocEntriesWithScores(
     auto entry = LoadEntry(doc, op_args);
     if (!entry)
       continue;
-    auto& [_, accessor] = *entry;
+    auto& [key, accessor] = *entry;
 
     SearchDocData extracted_sort_indicies;
     extracted_sort_indicies.reserve(sort_indicies.size());
@@ -1047,6 +1064,10 @@ vector<SearchDocData> ShardDocIndex::LoadDocEntriesWithScores(
     if (!text_score_map.empty()) {
       if (auto it = text_score_map.find(doc); it != text_score_map.end())
         out.back()["__score"] = static_cast<double>(it->second);
+      // Hidden (never in fields_to_print) tie-break key for Aggregator::DoSort: when two docs
+      // share the same __score, breaking the tie by key keeps ordering identical regardless of
+      // shard count, instead of leaving it to (shard-count-dependent) input order.
+      out.back()["__key"] = string(key);
     }
   }
   return out;

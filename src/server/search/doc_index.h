@@ -355,6 +355,11 @@ class ShardDocIndex {
   SearchResult Search(const OpArgs& op_args, const SearchParams& params,
                       search::SearchAlgorithm* search_algo, bool is_knn_prefilter) const;
 
+  // Runs the query purely to collect this shard's local text-scoring statistics (no doc
+  // loading). Used to build a GlobalScoringStats before the real search/aggregate pass, so
+  // BM25STD/TFIDF/TFIDF.DOCNORM scores are consistent regardless of shard count.
+  search::LocalScoringStats CollectScoringStats(search::SearchAlgorithm* search_algo) const;
+
   // Perform search and load requested values - note params might be interpreted differently.
   std::vector<SearchDocData> SearchForAggregator(const OpArgs& op_args,
                                                  const AggregateParams& params,

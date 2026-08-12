@@ -1168,9 +1168,22 @@ void SearchReply(const SearchParams& params,
   const size_t end = limit + offset;
 
   // Apply SORTBY if its different from the KNN sort
-  if (params.sort_option && !ignore_sort)
+  if (params.sort_option && !ignore_sort) {
     PartialSort(absl::MakeSpan(docs), end, params.sort_option->order,
                 &SerializedSearchDoc::sort_score);
+  } else if (!knn_sort_option && (params.scorer || params.with_scores)) {
+    // No SORTBY, no KNN: default order is by text relevance score, descending. Sort globally
+    // here (once all shards' results are merged) instead of relying on each shard's local
+    // order, so the top-K is identical regardless of how many shards the corpus is split
+    // across. Ties fall back to key order so the cut boundary doesn't depend on shard
+    // iteration order either.
+    auto cb = [](const SerializedSearchDoc* l, const SerializedSearchDoc* r) {
+      if (l->text_score != r->text_score)
+        return l->text_score > r->text_score;
+      return l->key < r->key;
+    };
+    partial_sort(docs.begin(), docs.begin() + min(end, docs.size()), docs.end(), cb);
+  }
 
   const bool reply_with_ids_only = params.IdsOnly();
   auto* rb = static_cast<RedisReplyBuilder*>(builder);
@@ -2018,14 +2031,42 @@ void CmdFtSearch(CmdArgList args, CommandContext* cmd_cntx) {
   // If the query does not contain knn component, or it is a hybrid query.
   // HNSW vector range has no prefilter, so skip per-shard search entirely.
   if ((!knn || knn_has_prefilter) && !hnsw_range) {
-    cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
-      if (auto* index = es->search_indices()->GetIndex(index_name); index)
-        docs[es->shard_id()] =
-            index->Search(t->GetOpArgs(es), *params, &search_algo, knn_has_prefilter);
-      else
-        index_not_found.store(true, memory_order_relaxed);
-      return OpStatus::OK;
-    });
+    // BM25STD/TFIDF/TFIDF.DOCNORM depend on corpus-wide statistics (document count, per-term
+    // document frequency, per-field average length). Gather each shard's local view first,
+    // merge into one global view, and use it for the real search below — otherwise scores (and
+    // thus top-K) would depend on how many shards the corpus happens to be split across.
+    // Skipped for a single shard, where the local view already *is* the global view.
+    search::GlobalScoringStats global_scoring_stats;
+    if (search_algo.HasScorer() && shard_set->size() > 1) {
+      vector<search::LocalScoringStats> shard_stats(shard_set->size());
+      cmd_cntx->tx()->Execute(
+          [&](Transaction* t, EngineShard* es) {
+            if (auto* index = es->search_indices()->GetIndex(index_name); index)
+              shard_stats[es->shard_id()] = index->CollectScoringStats(&search_algo);
+            else
+              index_not_found.store(true, memory_order_relaxed);
+            return OpStatus::OK;
+          },
+          false);
+
+      if (index_not_found.load(memory_order_relaxed))
+        return cmd_cntx->SendError(string{index_name} + ": no such index");
+
+      for (const auto& stats : shard_stats)
+        global_scoring_stats.Merge(stats);
+      search_algo.SetGlobalScoringStats(&global_scoring_stats);
+    }
+
+    cmd_cntx->tx()->Execute(
+        [&](Transaction* t, EngineShard* es) {
+          if (auto* index = es->search_indices()->GetIndex(index_name); index)
+            docs[es->shard_id()] =
+                index->Search(t->GetOpArgs(es), *params, &search_algo, knn_has_prefilter);
+          else
+            index_not_found.store(true, memory_order_relaxed);
+          return OpStatus::OK;
+        },
+        true);
 
     if (index_not_found.load(memory_order_relaxed))
       return cmd_cntx->SendError(string{index_name} + ": no such index");
@@ -2388,6 +2429,25 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
       cmd_cntx->tx()->ScheduleSingleHop(
           make_load_cb(shard_docs, hnsw_range->score_alias, prefilter_text_scores));
     } else {
+      // BM25STD/TFIDF/TFIDF.DOCNORM depend on corpus-wide statistics. Gather each shard's
+      // local view first and merge into one global view before the real search below —
+      // see the analogous comment in CmdFtSearch for details. Skipped for a single shard.
+      search::GlobalScoringStats global_scoring_stats;
+      if (search_algo.HasScorer() && shard_set->size() > 1) {
+        vector<search::LocalScoringStats> shard_stats(shard_set->size());
+        cmd_cntx->tx()->Execute(
+            [&](Transaction* t, EngineShard* es) {
+              if (auto* index = es->search_indices()->GetIndex(params->index); index)
+                shard_stats[es->shard_id()] = index->CollectScoringStats(&search_algo);
+              return OpStatus::OK;
+            },
+            false);
+
+        for (const auto& stats : shard_stats)
+          global_scoring_stats.Merge(stats);
+        search_algo.SetGlobalScoringStats(&global_scoring_stats);
+      }
+
       cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
         if (auto* index = es->search_indices()->GetIndex(params->index); index) {
           query_results[es->shard_id()] =
