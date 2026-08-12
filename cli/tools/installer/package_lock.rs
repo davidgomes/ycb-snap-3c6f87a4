@@ -50,7 +50,7 @@ struct PackageLockPackage {
   cpu: Vec<String>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 struct PeerDependencyMeta {
   optional: bool,
 }
@@ -108,12 +108,12 @@ pub fn package_lock_to_deno_lockfile(
       if path.is_empty() || package.link || non_registry_paths.contains(path) {
         return None;
       }
-      let name: PackageName = package
-        .name
-        .as_deref()
-        .or_else(|| package_name_from_path(path))?
-        .parse()
-        .ok()?;
+      let name = PackageName::from_str(
+        package
+          .name
+          .as_deref()
+          .or_else(|| package_name_from_path(path))?,
+      );
       let version =
         Version::parse_from_npm(package.version.as_deref()?).ok()?;
       let integrity = package.integrity.as_ref()?.trim();
