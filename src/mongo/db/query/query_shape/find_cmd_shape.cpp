@@ -56,6 +56,7 @@ void addRemainingFindCommandFields(const FindCmdShapeComponents& components, BSO
     maybeAddWithName(components.awaitData, bob, FindCommandRequest::kAwaitDataFieldName);
     maybeAddWithName(components.mirrored, bob, FindCommandRequest::kMirroredFieldName);
     maybeAddWithName(components.oplogReplay, bob, FindCommandRequest::kOplogReplayFieldName);
+    maybeAddWithName(components.rawData, bob, FindCommandRequest::kRawDataFieldName);
 }
 
 }  // namespace
@@ -79,6 +80,8 @@ FindCmdShapeComponents::FindCmdShapeComponents(
       awaitData(request.findCommandRequest->getAwaitData()),
       mirrored(request.findCommandRequest->getMirrored()),
       oplogReplay(request.findCommandRequest->getOplogReplay()),
+      rawData(bool(request.findCommandRequest->getRawData()) ? OptionalBool(true)
+                                                              : OptionalBool()),
       let(request.findCommandRequest->getLet(), expCtx),
       hasField{.projection = request.proj.has_value(),
                .sort = request.sort.has_value(),
@@ -142,6 +145,7 @@ void FindCmdShapeComponents::HashValue(absl::HashState state) const {
                              awaitData,
                              mirrored,
                              oplogReplay,
+                             rawData,
                              let,
                              hasField);
 }
@@ -164,6 +168,11 @@ uint32_t FindCmdShapeComponents::optionalArgumentsEncoding() const {
 
     res |= static_cast<uint32_t>(hasField.skip);
     res |= static_cast<uint32_t>(hasField.limit) << 1;
+
+    // 'rawData' is appended as a standalone bit (rather than folded into the loop above) so that
+    // commands which never mention 'rawData' continue to produce the exact same encoding - and
+    // therefore the same query shape hash - as before 'rawData' was considered part of the shape.
+    res |= static_cast<uint32_t>(bool(rawData)) << 18;
 
     return res;
 }
@@ -207,6 +216,8 @@ std::unique_ptr<FindCommandRequest> FindCmdShape::toFindCommandRequest() const {
         fcr->setMirrored(bool(_components.mirrored));
     if (_components.oplogReplay.has_value())
         fcr->setOplogReplay(bool(_components.oplogReplay));
+    if (_components.rawData.has_value())
+        fcr->setRawData(bool(_components.rawData));
 
     // Common shape components.
     if (_components.let.hasLet)

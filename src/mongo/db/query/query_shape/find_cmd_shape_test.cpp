@@ -190,6 +190,33 @@ TEST_F(FindCmdShapeTest, AllOptionalArgumentsSetToFalse) {
 }
 
 
+TEST_F(FindCmdShapeTest, RawDataTrueIsPartOfEncoding) {
+    auto fcr = std::make_unique<FindCommandRequest>(kDefaultTestNss);
+    fcr->setRawData(true);
+    auto&& parsedRequest =
+        uassertStatusOK(::mongo::parsed_find_command::parse(_expCtx, {std::move(fcr)}));
+    auto cmdShape = std::make_unique<FindCmdShape>(*parsedRequest, _expCtx);
+    ASSERT_NOT_EQUALS(0, getShapeComponents(*cmdShape).optionalArgumentsEncoding());
+}
+
+// 'rawData: false' must be normalized like an absent 'rawData' for the purposes of the encoding
+// used in the shape hash.
+TEST_F(FindCmdShapeTest, RawDataFalseMatchesAbsentEncoding) {
+    auto fcrAbsent = std::make_unique<FindCommandRequest>(kDefaultTestNss);
+    auto&& parsedAbsent =
+        uassertStatusOK(::mongo::parsed_find_command::parse(_expCtx, {std::move(fcrAbsent)}));
+    auto shapeAbsent = std::make_unique<FindCmdShape>(*parsedAbsent, _expCtx);
+
+    auto fcrFalse = std::make_unique<FindCommandRequest>(kDefaultTestNss);
+    fcrFalse->setRawData(false);
+    auto&& parsedFalse =
+        uassertStatusOK(::mongo::parsed_find_command::parse(_expCtx, {std::move(fcrFalse)}));
+    auto shapeFalse = std::make_unique<FindCmdShape>(*parsedFalse, _expCtx);
+
+    ASSERT_EQUALS(getShapeComponents(*shapeAbsent).optionalArgumentsEncoding(),
+                  getShapeComponents(*shapeFalse).optionalArgumentsEncoding());
+}
+
 TEST_F(FindCmdShapeTest, SizeOfShapeComponents) {
     auto query = BSON("query" << 1 << "xEquals" << 42);
     auto findCmdComponent = makeShapeComponentsFromFilter(query.getOwned());
@@ -384,6 +411,29 @@ TEST_F(FindCmdShapeTest, FindCommandShapeSHA256Hash) {
 
     ASSERT_NE(findCommandShapeHashForCollectionAsUUID.toHexString(),
               findCommandShapeHashForCollectionAsNamespace.toHexString());
+}
+
+// Verifies that a 'rawData: true' find command produces a different query shape hash from the
+// same command without 'rawData' (or with 'rawData: false'), and that 'rawData: false' is
+// normalized to hash identically to an absent 'rawData'.
+TEST_F(FindCmdShapeTest, RawDataAffectsShapeHash) {
+    auto makeHash = [&](boost::optional<bool> rawData) {
+        auto fcr = std::make_unique<FindCommandRequest>(kDefaultTestNss);
+        fcr->setFilter(BSON("a" << 1));
+        if (rawData.has_value()) {
+            fcr->setRawData(*rawData);
+        }
+        auto parsedFind = uassertStatusOK(parsed_find_command::parse(_expCtx, {std::move(fcr)}));
+        auto findCommandShape = std::make_unique<FindCmdShape>(*parsedFind, _expCtx);
+        return findCommandShape->sha256Hash(nullptr, SerializationContext{});
+    };
+
+    auto hashNoRawData = makeHash(boost::none);
+    auto hashRawDataFalse = makeHash(false);
+    auto hashRawDataTrue = makeHash(true);
+
+    ASSERT_EQ(hashNoRawData.toHexString(), hashRawDataFalse.toHexString());
+    ASSERT_NE(hashNoRawData.toHexString(), hashRawDataTrue.toHexString());
 }
 }  // namespace
 

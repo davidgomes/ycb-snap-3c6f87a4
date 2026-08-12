@@ -54,6 +54,12 @@ struct FindCmdShapeComponents : public CmdSpecificShapeComponents {
     OptionalBool mirrored;
     OptionalBool oplogReplay;
 
+    // 'rawData' is normalized so that only an explicit value of 'true' is tracked as part of the
+    // shape - both an absent 'rawData' and an explicit 'false' are treated identically (i.e. not
+    // present), so that they continue to share a query shape (and hash) with commands that never
+    // mention 'rawData' at all.
+    OptionalBool rawData;
+
     LetShapeComponent let;
 
     // This anonymous struct represents the presence of the member variables as C++ bit fields.
@@ -76,6 +82,11 @@ struct FindCmdShapeComponents : public CmdSpecificShapeComponents {
     /**
      * Encodes all optional bools (as well as limit and skip) into a single uint32_t. Every flag
      * takes two bits. 0b00 stands for none, 0b10 for false and 0b11 for true.
+     *
+     * 'rawData' is the exception: since it is normalized so that only 'true' is tracked (both
+     * absent and 'false' collapse to the same "not set" state), it is encoded as a single extra
+     * bit above the other flags so that shapes which never mention 'rawData' keep the exact same
+     * encoding as before 'rawData' was considered part of the shape.
      */
     uint32_t optionalArgumentsEncoding() const;
 };
