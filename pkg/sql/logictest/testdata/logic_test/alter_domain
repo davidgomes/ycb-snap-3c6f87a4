@@ -224,8 +224,77 @@ subtest end
 
 subtest set_schema
 
-statement error pgcode 0A000 ALTER DOMAIN SET SCHEMA is not supported
-ALTER DOMAIN d SET SCHEMA public
+statement ok
+CREATE SCHEMA domain_s1;
+CREATE SCHEMA domain_s2;
+CREATE TABLE domain_ref (v d);
+INSERT INTO domain_ref VALUES (1)
+
+# Move the domain and its implicit array type.
+statement ok
+ALTER DOMAIN d SET SCHEMA domain_s1
+
+query TT rowsort
+SELECT n.nspname, t.typname
+  FROM pg_catalog.pg_type AS t
+  JOIN pg_catalog.pg_namespace AS n ON n.oid = t.typnamespace
+ WHERE t.typname IN ('d', '_d')
+----
+domain_s1  _d
+domain_s1  d
+
+query T
+SELECT ARRAY[1::domain_s1.d]::domain_s1._d
+----
+{1}
+
+# Setting the same schema is a no-op.
+statement ok
+ALTER DOMAIN domain_s1.d SET SCHEMA domain_s1
+
+# A table column references the domain by descriptor ID and remains usable.
+statement ok
+ALTER DOMAIN domain_s1.d SET SCHEMA domain_s2;
+INSERT INTO domain_ref VALUES (2)
+
+query I rowsort
+SELECT v::INT FROM domain_ref
+----
+1
+2
+
+statement error pgcode 3F000 unknown schema "does_not_exist"
+ALTER DOMAIN domain_s2.d SET SCHEMA does_not_exist
+
+statement error pgcode 0A000 cannot move objects into or out of virtual schemas
+ALTER DOMAIN domain_s2.d SET SCHEMA information_schema
+
+statement ok
+SET experimental_enable_temp_tables = 'on';
+CREATE TEMPORARY TABLE domain_temp (i INT)
+
+let $temp_schema
+SELECT schema_name FROM [SHOW SCHEMAS] WHERE schema_name LIKE '%pg_temp%'
+
+statement error pgcode 0A000 cannot move objects into or out of temporary schemas
+ALTER DOMAIN domain_s2.d SET SCHEMA $temp_schema
+
+# Reject a conflict with the domain's name.
+statement ok
+CREATE DOMAIN domain_s1.d AS INT
+
+statement error pgcode 42710 type "test.domain_s1.d" already exists
+ALTER DOMAIN domain_s2.d SET SCHEMA domain_s1
+
+statement ok
+DROP DOMAIN domain_s1.d
+
+# Reject a conflict with the implicit array type's name.
+statement ok
+CREATE TABLE domain_s1._d (i INT)
+
+statement error pgcode 42P07 relation "test.domain_s1._d" already exists
+ALTER DOMAIN domain_s2.d SET SCHEMA domain_s1
 
 subtest end
 

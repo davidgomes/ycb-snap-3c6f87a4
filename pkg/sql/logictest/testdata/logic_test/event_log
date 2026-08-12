@@ -975,6 +975,10 @@ ALTER TYPE eventlog SET SCHEMA testing;
 ALTER TYPE testing.eventlog SET SCHEMA public
 
 statement ok
+CREATE DOMAIN eventlog_domain AS INT;
+ALTER DOMAIN eventlog_domain SET SCHEMA testing
+
+statement ok
 ALTER TYPE eventlog RENAME TO eventlog_renamed
 
 query ITT
@@ -989,6 +993,7 @@ ORDER BY "timestamp", info
 1  alter_type_drop_value    {"EventType": "alter_type_drop_value", "Statement": "ALTER TYPE defaultdb.public.eventlog DROP VALUE 'testing'", "Tag": "ALTER TYPE", "TypeName": "defaultdb.public.eventlog", "User": "root", "Value": "testing"}
 1  set_schema               {"DescriptorName": "defaultdb.public.eventlog", "DescriptorType": "type", "EventType": "set_schema", "NewDescriptorName": "defaultdb.testing.eventlog", "Statement": "ALTER TYPE defaultdb.public.eventlog SET SCHEMA testing", "Tag": "ALTER TYPE", "User": "root"}
 1  set_schema               {"DescriptorName": "defaultdb.testing.eventlog", "DescriptorType": "type", "EventType": "set_schema", "NewDescriptorName": "defaultdb.public.eventlog", "Statement": "ALTER TYPE defaultdb.testing.eventlog SET SCHEMA public", "Tag": "ALTER TYPE", "User": "root"}
+1  set_schema               {"DescriptorName": "defaultdb.public.eventlog_domain", "DescriptorType": "domain", "EventType": "set_schema", "NewDescriptorName": "defaultdb.testing.eventlog_domain", "Statement": "ALTER DOMAIN defaultdb.public.eventlog_domain SET SCHEMA testing", "Tag": "ALTER DOMAIN", "User": "root"}
 1  rename_type              {"EventType": "rename_type", "NewTypeName": "eventlog_renamed", "Statement": "ALTER TYPE defaultdb.public.eventlog RENAME TO eventlog_renamed", "Tag": "ALTER TYPE", "TypeName": "defaultdb.public.eventlog", "User": "root"}
 
 statement ok
@@ -1084,6 +1089,7 @@ ORDER BY "timestamp", info
 ----
 1  {"DescriptorName": "defaultdb.public.eventlog", "DescriptorType": "type", "EventType": "set_schema", "NewDescriptorName": "defaultdb.testing.eventlog", "Statement": "ALTER TYPE defaultdb.public.eventlog SET SCHEMA testing", "Tag": "ALTER TYPE", "User": "root"}
 1  {"DescriptorName": "defaultdb.testing.eventlog", "DescriptorType": "type", "EventType": "set_schema", "NewDescriptorName": "defaultdb.public.eventlog", "Statement": "ALTER TYPE defaultdb.testing.eventlog SET SCHEMA public", "Tag": "ALTER TYPE", "User": "root"}
+1  {"DescriptorName": "defaultdb.public.eventlog_domain", "DescriptorType": "domain", "EventType": "set_schema", "NewDescriptorName": "defaultdb.testing.eventlog_domain", "Statement": "ALTER DOMAIN defaultdb.public.eventlog_domain SET SCHEMA testing", "Tag": "ALTER DOMAIN", "User": "root"}
 1  {"DescriptorName": "defaultdb.public.a", "DescriptorType": "table", "EventType": "set_schema", "NewDescriptorName": "defaultdb.testing.a", "Statement": "ALTER TABLE a SET SCHEMA testing", "Tag": "ALTER TABLE", "User": "root"}
 1  {"DescriptorName": "defaultdb.public.s", "DescriptorType": "sequence", "EventType": "set_schema", "NewDescriptorName": "defaultdb.testing.s", "Statement": "ALTER SEQUENCE s SET SCHEMA testing", "Tag": "ALTER SEQUENCE", "User": "root"}
 1  {"DescriptorName": "defaultdb.public.v", "DescriptorType": "view", "EventType": "set_schema", "NewDescriptorName": "defaultdb.test_sc.v", "Statement": "ALTER VIEW v SET SCHEMA test_sc", "Tag": "ALTER VIEW", "User": "root"}
