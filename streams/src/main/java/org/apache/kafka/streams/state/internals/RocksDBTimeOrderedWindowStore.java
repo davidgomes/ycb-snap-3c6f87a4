@@ -16,14 +16,14 @@
  */
 package org.apache.kafka.streams.state.internals;
 
-import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.kstream.Windowed;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.processor.StateStoreContext;
-import org.apache.kafka.streams.query.PositionBound;
 import org.apache.kafka.streams.query.Position;
+import org.apache.kafka.streams.query.PositionBound;
 import org.apache.kafka.streams.query.Query;
 import org.apache.kafka.streams.query.QueryConfig;
 import org.apache.kafka.streams.query.QueryResult;
@@ -34,9 +34,9 @@ import org.apache.kafka.streams.state.WindowStore;
 import org.apache.kafka.streams.state.WindowStoreIterator;
 import org.apache.kafka.streams.state.internals.PrefixedWindowKeySchemas.TimeFirstWindowKeySchema;
 
+import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
-import java.time.Instant;
 
 
 public class RocksDBTimeOrderedWindowStore<S extends Segment>

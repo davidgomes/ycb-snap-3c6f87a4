@@ -16,13 +16,13 @@
  */
 package org.apache.kafka.streams.state.internals;
 
-import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.kstream.Windowed;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.processor.StateStoreContext;
-import org.apache.kafka.streams.query.PositionBound;
 import org.apache.kafka.streams.query.Position;
+import org.apache.kafka.streams.query.PositionBound;
 import org.apache.kafka.streams.query.Query;
 import org.apache.kafka.streams.query.QueryConfig;
 import org.apache.kafka.streams.query.QueryResult;
@@ -31,8 +31,8 @@ import org.apache.kafka.streams.state.ReadOnlySessionStore;
 import org.apache.kafka.streams.state.SessionStore;
 import org.apache.kafka.streams.state.internals.PrefixedSessionKeySchemas.TimeFirstSessionKeySchema;
 
-import java.util.Objects;
 import java.time.Instant;
+import java.util.Objects;
 
 public class RocksDBTimeOrderedSessionStore
     extends WrappedStateStore<AbstractRocksDBTimeOrderedSegmentedBytesStore<? extends Segment>, Object, Object>
