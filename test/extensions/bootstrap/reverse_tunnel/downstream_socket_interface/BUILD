@@ -37,12 +37,15 @@ envoy_cc_test(
     size = "medium",
     srcs = ["reverse_tunnel_initiator_extension_test.cc"],
     deps = [
+        "//source/extensions/access_loggers/stream:config",
         "//source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface:reverse_tunnel_extension_lib",
         "//source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface:reverse_tunnel_initiator_lib",
+        "//test/mocks/access_log:access_log_mocks",
         "//test/mocks/event:event_mocks",
         "//test/mocks/server:factory_context_mocks",
         "//test/mocks/thread_local:thread_local_mocks",
         "//test/mocks/upstream:upstream_mocks",
+        "@envoy_api//envoy/extensions/access_loggers/stream/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3:pkg_cc_proto",
     ],
 )
@@ -56,6 +59,7 @@ envoy_cc_test(
         "//source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface:reverse_connection_io_handle_lib",
         "//source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface:reverse_tunnel_extension_lib",
         "//source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface:reverse_tunnel_initiator_lib",
+        "//test/mocks/access_log:access_log_mocks",
         "//test/common/tls:mock_ssl_handshaker_lib",
         "//test/mocks/api:api_mocks",
         "//test/mocks/event:event_mocks",

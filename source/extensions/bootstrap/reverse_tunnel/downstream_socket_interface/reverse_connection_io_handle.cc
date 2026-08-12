@@ -794,6 +794,12 @@ void ReverseConnectionIOHandle::onDownstreamConnectionClosed(const std::string& 
   ENVOY_LOG(debug, "Found connection {} belongs to host {} in cluster {}", connection_key,
             host_address, cluster_name);
 
+  if (extension_ != nullptr && !extension_->accessLogs().empty()) {
+    extension_->emitAccessLog(getTimeSource(), "connection_closed", config_.src_node_id,
+                              config_.src_cluster_id, config_.src_tenant_id, cluster_name,
+                              host_address, connection_key, "");
+  }
+
   // Remove the connection key from the host's connection set.
   auto host_it = host_to_conn_info_map_.find(host_address);
   if (host_it != host_to_conn_info_map_.end()) {
@@ -1100,8 +1106,18 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
   // Process connection result safely.
   bool is_success = (error == "reverse connection accepted" || error == "success" ||
                      error == "handshake successful" || error == "connection established");
+  const bool handshake_failed = closed || (!error.empty() && !is_success);
 
-  if (closed || (!error.empty() && !is_success)) {
+  if (extension_ != nullptr && !extension_->accessLogs().empty()) {
+    const std::string error_message =
+        handshake_failed ? (error.empty() ? "connection closed during handshake" : error) : "";
+    extension_->emitAccessLog(getTimeSource(),
+                              handshake_failed ? "handshake_failure" : "handshake_success",
+                              config_.src_node_id, config_.src_cluster_id, config_.src_tenant_id,
+                              cluster_name, host_address, connection_key, error_message);
+  }
+
+  if (handshake_failed) {
     // Handle connection failure.
     ENVOY_LOG(error, "reverse_tunnel: Connection failed - error '{}', cleaning up host {}", error,
               host_address);

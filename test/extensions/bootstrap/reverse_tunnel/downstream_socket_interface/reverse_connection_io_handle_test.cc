@@ -15,6 +15,7 @@
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator_extension.h"
 
 #include "test/common/tls/mock_ssl_handshaker.h"
+#include "test/mocks/access_log/mocks.h"
 #include "test/mocks/api/mocks.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/server/factory_context.h"
@@ -173,6 +174,10 @@ protected:
 
     // Set the slot in the extension using the test-only method.
     extension_->setTestOnlyTLSRegistry(std::move(another_tls_slot_));
+  }
+
+  void setAccessLogs(AccessLog::InstanceSharedPtrVector access_logs) {
+    extension_->access_logs_ = std::move(access_logs);
   }
 
   // Trigger Pipe Management Helpers.
@@ -2010,8 +2015,30 @@ TEST_F(ReverseConnectionIOHandleTest, OnConnectionDoneFailureAndRecovery) {
   setupThreadLocalSlot();
 
   auto config = createDefaultTestConfig();
+  config.src_tenant_id = "test-tenant";
   io_handle_ = createTestIOHandle(config);
   EXPECT_NE(io_handle_, nullptr);
+
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  setAccessLogs({access_log});
+  std::vector<std::pair<std::string, std::string>> access_log_events;
+  EXPECT_CALL(*access_log, log(_, _))
+      .Times(2)
+      .WillRepeatedly(Invoke(
+          [&access_log_events](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+            const auto& fields = stream_info.dynamicMetadata()
+                                     .filter_metadata()
+                                     .at("envoy.reverse_tunnel.initiator")
+                                     .fields();
+            EXPECT_EQ(fields.at("node_id").string_value(), "test-node");
+            EXPECT_EQ(fields.at("cluster_id").string_value(), "test-cluster");
+            EXPECT_EQ(fields.at("tenant_id").string_value(), "test-tenant");
+            EXPECT_EQ(fields.at("upstream_cluster").string_value(), "test-cluster");
+            EXPECT_EQ(fields.at("host_address").string_value(), "192.168.1.1");
+            EXPECT_FALSE(fields.at("connection_key").string_value().empty());
+            access_log_events.emplace_back(fields.at("event").string_value(),
+                                           fields.at("error").string_value());
+          }));
 
   // Set up mock thread local cluster.
   auto mock_thread_local_cluster = std::make_shared<NiceMock<Upstream::MockThreadLocalCluster>>();
@@ -2065,6 +2092,10 @@ TEST_F(ReverseConnectionIOHandleTest, OnConnectionDoneFailureAndRecovery) {
 
   // Step 2: Simulate connection failure by calling onConnectionDone with error.
   io_handle_->onConnectionDone("connection timeout", wrapper_ptr, true);
+
+  ASSERT_EQ(access_log_events.size(), 1);
+  EXPECT_EQ(access_log_events[0].first, "handshake_failure");
+  EXPECT_EQ(access_log_events[0].second, "connection timeout");
 
   // Verify wrapper was removed from tracking maps after failure.
   EXPECT_EQ(getConnWrapperToHostMap().size(), 0);
@@ -2129,6 +2160,10 @@ TEST_F(ReverseConnectionIOHandleTest, OnConnectionDoneFailureAndRecovery) {
   // Step 4: Simulate connection success (recovery) by calling onConnectionDone with success.
   io_handle_->onConnectionDone("reverse connection accepted", wrapper_ptr2, false);
 
+  ASSERT_EQ(access_log_events.size(), 2);
+  EXPECT_EQ(access_log_events[1].first, "handshake_success");
+  EXPECT_TRUE(access_log_events[1].second.empty());
+
   // Verify wrapper was removed from tracking maps after success.
   EXPECT_EQ(getConnWrapperToHostMap().size(), 0);
   EXPECT_EQ(getConnectionWrappers().size(), 0);
@@ -2170,8 +2205,30 @@ TEST_F(ReverseConnectionIOHandleTest, OnDownstreamConnectionClosedTriggersReInit
   setupThreadLocalSlot();
 
   auto config = createDefaultTestConfig();
+  config.src_tenant_id = "test-tenant";
   io_handle_ = createTestIOHandle(config);
   EXPECT_NE(io_handle_, nullptr);
+
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  setAccessLogs({access_log});
+  std::vector<std::pair<std::string, std::string>> access_log_events;
+  EXPECT_CALL(*access_log, log(_, _))
+      .Times(2)
+      .WillRepeatedly(Invoke(
+          [&access_log_events](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+            const auto& fields = stream_info.dynamicMetadata()
+                                     .filter_metadata()
+                                     .at("envoy.reverse_tunnel.initiator")
+                                     .fields();
+            EXPECT_EQ(fields.at("node_id").string_value(), "test-node");
+            EXPECT_EQ(fields.at("cluster_id").string_value(), "test-cluster");
+            EXPECT_EQ(fields.at("tenant_id").string_value(), "test-tenant");
+            EXPECT_EQ(fields.at("upstream_cluster").string_value(), "test-cluster");
+            EXPECT_EQ(fields.at("host_address").string_value(), "192.168.1.1");
+            EXPECT_TRUE(fields.at("error").string_value().empty());
+            access_log_events.emplace_back(fields.at("event").string_value(),
+                                           fields.at("connection_key").string_value());
+          }));
 
   // Create trigger pipe BEFORE initiating connection to ensure it's ready.
   createTriggerPipe();
@@ -2228,6 +2285,10 @@ TEST_F(ReverseConnectionIOHandleTest, OnDownstreamConnectionClosedTriggersReInit
   // Step 2: Simulate successful connection completion.
   io_handle_->onConnectionDone("reverse connection accepted", wrapper_ptr, false);
 
+  ASSERT_EQ(access_log_events.size(), 1);
+  EXPECT_EQ(access_log_events[0].first, "handshake_success");
+  EXPECT_FALSE(access_log_events[0].second.empty());
+
   // Verify wrapper was removed from tracking (cleanup should happen)
   EXPECT_EQ(getConnWrapperToHostMap().size(), 0);
   EXPECT_EQ(getConnectionWrappers().size(), 0);
@@ -2264,6 +2325,10 @@ TEST_F(ReverseConnectionIOHandleTest, OnDownstreamConnectionClosedTriggersReInit
 
   // Step 4: Simulate downstream connection closure.
   io_handle_->onDownstreamConnectionClosed(connection_key);
+
+  ASSERT_EQ(access_log_events.size(), 2);
+  EXPECT_EQ(access_log_events[1].first, "connection_closed");
+  EXPECT_EQ(access_log_events[1].second, access_log_events[0].second);
 
   // Verify connection key is removed from host tracking.
   host_it = getHostToConnInfoMap().find("192.168.1.1");

@@ -5,17 +5,66 @@
 #include "envoy/stats/stats_macros.h"
 #include "envoy/thread_local/thread_local.h"
 
+#include "source/common/access_log/access_log_impl.h"
 #include "source/common/common/logger.h"
+#include "source/common/protobuf/protobuf.h"
 #include "source/common/stats/symbol_table.h"
 #include "source/common/stats/utility.h"
+#include "source/common/stream_info/stream_info_impl.h"
+#include "source/extensions/bootstrap/reverse_tunnel/common/reverse_connection_utility.h"
+#include "source/server/generic_factory_context.h"
+
+#include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace Bootstrap {
 namespace ReverseConnection {
 
+namespace {
+
+constexpr absl::string_view kAccessLogMetadataNamespace = "envoy.reverse_tunnel.initiator";
+
+void setStringMetadataField(Protobuf::Struct& metadata, absl::string_view key,
+                            absl::string_view value) {
+  (*metadata.mutable_fields())[std::string(key)].set_string_value(std::string(value));
+}
+
+} // namespace
+
 // Static warning flag for reverse tunnel detailed stats activation.
 static bool reverse_tunnel_detailed_stats_warning_logged = false;
+
+ReverseTunnelInitiatorExtension::ReverseTunnelInitiatorExtension(
+    Server::Configuration::ServerFactoryContext& context,
+    const envoy::extensions::bootstrap::reverse_tunnel::downstream_socket_interface::v3::
+        DownstreamReverseConnectionSocketInterface& config)
+    : context_(context), config_(config) {
+  stat_prefix_ = PROTOBUF_GET_STRING_OR_DEFAULT(config, stat_prefix, "reverse_tunnel_initiator");
+  enable_detailed_stats_ = config.enable_detailed_stats();
+  if (config.has_http_handshake() && !config.http_handshake().request_path().empty()) {
+    handshake_request_path_ = config.http_handshake().request_path();
+  } else {
+    handshake_request_path_ =
+        std::string(ReverseConnectionUtility::DEFAULT_REVERSE_TUNNEL_REQUEST_PATH);
+  }
+  if (config.has_http_handshake()) {
+    additional_headers_ = {config.http_handshake().additional_headers().begin(),
+                           config.http_handshake().additional_headers().end()};
+    use_http_upgrade_ = config.http_handshake().use_http_upgrade();
+  }
+
+  Server::GenericFactoryContextImpl generic_context(context_, context_.messageValidationVisitor());
+  for (const auto& access_log_config : config.access_log()) {
+    access_logs_.push_back(
+        AccessLog::AccessLogFactory::fromProto(access_log_config, generic_context));
+  }
+
+  ENVOY_LOG(debug,
+            "ReverseTunnelInitiatorExtension: creating downstream reverse connection "
+            "socket interface with stat_prefix: {}, access_logs: {}",
+            stat_prefix_, access_logs_.size());
+}
 
 // ReverseTunnelInitiatorExtension implementation
 void ReverseTunnelInitiatorExtension::onServerInitialized(Server::Instance&) {
@@ -48,6 +97,36 @@ DownstreamSocketThreadLocal* ReverseTunnelInitiatorExtension::getLocalRegistry()
   }
 
   return nullptr;
+}
+
+void ReverseTunnelInitiatorExtension::emitAccessLog(
+    TimeSource& time_source, const std::string& event, const std::string& node_id,
+    const std::string& cluster_id, const std::string& tenant_id,
+    const std::string& upstream_cluster, const std::string& host_address,
+    const std::string& connection_key, const std::string& error_message) {
+  if (access_logs_.empty()) {
+    return;
+  }
+
+  StreamInfo::StreamInfoImpl stream_info(time_source, nullptr,
+                                         StreamInfo::FilterState::LifeSpan::Connection);
+  Protobuf::Struct metadata;
+  setStringMetadataField(metadata, "event", event);
+  setStringMetadataField(metadata, "node_id", node_id);
+  setStringMetadataField(metadata, "cluster_id", cluster_id);
+  setStringMetadataField(metadata, "tenant_id", tenant_id);
+  setStringMetadataField(metadata, "upstream_cluster", upstream_cluster);
+  setStringMetadataField(metadata, "host_address", host_address);
+  setStringMetadataField(metadata, "connection_key", connection_key);
+  setStringMetadataField(metadata, "error", error_message);
+  stream_info.setDynamicMetadata(std::string(kAccessLogMetadataNamespace), metadata);
+  stream_info.onRequestComplete();
+
+  const Formatter::Context log_context(nullptr, nullptr, nullptr, {},
+                                       AccessLog::AccessLogType::NotSet);
+  for (const auto& access_log : access_logs_) {
+    access_log->log(log_context, stream_info);
+  }
 }
 
 void ReverseTunnelInitiatorExtension::updateConnectionStats(const std::string& host_address,
