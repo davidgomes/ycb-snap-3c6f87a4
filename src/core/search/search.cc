@@ -117,8 +117,9 @@ struct ProfileBuilder {
 struct BasicSearch {
   using LogicOp = AstLogicalNode::LogicOp;
 
-  BasicSearch(const FieldIndices* indices, ScorerFn scorer = nullptr)
-      : indices_{indices}, scorer_{scorer} {
+  BasicSearch(const FieldIndices* indices, ScorerFn scorer = nullptr,
+              const GlobalScoringStats* global_stats = nullptr)
+      : indices_{indices}, scorer_{scorer}, global_stats_{global_stats} {
   }
 
   void EnableProfiling() {
@@ -669,7 +670,8 @@ struct BasicSearch {
 
     if (scorer_ && !matched_text_terms_.empty()) {
       // Score ALL matched docs and return top-K by score (not arbitrary cutoff).
-      auto [out, total_size, text_scores] = TakeScoredTopK(std::move(result), cuttoff_limit);
+      auto [out, total_size, text_scores, local_stats] =
+          TakeScoredTopK(std::move(result), cuttoff_limit);
 
       // KNN populated knn_scores_ in distance order; TakeScoredTopK reordered
       // `out` by text score, so realign knn_scores_ to the new id order.
@@ -688,13 +690,14 @@ struct BasicSearch {
       }
 
       return SearchResult{
-          total_size,         std::move(out),   std::move(knn_scores_), std::move(text_scores),
-          std::move(profile), std::move(error_)};
+          total_size,         std::move(out),    std::move(knn_scores_), std::move(text_scores),
+          std::move(profile), std::move(error_), std::move(local_stats)};
     }
 
     auto [out, total_size] = result.Take(cuttoff_limit);
     return SearchResult{total_size, std::move(out),     std::move(knn_scores_),
-                        {},         std::move(profile), std::move(error_)};
+                        {},         std::move(profile), std::move(error_),
+                        {}};
   }
 
  private:
@@ -702,6 +705,8 @@ struct BasicSearch {
   // Advances forward only - amortized O(1) per doc when docs are sorted.
   struct TermCursor {
     TextIndex* index;
+    string_view field_name;
+    string_view term;
     size_t term_docs;
     TextIndex::Container::BlockListIterator it;
     TextIndex::Container::BlockListIterator end;
@@ -716,12 +721,17 @@ struct BasicSearch {
 
   // Score all matched docs via cursor-based posting list traversal and return top-K by score.
   // Total work: O(sum of posting_list_sizes) for cursors + O(N log K) for partial sort.
-  std::tuple<vector<DocId>, size_t, vector<pair<DocId, float>>> TakeScoredTopK(IndexResult&& result,
-                                                                               size_t limit) {
+  //
+  // IDF/avg-field-length statistics come from `global_stats_` when set (cross-shard-consistent
+  // scoring), otherwise from this shard's own local view (single-shard case, or a first pass
+  // used only to harvest `local_scoring_stats` for building a GlobalScoringStats).
+  std::tuple<vector<DocId>, size_t, vector<pair<DocId, float>>, LocalScoringStats> TakeScoredTopK(
+      IndexResult&& result, size_t limit) {
     auto [all_docs, total_size] = result.Take();  // all matched docs
 
     if (all_docs.empty())
-      return std::make_tuple(vector<DocId>{}, total_size, vector<pair<DocId, float>>{});
+      return std::make_tuple(vector<DocId>{}, total_size, vector<pair<DocId, float>>{},
+                             LocalScoringStats{});
 
     // Ensure sorted for cursor-based scoring
     sort(all_docs.begin(), all_docs.end());
@@ -733,10 +743,33 @@ struct BasicSearch {
       auto* container = index->Matching(term, /*strip_whitespace=*/false);
       if (!container)
         continue;
-      cursors.push_back({index, container->Size(), container->begin(), container->end()});
+      cursors.push_back({index, indices_->GetFieldName(index), term, container->Size(),
+                         container->begin(), container->end()});
     }
 
-    ScoringContext ctx{indices_->GetAllDocs().size()};
+    // This shard's local statistics for the matched (field, term) pairs and fields, plus the
+    // per-term/per-field values actually used for scoring below (global when available).
+    LocalScoringStats local_stats;
+    local_stats.num_docs = indices_->GetAllDocs().size();
+    absl::flat_hash_set<TextIndex*> seen_indices;
+    vector<size_t> resolved_term_docs(cursors.size());
+    vector<double> resolved_field_avg(cursors.size());
+    for (size_t t = 0; t < cursors.size(); t++) {
+      const auto& c = cursors[t];
+      local_stats.term_docs[{string(c.field_name), string(c.term)}] = c.term_docs;
+      if (seen_indices.insert(c.index).second) {
+        auto& fs = local_stats.field_len_stats[string(c.field_name)];
+        fs.total_docs_len = c.index->GetFieldTotalDocsLen();
+        fs.num_docs = c.index->GetFieldNumDocs();
+      }
+
+      resolved_term_docs[t] =
+          global_stats_ ? global_stats_->GetTermDocs(c.field_name, c.term) : c.term_docs;
+      resolved_field_avg[t] = global_stats_ ? global_stats_->GetFieldAvgDocLen(c.field_name)
+                                            : c.index->GetFieldAvgDocLen();
+    }
+
+    ScoringContext ctx{global_stats_ ? global_stats_->NumDocs() : local_stats.num_docs};
 
     // Score all docs - reuse term_infos buffer across iterations
     vector<pair<float, DocId>> scored;
@@ -745,12 +778,10 @@ struct BasicSearch {
 
     for (DocId doc : all_docs) {
       for (size_t t = 0; t < cursors.size(); t++) {
-        term_infos[t].term_docs = cursors[t].term_docs;
+        term_infos[t].term_docs = resolved_term_docs[t];
         term_infos[t].term_freq = SeekCursor(cursors[t], doc);
-        if (cursors[t].index) {
-          term_infos[t].field_doc_len = cursors[t].index->GetFieldDocLength(doc);
-          term_infos[t].field_avg_doc_len = cursors[t].index->GetFieldAvgDocLen();
-        }
+        term_infos[t].field_doc_len = cursors[t].index->GetFieldDocLength(doc);
+        term_infos[t].field_avg_doc_len = resolved_field_avg[t];
       }
       scored.emplace_back(static_cast<float>(ScoreDocument(scorer_, ctx, term_infos)), doc);
     }
@@ -772,7 +803,8 @@ struct BasicSearch {
       text_scores.emplace_back(doc, score);
     }
 
-    return std::make_tuple(std::move(out), total_size, std::move(text_scores));
+    return std::make_tuple(std::move(out), total_size, std::move(text_scores),
+                           std::move(local_stats));
   }
 
   void AddMatchedTerm(TextIndex* index, string term) {
@@ -782,6 +814,7 @@ struct BasicSearch {
 
   const FieldIndices* indices_;
   ScorerFn scorer_ = nullptr;
+  const GlobalScoringStats* global_stats_ = nullptr;
 
   string error_;
   optional<ProfileBuilder> profile_builder_ = ProfileBuilder{};
@@ -960,6 +993,14 @@ BaseSortIndex* FieldIndices::GetSortIndex(string_view field) const {
   return it != sort_indices_.end() ? it->second.get() : nullptr;
 }
 
+string_view FieldIndices::GetFieldName(const BaseIndex* index) const {
+  for (const auto& [field_name, ptr] : indices_) {
+    if (ptr.get() == index)
+      return field_name;
+  }
+  return {};
+}
+
 std::vector<TextIndex*> FieldIndices::GetAllTextIndices() const {
   vector<TextIndex*> out;
   for (const auto& [field_name, field_info] : schema_.fields) {
@@ -1046,7 +1087,7 @@ bool SearchAlgorithm::Init(string_view query, const QueryParams* params,
 SearchResult SearchAlgorithm::Search(const FieldIndices* index, size_t cuttoff_limit) const {
   DCHECK(query_);
 
-  auto bs = BasicSearch{index, scorer_};
+  auto bs = BasicSearch{index, scorer_, global_stats_};
   if (profiling_enabled_)
     bs.EnableProfiling();
   return bs.Search(*query_, cuttoff_limit);
@@ -1097,6 +1138,10 @@ void SearchAlgorithm::EnableProfiling() {
 
 void SearchAlgorithm::SetScorer(ScorerFn scorer) {
   scorer_ = scorer;
+}
+
+void SearchAlgorithm::SetGlobalScoringStats(const GlobalScoringStats* stats) {
+  global_stats_ = stats;
 }
 
 const AstVectorRangeNode* SearchAlgorithm::GetVectorRangeNode() const {

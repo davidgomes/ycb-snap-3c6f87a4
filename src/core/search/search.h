@@ -150,6 +150,10 @@ class FieldIndices {
   BaseSortIndex* GetSortIndex(std::string_view field) const;
   std::vector<TextIndex*> GetAllTextIndices() const;
 
+  // Reverse lookup: returns the field identifier owning `index`, or empty if not found.
+  // Used to build stable (field, term) keys for cross-shard scoring-stat aggregation.
+  std::string_view GetFieldName(const BaseIndex* index) const;
+
   const std::vector<DocId>& GetAllDocs() const;
   const Schema& GetSchema() const;
 
@@ -210,6 +214,11 @@ struct SearchResult {
 
   // If an error occurred, last recent one
   std::string error;
+
+  // This shard's local statistics for the (field, term) pairs matched while scoring.
+  // Populated whenever a scorer matched text terms, regardless of whether global scoring
+  // stats were already applied — callers can harvest it to build a GlobalScoringStats.
+  LocalScoringStats local_scoring_stats;
 };
 
 struct KnnScoreSortOption {
@@ -245,9 +254,19 @@ class SearchAlgorithm {
 
   void SetScorer(ScorerFn scorer);
 
+  // True if a scorer (BM25STD/TFIDF/TFIDF.DOCNORM or custom) is set.
+  bool HasScorer() const {
+    return scorer_ != nullptr;
+  }
+
+  // Supplies corpus-wide statistics (aggregated across all shards) to use instead of this
+  // shard's local view when scoring matched text terms. `stats` must outlive the Search() call.
+  void SetGlobalScoringStats(const GlobalScoringStats* stats);
+
  private:
   bool profiling_enabled_ = false;
   ScorerFn scorer_ = nullptr;
+  const GlobalScoringStats* global_stats_ = nullptr;
   std::unique_ptr<AstNode> query_;
   std::optional<KnnScoreSortOption> knn_hnsw_score_sort_option_;
 };
