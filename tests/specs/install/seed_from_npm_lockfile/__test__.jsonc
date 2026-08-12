@@ -1,0 +1,20 @@
+{
+  "tempDir": true,
+  "steps": [
+    // no `deno.lock` exists yet, but a sibling `package-lock.json` pins
+    // @denotest/has-patch-versions to 0.1.0 even though 0.1.1 also satisfies
+    // the package.json range of ^0.1.0 (and would otherwise be picked as the
+    // newest match) -- the pinned version and its lockfile entry should win
+    {
+      "args": "install",
+      "output": "install.out"
+    },
+    {
+      "args": [
+        "eval",
+        "console.log(Deno.readTextFileSync('deno.lock').trim())"
+      ],
+      "output": "deno.lock.out"
+    }
+  ]
+}

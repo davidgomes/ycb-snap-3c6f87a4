@@ -1,0 +1,7 @@
+{
+  "name": "seed-from-npm-lockfile-test",
+  "version": "1.0.0",
+  "dependencies": {
+    "@denotest/has-patch-versions": "^0.1.0"
+  }
+}
