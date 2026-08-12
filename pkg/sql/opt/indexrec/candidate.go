@@ -12,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
 
@@ -42,6 +43,16 @@ import (
 //  7. For JSON and array columns, we create single column inverted indexes. We
 //     also create the following multi-column combination candidates for each
 //     inverted column: eq + 'inverted column', EQ + 'inverted column'.
+//  8. For a column that is compared to another operand via a vector distance
+//     operator (<->, <=>, or <#>) in an ORDER BY ... LIMIT clause, we create a
+//     single-column vector index candidate tagged with the distance metric
+//     implied by the operator. The vector column may appear on either side of
+//     the operator. As with inverted indexes, we also create the following
+//     multi-column combination candidates for each vector column: eq +
+//     'vector column', EQ + 'vector column'. Because two vector indexes on the
+//     same column are not equivalent unless they share a distance metric,
+//     these candidates are returned separately, tagged with their metric,
+//     rather than being merged into the overall candidate set.
 //
 // TODO(nehageorge): Add a rule for columns that are referenced in the statement
 // but do not fall into one of these categories. In order to account for this,
@@ -50,23 +61,44 @@ import (
 // RFC for inspiration: https://github.com/cockroachdb/cockroach/pull/71784. We
 // may also consider matching more types of SQL expressions, including LIKE
 // expressions.
-func FindIndexCandidateSet(rootExpr opt.Expr, md *opt.Metadata) map[cat.Table][][]cat.IndexColumn {
+func FindIndexCandidateSet(
+	rootExpr opt.Expr, md *opt.Metadata,
+) (map[cat.Table][][]cat.IndexColumn, map[cat.Table][]VectorIndexCandidate) {
 	var candidateSet indexCandidateSet
 	candidateSet.init(md)
 	candidateSet.categorizeIndexCandidates(rootExpr)
 	candidateSet.combineIndexCandidates()
-	return candidateSet.overallCandidates
+	return candidateSet.overallCandidates, candidateSet.overallVectorCandidates
+}
+
+// VectorIndexCandidate represents a candidate vector index for a query: a set
+// of prefix columns (built analogously to inverted eq-prefix candidates,
+// restricted to equality columns) followed by a vector column, along with the
+// distance metric implied by the comparison operator (<->, <=>, or <#>) that
+// was used to reference the vector column.
+type VectorIndexCandidate struct {
+	Cols   []cat.IndexColumn
+	Metric vecpb.DistanceMetric
+}
+
+// vectorCandidate is the internal, pre-combination representation of a
+// single-column vector index candidate.
+type vectorCandidate struct {
+	cols   []cat.IndexColumn
+	metric vecpb.DistanceMetric
 }
 
 // indexCandidateSet stores potential indexes that could be recommended for a
 // given query, as well as the query's metadata.
 type indexCandidateSet struct {
-	md                 *opt.Metadata
-	equalCandidates    map[cat.Table][][]cat.IndexColumn
-	rangeCandidates    map[cat.Table][][]cat.IndexColumn
-	joinCandidates     map[cat.Table][][]cat.IndexColumn
-	invertedCandidates map[cat.Table][][]cat.IndexColumn
-	overallCandidates  map[cat.Table][][]cat.IndexColumn
+	md                      *opt.Metadata
+	equalCandidates         map[cat.Table][][]cat.IndexColumn
+	rangeCandidates         map[cat.Table][][]cat.IndexColumn
+	joinCandidates          map[cat.Table][][]cat.IndexColumn
+	invertedCandidates      map[cat.Table][][]cat.IndexColumn
+	vectorCandidates        map[cat.Table][]vectorCandidate
+	overallCandidates       map[cat.Table][][]cat.IndexColumn
+	overallVectorCandidates map[cat.Table][]VectorIndexCandidate
 }
 
 // init allocates memory for the maps in the set.
@@ -77,7 +109,9 @@ func (ics *indexCandidateSet) init(md *opt.Metadata) {
 	ics.rangeCandidates = make(map[cat.Table][][]cat.IndexColumn, numTables)
 	ics.joinCandidates = make(map[cat.Table][][]cat.IndexColumn, numTables)
 	ics.invertedCandidates = make(map[cat.Table][][]cat.IndexColumn, numTables)
+	ics.vectorCandidates = make(map[cat.Table][]vectorCandidate, numTables)
 	ics.overallCandidates = make(map[cat.Table][][]cat.IndexColumn, numTables)
+	ics.overallVectorCandidates = make(map[cat.Table][]VectorIndexCandidate, numTables)
 }
 
 // combineIndexCandidates adds index candidates that are combinations of
@@ -105,6 +139,50 @@ func (ics *indexCandidateSet) combineIndexCandidates() {
 	constructIndexCombinations(equalJoinCandidates, ics.rangeCandidates, ics.overallCandidates)
 	constructIndexCombinations(ics.equalCandidates, ics.invertedCandidates, ics.overallCandidates)
 	constructIndexCombinations(equalGroupedCandidates, ics.invertedCandidates, ics.overallCandidates)
+
+	ics.overallVectorCandidates = ics.combineVectorCandidates(ics.equalCandidates, equalGroupedCandidates)
+}
+
+// combineVectorCandidates constructs eq + vector and EQ + vector index
+// candidate combinations, analogous to how eq + inverted and EQ + inverted
+// combinations are constructed above. Because two vector indexes on the same
+// column are not equivalent unless they share a distance metric, combinations
+// are built independently for each distinct metric that appears in the query,
+// using the same generic helpers used for the other index candidate
+// categories.
+func (ics *indexCandidateSet) combineVectorCandidates(
+	equalCandidates, equalGroupedCandidates map[cat.Table][][]cat.IndexColumn,
+) map[cat.Table][]VectorIndexCandidate {
+	// Group the single-column vector candidates by distance metric so that the
+	// generic combination helpers, which know nothing about distance metrics,
+	// can be reused unmodified for each metric in turn.
+	byMetric := make(map[vecpb.DistanceMetric]map[cat.Table][][]cat.IndexColumn)
+	for t, candidates := range ics.vectorCandidates {
+		for _, vc := range candidates {
+			metricCandidates, ok := byMetric[vc.metric]
+			if !ok {
+				metricCandidates = make(map[cat.Table][][]cat.IndexColumn)
+				byMetric[vc.metric] = metricCandidates
+			}
+			metricCandidates[t] = append(metricCandidates[t], vc.cols)
+		}
+	}
+
+	overallVectorCandidates := make(map[cat.Table][]VectorIndexCandidate, len(ics.vectorCandidates))
+	for metric, metricCandidates := range byMetric {
+		combined := make(map[cat.Table][][]cat.IndexColumn, len(metricCandidates))
+		copyIndexes(metricCandidates, combined)
+		constructIndexCombinations(equalCandidates, metricCandidates, combined)
+		constructIndexCombinations(equalGroupedCandidates, metricCandidates, combined)
+		for t, indexes := range combined {
+			for _, cols := range indexes {
+				overallVectorCandidates[t] = append(
+					overallVectorCandidates[t], VectorIndexCandidate{Cols: cols, Metric: metric},
+				)
+			}
+		}
+	}
+	return overallVectorCandidates
 }
 
 // categorizeIndexCandidates finds potential index candidates for a given
@@ -193,6 +271,12 @@ func (ics *indexCandidateSet) categorizeIndexCandidates(expr opt.Expr) {
 	case *memo.BBoxIntersectsExpr:
 		ics.addVariableExprIndex(expr.Left, ics.overallCandidates)
 		ics.addVariableExprIndex(expr.Right, ics.overallCandidates)
+	case *memo.VectorDistanceExpr:
+		ics.addVectorDistanceIndex(expr.Left, expr.Right, vecpb.L2SquaredDistance)
+	case *memo.VectorCosDistanceExpr:
+		ics.addVectorDistanceIndex(expr.Left, expr.Right, vecpb.CosineDistance)
+	case *memo.VectorNegInnerProductExpr:
+		ics.addVectorDistanceIndex(expr.Left, expr.Right, vecpb.InnerProductDistance)
 	}
 	for i, n := 0, expr.ChildCount(); i < n; i++ {
 		ics.categorizeIndexCandidates(expr.Child(i))
@@ -242,10 +326,15 @@ func (ics indexCandidateSet) addOrderingIndex(ordering opt.Ordering) {
 func (ics *indexCandidateSet) addJoinIndexes(expr memo.FiltersExpr) {
 	outerCols := expr.OuterCols().ToList()
 	for _, col := range outerCols {
+		typ := ics.md.ColumnMeta(col).Type
+		if colinfo.ColumnTypeIsVectorIndexable(typ) {
+			// Vector columns can only become index candidates via a vector
+			// distance expression (<->, <=>, <#>); see addVectorDistanceIndex.
+			continue
+		}
 		// TODO (Shivam): Index recommendations should not only allow JSON columns
 		// to be part of inverted indexes since they are also forward indexable.
-		if colinfo.ColumnTypeIsIndexable(ics.md.ColumnMeta(col).Type) &&
-			ics.md.ColumnMeta(col).Type.Family() != types.JsonFamily {
+		if colinfo.ColumnTypeIsIndexable(typ) && typ.Family() != types.JsonFamily {
 			ics.addSingleColumnIndex(col, false /* desc */, ics.joinCandidates)
 		} else {
 			ics.addSingleColumnIndex(col, false /* desc */, ics.invertedCandidates)
@@ -331,15 +420,75 @@ func (ics *indexCandidateSet) addVariableExprIndex(
 	switch expr := expr.(type) {
 	case *memo.VariableExpr:
 		col := expr.Col
+		typ := ics.md.ColumnMeta(col).Type
+		if colinfo.ColumnTypeIsVectorIndexable(typ) {
+			// Vector columns can only become index candidates via a vector
+			// distance expression (<->, <=>, <#>); see addVectorDistanceIndex.
+			return
+		}
 		// TODO (Shivam): Index recommendations should not only allow JSON columns
 		// to be part of inverted indexes since they are also forward indexable.
-		if colinfo.ColumnTypeIsIndexable(ics.md.ColumnMeta(col).Type) &&
-			ics.md.ColumnMeta(col).Type.Family() != types.JsonFamily {
+		if colinfo.ColumnTypeIsIndexable(typ) && typ.Family() != types.JsonFamily {
 			ics.addSingleColumnIndex(col, false /* desc */, indexCandidates)
 		} else {
 			ics.addSingleColumnIndex(col, false /* desc */, ics.invertedCandidates)
 		}
 	}
+}
+
+// addVectorDistanceIndex adds a candidate vector index for each operand of a
+// vector distance expression (VectorDistance, VectorCosDistance, or
+// VectorNegInnerProduct) that is a reference to a fixed-width vector column.
+// The vector column may appear on either side of the expression, i.e. operand
+// order does not matter. metric is the distance metric implied by the
+// operator that was used (<->, <=>, or <#>).
+func (ics *indexCandidateSet) addVectorDistanceIndex(
+	left, right opt.Expr, metric vecpb.DistanceMetric,
+) {
+	ics.addVectorDistanceOperand(left, metric)
+	ics.addVectorDistanceOperand(right, metric)
+}
+
+// addVectorDistanceOperand adds a candidate vector index on expr's column if
+// expr is a *memo.VariableExpr referencing a fixed-width vector column.
+func (ics *indexCandidateSet) addVectorDistanceOperand(expr opt.Expr, metric vecpb.DistanceMetric) {
+	variable, ok := expr.(*memo.VariableExpr)
+	if !ok {
+		return
+	}
+	typ := ics.md.ColumnMeta(variable.Col).Type
+	if !colinfo.ColumnTypeIsVectorIndexable(typ) || typ.Width() <= 0 {
+		// Only fixed-width vector columns can be indexed by a vector index.
+		return
+	}
+	ics.addVectorCandidate(variable.Col, metric)
+}
+
+// addVectorCandidate adds a candidate single-column vector index on the
+// column with the given opt.ColumnID and distance metric to
+// indexCandidateSet.vectorCandidates, if an identical candidate does not
+// already exist.
+func (ics *indexCandidateSet) addVectorCandidate(colID opt.ColumnID, metric vecpb.DistanceMetric) {
+	columnMeta := ics.md.ColumnMeta(colID)
+
+	// If there's no base table for the column, return.
+	tableID := columnMeta.Table
+	if tableID == 0 {
+		return
+	}
+
+	currTable := ics.md.Table(tableID)
+	currCol := currTable.Column(tableID.ColumnOrdinal(colID))
+	for _, existing := range ics.vectorCandidates[currTable] {
+		if existing.metric == metric && existing.cols[0].Column == currCol {
+			// Duplicate candidate found, return.
+			return
+		}
+	}
+	indexCol := cat.IndexColumn{Column: currCol}
+	ics.vectorCandidates[currTable] = append(
+		ics.vectorCandidates[currTable], vectorCandidate{cols: []cat.IndexColumn{indexCol}, metric: metric},
+	)
 }
 
 // addMultiColumnIndex adds indexes to indexCandidates for groups of columns

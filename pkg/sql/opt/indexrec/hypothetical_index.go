@@ -45,6 +45,10 @@ type hypotheticalIndex struct {
 
 	// typ indicates the type of the index - forward, inverted, or vector.
 	typ idxtype.T
+
+	// metric is the distance metric used by a vector index. It is only
+	// meaningful when typ is idxtype.VECTOR.
+	metric vecpb.DistanceMetric
 }
 
 var _ cat.Index = &hypotheticalIndex{}
@@ -55,6 +59,7 @@ func (hi *hypotheticalIndex) init(
 	cols []cat.IndexColumn,
 	indexOrd int,
 	typ idxtype.T,
+	metric vecpb.DistanceMetric,
 	zone cat.Zone,
 ) {
 	hi.tab = tab
@@ -62,6 +67,7 @@ func (hi *hypotheticalIndex) init(
 	hi.cols = cols
 	hi.indexOrdinal = indexOrd
 	hi.typ = typ
+	hi.metric = metric
 	hi.zone = zone
 
 	// Build an index column ordinal set.
@@ -178,7 +184,10 @@ func (hi *hypotheticalIndex) InvertedColumn() cat.IndexColumn {
 
 // VectorColumn is part of the cat.Index interface.
 func (hi *hypotheticalIndex) VectorColumn() cat.IndexColumn {
-	panic(errors.AssertionFailedf("hypothetical indexes do not have vector columns"))
+	if hi.Type() != idxtype.VECTOR {
+		panic(errors.AssertionFailedf("non-vector indexes do not have vector columns"))
+	}
+	return hi.cols[len(hi.cols)-1]
 }
 
 // Predicate is part of the cat.Index interface.
@@ -232,7 +241,10 @@ func (hi *hypotheticalIndex) GeoConfig() geopb.Config {
 
 // VecConfig is part of the cat.Index interface.
 func (hi *hypotheticalIndex) VecConfig() *vecpb.Config {
-	return nil
+	if hi.Type() != idxtype.VECTOR {
+		return nil
+	}
+	return &vecpb.Config{DistanceMetric: hi.metric}
 }
 
 // Version is part of the cat.Index interface.
@@ -276,6 +288,18 @@ func (hi *hypotheticalIndex) hasPrefixOfExplicitCols(existingIndex cat.Index) bo
 	if existingIndex.ExplicitColumnCount() < len(indexCols) {
 		return false
 	}
+	if hi.Type() == idxtype.VECTOR {
+		// Two vector indexes are only considered equivalent if they use the same
+		// distance metric. The same vector column can be usefully indexed with
+		// more than one metric, and search results differ between metrics, so a
+		// different metric is never redundant, nor is it a valid candidate to
+		// become visible via ALTER INDEX ... VISIBLE.
+		existingVecConfig := existingIndex.VecConfig()
+		if existingIndex.Type() != idxtype.VECTOR || existingVecConfig == nil ||
+			existingVecConfig.DistanceMetric != hi.metric {
+			return false
+		}
+	}
 	for j, m := 0, len(indexCols); j < m; j++ {
 		// Compare every existingIndex columns with indexCols.
 		existingIndexCol := existingIndex.Column(j)
@@ -292,4 +316,18 @@ func (hi *hypotheticalIndex) hasPrefixOfExplicitCols(existingIndex cat.Index) bo
 		}
 	}
 	return true
+}
+
+// VectorOpClass returns the operator class name for the given vector index
+// distance metric, as used in the last column of a CREATE VECTOR INDEX
+// statement (e.g. "vector_l2_ops", "vector_cosine_ops", "vector_ip_ops").
+func VectorOpClass(metric vecpb.DistanceMetric) tree.Name {
+	switch metric {
+	case vecpb.CosineDistance:
+		return "vector_cosine_ops"
+	case vecpb.InnerProductDistance:
+		return "vector_ip_ops"
+	default:
+		return "vector_l2_ops"
+	}
 }

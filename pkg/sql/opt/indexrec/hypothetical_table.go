@@ -18,20 +18,31 @@ import (
 )
 
 // BuildOptAndHypTableMaps builds a HypotheticalTable for each table in
-// indexCandidates. This HypotheticalTable stores a hypothetical index for each
-// of the table's index candidates. The function returns a map from each table's
-// cat.StableID to its original sql.optTable, as well as a map from each table's
-// cat.StableID to its constructed HypotheticalTable. These tables will be used
-// to update the table query metadata when making index recommendations.
+// indexCandidates or vectorCandidates. This HypotheticalTable stores a
+// hypothetical index for each of the table's index candidates. The function
+// returns a map from each table's cat.StableID to its original sql.optTable,
+// as well as a map from each table's cat.StableID to its constructed
+// HypotheticalTable. These tables will be used to update the table query
+// metadata when making index recommendations.
 func BuildOptAndHypTableMaps(
-	c cat.Catalog, indexCandidates map[cat.Table][][]cat.IndexColumn,
+	c cat.Catalog,
+	indexCandidates map[cat.Table][][]cat.IndexColumn,
+	vectorCandidates map[cat.Table][]VectorIndexCandidate,
 ) (optTables, hypTables map[cat.StableID]cat.Table) {
-	numTables := len(indexCandidates)
-	hypTables = make(map[cat.StableID]cat.Table, numTables)
-	optTables = make(map[cat.StableID]cat.Table, numTables)
+	tables := make(map[cat.Table]struct{}, len(indexCandidates)+len(vectorCandidates))
+	for t := range indexCandidates {
+		tables[t] = struct{}{}
+	}
+	for t := range vectorCandidates {
+		tables[t] = struct{}{}
+	}
+	hypTables = make(map[cat.StableID]cat.Table, len(tables))
+	optTables = make(map[cat.StableID]cat.Table, len(tables))
 
-	for t, indexes := range indexCandidates {
-		hypIndexes := make([]hypotheticalIndex, 0, len(indexes))
+	for t := range tables {
+		indexes := indexCandidates[t]
+		vecIndexes := vectorCandidates[t]
+		hypIndexes := make([]hypotheticalIndex, 0, len(indexes)+len(vecIndexes))
 		var hypTable HypotheticalTable
 		hypTable.init(c, t)
 
@@ -55,6 +66,7 @@ func BuildOptAndHypTableMaps(
 				indexCols,
 				indexOrd,
 				indexType,
+				0, /* metric */
 				t.Zone(),
 			)
 
@@ -62,7 +74,29 @@ func BuildOptAndHypTableMaps(
 			// index with the same key. Inverted indexes do not have stored columns,
 			// so we should not make a recommendation if the same index already
 			// exists.
-			if indexType != idxtype.INVERTED || hypTable.existingRedundantIndex(&hypIndex) == nil {
+			if indexType.SupportsStoring() || hypTable.existingRedundantIndex(&hypIndex) == nil {
+				hypIndexes = append(hypIndexes, hypIndex)
+			}
+		}
+
+		for _, vecIndex := range vecIndexes {
+			indexOrd := hypTable.Table.IndexCount() + len(hypIndexes)
+			var hypIndex hypotheticalIndex
+			hypIndex.init(
+				&hypTable,
+				tree.Name(fmt.Sprintf("_hyp_%d", indexOrd)),
+				vecIndex.Cols,
+				indexOrd,
+				idxtype.VECTOR,
+				vecIndex.Metric,
+				t.Zone(),
+			)
+
+			// Do not add hypothetical vector indexes for which there is an existing
+			// index with the same key and distance metric. Vector indexes do not
+			// have stored columns, so we should not make a recommendation if the
+			// same index already exists.
+			if hypTable.existingRedundantIndex(&hypIndex) == nil {
 				hypIndexes = append(hypIndexes, hypIndex)
 			}
 		}

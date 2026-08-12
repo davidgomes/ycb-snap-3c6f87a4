@@ -84,6 +84,8 @@ func (rc recCollector) addIndexRec(md *opt.Metadata, expr opt.Expr) {
 	case *memo.ZigzagJoinExpr:
 		rc.addIndex(md, expr.LeftIndex, expr.Cols, expr.LeftTable)
 		rc.addIndex(md, expr.RightIndex, expr.Cols, expr.RightTable)
+	case *memo.VectorSearchExpr:
+		rc.addIndex(md, expr.Index, expr.Cols, expr.Table)
 	}
 	for i, n := 0, expr.ChildCount(); i < n; i++ {
 		rc.addIndexRec(md, expr.Child(i))
@@ -455,9 +457,16 @@ func (ir *indexRecommendation) indexCols() []tree.IndexElem {
 	for i := range ir.index.cols {
 		indexCol := ir.index.Column(i)
 		colName := indexCol.Column.ColName()
+		isLastCol := i == len(ir.index.cols)-1
 
-		if ir.index.Type() == idxtype.INVERTED && i == len(ir.index.cols)-1 {
+		var opClass tree.Name
+		switch {
+		case ir.index.Type() == idxtype.INVERTED && isLastCol:
 			colName = ir.index.tab.Column(indexCol.InvertedSourceColumnOrdinal()).ColName()
+		case ir.index.Type() == idxtype.VECTOR && isLastCol:
+			// Always include the operator class so that the recommended distance
+			// metric is unambiguous, even when it is the default (L2).
+			opClass = VectorOpClass(ir.index.metric)
 		}
 
 		var direction tree.Direction
@@ -465,7 +474,7 @@ func (ir *indexRecommendation) indexCols() []tree.IndexElem {
 			direction = tree.Descending
 		}
 
-		indexCols[i] = tree.IndexElem{Column: colName, Direction: direction}
+		indexCols[i] = tree.IndexElem{Column: colName, Direction: direction, OpClass: opClass}
 	}
 
 	return indexCols

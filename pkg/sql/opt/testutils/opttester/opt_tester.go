@@ -2235,31 +2235,34 @@ func (ot *OptTester) IndexCandidates() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	indexCandidates := indexrec.FindIndexCandidateSet(expr, ot.f.Memo().Metadata())
+	indexCandidates, vectorCandidates := indexrec.FindIndexCandidateSet(expr, ot.f.Memo().Metadata())
 
-	// Build a formatted string to output from the map of indexCandidates.
-	tablesOutput := make([]string, 0, len(indexCandidates))
-	for t, indexes := range indexCandidates {
+	tables := make(map[cat.Table]struct{}, len(indexCandidates)+len(vectorCandidates))
+	for t := range indexCandidates {
+		tables[t] = struct{}{}
+	}
+	for t := range vectorCandidates {
+		tables[t] = struct{}{}
+	}
+
+	// Build a formatted string to output from the maps of indexCandidates and
+	// vectorCandidates.
+	tablesOutput := make([]string, 0, len(tables))
+	for t := range tables {
 		var tableSb strings.Builder
 		tableName := t.Name()
 		tableSb.WriteString(tableName.String())
 		tableSb.WriteString(":\n")
-		indexesOutput := make([]string, len(indexes))
-		for i, index := range indexes {
-			var indexSb strings.Builder
-			indexSb.WriteString(" (")
-			for j, indexCol := range index {
-				if j > 0 {
-					indexSb.WriteString(", ")
-				}
-				colName := indexCol.Column.ColName()
-				indexSb.WriteString(colName.String())
-				if indexCol.Descending {
-					indexSb.WriteString(" DESC")
-				}
-			}
-			indexSb.WriteString(")\n")
-			indexesOutput[i] = indexSb.String()
+
+		indexes := indexCandidates[t]
+		vecIndexes := vectorCandidates[t]
+		indexesOutput := make([]string, 0, len(indexes)+len(vecIndexes))
+		for _, index := range indexes {
+			indexesOutput = append(indexesOutput, formatIndexCandidate(index, "" /* opClass */))
+		}
+		for _, vecIndex := range vecIndexes {
+			opClass := string(indexrec.VectorOpClass(vecIndex.Metric))
+			indexesOutput = append(indexesOutput, formatIndexCandidate(vecIndex.Cols, opClass))
 		}
 		sort.Strings(indexesOutput)
 		tableSb.WriteString(strings.Join(indexesOutput, ""))
@@ -2267,6 +2270,30 @@ func (ot *OptTester) IndexCandidates() (string, error) {
 	}
 	sort.Strings(tablesOutput)
 	return strings.Join(tablesOutput, ""), nil
+}
+
+// formatIndexCandidate formats a single index candidate's columns, e.g.
+// " (col1, col2)\n". If opClass is non-empty, it is appended to the last
+// column, e.g. " (col1, col2 vector_cosine_ops)\n".
+func formatIndexCandidate(index []cat.IndexColumn, opClass string) string {
+	var indexSb strings.Builder
+	indexSb.WriteString(" (")
+	for j, indexCol := range index {
+		if j > 0 {
+			indexSb.WriteString(", ")
+		}
+		colName := indexCol.Column.ColName()
+		indexSb.WriteString(colName.String())
+		if opClass != "" && j == len(index)-1 {
+			indexSb.WriteString(" ")
+			indexSb.WriteString(opClass)
+		}
+		if indexCol.Descending {
+			indexSb.WriteString(" DESC")
+		}
+	}
+	indexSb.WriteString(")\n")
+	return indexSb.String()
 }
 
 // IndexRecommendations is used with the index-recommendations option. It
@@ -2278,8 +2305,8 @@ func (ot *OptTester) IndexRecommendations() (string, error) {
 		return "", err
 	}
 	md := ot.f.Memo().Metadata()
-	indexCandidates := indexrec.FindIndexCandidateSet(normExpr, md)
-	_, hypTables := indexrec.BuildOptAndHypTableMaps(ot.catalog, indexCandidates)
+	indexCandidates, vectorCandidates := indexrec.FindIndexCandidateSet(normExpr, md)
+	_, hypTables := indexrec.BuildOptAndHypTableMaps(ot.catalog, indexCandidates, vectorCandidates)
 
 	optExpr, err := ot.OptimizeWithTables(hypTables)
 	if err != nil {
