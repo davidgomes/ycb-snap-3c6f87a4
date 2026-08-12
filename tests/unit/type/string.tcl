@@ -281,6 +281,157 @@ start_server {tags {"string"}} {
         list [r msetnx x1{t} xxx x1{t} zzz] [r get x1{t}]
     } {0 yyy}
 
+    test {MSETEX - basic usage} {
+        r del m1{t} m2{t}
+        list [r msetex 2 m1{t} v1 m2{t} v2] [r mget m1{t} m2{t}] [r ttl m1{t}]
+    } {1 {v1 v2} -1}
+
+    test {MSETEX - wrong number of args} {
+        assert_error {*wrong number of arguments for 'msetex' command} {r msetex}
+        assert_error {*wrong number of arguments for 'msetex' command} {r msetex 1}
+    }
+
+    test {MSETEX - invalid numkeys} {
+        assert_error {*numkeys should be greater than 0*} {r msetex 0 m1{t} v1}
+        assert_error {*numkeys should be greater than 0*} {r msetex -1 m1{t} v1}
+        assert_error {ERR syntax error} {r msetex 2 m1{t} v1}
+        assert_error {*numkeys should be greater than 0*} {r msetex foo m1{t} v1}
+    }
+
+    test {MSETEX - conflicting/invalid options are rejected} {
+        assert_error {ERR syntax error} {r msetex 1 m1{t} v1 nx xx}
+        assert_error {ERR syntax error} {r msetex 1 m1{t} v1 ex 10 px 10000}
+        assert_error {ERR syntax error} {r msetex 1 m1{t} v1 keepttl ex 10}
+        assert_error {ERR syntax error} {r msetex 1 m1{t} v1 bogus}
+        assert_error {ERR syntax error} {r msetex 1 m1{t} v1 ex}
+    }
+
+    test {MSETEX - NX fails and touches nothing if any key exists} {
+        r del m1{t} m2{t}
+        r set m1{t} old
+        list [r msetex 2 m1{t} new1 m2{t} new2 nx] [r get m1{t}] [r exists m2{t}]
+    } {0 old 0}
+
+    test {MSETEX - NX succeeds only if none of the keys exist} {
+        r del m1{t} m2{t}
+        list [r msetex 2 m1{t} v1 m2{t} v2 nx] [r mget m1{t} m2{t}]
+    } {1 {v1 v2}}
+
+    test {MSETEX - XX fails and touches nothing if any key is missing} {
+        r del m1{t} m2{t}
+        r set m1{t} old
+        list [r msetex 2 m1{t} new1 m2{t} new2 xx] [r get m1{t}] [r exists m2{t}]
+    } {0 old 0}
+
+    test {MSETEX - XX succeeds only if all of the keys exist} {
+        r set m1{t} old1
+        r set m2{t} old2
+        list [r msetex 2 m1{t} v1 m2{t} v2 xx] [r mget m1{t} m2{t}]
+    } {1 {v1 v2}}
+
+    test {MSETEX - EX option sets a shared TTL on every key} {
+        r del m1{t} m2{t}
+        r msetex 2 m1{t} v1 m2{t} v2 ex 100
+        set ttl1 [r ttl m1{t}]
+        set ttl2 [r ttl m2{t}]
+        list [expr {$ttl1 <= 100 && $ttl1 > 90}] [expr {$ttl2 <= 100 && $ttl2 > 90}]
+    } {1 1}
+
+    test {MSETEX - PX/EXAT/PXAT options set a shared TTL on every key} {
+        r del m1{t} m2{t}
+        r msetex 2 m1{t} v1 m2{t} v2 px 100000
+        assert_range [r ttl m1{t}] 90 100
+        assert_range [r ttl m2{t}] 90 100
+
+        r del m1{t} m2{t}
+        r msetex 2 m1{t} v1 m2{t} v2 exat [expr [clock seconds] + 100]
+        assert_range [r ttl m1{t}] 90 100
+        assert_range [r ttl m2{t}] 90 100
+
+        r del m1{t} m2{t}
+        r msetex 2 m1{t} v1 m2{t} v2 pxat [expr [clock milliseconds] + 100000]
+        assert_range [r ttl m1{t}] 90 100
+        assert_range [r ttl m2{t}] 90 100
+    }
+
+    test {MSETEX - KEEPTTL keeps the existing TTL of every key} {
+        r del m1{t} m2{t}
+        r set m1{t} old ex 500
+        r set m2{t} old ex 500
+        r msetex 2 m1{t} v1 m2{t} v2 keepttl
+        list [r mget m1{t} m2{t}] [expr {[r ttl m1{t}] > 0}] [expr {[r ttl m2{t}] > 0}]
+    } {{v1 v2} 1 1}
+
+    test {MSETEX - without KEEPTTL/expire options, TTL is cleared} {
+        r del m1{t}
+        r set m1{t} old ex 500
+        r msetex 1 m1{t} v1
+        r ttl m1{t}
+    } {-1}
+
+    test {MSETEX - already expired PXAT deletes existing keys and creates nothing} {
+        r debug set-active-expire 0
+        r del m1{t} m2{t}
+        r set m1{t} old
+        r msetex 2 m1{t} newval m2{t} newval2 pxat 1
+        list [r exists m1{t}] [r exists m2{t}]
+    } {0 0} {needs:debug}
+
+    test {MSETEX - already expired reply is still 1 (a successful write)} {
+        r debug set-active-expire 0
+        r del m1{t}
+        r set m1{t} old
+        set reply [r msetex 1 m1{t} newval pxat 1]
+        r del m1{t}
+        r debug set-active-expire 1
+        set reply
+    } {1} {needs:debug}
+
+    test {MSETEX - COMMAND GETKEYS reports every key, skipping values} {
+        r command getkeys msetex 3 k1{t} v1 k2{t} v2 k3{t} v3 nx ex 100
+    } {k1{t} k2{t} k3{t}}
+
+    test {MSETEX propagates EX/EXAT as an absolute PXAT to the replication stream} {
+        r debug set-active-expire 0
+        r set m1{t} placeholder
+        r set m2{t} placeholder
+        set repl [attach_to_replication_stream]
+
+        r del m1{t} m2{t}
+        r msetex 2 m1{t} v1 m2{t} v2 ex 100
+        r msetex 2 m1{t} v3 m2{t} v4 nx
+
+        assert_replication_stream $repl {
+            {select *}
+            {del m1{t} m2{t}}
+            {msetex 2 m1{t} v1 m2{t} v2 PXAT *}
+        }
+        close_replication_stream $repl
+        r debug set-active-expire 1
+        set _ {}
+    } {} {needs:debug needs:repl}
+
+    test {MSETEX propagates an already-expired shared TTL as a DEL/UNLINK} {
+        r debug set-active-expire 0
+        r set m1{t} placeholder
+        r set m2{t} placeholder
+        set repl [attach_to_replication_stream]
+
+        r del m1{t} m2{t}
+        r set m1{t} old
+        r msetex 2 m1{t} newval m2{t} newval2 pxat 1
+
+        assert_replication_stream $repl {
+            {select *}
+            {del m1{t} m2{t}}
+            {set m1{t} old}
+            {unlink m1{t}}
+        }
+        close_replication_stream $repl
+        r debug set-active-expire 1
+        set _ {}
+    } {} {needs:debug needs:repl}
+
     test "STRLEN against non-existing key" {
         assert_equal 0 [r strlen notakey]
     }

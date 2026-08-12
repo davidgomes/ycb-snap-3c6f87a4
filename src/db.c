@@ -2723,6 +2723,14 @@ int bzmpopGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResul
     return genericGetKeys(0, 2, 3, 1, argv, argc, result);
 }
 
+/* MSETEX numkeys key value [key value ...] [NX | XX] [EX ...|PX ...|EXAT ...|PXAT ...|KEEPTTL]
+ *
+ * Keys and values are interleaved (step 2), starting right after numkeys. */
+int msetexGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+    UNUSED(cmd);
+    return genericGetKeys(0, 1, 2, 2, argv, argc, result);
+}
+
 /* Helper function to extract keys from the SORT RO command.
  *
  * SORT_RO <sort-key>
