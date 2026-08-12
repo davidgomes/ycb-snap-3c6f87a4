@@ -88,7 +88,7 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 			return nil, funcDef.MakeUnsupportedError()
 		}
 		overload := funcDef.Overloads[0]
-		return tree.NewDOidWithTypeAndName(overload.Oid, t, funcDef.Name), nil
+		return resolveRegOIDByOID(ctx, evalCtx, t, overload.Oid)
 	case oid.T_regprocedure:
 		// Fake a ALTER FUNCTION statement to extract the function signature.
 		// We're kinda being lazy here to rely on the parser to determine if the
@@ -125,7 +125,7 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 			if !catid.IsOIDUserDefined(ol.Oid) &&
 				ol.Types.Length() == 1 &&
 				ol.Types.GetAt(0).Identical(types.AnyElement) {
-				return tree.NewDOidWithTypeAndName(ol.Oid, t, fd.Name), nil
+				return resolveRegOIDByOID(ctx, evalCtx, t, ol.Oid)
 			}
 		}
 
@@ -141,13 +141,16 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 		if err != nil {
 			return nil, err
 		}
-		return tree.NewDOidWithTypeAndName(ol.Oid, t, fd.Name), nil
+		return resolveRegOIDByOID(ctx, evalCtx, t, ol.Oid)
 	case oid.T_regtype:
 		parsedTyp, err := evalCtx.Planner.GetTypeFromValidSQLSyntax(ctx, s)
 		if err == nil {
-			return tree.NewDOidWithTypeAndName(
-				parsedTyp.Oid(), t, parsedTyp.SQLStandardName(),
-			), nil
+			if !types.IsOIDUserDefinedType(parsedTyp.Oid()) {
+				return tree.NewDOidWithTypeAndName(
+					parsedTyp.Oid(), t, parsedTyp.SQLStandardName(),
+				), nil
+			}
+			return resolveRegOIDByOID(ctx, evalCtx, t, parsedTyp.Oid())
 		}
 
 		// Fall back to searching pg_type, since we don't provide syntax for
@@ -201,7 +204,7 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 				uint32(id),
 				sessiondatapb.IsPgDumpCompatibilityEnabled(evalCtx.SessionData().PgDumpCompatibility),
 			)
-			return tree.NewDOidWithTypeAndName(resolvedOid, t, tn.ObjectName.String()), nil
+			return resolveRegOIDByOID(ctx, evalCtx, t, resolvedOid)
 		} else if pgerror.GetPGCode(err) != pgcode.UndefinedTable {
 			return nil, err
 		}
@@ -211,12 +214,27 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 		if err != nil {
 			return nil, err
 		}
-		return tree.NewDOidWithTypeAndName(oidRes, t, tn.ObjectName.String()), nil
+		return resolveRegOIDByOID(ctx, evalCtx, t, oidRes)
 
 	default:
 		d, _ /* errSafeToIgnore */, err := evalCtx.Planner.ResolveOIDFromString(ctx, t, tree.NewDString(s))
 		return d, err
 	}
+}
+
+// resolveRegOIDByOID resolves a reg* OID through the same path as an OID cast,
+// so name parsing and OID casts agree on search-path-sensitive display names.
+func resolveRegOIDByOID(
+	ctx context.Context, evalCtx *Context, t *types.T, o oid.Oid,
+) (*tree.DOid, error) {
+	d, errSafeToIgnore, err := evalCtx.Planner.ResolveOIDFromOID(ctx, t, tree.NewDOid(o))
+	if err == nil {
+		return d, nil
+	}
+	if !errSafeToIgnore {
+		return nil, err
+	}
+	return tree.NewDOidWithType(o, t), nil
 }
 
 // indexNameToOID finds the OID for the given index. If the name is qualified,

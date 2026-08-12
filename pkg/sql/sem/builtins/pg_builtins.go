@@ -1746,45 +1746,65 @@ FROM defaults_parsed
 		},
 	),
 
-	// pg_function_is_visible returns true if the input oid corresponds to a
-	// builtin function that is part of the databases on the search path.
+	// pg_function_is_visible returns true if the input oid's schema is the
+	// first schema on the search path that contains a function of that name.
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_function_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
-			Body: `SELECT n.nspname = any current_schemas(true)
+			Body: `SELECT n.nspname = (
+               SELECT n2.nspname
+                 FROM pg_catalog.pg_proc p2
+                 INNER LOOKUP JOIN pg_catalog.pg_namespace n2
+                 ON p2.pronamespace = n2.oid
+                 JOIN unnest(current_schemas(true)) WITH ORDINALITY AS path(nspname, ordinality)
+                 ON n2.nspname = path.nspname
+                WHERE p2.proname = p.proname
+                ORDER BY path.ordinality
+                LIMIT 1
+             )
              FROM pg_catalog.pg_proc p
              INNER LOOKUP JOIN pg_catalog.pg_namespace n
              ON p.pronamespace = n.oid
              WHERE p.oid=$1 LIMIT 1`,
 			CalledOnNullInput: true,
-			Info:              "Returns whether the function with the given OID belongs to one of the schemas on the search path.",
+			Info:              "Returns whether the function with the given OID is visible on the search path.",
 			Volatility:        volatility.Stable,
 			Language:          tree.RoutineLangSQL,
 		},
 	),
 	// pg_table_is_visible returns true if the input oid corresponds to a table
-	// that is part of the schemas on the search path.
+	// whose schema is the first search path schema that contains its name.
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_table_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
-			Body: `SELECT n.nspname = any current_schemas(true)
+			Body: `SELECT n.nspname = (
+               SELECT n2.nspname
+                 FROM pg_catalog.pg_class c2
+                 INNER LOOKUP JOIN pg_catalog.pg_namespace n2
+                 ON c2.relnamespace = n2.oid
+                 JOIN unnest(current_schemas(true)) WITH ORDINALITY AS path(nspname, ordinality)
+                 ON n2.nspname = path.nspname
+                WHERE c2.relname = c.relname
+                ORDER BY path.ordinality
+                LIMIT 1
+             )
              FROM pg_catalog.pg_class c
              INNER LOOKUP JOIN pg_catalog.pg_namespace n
              ON c.relnamespace = n.oid
              WHERE c.oid=$1 LIMIT 1`,
 			CalledOnNullInput: true,
-			Info:              "Returns whether the table with the given OID belongs to one of the schemas on the search path.",
+			Info:              "Returns whether the table with the given OID is visible on the search path.",
 			Volatility:        volatility.Stable,
 			Language:          tree.RoutineLangSQL,
 		},
 	),
 
 	// pg_type_is_visible returns true if the input oid corresponds to a type
-	// that is part of the databases on the search path, or NULL if no such type
+	// whose schema is the first search path schema that contains its name, or NULL if no such type
 	// exists. CockroachDB doesn't support the notion of type visibility for
 	// builtin types, so we  always return true for those. For user-defined types,
 	// we consult pg_type.
@@ -1793,13 +1813,23 @@ FROM defaults_parsed
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
-			Body: `SELECT n.nspname = any current_schemas(true)
+			Body: `SELECT n.nspname = (
+               SELECT n2.nspname
+                 FROM pg_catalog.pg_type t2
+                 INNER LOOKUP JOIN pg_catalog.pg_namespace n2
+                 ON t2.typnamespace = n2.oid
+                 JOIN unnest(current_schemas(true)) WITH ORDINALITY AS path(nspname, ordinality)
+                 ON n2.nspname = path.nspname
+                WHERE t2.typname = t.typname
+                ORDER BY path.ordinality
+                LIMIT 1
+             )
              FROM pg_catalog.pg_type t
              INNER LOOKUP JOIN pg_catalog.pg_namespace n
              ON t.typnamespace = n.oid
              WHERE t.oid=$1 LIMIT 1`,
 			CalledOnNullInput: true,
-			Info:              "Returns whether the type with the given OID belongs to one of the schemas on the search path.",
+			Info:              "Returns whether the type with the given OID is visible on the search path.",
 			Volatility:        volatility.Stable,
 			Language:          tree.RoutineLangSQL,
 		},

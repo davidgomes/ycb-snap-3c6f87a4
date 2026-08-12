@@ -1119,30 +1119,6 @@ func performIntToOidCast(
 	switch t.Oid() {
 	case oid.T_oid:
 		return tree.NewDOidWithType(o, t), nil
-	case oid.T_regtype:
-		// Mapping an dOid to a regtype is easy: we have a hardcoded map.
-		var name string
-		if typ, ok := types.OidToType[o]; ok {
-			name = typ.PGName()
-		} else if types.IsOIDUserDefinedType(o) {
-			typ, err := res.ResolveTypeByOID(ctx, o)
-			if err != nil {
-				return nil, err
-			}
-			name = typ.PGName()
-		}
-		return tree.NewDOidWithTypeAndName(o, t, name), nil
-
-	case oid.T_regproc, oid.T_regprocedure:
-		name, _, err := res.ResolveFunctionByOID(ctx, oid.Oid(v))
-		if err != nil {
-			if errors.Is(err, tree.ErrRoutineUndefined) {
-				return tree.NewDOidWithType(o, t), nil //nolint:returnerrcheck
-			}
-			return nil, err
-		}
-		return tree.NewDOidWithTypeAndName(o, t, name.Object()), nil
-
 	default:
 		dOid, errSafeToIgnore, err := res.ResolveOIDFromOID(ctx, t, tree.NewDOid(o))
 		if err != nil {

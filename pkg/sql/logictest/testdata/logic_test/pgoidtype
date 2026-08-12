@@ -616,21 +616,21 @@ SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
 JOIN pg_namespace n ON c.relnamespace = n.oid
 WHERE c.oid='other_schema.table_with_indexes'::regclass
 ----
-table_with_indexes  table_with_indexes  other_schema
+table_with_indexes  other_schema.table_with_indexes  other_schema
 
 query TTT
 SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
 JOIN pg_namespace n ON c.relnamespace = n.oid
 WHERE c.oid='other_schema.table_with_indexes_pkey'::regclass
 ----
-table_with_indexes_pkey  table_with_indexes_pkey  other_schema
+table_with_indexes_pkey  other_schema.table_with_indexes_pkey  other_schema
 
 query TTT
 SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
 JOIN pg_namespace n ON c.relnamespace = n.oid
 WHERE c.oid='other_schema.my_b_index'::regclass
 ----
-my_b_index  my_b_index  other_schema
+my_b_index  other_schema.my_b_index  other_schema
 
 # Changing the search_path should influence what gets resolved while casting.
 
@@ -681,6 +681,70 @@ JOIN pg_namespace n ON c.relnamespace = n.oid
 WHERE c.oid='my_b_index'::regclass
 ----
 my_b_index  my_b_index  public
+
+statement ok
+RESET search_path
+
+# reg* output must be schema-qualified when an earlier search path entry
+# shadows the name, and the visibility predicates must use the same rule.
+statement ok
+CREATE TABLE visibility_table (id INT PRIMARY KEY);
+CREATE TABLE other_schema.visibility_table (id INT PRIMARY KEY);
+CREATE FUNCTION visibility_fn() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE FUNCTION other_schema.visibility_fn() RETURNS INT LANGUAGE SQL AS $$ SELECT 2 $$;
+CREATE TYPE visibility_typ AS ENUM ('public');
+CREATE TYPE other_schema.visibility_typ AS ENUM ('other');
+
+statement ok
+SET search_path = public, other_schema
+
+query TTTT
+SELECT 'other_schema.visibility_table'::regclass::text,
+       'other_schema.visibility_fn'::regproc::text,
+       'other_schema.visibility_fn()'::regprocedure::text,
+       'other_schema.visibility_typ'::regtype::text
+----
+other_schema.visibility_table  other_schema.visibility_fn  other_schema.visibility_fn  other_schema.visibility_typ
+
+query BBBBBB
+SELECT pg_table_is_visible('other_schema.visibility_table'::regclass::oid),
+       pg_table_is_visible('visibility_table'::regclass::oid),
+       pg_function_is_visible('other_schema.visibility_fn()'::regprocedure::oid),
+       pg_function_is_visible('visibility_fn()'::regprocedure::oid),
+       pg_type_is_visible('other_schema.visibility_typ'::regtype::oid),
+       pg_type_is_visible('visibility_typ'::regtype::oid)
+----
+false  true  false  true  false  true
+
+statement ok
+SET search_path = other_schema, public
+
+query TTTT
+SELECT 'other_schema.visibility_table'::regclass::text,
+       'other_schema.visibility_fn'::regproc::text,
+       'other_schema.visibility_fn()'::regprocedure::text,
+       'other_schema.visibility_typ'::regtype::text
+----
+visibility_table  visibility_fn  visibility_fn  visibility_typ
+
+query BBBBBB
+SELECT pg_table_is_visible('public.visibility_table'::regclass::oid),
+       pg_table_is_visible('visibility_table'::regclass::oid),
+       pg_function_is_visible('public.visibility_fn()'::regprocedure::oid),
+       pg_function_is_visible('visibility_fn()'::regprocedure::oid),
+       pg_type_is_visible('public.visibility_typ'::regtype::oid),
+       pg_type_is_visible('visibility_typ'::regtype::oid)
+----
+false  true  false  true  false  true
+
+statement ok
+CREATE SCHEMA "Schema With Space";
+CREATE TABLE "Schema With Space"."Mixed Name" (id INT PRIMARY KEY);
+
+query T
+SELECT '"Schema With Space"."Mixed Name"'::regclass::text
+----
+"Schema With Space"."Mixed Name"
 
 statement ok
 RESET search_path
