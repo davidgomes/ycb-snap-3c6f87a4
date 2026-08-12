@@ -307,6 +307,17 @@ CREATE TYPE domain_schema_1."_domain_schema_test" AS ENUM ('conflict')
 statement error pq: type "test.domain_schema_1._domain_schema_test" already exists
 ALTER DOMAIN domain_schema_2.domain_schema_test SET SCHEMA domain_schema_1
 
+# Failed moves leave both descriptors in the source schema.
+query I
+SELECT 1::domain_schema_2.domain_schema_test
+----
+1
+
+query T
+SELECT ARRAY[1]::domain_schema_2._domain_schema_test
+----
+{1}
+
 statement ok
 DROP TYPE domain_schema_1."_domain_schema_test";
 DROP TABLE domain_schema_ref;
