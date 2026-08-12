@@ -60,6 +60,7 @@
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_cast.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_database.h"
@@ -132,6 +133,7 @@
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/array.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
@@ -9136,6 +9138,28 @@ string_list_compare(const ListCell *a, const ListCell *b)
 	return strcmp((char *) lfirst(a), (char *) lfirst(b));
 }
 
+static bool
+YbCanViewTabletMetadata(const YbcPgGlobalTabletsDescriptor *tablet,
+						const char *current_database_name,
+						bool is_privileged)
+{
+	const YbcPgTabletsDescriptor *tablet_descriptor = &tablet->tablet_descriptor;
+
+	if (strcmp(tablet_descriptor->namespace_name, "system") == 0 &&
+		strcmp(tablet_descriptor->table_name, "transactions") == 0)
+		return true;
+
+	if (is_privileged)
+		return true;
+
+	if (strcmp(tablet_descriptor->namespace_name, current_database_name) != 0 ||
+		!OidIsValid(tablet->pg_table_oid) ||
+		!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(tablet->pg_table_oid)))
+		return false;
+
+	return pg_class_aclcheck(tablet->pg_table_oid, GetUserId(), ACL_SELECT) == ACLCHECK_OK;
+}
+
 /*
  * Returns the metadata for all tablets in the cluster.
  * The returned data structure is a row type with the following columns:
@@ -9200,6 +9224,9 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 
 	YbcPgGlobalTabletsDescriptor *tablets = NULL;
 	size_t		num_tablets = 0;
+	const char *current_database_name = get_database_name(MyDatabaseId);
+	bool		is_privileged = superuser() ||
+		is_member_of_role(GetUserId(), DEFAULT_ROLE_YB_DB_ADMIN);
 
 	HandleYBStatus(YBCTabletsMetadata(&tablets, &num_tablets));
 
@@ -9209,9 +9236,13 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 		YbcPgTabletsDescriptor *tablet_descriptor = &tablet->tablet_descriptor;
 		Datum		values[ncols];
 		bool		nulls[ncols];
+		bool		can_view_sensitive_columns;
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
+
+		can_view_sensitive_columns =
+			YbCanViewTabletMetadata(tablet, current_database_name, is_privileged);
 
 		values[0] = CStringGetTextDatum(tablet_descriptor->tablet_id);
 		values[1] = CStringGetTextDatum(tablet_descriptor->table_id);
@@ -9228,7 +9259,9 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 
 		values[3] = CStringGetTextDatum(tablet_descriptor->namespace_name);
-		values[4] = CStringGetTextDatum(tablet_descriptor->table_name);
+		values[4] = CStringGetTextDatum(can_view_sensitive_columns
+										? tablet_descriptor->table_name
+										: "<insufficient privilege>");
 		values[5] = CStringGetTextDatum(tablet_descriptor->table_type);
 
 		if (tablet->is_hash_partitioned)
@@ -9274,9 +9307,33 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[9] = true;
 		}
 
-		/* TODO (#28172): start_range, end_range, tablet_attrs are populated in a follow-up change. */
-		nulls[10] = true;
-		nulls[11] = true;
+		if (tablet->is_hash_partitioned)
+		{
+			nulls[10] = true;
+			nulls[11] = true;
+		}
+		else if (can_view_sensitive_columns)
+		{
+			if (tablet_descriptor->partition_key_start_len > 0)
+				values[10] = CStringGetTextDatum(
+					YBCDecodeRangePartitionKey(tablet_descriptor->partition_key_start,
+											   tablet_descriptor->partition_key_start_len));
+			else
+				nulls[10] = true;
+
+			if (tablet_descriptor->partition_key_end_len > 0)
+				values[11] = CStringGetTextDatum(
+					YBCDecodeRangePartitionKey(tablet_descriptor->partition_key_end,
+											   tablet_descriptor->partition_key_end_len));
+			else
+				nulls[11] = true;
+		}
+		else
+		{
+			values[10] = CStringGetTextDatum("<insufficient privilege>");
+			values[11] = CStringGetTextDatum("<insufficient privilege>");
+		}
+
 		nulls[12] = true;
 
 		if (tablet->tablet_state)

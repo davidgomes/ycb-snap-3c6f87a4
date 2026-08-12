@@ -905,6 +905,10 @@ uint16_t YBCDecodeMultiColumnHashRightBound(const char* partition_key, size_t ke
       dockv::PartitionSchema::DecodePartitionKeyEndAsHashRightBoundInclusive(slice));
 }
 
+const char* YBCDecodeRangePartitionKey(const char* partition_key, size_t key_len) {
+  return YBCPAllocStdString(dockv::DocKey::DebugSliceToString(yb::Slice(partition_key, key_len)));
+}
+
 bool YBCIsObjectLockingEnabled() {
   return FLAGS_enable_object_locking_for_table_locks && enable_object_locking_infra;
 }

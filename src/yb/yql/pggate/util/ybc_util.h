@@ -173,6 +173,7 @@ void YBCUpdateInitPostgresMetrics();
 // Partition key hash decoding helpers
 uint16_t YBCDecodeMultiColumnHashLeftBound(const char* partition_key, size_t key_len);
 uint16_t YBCDecodeMultiColumnHashRightBound(const char* partition_key, size_t key_len);
+const char* YBCDecodeRangePartitionKey(const char* partition_key, size_t key_len);
 
 bool YBCIsObjectLockingEnabled();
 void YBCPgSetClampUncertaintyWindow(bool clamp);
