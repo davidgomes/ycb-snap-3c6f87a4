@@ -305,3 +305,92 @@ func TestContextMetadata(t *testing.T) {
 		require.Nil(t, md)
 	})
 }
+
+// TestHasEnoughTimeForRetry verifies that the schedule-to-close deadline used to gate retries is
+// measured from schedule_time + start_delay, so a start delay does not cause retries to be
+// rejected early by roughly the delay duration.
+func TestHasEnoughTimeForRetry(t *testing.T) {
+	testCases := []struct {
+		name                    string
+		startDelay              time.Duration
+		scheduleToCloseTimeout  time.Duration
+		now                     time.Time
+		overridingRetryInterval time.Duration
+		expectEnoughTime        bool
+	}{
+		{
+			name:                    "without start delay - retry rejected near schedule-to-close boundary",
+			startDelay:              0,
+			scheduleToCloseTimeout:  10 * time.Minute,
+			now:                     defaultTime.Add(9 * time.Minute),
+			overridingRetryInterval: 2 * time.Minute,
+			expectEnoughTime:        false,
+		},
+		{
+			name:                    "start delay extends the deadline, allowing the same retry",
+			startDelay:              5 * time.Minute,
+			scheduleToCloseTimeout:  10 * time.Minute,
+			now:                     defaultTime.Add(9 * time.Minute),
+			overridingRetryInterval: 2 * time.Minute,
+			expectEnoughTime:        true,
+		},
+		{
+			name:                    "no schedule-to-close timeout - always enough time",
+			startDelay:              0,
+			scheduleToCloseTimeout:  0,
+			now:                     defaultTime.Add(365 * 24 * time.Hour),
+			overridingRetryInterval: 2 * time.Minute,
+			expectEnoughTime:        true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := &chasm.MockMutableContext{
+				MockContext: chasm.MockContext{
+					HandleNow: func(chasm.Component) time.Time { return tc.now },
+				},
+			}
+			activity := &Activity{
+				ActivityState: &activitypb.ActivityState{
+					ScheduleToCloseTimeout: durationpb.New(tc.scheduleToCloseTimeout),
+					ScheduleTime:           timestamppb.New(defaultTime),
+					StartDelay:             durationpb.New(tc.startDelay),
+				},
+				LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{Count: 1}),
+			}
+
+			enoughTime, _ := activity.hasEnoughTimeForRetry(ctx, tc.overridingRetryInterval)
+			require.Equal(t, tc.expectEnoughTime, enoughTime)
+		})
+	}
+}
+
+// TestAttemptScheduleTime verifies that the first attempt's scheduled time reflects the start
+// delay, while retries (computed from attemptScheduleTimeForRetry) do not re-apply it.
+func TestAttemptScheduleTime(t *testing.T) {
+	startDelay := 90 * time.Second
+	activity := &Activity{
+		ActivityState: &activitypb.ActivityState{
+			ScheduleTime: timestamppb.New(defaultTime),
+			StartDelay:   durationpb.New(startDelay),
+		},
+	}
+
+	t.Run("first attempt includes start delay", func(t *testing.T) {
+		attempt := &activitypb.ActivityAttemptState{Count: 1}
+		scheduledTime := activity.attemptScheduleTime(attempt)
+		require.Equal(t, defaultTime.Add(startDelay), scheduledTime.AsTime())
+	})
+
+	t.Run("retry attempt does not re-apply start delay", func(t *testing.T) {
+		completeTime := defaultTime.Add(5 * time.Minute)
+		attempt := &activitypb.ActivityAttemptState{
+			Count:                2,
+			CompleteTime:         timestamppb.New(completeTime),
+			CurrentRetryInterval: durationpb.New(time.Minute),
+		}
+		scheduledTime := activity.attemptScheduleTime(attempt)
+		require.Equal(t, completeTime.Add(time.Minute), scheduledTime.AsTime())
+	})
+}

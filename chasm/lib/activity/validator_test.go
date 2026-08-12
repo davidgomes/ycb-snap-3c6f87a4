@@ -409,6 +409,7 @@ func newTestFrontendHandler(
 			BlobSizeLimitError: blobSizeLimitError,
 			BlobSizeLimitWarn:  blobSizeLimitWarn,
 			MaxIDLengthLimit:   func() int { return maxIDLengthLimit },
+			StartDelayEnabled:  func(string) bool { return false },
 		},
 		logger: log.NewNoopLogger(),
 	}
@@ -685,6 +686,27 @@ func TestValidateDeleteActivityExecutionRequest(t *testing.T) {
 		err := validateAndNormalizeDeleteRequest(req, defaultMaxIDLengthLimit)
 		var invalidArgErr *serviceerror.InvalidArgument
 		require.ErrorAs(t, err, &invalidArgErr)
+	})
+}
+
+func TestValidateStartDelay(t *testing.T) {
+	t.Run("nil is valid", func(t *testing.T) {
+		require.NoError(t, validateStartDelay(nil))
+	})
+
+	t.Run("zero is valid", func(t *testing.T) {
+		require.NoError(t, validateStartDelay(durationpb.New(0)))
+	})
+
+	t.Run("positive duration is valid", func(t *testing.T) {
+		require.NoError(t, validateStartDelay(durationpb.New(time.Minute)))
+	})
+
+	t.Run("negative duration is rejected", func(t *testing.T) {
+		err := validateStartDelay(durationpb.New(-time.Second))
+		var invalidArgErr *serviceerror.InvalidArgument
+		require.ErrorAs(t, err, &invalidArgErr)
+		require.Contains(t, invalidArgErr.Error(), "invalid StartDelay")
 	})
 }
 

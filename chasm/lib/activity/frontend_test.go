@@ -26,6 +26,7 @@ func TestRequestIdStableAcrossRetries(t *testing.T) {
 			BlobSizeLimitWarn:          defaultBlobSizeLimitWarn,
 			MaxIDLengthLimit:           func() int { return defaultMaxIDLengthLimit },
 			DefaultActivityRetryPolicy: getDefaultRetrySettings,
+			StartDelayEnabled:          func(string) bool { return false },
 		},
 		logger: log.NewNoopLogger(),
 	}
@@ -97,5 +98,66 @@ func TestRequestIdStableAcrossRetries(t *testing.T) {
 			return validateAndNormalizeCancelRequest(
 				req, defaultMaxIDLengthLimit, defaultBlobSizeLimitError, defaultBlobSizeLimitWarn, log.NewNoopLogger())
 		})
+	})
+}
+
+// TestStartDelayHonoredWhenEnabled verifies that StartActivityExecution requests only carry
+// through the start_delay field when the namespace-scoped feature is enabled, and that the
+// request's start_delay is otherwise dropped rather than rejected.
+func TestStartDelayHonoredWhenEnabled(t *testing.T) {
+	nsID := namespace.ID("test-namespace-id")
+	newReq := func(startDelay *durationpb.Duration) *workflowservice.StartActivityExecutionRequest {
+		return &workflowservice.StartActivityExecutionRequest{
+			Namespace:  "test-namespace",
+			ActivityId: "test-activity",
+			ActivityType: &commonpb.ActivityType{
+				Name: "test-type",
+			},
+			TaskQueue: &taskqueuepb.TaskQueue{
+				Name: "test-queue",
+			},
+			StartToCloseTimeout: durationpb.New(time.Minute),
+			StartDelay:          startDelay,
+		}
+	}
+
+	newHandler := func(enabled bool) *frontendHandler {
+		return &frontendHandler{
+			config: &Config{
+				BlobSizeLimitError:         defaultBlobSizeLimitError,
+				BlobSizeLimitWarn:          defaultBlobSizeLimitWarn,
+				MaxIDLengthLimit:           func() int { return defaultMaxIDLengthLimit },
+				DefaultActivityRetryPolicy: getDefaultRetrySettings,
+				StartDelayEnabled:          func(string) bool { return enabled },
+			},
+			logger: log.NewNoopLogger(),
+		}
+	}
+
+	t.Run("honored when enabled", func(t *testing.T) {
+		h := newHandler(true)
+		req, err := h.validateAndPopulateStartRequest(newReq(durationpb.New(30*time.Second)), nsID)
+		require.NoError(t, err)
+		require.Equal(t, 30*time.Second, req.GetStartDelay().AsDuration())
+	})
+
+	t.Run("dropped when disabled", func(t *testing.T) {
+		h := newHandler(false)
+		req, err := h.validateAndPopulateStartRequest(newReq(durationpb.New(30*time.Second)), nsID)
+		require.NoError(t, err)
+		require.Nil(t, req.GetStartDelay())
+	})
+
+	t.Run("negative start delay rejected when enabled", func(t *testing.T) {
+		h := newHandler(true)
+		_, err := h.validateAndPopulateStartRequest(newReq(durationpb.New(-time.Second)), nsID)
+		require.Error(t, err)
+	})
+
+	t.Run("negative start delay ignored when disabled", func(t *testing.T) {
+		h := newHandler(false)
+		req, err := h.validateAndPopulateStartRequest(newReq(durationpb.New(-time.Second)), nsID)
+		require.NoError(t, err)
+		require.Nil(t, req.GetStartDelay())
 	})
 }
