@@ -172,6 +172,13 @@ static int rd_kafka_mock_handle_Produce(rd_kafka_mock_connection_t *mconn,
                         else if (mpart->leader != mconn->broker)
                                 err =
                                     RD_KAFKA_RESP_ERR_NOT_LEADER_FOR_PARTITION;
+                        else {
+                                mtx_lock(&mcluster->lock);
+                                err =
+                                    rd_kafka_mock_partition_next_request_error(
+                                        mpart, rkbuf->rkbuf_reqhdr.ApiKey);
+                                mtx_unlock(&mcluster->lock);
+                        }
 
                         /* Append to partition log */
                         if (!err)
@@ -495,6 +502,14 @@ static int rd_kafka_mock_handle_Fetch(rd_kafka_mock_connection_t *mconn,
                                          !on_follower)
                                         err =
                                             RD_KAFKA_RESP_ERR_NOT_LEADER_OR_FOLLOWER;
+                                else if (mpart) {
+                                        mtx_lock(&mcluster->lock);
+                                        err =
+                                            rd_kafka_mock_partition_next_request_error(
+                                                mpart,
+                                                rkbuf->rkbuf_reqhdr.ApiKey);
+                                        mtx_unlock(&mcluster->lock);
+                                }
                         }
 
                         if (!err && mpart)
@@ -4376,6 +4391,12 @@ static int rd_kafka_mock_handle_ShareFetch(rd_kafka_mock_connection_t *mconn,
                                 if (mpart->leader != mconn->broker)
                                         continue;
 
+                                rktpar->err =
+                                    rd_kafka_mock_partition_next_request_error(
+                                        mpart, rkbuf->rkbuf_reqhdr.ApiKey);
+                                if (rktpar->err)
+                                        continue;
+
                                 rd_kafka_mock_sgrp_partmeta_t *pmeta =
                                     rd_kafka_mock_sgrp_partmeta_get(
                                         sgrp, topic_id, rktpar->partition,
@@ -4494,7 +4515,9 @@ static int rd_kafka_mock_handle_ShareFetch(rd_kafka_mock_connection_t *mconn,
                                         rd_kafka_resp_err_t ack_err;
                                         rd_kafka_resp_err_t part_err;
 
-                                        if (!mpart)
+                                        if (rktpar->err)
+                                                part_err = rktpar->err;
+                                        else if (!mpart)
                                                 part_err =
                                                     RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART;
                                         else if (mpart->leader != mconn->broker)
@@ -4840,6 +4863,33 @@ rd_kafka_mock_handle_ShareAcknowledge(rd_kafka_mock_connection_t *mconn,
                         session->session_epoch++;
                 }
 
+                if (!err) {
+                        int i;
+
+                        for (i = 0; i < ack_partitions->cnt; i++) {
+                                rd_kafka_topic_partition_t *rktpar =
+                                    &ack_partitions->elems[i];
+                                rd_kafka_Uuid_t topic_id =
+                                    rd_kafka_topic_partition_get_topic_id(
+                                        rktpar);
+                                rd_kafka_mock_topic_t *mtopic =
+                                    rd_kafka_mock_topic_find_by_id(mcluster,
+                                                                   topic_id);
+                                rd_kafka_mock_partition_t *mpart =
+                                    mtopic
+                                        ? rd_kafka_mock_partition_find(
+                                              mtopic, rktpar->partition)
+                                        : NULL;
+
+                                if (mpart &&
+                                    mpart->leader == mconn->broker)
+                                        rktpar->err =
+                                            rd_kafka_mock_partition_next_request_error(
+                                                mpart,
+                                                rkbuf->rkbuf_reqhdr.ApiKey);
+                        }
+                }
+
                 /* Apply acknowledgement batches */
                 if (!err && sgrp && rd_list_cnt(&ack_entries) > 0) {
                         int k;
@@ -4852,6 +4902,15 @@ rd_kafka_mock_handle_ShareAcknowledge(rd_kafka_mock_connection_t *mconn,
                         for (k = 0; k < rd_list_cnt(&ack_entries); k++) {
                                 struct rd_kafka_mock_sgrp_ack_entry *entry =
                                     rd_list_elem(&ack_entries, k);
+                                int idx =
+                                    rd_kafka_topic_partition_list_find_idx_by_id(
+                                        ack_partitions, entry->topic_id,
+                                        entry->partition);
+
+                                if (idx >= 0 &&
+                                    ack_partitions->elems[idx].err)
+                                        continue;
+
                                 entry->err = rd_kafka_mock_sgrp_apply_ack(
                                     sgrp, entry->topic_id, entry->partition,
                                     entry->first_offset, entry->last_offset,
@@ -4944,7 +5003,9 @@ rd_kafka_mock_handle_ShareAcknowledge(rd_kafka_mock_connection_t *mconn,
                                                 : NULL;
                                         rd_kafka_resp_err_t part_err;
 
-                                        if (!mpart)
+                                        if (rktpar->err)
+                                                part_err = rktpar->err;
+                                        else if (!mpart)
                                                 part_err =
                                                     RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART;
                                         else if (mpart->leader != mconn->broker)

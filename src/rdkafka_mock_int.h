@@ -528,6 +528,10 @@ typedef struct rd_kafka_mock_partition_s {
         /**< Leader responses */
         TAILQ_HEAD(, rd_kafka_mock_partition_leader_s)
         leader_responses;
+
+        /**< Per-protocol request error stack.
+         *   @locks mcluster->lock */
+        rd_kafka_mock_error_stack_head_t errstacks;
 } rd_kafka_mock_partition_t;
 
 
@@ -785,6 +789,13 @@ rd_kafka_mock_msgset_find(const rd_kafka_mock_partition_t *mpart,
 rd_kafka_resp_err_t
 rd_kafka_mock_next_request_error(rd_kafka_mock_connection_t *mconn,
                                  rd_kafka_buf_t *resp);
+
+/**
+ * @locks mcluster->lock MUST be held.
+ */
+rd_kafka_resp_err_t rd_kafka_mock_partition_next_request_error(
+    rd_kafka_mock_partition_t *mpart,
+    int16_t ApiKey);
 
 rd_kafka_resp_err_t
 rd_kafka_mock_partition_log_append(rd_kafka_mock_partition_t *mpart,

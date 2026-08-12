@@ -51,6 +51,8 @@ rd_kafka_mock_request_new(int32_t id, int16_t api_key, int64_t timestamp_us);
 static void rd_kafka_mock_request_free(void *element);
 static void rd_kafka_mock_coord_remove(rd_kafka_mock_cluster_t *mcluster,
                                        int32_t broker_id);
+static void
+rd_kafka_mock_error_stack_destroy(rd_kafka_mock_error_stack_t *errstack);
 
 static rd_kafka_mock_broker_t *
 rd_kafka_mock_broker_find(const rd_kafka_mock_cluster_t *mcluster,
@@ -873,6 +875,7 @@ static void rd_kafka_mock_partition_destroy(rd_kafka_mock_partition_t *mpart) {
         rd_kafka_mock_committed_offset_t *coff, *tmpcoff;
         rd_kafka_mock_partition_leader_t *mpart_leader, *tmp_mpart_leader;
         rd_kafka_mock_aborted_txn_t *mabort, *tmp_mabort;
+        rd_kafka_mock_error_stack_t *errstack;
 
         TAILQ_FOREACH_SAFE(mset, &mpart->msgsets, link, tmp)
         rd_kafka_mock_msgset_destroy(mpart, mset);
@@ -889,6 +892,11 @@ static void rd_kafka_mock_partition_destroy(rd_kafka_mock_partition_t *mpart) {
         TAILQ_FOREACH_SAFE(mabort, &mpart->aborted_txns, link, tmp_mabort) {
                 TAILQ_REMOVE(&mpart->aborted_txns, mabort, link);
                 rd_free(mabort);
+        }
+
+        while ((errstack = TAILQ_FIRST(&mpart->errstacks))) {
+                TAILQ_REMOVE(&mpart->errstacks, errstack, link);
+                rd_kafka_mock_error_stack_destroy(errstack);
         }
 
         rd_free(mpart->replicas);
@@ -916,6 +924,7 @@ static void rd_kafka_mock_partition_init(rd_kafka_mock_topic_t *mtopic,
 
         TAILQ_INIT(&mpart->committed_offsets);
         TAILQ_INIT(&mpart->leader_responses);
+        TAILQ_INIT(&mpart->errstacks);
 
         rd_list_init(&mpart->pidstates, 0, rd_free);
 
@@ -2260,6 +2269,18 @@ rd_kafka_mock_error_stack_get(rd_kafka_mock_error_stack_head_t *shead,
         return errstack;
 }
 
+rd_kafka_resp_err_t rd_kafka_mock_partition_next_request_error(
+    rd_kafka_mock_partition_t *mpart,
+    int16_t ApiKey) {
+        rd_kafka_mock_error_stack_t *errstack;
+
+        errstack = rd_kafka_mock_error_stack_find(&mpart->errstacks, ApiKey);
+        if (!errstack)
+                return RD_KAFKA_RESP_ERR_NO_ERROR;
+
+        return rd_kafka_mock_error_stack_next(errstack).err;
+}
+
 
 
 /**
@@ -2375,6 +2396,53 @@ void rd_kafka_mock_push_request_errors(rd_kafka_mock_cluster_t *mcluster,
         va_end(ap);
 
         rd_kafka_mock_push_request_errors_array(mcluster, ApiKey, cnt, errors);
+}
+
+rd_kafka_resp_err_t
+rd_kafka_mock_partition_push_request_errors(rd_kafka_mock_cluster_t *mcluster,
+                                            const char *topic,
+                                            int32_t partition,
+                                            int16_t ApiKey,
+                                            size_t cnt,
+                                            ...) {
+        rd_kafka_mock_partition_t *mpart;
+        rd_kafka_mock_error_stack_t *errstack;
+        rd_kafka_resp_err_t *errors;
+        va_list ap;
+        size_t i, totcnt;
+
+        errors = rd_alloca(sizeof(*errors) * cnt);
+        va_start(ap, cnt);
+        for (i = 0; i < cnt; i++)
+                errors[i] = va_arg(ap, rd_kafka_resp_err_t);
+        va_end(ap);
+
+        if (partition < 0)
+                return RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART;
+
+        mtx_lock(&mcluster->lock);
+
+        mpart = rd_kafka_mock_partition_get(mcluster, topic, partition);
+        if (!mpart) {
+                mtx_unlock(&mcluster->lock);
+                return RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART;
+        }
+
+        errstack = rd_kafka_mock_error_stack_get(&mpart->errstacks, ApiKey);
+        totcnt   = errstack->cnt + cnt;
+        if (totcnt > errstack->size) {
+                errstack->size = totcnt + 4;
+                errstack->errs = rd_realloc(
+                    errstack->errs, errstack->size * sizeof(*errstack->errs));
+        }
+
+        for (i = 0; i < cnt; i++) {
+                errstack->errs[errstack->cnt].err   = errors[i];
+                errstack->errs[errstack->cnt++].rtt = 0;
+        }
+
+        mtx_unlock(&mcluster->lock);
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
 }
 
 

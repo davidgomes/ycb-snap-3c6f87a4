@@ -167,6 +167,26 @@ rd_kafka_mock_push_request_errors_array(rd_kafka_mock_cluster_t *mcluster,
                                         size_t cnt,
                                         const rd_kafka_resp_err_t *errors);
 
+/**
+ * @brief Push \p cnt errors in the \p ... va-arg list onto a partition's
+ *        error stack for the given \p ApiKey.
+ *
+ * The following requests matching \p ApiKey for the given topic-partition
+ * will fail with the provided error codes, starting with the first error code.
+ * Unknown topics are automatically created; an out-of-range partition for an
+ * existing topic returns \c RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART.
+ *
+ * @returns \c RD_KAFKA_RESP_ERR_NO_ERROR on success, or an error if the
+ *          topic-partition could not be configured.
+ */
+RD_EXPORT rd_kafka_resp_err_t
+rd_kafka_mock_partition_push_request_errors(rd_kafka_mock_cluster_t *mcluster,
+                                            const char *topic,
+                                            int32_t partition,
+                                            int16_t ApiKey,
+                                            size_t cnt,
+                                            ...);
+
 
 /**
  * @brief Apply broker configuration group.initial.rebalance.delay.ms
