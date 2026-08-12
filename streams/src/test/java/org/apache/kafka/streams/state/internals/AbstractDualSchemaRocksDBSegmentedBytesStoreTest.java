@@ -17,6 +17,7 @@
 package org.apache.kafka.streams.state.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.header.Headers;
@@ -1674,6 +1675,105 @@ public abstract class AbstractDualSchemaRocksDBSegmentedBytesStoreTest {
         for (final KeyValueSegment segment : bytesStore.getSegments()) {
             assertEquals(expected, segment.getPosition());
         }
+    }
+
+    @Test
+    public void readCommittedShouldHideStagedWritesUntilCommit() {
+        initTransactional();
+        final Bytes storeKey = serializeKey(new Windowed<>("a", windows[0]));
+
+        bytesStore.put(storeKey, serializeValue(10L));
+        bytesStore.commit(Map.of());
+        bytesStore.put(storeKey, serializeValue(50L));
+
+        final AbstractRocksDBTimeOrderedSegmentedBytesStore.ReadOnlyView uncommitted =
+            timeOrderedStore().readOnly(IsolationLevel.READ_UNCOMMITTED);
+        final AbstractRocksDBTimeOrderedSegmentedBytesStore.ReadOnlyView committed =
+            timeOrderedStore().readOnly(IsolationLevel.READ_COMMITTED);
+        assertEquals(50L, deserializeValue(uncommitted.get(storeKey)));
+        assertEquals(10L, deserializeValue(committed.get(storeKey)));
+
+        try (KeyValueIterator<Bytes, byte[]> iterator = uncommitted.fetch(Bytes.wrap("a".getBytes()), 0, windows[0].start())) {
+            assertTrue(iterator.hasNext());
+            assertEquals(50L, deserializeValue(iterator.next().value));
+        }
+        try (KeyValueIterator<Bytes, byte[]> iterator = committed.fetch(Bytes.wrap("a".getBytes()), 0, windows[0].start())) {
+            assertTrue(iterator.hasNext());
+            assertEquals(10L, deserializeValue(iterator.next().value));
+        }
+    }
+
+    @Test
+    public void commitShouldPublishStagedWritesAndPosition() {
+        initTransactional();
+        final Bytes storeKey = serializeKey(new Windowed<>("a", windows[0]));
+
+        context.setRecordContext(new ProcessorRecordContext(0, 1L, 0, "input", new RecordHeaders()));
+        bytesStore.put(storeKey, serializeValue(10L));
+        bytesStore.commit(Map.of());
+
+        context.setRecordContext(new ProcessorRecordContext(0, 5L, 0, "input", new RecordHeaders()));
+        bytesStore.put(storeKey, serializeValue(50L));
+
+        assertEquals(10L, deserializeValue(timeOrderedStore().readOnly(IsolationLevel.READ_COMMITTED).get(storeKey)));
+        assertEquals(Map.of(0, 1L), timeOrderedStore().getCommittedPosition().getPartitionPositions("input"));
+        assertEquals(Map.of(0, 5L), timeOrderedStore().getPosition().getPartitionPositions("input"));
+
+        bytesStore.commit(Map.of());
+
+        assertEquals(50L, deserializeValue(timeOrderedStore().readOnly(IsolationLevel.READ_COMMITTED).get(storeKey)));
+        assertEquals(50L, deserializeValue(timeOrderedStore().readOnly(IsolationLevel.READ_UNCOMMITTED).get(storeKey)));
+        assertEquals(Map.of(0, 5L), timeOrderedStore().getCommittedPosition().getPartitionPositions("input"));
+    }
+
+    @Test
+    public void approximateNumUncommittedBytesShouldReflectStagedWrites() {
+        initTransactional();
+        final Bytes storeKey = serializeKey(new Windowed<>("a", windows[0]));
+
+        assertEquals(0, timeOrderedStore().approximateNumUncommittedBytes());
+        bytesStore.put(storeKey, serializeValue(10L));
+        final long staged = timeOrderedStore().approximateNumUncommittedBytes();
+        assertTrue(staged > 0, "a staged write should contribute uncommitted bytes");
+
+        bytesStore.commit(Map.of());
+        assertTrue(timeOrderedStore().approximateNumUncommittedBytes() < staged,
+            "commit should flush staged writes");
+    }
+
+    @Test
+    public void nonTransactionalStoreShouldReadIdenticallyAcrossIsolationLevels() {
+        final Bytes storeKey = serializeKey(new Windowed<>("a", windows[0]));
+        bytesStore.put(storeKey, serializeValue(10L));
+
+        assertEquals(10L, deserializeValue(timeOrderedStore().readOnly(IsolationLevel.READ_UNCOMMITTED).get(storeKey)));
+        assertEquals(10L, deserializeValue(timeOrderedStore().readOnly(IsolationLevel.READ_COMMITTED).get(storeKey)));
+    }
+
+    @SuppressWarnings("unchecked")
+    private AbstractRocksDBTimeOrderedSegmentedBytesStore<KeyValueSegment> timeOrderedStore() {
+        return (AbstractRocksDBTimeOrderedSegmentedBytesStore<KeyValueSegment>) bytesStore;
+    }
+
+    private void initTransactional() {
+        bytesStore.close();
+        bytesStore = getBytesStore();
+        context = getTransactionalEOSProcessorContext();
+        bytesStore.init(context, bytesStore);
+    }
+
+    private InternalMockProcessorContext<?, ?> getTransactionalEOSProcessorContext() {
+        final Properties streamsProps = StreamsTestUtils.getStreamsConfig();
+        streamsProps.setProperty(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_V2);
+        streamsProps.setProperty(StreamsConfig.TRANSACTIONAL_STATE_STORES_CONFIG, "true");
+        return new InternalMockProcessorContext<>(
+            stateDir,
+            Serdes.String(),
+            Serdes.Long(),
+            new MockRecordCollector(),
+            new ThreadCache(new LogContext("testCache "), 0, new MockStreamsMetrics(new Metrics())),
+            new StreamsConfig(streamsProps)
+        );
     }
 
     private Set<String> segmentDirs() {

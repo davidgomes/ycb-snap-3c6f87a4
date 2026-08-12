@@ -17,6 +17,7 @@
 package org.apache.kafka.streams.state.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.state.KeyValueIterator;
@@ -49,6 +50,11 @@ public class RocksDBTimeOrderedWindowSegmentedBytesStore<S extends Segment> exte
     class WindowKeySchemaIndexToBaseStoreIterator extends IndexToBaseStoreIterator {
         WindowKeySchemaIndexToBaseStoreIterator(final KeyValueIterator<Bytes, byte[]> indexIterator) {
             super(indexIterator);
+        }
+
+        WindowKeySchemaIndexToBaseStoreIterator(final KeyValueIterator<Bytes, byte[]> indexIterator,
+                                                final IsolationLevel isolationLevel) {
+            super(indexIterator, isolationLevel);
         }
 
         @Override
@@ -103,7 +109,8 @@ public class RocksDBTimeOrderedWindowSegmentedBytesStore<S extends Segment> exte
     }
 
     @Override
-    protected IndexToBaseStoreIterator getIndexToBaseStoreIterator(final SegmentIterator<S> segmentIterator) {
-        return new WindowKeySchemaIndexToBaseStoreIterator(segmentIterator);
+    protected IndexToBaseStoreIterator getIndexToBaseStoreIterator(final SegmentIterator<S> segmentIterator,
+                                                                   final IsolationLevel isolationLevel) {
+        return new WindowKeySchemaIndexToBaseStoreIterator(segmentIterator, isolationLevel);
     }
 }

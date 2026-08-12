@@ -17,15 +17,18 @@
 package org.apache.kafka.streams.state.internals;
 
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.kstream.Windowed;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.processor.StateStoreContext;
 import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Position;
 import org.apache.kafka.streams.query.Query;
 import org.apache.kafka.streams.query.QueryConfig;
 import org.apache.kafka.streams.query.QueryResult;
 import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.ReadOnlyWindowStore;
 import org.apache.kafka.streams.state.TimestampedBytesStore;
 import org.apache.kafka.streams.state.WindowStore;
 import org.apache.kafka.streams.state.WindowStoreIterator;
@@ -33,6 +36,7 @@ import org.apache.kafka.streams.state.internals.PrefixedWindowKeySchemas.TimeFir
 
 import java.util.Map;
 import java.util.Objects;
+import java.time.Instant;
 
 
 public class RocksDBTimeOrderedWindowStore<S extends Segment>
@@ -179,16 +183,82 @@ public class RocksDBTimeOrderedWindowStore<S extends Segment>
     }
 
     @Override
+    public ReadOnlyWindowStore<Bytes, byte[]> readOnly(final IsolationLevel isolationLevel) {
+        Objects.requireNonNull(isolationLevel, "isolationLevel cannot be null");
+        return new ReadOnlyView(isolationLevel);
+    }
+
+    /** Read view; reads go through the segmented store's isolation view, so READ_COMMITTED hides staged writes. */
+    private final class ReadOnlyView implements ReadOnlyWindowStore<Bytes, byte[]> {
+
+        private final AbstractRocksDBTimeOrderedSegmentedBytesStore.ReadOnlyView segmented;
+
+        ReadOnlyView(final IsolationLevel isolationLevel) {
+            this.segmented = wrapped().readOnly(isolationLevel);
+        }
+
+        @Override
+        public byte[] fetch(final Bytes key, final long time) {
+            return segmented.get(TimeFirstWindowKeySchema.toStoreKeyBinary(key, time, seqnum));
+        }
+
+        @Override
+        public WindowStoreIterator<byte[]> fetch(final Bytes key, final Instant timeFrom, final Instant timeTo) {
+            return valuesIterator(segmented.fetch(key, timeFrom.toEpochMilli(), timeTo.toEpochMilli()));
+        }
+
+        @Override
+        public WindowStoreIterator<byte[]> backwardFetch(final Bytes key, final Instant timeFrom, final Instant timeTo) {
+            return valuesIterator(segmented.backwardFetch(key, timeFrom.toEpochMilli(), timeTo.toEpochMilli()));
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> fetch(final Bytes keyFrom, final Bytes keyTo,
+                                                               final Instant timeFrom, final Instant timeTo) {
+            return keyValueIterator(segmented.fetch(keyFrom, keyTo, timeFrom.toEpochMilli(), timeTo.toEpochMilli()));
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> backwardFetch(final Bytes keyFrom, final Bytes keyTo,
+                                                                       final Instant timeFrom, final Instant timeTo) {
+            return keyValueIterator(segmented.backwardFetch(keyFrom, keyTo, timeFrom.toEpochMilli(), timeTo.toEpochMilli()));
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> fetchAll(final Instant timeFrom, final Instant timeTo) {
+            return keyValueIterator(segmented.fetchAll(timeFrom.toEpochMilli(), timeTo.toEpochMilli()));
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> backwardFetchAll(final Instant timeFrom, final Instant timeTo) {
+            return keyValueIterator(segmented.backwardFetchAll(timeFrom.toEpochMilli(), timeTo.toEpochMilli()));
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> all() {
+            return keyValueIterator(segmented.all());
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> backwardAll() {
+            return keyValueIterator(segmented.backwardAll());
+        }
+    }
+
+    @Override
     public <R> QueryResult<R> query(final Query<R> query,
                                     final PositionBound positionBound,
                                     final QueryConfig config) {
 
+        final Position queryPosition = config.getIsolationLevel() == IsolationLevel.READ_COMMITTED
+            ? wrapped().getCommittedPosition()
+            : getPosition();
         return StoreQueryUtils.handleBasicQueries(
             query,
             positionBound,
             config,
             this,
-            getPosition(),
+            queryPosition,
             stateStoreContext
         );
     }

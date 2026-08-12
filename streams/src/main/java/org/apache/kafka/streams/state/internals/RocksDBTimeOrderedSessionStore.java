@@ -17,18 +17,22 @@
 package org.apache.kafka.streams.state.internals;
 
 import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.streams.kstream.Windowed;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.processor.StateStoreContext;
 import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Position;
 import org.apache.kafka.streams.query.Query;
 import org.apache.kafka.streams.query.QueryConfig;
 import org.apache.kafka.streams.query.QueryResult;
 import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.ReadOnlySessionStore;
 import org.apache.kafka.streams.state.SessionStore;
 import org.apache.kafka.streams.state.internals.PrefixedSessionKeySchemas.TimeFirstSessionKeySchema;
 
 import java.util.Objects;
+import java.time.Instant;
 
 public class RocksDBTimeOrderedSessionStore
     extends WrappedStateStore<AbstractRocksDBTimeOrderedSegmentedBytesStore<? extends Segment>, Object, Object>
@@ -52,12 +56,15 @@ public class RocksDBTimeOrderedSessionStore
                                     final PositionBound positionBound,
                                     final QueryConfig config) {
 
+        final Position queryPosition = config.getIsolationLevel() == IsolationLevel.READ_COMMITTED
+            ? wrapped().getCommittedPosition()
+            : getPosition();
         return StoreQueryUtils.handleBasicQueries(
             query,
             positionBound,
             config,
             this,
-            getPosition(),
+            queryPosition,
             stateStoreContext
         );
     }
@@ -160,5 +167,89 @@ public class RocksDBTimeOrderedSessionStore
     @Override
     public void put(final Windowed<Bytes> sessionKey, final byte[] aggregate) {
         wrapped().put(sessionKey, aggregate);
+    }
+
+    @Override
+    public ReadOnlySessionStore<Bytes, byte[]> readOnly(final IsolationLevel isolationLevel) {
+        Objects.requireNonNull(isolationLevel, "isolationLevel cannot be null");
+        return new ReadOnlyView(isolationLevel);
+    }
+
+    /** Read view; reads go through the segmented store's isolation view, so READ_COMMITTED hides staged writes. */
+    private final class ReadOnlyView implements ReadOnlySessionStore<Bytes, byte[]> {
+
+        private final AbstractRocksDBTimeOrderedSegmentedBytesStore.ReadOnlyView segmented;
+
+        ReadOnlyView(final IsolationLevel isolationLevel) {
+            this.segmented = wrapped().readOnly(isolationLevel);
+        }
+
+        @Override
+        public byte[] fetchSession(final Bytes key, final long sessionStartTime, final long sessionEndTime) {
+            return segmented.get(TimeFirstSessionKeySchema.toBinary(key, sessionStartTime, sessionEndTime));
+        }
+
+        @Override
+        public byte[] fetchSession(final Bytes key, final Instant sessionStartTime, final Instant sessionEndTime) {
+            return fetchSession(key, sessionStartTime.toEpochMilli(), sessionEndTime.toEpochMilli());
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> findSessions(final Bytes key,
+                                                                      final long earliestSessionEndTime,
+                                                                      final long latestSessionStartTime) {
+            return new WrappedSessionStoreIterator(
+                segmented.fetch(key, earliestSessionEndTime, latestSessionStartTime),
+                TimeFirstSessionKeySchema::from);
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> backwardFindSessions(final Bytes key,
+                                                                              final long earliestSessionEndTime,
+                                                                              final long latestSessionStartTime) {
+            return new WrappedSessionStoreIterator(
+                segmented.backwardFetch(key, earliestSessionEndTime, latestSessionStartTime),
+                TimeFirstSessionKeySchema::from);
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> findSessions(final Bytes keyFrom,
+                                                                      final Bytes keyTo,
+                                                                      final long earliestSessionEndTime,
+                                                                      final long latestSessionStartTime) {
+            return new WrappedSessionStoreIterator(
+                segmented.fetch(keyFrom, keyTo, earliestSessionEndTime, latestSessionStartTime),
+                TimeFirstSessionKeySchema::from);
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> backwardFindSessions(final Bytes keyFrom,
+                                                                              final Bytes keyTo,
+                                                                              final long earliestSessionEndTime,
+                                                                              final long latestSessionStartTime) {
+            return new WrappedSessionStoreIterator(
+                segmented.backwardFetch(keyFrom, keyTo, earliestSessionEndTime, latestSessionStartTime),
+                TimeFirstSessionKeySchema::from);
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> fetch(final Bytes key) {
+            return findSessions(key, 0, Long.MAX_VALUE);
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> backwardFetch(final Bytes key) {
+            return backwardFindSessions(key, 0, Long.MAX_VALUE);
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> fetch(final Bytes keyFrom, final Bytes keyTo) {
+            return findSessions(keyFrom, keyTo, 0, Long.MAX_VALUE);
+        }
+
+        @Override
+        public KeyValueIterator<Windowed<Bytes>, byte[]> backwardFetch(final Bytes keyFrom, final Bytes keyTo) {
+            return backwardFindSessions(keyFrom, keyTo, 0, Long.MAX_VALUE);
+        }
     }
 }
