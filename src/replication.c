@@ -660,7 +660,7 @@ void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv,
     listRewind(monitors,&li);
     while((ln = listNext(&li))) {
         client *monitor = ln->value;
-        if (c->cmd && (c->cmd->flags & CMD_INTERNAL) &&
+        if (c->realcmd && (c->realcmd->flags & CMD_INTERNAL) &&
             !(monitor->flags & CLIENT_INTERNAL))
             continue;
         addReply(monitor,cmdobj);

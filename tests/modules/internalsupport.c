@@ -18,6 +18,45 @@ static int callInternalCommand(RedisModuleCtx *ctx, RedisModuleString **argv, in
     return REDISMODULE_OK;
 }
 
+static int callCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc,
+                       int detached, int replicate) {
+    if (argc < 2) return RedisModule_WrongArity(ctx);
+
+    RedisModuleCtx *call_ctx = ctx;
+    if (detached) {
+        call_ctx = RedisModule_GetThreadSafeContext(NULL);
+        if (!call_ctx) {
+            RedisModule_ReplyWithError(ctx, "ERR failed to create detached context");
+            return REDISMODULE_ERR;
+        }
+    }
+
+    const char *command = RedisModule_StringPtrLen(argv[1], NULL);
+    const char *format = detached ? "vCE" : "vE";
+    RedisModuleCallReply *reply = RedisModule_Call(call_ctx, command, format,
+                                                    argv + 2, argc - 2);
+    if (reply) {
+        RedisModule_ReplyWithCallReply(ctx, reply);
+        RedisModule_FreeCallReply(reply);
+        if (replicate)
+            RedisModule_ReplicateVerbatim(ctx);
+    } else {
+        RedisModule_ReplyWithError(ctx, "ERR unknown command");
+    }
+
+    if (detached)
+        RedisModule_FreeThreadSafeContext(call_ctx);
+    return REDISMODULE_OK;
+}
+
+static int detachedCallCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    return callCommand(ctx, argv, argc, 1, 0);
+}
+
+static int replicatedCallCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    return callCommand(ctx, argv, argc, 0, 1);
+}
+
 static int getInternalSecretCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     REDISMODULE_NOT_USED(argv);
     if (argc != 1) return RedisModule_WrongArity(ctx);
@@ -42,6 +81,12 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
         return REDISMODULE_ERR;
     if (RedisModule_CreateCommand(ctx, "internalsupport.call", callInternalCommand,
                                   "fast", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "internalsupport.detached-call", detachedCallCommand,
+                                  "fast", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "internalsupport.replicated-call", replicatedCallCommand,
+                                  "write internal", 0, 0, 0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
     if (RedisModule_CreateCommand(ctx, "internalsupport.get-secret", getInternalSecretCommand,
                                   "fast", 0, 0, 0) == REDISMODULE_ERR)

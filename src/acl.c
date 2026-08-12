@@ -3240,7 +3240,7 @@ void authCommand(client *c) {
         if (!secret) {
             addReplyError(c, "Internal connection authentication is only supported in cluster mode.");
         } else if (sdslen(password->ptr) != secret_len ||
-                   memcmp(password->ptr, secret, secret_len) != 0)
+                   time_independent_strcmp(password->ptr, (char *)secret, (int)secret_len) != 0)
         {
             addAuthErrReply(c, NULL);
         } else {

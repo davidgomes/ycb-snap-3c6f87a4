@@ -6298,6 +6298,8 @@ fmterr:
  *              the command to run as the determined user, so that any future user
  *              dependent activity, such as ACL checks within scripts will proceed as
  *              expected.
+ *              On an internal connection this flag is ignored and the command runs
+ *              as the Redis unrestricted user.
  *              Otherwise, the command will run as the Redis unrestricted user.
  *     * `S` -- Run the command in a script mode, this means that it will raise
  *              an error if a command which are not allowed inside a script

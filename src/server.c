@@ -4009,6 +4009,8 @@ int processCommand(client *c) {
                 return C_ERR;
             }
         }
+        if (cmd && !commandAllowedForClient(c, cmd))
+            cmd = NULL;
         c->cmd = c->lastcmd = c->realcmd = cmd;
         sds err;
         if (!commandCheckExistence(c, &err)) {

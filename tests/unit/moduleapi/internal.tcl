@@ -68,6 +68,12 @@ start_server {tags {"modules"}} {
         assert_equal {internalsupport.command} [lindex [lindex [r slowlog get 1] 0] 3]
     }
 
+    test "Detached module contexts do not inherit internal status" {
+        assert_error {*unknown command*} {
+            r internalsupport.detached-call internalsupport.command
+        }
+    }
+
     test "Non-cluster instances reject internal authentication" {
         r debug mark-internal-client unmark
         assert_error {*only supported in cluster mode*} {r auth {internal connection} wrong-secret}
@@ -75,6 +81,42 @@ start_server {tags {"modules"}} {
     }
 
     r module unload internalsupport
+}
+
+start_server {tags {"modules"}} {
+    r module load $testmodule
+    r config set appendonly yes
+    r config set appendfsync always
+    waitForBgrewriteaof r
+
+    test "AOF loading executes internal module commands" {
+        r debug mark-internal-client
+        assert_equal {OK} [r internalsupport.replicated-call set internal-aof-key 5]
+        assert_equal {OK} [r debug loadaof]
+        assert_equal {5} [r get internal-aof-key]
+    }
+
+    r module unload internalsupport
+}
+
+tags {modules} {
+    set modules [list loadmodule $testmodule]
+    start_cluster 1 1 [list config_lines $modules] {
+        set master [srv 0 client]
+        set replica [srv -1 client]
+
+        test "Replica links apply internal module commands" {
+            $master debug mark-internal-client
+            assert_equal {OK} [$master internalsupport.replicated-call set internal-replica-key 5]
+            $replica readonly
+            wait_for_condition 1000 50 {
+                [$replica exists internal-replica-key] eq "1"
+            } else {
+                fail "Replica did not apply the internal module command"
+            }
+            assert_equal {5} [$replica get internal-replica-key]
+        }
+    }
 }
 
 start_server {tags {"modules cluster"} overrides {cluster-enabled {yes}}} {
