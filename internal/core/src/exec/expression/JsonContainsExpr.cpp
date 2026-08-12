@@ -373,7 +373,7 @@ PhyJsonContainsFilterExpr::ExecArrayContains(EvalCtx& context) {
             processed_cursor += size;
             return;
         }
-        auto executor = [&](size_t i) -> std::optional<bool> {
+        auto executor = [&](size_t i) {
             const auto& array = data[i];
             for (int j = 0; j < array.length(); ++j) {
                 if (elements.find(array.template get_data<GetType>(j)) !=
