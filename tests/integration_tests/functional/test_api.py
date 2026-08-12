@@ -1144,6 +1144,7 @@ def test_get_full_config_after_restoring_snapshot(microvm_factory, uvm_nano):
         "version": "V1",
         "ipv4_address": "169.254.169.254",
         "network_interfaces": [net_iface.dev_name],
+        "imds_compat": False,
     }
 
     # We should expect a null entropy device
@@ -1244,6 +1245,7 @@ def test_get_full_config(uvm_plain):
         "version": "V2",
         "ipv4_address": "169.254.169.250",
         "network_interfaces": ["1"],
+        "imds_compat": False,
     }
 
     # We should expect a null entropy device

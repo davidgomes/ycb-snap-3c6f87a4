@@ -203,7 +203,13 @@ fn respond_to_get_request(mmds: &Mmds, request: Request) -> Response {
     // sanitize the URI.
     let json_path = sanitize_uri(uri.to_string());
 
-    let content_type = request.headers.accept();
+    // If IMDS compatibility mode is enabled, always respond in IMDS format (plain text),
+    // ignoring the `Accept` header, as EC2 IMDS does.
+    let content_type = if mmds.imds_compat() {
+        MediaType::PlainText
+    } else {
+        request.headers.accept()
+    };
 
     match mmds.get_value(json_path, content_type.into()) {
         Ok(response_body) => build_response(
@@ -474,6 +480,45 @@ mod tests {
               Accept: application/json\r\n\r\n",
             MediaType::ApplicationJson,
         );
+        assert_eq!(convert_to_response(mmds, request), expected_response);
+    }
+
+    #[test]
+    fn test_imds_compat_ignores_accept_header() {
+        // When IMDS compatibility mode is enabled, MMDS must always respond in IMDS
+        // format (plain text), regardless of the `Accept` header.
+        let mmds = populate_mmds();
+        mmds.lock().expect("Poisoned lock").set_imds_compat(true);
+
+        for accept_header in ["", "Accept: text/plain\r\n", "Accept: application/json\r\n"] {
+            #[rustfmt::skip]
+            let (request, expected_response) = generate_request_and_expected_response(
+                format!(
+                    "GET http://169.254.169.254/ HTTP/1.0\r\n\
+                     {accept_header}\r\n",
+                )
+                .as_bytes(),
+                MediaType::PlainText,
+            );
+            assert_eq!(
+                convert_to_response(mmds.clone(), request),
+                expected_response
+            );
+        }
+
+        // Values with unsupported types must return the same error as the existing
+        // IMDS-format path, even when JSON output is requested.
+        let request = Request::try_from(
+            b"GET http://169.254.169.254/age HTTP/1.0\r\n\
+              Accept: application/json\r\n\r\n",
+            None,
+        )
+        .unwrap();
+        let mut expected_response = Response::new(Version::Http10, StatusCode::NotImplemented);
+        expected_response.set_content_type(MediaType::PlainText);
+        expected_response.set_body(Body::new(
+            MmdsError::UnsupportedValueType.to_string(),
+        ));
         assert_eq!(convert_to_response(mmds, request), expected_response);
     }
 

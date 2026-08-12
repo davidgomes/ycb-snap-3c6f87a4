@@ -30,6 +30,12 @@ and this project adheres to
   version 2. These metrics also count requests that would be rejected in MMDS
   version 2 when MMDS version 1 is configured. They helps users assess readiness
   for migrating to MMDS version 2.
+- Added an optional `imds_compat` boolean field to the MMDS configuration
+  (`PUT /mmds/config`). When set to `true`, MMDS always responds in EC2 IMDS
+  format (plain text), ignoring the request's `Accept` header, as EC2 IMDS does.
+  Defaults to `false`, keeping the existing `Accept`-based format selection. The
+  field is persisted across snapshot-restore; snapshots taken with previous
+  Firecracker versions need to be regenerated to use this feature.
 
 ### Changed
 

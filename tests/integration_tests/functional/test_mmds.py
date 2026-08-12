@@ -52,6 +52,7 @@ def _validate_mmds_snapshot(
         "version": version,
         "ipv4_address": ipv4_address,
         "network_interfaces": ["eth0"],
+        "imds_compat": False,
     }
     response = basevm.api.vm_config.get()
     assert response.json()["mmds-config"] == expected_mmds_config

@@ -454,6 +454,7 @@ def test_config_start_and_mmds_with_api(uvm_plain, vm_config_file):
         "network_interfaces": ["1"],
         "ipv4_address": ipv4_address,
         "version": version,
+        "imds_compat": False,
     }
 
 

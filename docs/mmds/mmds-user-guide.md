@@ -293,8 +293,9 @@ The data store is **not** persisted across snapshots, in order to avoid leaking
 vm-specific information that may need to be reseeded into the data store for a
 new clone.
 
-The MMDS version, network stack configuration and IP address used for accessing
-the service are persisted across snapshot-restore.
+The MMDS version, IMDS compatibility mode (`imds_compat`), network stack
+configuration and IP address used for accessing the service are persisted across
+snapshot-restore.
 
 If the targeted snapshot version does not support Mmds Version 2, it will not be
 persisted in the snapshot (the clone will use the default, V1). Similarly, if a
@@ -312,6 +313,31 @@ the output to IMDS.
 
 Retrieving MMDS resources in IMDS format, other than JSON `string` and `object`
 types, is not supported.
+
+Note that EC2 IMDS always responds in IMDS format (plain text) and ignores the
+`Accept` header. If guest applications rely on that behavior (e.g. they use
+libraries that send `Accept: application/json` and cannot be changed), MMDS can
+be configured to do the same by setting the optional `imds_compat` boolean field
+of the HTTP `PUT` request to the `/mmds/config` resource. When `imds_compat` is
+`true`, MMDS always responds in IMDS format regardless of the `Accept` header.
+If the field is `false` or omitted, the output format keeps being selected based
+on the `Accept` header, as described above. The value of `imds_compat` is
+persisted across snapshot-restore; however, snapshots taken with a Firecracker
+version that did not support this field need to be regenerated in order to use
+it.
+
+```bash
+MMDS_IPV4_ADDR=169.254.170.2
+curl --unix-socket /tmp/firecracker.socket -i \
+    -X PUT "http://localhost/mmds/config"     \
+    -H "Content-Type: application/json"       \
+    -d '{
+             "network_interfaces": ["${MMDS_NET_IF}"],
+             "version": "V2",
+             "ipv4_address": "${MMDS_IPV4_ADDR}",
+             "imds_compat": true
+    }'
+```
 
 Below is an example on how to retrieve the `latest/meta-data` resource in JSON
 format:

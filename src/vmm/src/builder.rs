@@ -982,12 +982,14 @@ pub(crate) mod tests {
         event_manager: &mut EventManager,
         net_config: NetworkInterfaceConfig,
         mmds_version: MmdsVersion,
+        imds_compat: bool,
     ) {
         let mut net_builder = NetBuilder::new();
         net_builder.build(net_config).unwrap();
         let net = net_builder.iter().next().unwrap();
         let mut mmds = Mmds::default();
         mmds.set_version(mmds_version);
+        mmds.set_imds_compat(imds_compat);
         net.lock().unwrap().configure_mmds_network_stack(
             MmdsNetworkStack::default_ipv4_addr(),
             Arc::new(Mutex::new(mmds)),

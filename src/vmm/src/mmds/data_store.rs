@@ -13,6 +13,7 @@ use crate::mmds::token::{MmdsTokenError as TokenError, TokenAuthority};
 #[derive(Debug)]
 pub struct Mmds {
     version: MmdsVersion,
+    imds_compat: bool,
     data_store: Value,
     token_authority: TokenAuthority,
     is_initialized: bool,
@@ -74,6 +75,7 @@ impl Mmds {
     pub fn try_new(data_store_limit: usize) -> Result<Self, MmdsDatastoreError> {
         Ok(Mmds {
             version: MmdsVersion::default(),
+            imds_compat: false,
             data_store: Value::default(),
             token_authority: TokenAuthority::try_new()?,
             is_initialized: false,
@@ -100,6 +102,18 @@ impl Mmds {
     /// Get the MMDS version.
     pub fn version(&self) -> MmdsVersion {
         self.version
+    }
+
+    /// Set whether MMDS should respond in EC2 IMDS format (plain text) regardless of the
+    /// `Accept` header.
+    pub fn set_imds_compat(&mut self, imds_compat: bool) {
+        self.imds_compat = imds_compat;
+    }
+
+    /// Get whether MMDS responds in EC2 IMDS format (plain text) regardless of the
+    /// `Accept` header.
+    pub fn imds_compat(&self) -> bool {
+        self.imds_compat
     }
 
     /// Sets the Additional Authenticated Data to be used for encryption and
@@ -288,6 +302,20 @@ mod tests {
         // Test setting MMDS version back to v1.
         mmds.set_version(MmdsVersion::V1);
         assert_eq!(mmds.version(), MmdsVersion::V1);
+    }
+
+    #[test]
+    fn test_mmds_imds_compat() {
+        let mut mmds = Mmds::default();
+
+        // IMDS compatibility mode is disabled by default.
+        assert!(!mmds.imds_compat());
+
+        mmds.set_imds_compat(true);
+        assert!(mmds.imds_compat());
+
+        mmds.set_imds_compat(false);
+        assert!(!mmds.imds_compat());
     }
 
     #[test]

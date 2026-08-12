@@ -101,6 +101,21 @@ mod tests {
         }"#;
         parse_put_mmds(&Body::new(body), Some(config_path)).unwrap();
 
+        // Test `imds_compat` field.
+        let body = r#"{
+            "version": "V2",
+            "ipv4_address": "169.254.170.2",
+            "network_interfaces": [],
+            "imds_compat": true
+        }"#;
+        parse_put_mmds(&Body::new(body), Some(config_path)).unwrap();
+
+        let body = r#"{
+            "network_interfaces": [],
+            "imds_compat": "not_a_bool"
+        }"#;
+        parse_put_mmds(&Body::new(body), Some(config_path)).unwrap_err();
+
         let body = r#"{
             "version": "foo",
             "ipv4_address": "169.254.170.2",

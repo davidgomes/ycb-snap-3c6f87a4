@@ -1125,6 +1125,14 @@ definitions:
         format: "169.254.([1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4]).([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])"
         default: "169.254.169.254"
         description: A valid IPv4 link-local address.
+      imds_compat:
+        type: boolean
+        default: false
+        description:
+          If true, MMDS always responds in EC2 IMDS format (plain text),
+          ignoring the request's Accept header, as EC2 IMDS does. If false
+          or omitted, the response format is chosen based on the Accept
+          header (application/json for JSON, otherwise plain text).
 
   MmdsContentsObject:
     type: object

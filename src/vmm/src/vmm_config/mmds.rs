@@ -18,6 +18,11 @@ pub struct MmdsConfig {
     pub network_interfaces: Vec<String>,
     /// MMDS IPv4 configured address.
     pub ipv4_address: Option<Ipv4Addr>,
+    /// Whether MMDS should respond in EC2 IMDS format (plain text) regardless of the
+    /// request's `Accept` header. Defaults to `false`, in which case the response format
+    /// is chosen based on the `Accept` header.
+    #[serde(default)]
+    pub imds_compat: bool,
 }
 
 impl MmdsConfig {
