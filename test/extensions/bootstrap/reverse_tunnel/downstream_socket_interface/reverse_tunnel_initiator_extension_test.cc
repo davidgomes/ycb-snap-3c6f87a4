@@ -24,6 +24,7 @@ using testing::Invoke;
 using testing::NiceMock;
 using testing::Return;
 using testing::ReturnRef;
+using testing::StrictMock;
 
 namespace Envoy {
 namespace Extensions {
@@ -193,8 +194,8 @@ TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogInvokesEveryConfiguredL
   auto second_access_log = std::make_shared<StrictMock<AccessLog::MockInstance>>();
   setAccessLogs({first_access_log, second_access_log});
 
-  EXPECT_CALL(*first_access_log, log(_, _)).Times(1);
-  EXPECT_CALL(*second_access_log, log(_, _)).Times(1);
+  EXPECT_CALL(*first_access_log, log(_, _));
+  EXPECT_CALL(*second_access_log, log(_, _));
 
   extension_->emitAccessLog(dispatcher_.timeSource(), "handshake_success", "node", "cluster",
                             "tenant", "upstream", "host", "key", "");

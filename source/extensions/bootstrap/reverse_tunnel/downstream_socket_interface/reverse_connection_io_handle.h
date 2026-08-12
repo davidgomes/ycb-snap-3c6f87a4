@@ -3,6 +3,7 @@
 #include <memory>
 #include <queue>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "envoy/config/core/v3/base.pb.h"
@@ -423,6 +424,10 @@ private:
 
   // Map from host address to connection info.
   absl::flat_hash_map<std::string, HostConnectionInfo> host_to_conn_info_map_;
+  // Map established connection keys to their target host and upstream cluster. This outlives host
+  // discovery entries so close events retain their access log metadata after a host is removed.
+  absl::flat_hash_map<std::string, std::pair<std::string, std::string>>
+      connection_key_to_target_map_;
   // Map from cluster name to set of resolved hosts
   absl::flat_hash_map<std::string, absl::flat_hash_set<std::string>> cluster_to_resolved_hosts_map_;
 

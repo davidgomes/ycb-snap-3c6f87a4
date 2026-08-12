@@ -81,6 +81,7 @@ void ReverseConnectionIOHandle::cleanup() {
   // Clear cluster to hosts mapping.
   cluster_to_resolved_hosts_map_.clear();
   host_to_conn_info_map_.clear();
+  connection_key_to_target_map_.clear();
 
   // Clear established connections queue safely.
   size_t queue_size = established_connections_.size();
@@ -777,12 +778,18 @@ void ReverseConnectionIOHandle::onDownstreamConnectionClosed(const std::string& 
   std::string host_address;
   std::string cluster_name;
 
-  // Search through host_to_conn_info_map_ to find which host this connection belongs to.
-  for (const auto& [host, host_info] : host_to_conn_info_map_) {
-    if (host_info.connection_keys.find(connection_key) != host_info.connection_keys.end()) {
-      host_address = host;
-      cluster_name = host_info.cluster_name;
-      break;
+  const auto target_it = connection_key_to_target_map_.find(connection_key);
+  if (target_it != connection_key_to_target_map_.end()) {
+    host_address = target_it->second.first;
+    cluster_name = target_it->second.second;
+  } else {
+    // Fall back to the host map for connections created before target metadata was recorded.
+    for (const auto& [host, host_info] : host_to_conn_info_map_) {
+      if (host_info.connection_keys.find(connection_key) != host_info.connection_keys.end()) {
+        host_address = host;
+        cluster_name = host_info.cluster_name;
+        break;
+      }
     }
   }
 
@@ -799,6 +806,7 @@ void ReverseConnectionIOHandle::onDownstreamConnectionClosed(const std::string& 
                               config_.src_cluster_id, config_.src_tenant_id, cluster_name,
                               host_address, connection_key, "");
   }
+  connection_key_to_target_map_.erase(connection_key);
 
   // Remove the connection key from the host's connection set.
   auto host_it = host_to_conn_info_map_.find(host_address);
@@ -1164,6 +1172,7 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
     Network::ClientConnectionPtr released_conn = wrapper->releaseConnection();
 
     if (released_conn) {
+      connection_key_to_target_map_[connection_key] = {host_address, cluster_name};
       ENVOY_LOG(info, "reverse_tunnel: Connection will be consumed by "
                       "reverse_conn_listener for HTTP processing");
 

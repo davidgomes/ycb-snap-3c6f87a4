@@ -37,7 +37,8 @@ RCConnectionWrapper::~RCConnectionWrapper() {
 }
 
 void RCConnectionWrapper::onEvent(Network::ConnectionEvent event) {
-  if (event == Network::ConnectionEvent::RemoteClose) {
+  if (event == Network::ConnectionEvent::RemoteClose ||
+      event == Network::ConnectionEvent::LocalClose) {
     if (!connection_) {
       ENVOY_LOG(debug, "RCConnectionWrapper: connection is null, skipping event handling");
       return;
@@ -48,17 +49,22 @@ void RCConnectionWrapper::onEvent(Network::ConnectionEvent event) {
         connection_->connectionInfoProvider().localAddress()->asString();
     const uint64_t connectionId = connection_->id();
 
-    ENVOY_LOG(debug, "RCConnectionWrapper: connection: {}, found connection {} remote closed",
-              connectionId, connectionKey);
+    ENVOY_LOG(debug, "RCConnectionWrapper: connection: {}, found connection {}, event {}",
+              connectionId, connectionKey, static_cast<int>(event));
 
     if (!handshake_completed_) {
       handshake_completed_ = true;
-      emitAccessLog("handshake_failure", "Connection closed");
+      emitAccessLog("handshake_failure",
+                    event == Network::ConnectionEvent::RemoteClose
+                        ? "Remote connection closed during handshake"
+                        : "Local connection closed during handshake");
     }
 
-    // Don't call shutdown() here as it may cause cleanup during event processing
-    // Instead, just notify parent of closure.
-    parent_.onConnectionDone("Connection closed", this, true);
+    if (event == Network::ConnectionEvent::RemoteClose) {
+      // Don't call shutdown() here as it may cause cleanup during event processing
+      // Instead, just notify parent of closure.
+      parent_.onConnectionDone("Connection closed", this, true);
+    }
   }
 }
 
@@ -82,7 +88,8 @@ std::string RCConnectionWrapper::connect(const std::string& src_tenant_id,
   src_tenant_id_ = src_tenant_id;
   src_cluster_id_ = src_cluster_id;
   src_node_id_ = src_node_id;
-  host_address_ = host_ != nullptr && host_->address() != nullptr ? host_->address()->asString() : "";
+  host_address_ =
+      host_ != nullptr && host_->address() != nullptr ? host_->address()->asString() : "";
 
   // Register connection callbacks.
   ENVOY_LOG(debug, "RCConnectionWrapper: connection: {}, adding connection callbacks",
@@ -211,8 +218,11 @@ void RCConnectionWrapper::decodeHeaders(Http::ResponseHeaderMapPtr&& headers, bo
 void RCConnectionWrapper::dispatchHttp1(Buffer::Instance& buffer) {
   if (http1_parse_connection_ != nullptr) {
     const Http::Status status = http1_parse_connection_->dispatch(buffer);
-    if (!status.ok()) {
+    if (!status.ok() && !handshake_completed_) {
       ENVOY_LOG(debug, "RCConnectionWrapper: HTTP/1 codec dispatch error: {}", status.message());
+      handshake_completed_ = true;
+      emitAccessLog("handshake_failure",
+                    absl::StrCat("HTTP handshake decode failed: ", status.message()));
     }
   }
 }
