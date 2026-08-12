@@ -1,0 +1,71 @@
+/* setup */
+CREATE DOMAIN salary AS INT CHECK (VALUE > 0);
+CREATE SCHEMA payroll;
+CREATE TABLE employees (id INT PRIMARY KEY, pay salary);
+INSERT INTO employees VALUES (1, 100);
+
+/* test */
+EXPLAIN (DDL) ALTER DOMAIN salary SET SCHEMA payroll;
+----
+Schema change plan for ALTER DOMAIN ‹defaultdb›.‹public›.‹salary› SET SCHEMA ‹payroll›;
+ ├── StatementPhase
+ │    └── Stage 1 of 1 in StatementPhase
+ │         ├── 4 elements transitioning toward PUBLIC
+ │         │    ├── ABSENT → PUBLIC Namespace:{DescID: 104 (salary-salary+), Name: "salary", ReferencedDescID: 100 (defaultdb), IntValue: 106}
+ │         │    ├── ABSENT → PUBLIC SchemaChild:{DescID: 104 (salary-salary+), ReferencedDescID: 106 (payroll)}
+ │         │    ├── ABSENT → PUBLIC Namespace:{DescID: 105 (_salary-_salary+), Name: "_salary", ReferencedDescID: 100 (defaultdb), IntValue: 106}
+ │         │    └── ABSENT → PUBLIC SchemaChild:{DescID: 105 (_salary-_salary+), ReferencedDescID: 106 (payroll)}
+ │         ├── 4 elements transitioning toward ABSENT
+ │         │    ├── PUBLIC → ABSENT Namespace:{DescID: 104 (salary-salary+), Name: "salary", ReferencedDescID: 100 (defaultdb), IntValue: 101}
+ │         │    ├── PUBLIC → ABSENT SchemaChild:{DescID: 104 (salary-salary+), ReferencedDescID: 101 (public)}
+ │         │    ├── PUBLIC → ABSENT Namespace:{DescID: 105 (_salary-_salary+), Name: "_salary", ReferencedDescID: 100 (defaultdb), IntValue: 101}
+ │         │    └── PUBLIC → ABSENT SchemaChild:{DescID: 105 (_salary-_salary+), ReferencedDescID: 101 (public)}
+ │         └── 10 Mutation operations
+ │              ├── DrainDescriptorName {"Namespace":{"DatabaseID":100,"DescriptorID":104,"Name":"salary","SchemaID":101}}
+ │              ├── RemoveObjectParent {"ObjectID":104,"ParentSchemaID":101}
+ │              ├── DrainDescriptorName {"Namespace":{"DatabaseID":100,"DescriptorID":105,"Name":"_salary","SchemaID":101}}
+ │              ├── RemoveObjectParent {"ObjectID":105,"ParentSchemaID":101}
+ │              ├── SetNameInDescriptor {"DescriptorID":104,"Name":"salary"}
+ │              ├── AddDescriptorName {"Namespace":{"DatabaseID":100,"DescriptorID":104,"Name":"salary","SchemaID":106}}
+ │              ├── SetObjectParentID {"ObjParent":{"ChildObjectID":104,"SchemaID":106}}
+ │              ├── SetNameInDescriptor {"DescriptorID":105,"Name":"_salary"}
+ │              ├── AddDescriptorName {"Namespace":{"DatabaseID":100,"DescriptorID":105,"Name":"_salary","SchemaID":106}}
+ │              └── SetObjectParentID {"ObjParent":{"ChildObjectID":105,"SchemaID":106}}
+ └── PreCommitPhase
+      ├── Stage 1 of 2 in PreCommitPhase
+      │    ├── 4 elements transitioning toward PUBLIC
+      │    │    ├── PUBLIC → ABSENT Namespace:{DescID: 104 (salary-salary+), Name: "salary", ReferencedDescID: 100 (defaultdb), IntValue: 106}
+      │    │    ├── PUBLIC → ABSENT SchemaChild:{DescID: 104 (salary-salary+), ReferencedDescID: 106 (payroll)}
+      │    │    ├── PUBLIC → ABSENT Namespace:{DescID: 105 (_salary-_salary+), Name: "_salary", ReferencedDescID: 100 (defaultdb), IntValue: 106}
+      │    │    └── PUBLIC → ABSENT SchemaChild:{DescID: 105 (_salary-_salary+), ReferencedDescID: 106 (payroll)}
+      │    ├── 4 elements transitioning toward ABSENT
+      │    │    ├── ABSENT → PUBLIC Namespace:{DescID: 104 (salary-salary+), Name: "salary", ReferencedDescID: 100 (defaultdb), IntValue: 101}
+      │    │    ├── ABSENT → PUBLIC SchemaChild:{DescID: 104 (salary-salary+), ReferencedDescID: 101 (public)}
+      │    │    ├── ABSENT → PUBLIC Namespace:{DescID: 105 (_salary-_salary+), Name: "_salary", ReferencedDescID: 100 (defaultdb), IntValue: 101}
+      │    │    └── ABSENT → PUBLIC SchemaChild:{DescID: 105 (_salary-_salary+), ReferencedDescID: 101 (public)}
+      │    └── 1 Mutation operation
+      │         └── UndoAllInTxnImmediateMutationOpSideEffects
+      └── Stage 2 of 2 in PreCommitPhase
+           ├── 4 elements transitioning toward PUBLIC
+           │    ├── ABSENT → PUBLIC Namespace:{DescID: 104 (salary-salary+), Name: "salary", ReferencedDescID: 100 (defaultdb), IntValue: 106}
+           │    ├── ABSENT → PUBLIC SchemaChild:{DescID: 104 (salary-salary+), ReferencedDescID: 106 (payroll)}
+           │    ├── ABSENT → PUBLIC Namespace:{DescID: 105 (_salary-_salary+), Name: "_salary", ReferencedDescID: 100 (defaultdb), IntValue: 106}
+           │    └── ABSENT → PUBLIC SchemaChild:{DescID: 105 (_salary-_salary+), ReferencedDescID: 106 (payroll)}
+           ├── 4 elements transitioning toward ABSENT
+           │    ├── PUBLIC → ABSENT Namespace:{DescID: 104 (salary-salary+), Name: "salary", ReferencedDescID: 100 (defaultdb), IntValue: 101}
+           │    ├── PUBLIC → ABSENT SchemaChild:{DescID: 104 (salary-salary+), ReferencedDescID: 101 (public)}
+           │    ├── PUBLIC → ABSENT Namespace:{DescID: 105 (_salary-_salary+), Name: "_salary", ReferencedDescID: 100 (defaultdb), IntValue: 101}
+           │    └── PUBLIC → ABSENT SchemaChild:{DescID: 105 (_salary-_salary+), ReferencedDescID: 101 (public)}
+           └── 12 Mutation operations
+                ├── DrainDescriptorName {"Namespace":{"DatabaseID":100,"DescriptorID":104,"Name":"salary","SchemaID":101}}
+                ├── RemoveObjectParent {"ObjectID":104,"ParentSchemaID":101}
+                ├── DrainDescriptorName {"Namespace":{"DatabaseID":100,"DescriptorID":105,"Name":"_salary","SchemaID":101}}
+                ├── RemoveObjectParent {"ObjectID":105,"ParentSchemaID":101}
+                ├── SetNameInDescriptor {"DescriptorID":104,"Name":"salary"}
+                ├── AddDescriptorName {"Namespace":{"DatabaseID":100,"DescriptorID":104,"Name":"salary","SchemaID":106}}
+                ├── UpdateTTLScheduleMetadata {"NewName":"salary","TableID":104}
+                ├── SetObjectParentID {"ObjParent":{"ChildObjectID":104,"SchemaID":106}}
+                ├── SetNameInDescriptor {"DescriptorID":105,"Name":"_salary"}
+                ├── AddDescriptorName {"Namespace":{"DatabaseID":100,"DescriptorID":105,"Name":"_salary","SchemaID":106}}
+                ├── UpdateTTLScheduleMetadata {"NewName":"_salary","TableID":105}
+                └── SetObjectParentID {"ObjParent":{"ChildObjectID":105,"SchemaID":106}}

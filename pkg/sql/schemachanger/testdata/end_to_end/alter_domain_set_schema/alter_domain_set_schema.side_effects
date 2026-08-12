@@ -1,0 +1,110 @@
+/* setup */
+CREATE DOMAIN salary AS INT CHECK (VALUE > 0);
+CREATE SCHEMA payroll;
+CREATE TABLE employees (id INT PRIMARY KEY, pay salary);
+INSERT INTO employees VALUES (1, 100);
+----
+...
++object {100 101 salary} -> 104
++object {100 101 _salary} -> 105
++schema {100 0 payroll} -> 106
++object {100 101 employees} -> 107
+
+/* test */
+ALTER DOMAIN salary SET SCHEMA payroll;
+----
+begin transaction #1
+# begin StatementPhase
+checking for feature: ALTER DOMAIN
+increment telemetry for sql.schema.alter_domain.set_schema
+write *eventpb.SetSchema to event log:
+  descriptorName: defaultdb.public.salary
+  descriptorType: domain
+  newDescriptorName: defaultdb.payroll.salary
+  sql:
+    descriptorId: 104
+    statement: ALTER DOMAIN ‹defaultdb›.‹public›.‹salary› SET SCHEMA ‹payroll›
+    tag: ALTER DOMAIN
+    user: root
+## StatementPhase stage 1 of 1 with 10 MutationType ops
+delete object namespace entry {100 101 salary} -> 104
+delete object namespace entry {100 101 _salary} -> 105
+add object namespace entry {100 106 salary} -> 104
+add object namespace entry {100 106 _salary} -> 105
+upsert descriptor #104
+  ...
+     name: salary
+     parentId: 100
+  -  parentSchemaId: 101
+  +  parentSchemaId: 106
+     privileges:
+       ownerProto: root
+  ...
+     referencingDescriptorIds:
+     - 107
+  -  version: "2"
+  +  version: "3"
+upsert descriptor #105
+  ...
+     name: _salary
+     parentId: 100
+  -  parentSchemaId: 101
+  +  parentSchemaId: 106
+     privileges:
+       ownerProto: root
+  ...
+     - 104
+     - 107
+  -  version: "2"
+  +  version: "3"
+upsert descriptor #106
+  ...
+         withGrantOption: "2"
+       version: 3
+  -  version: "1"
+  +  version: "2"
+# end StatementPhase
+# begin PreCommitPhase
+## PreCommitPhase stage 1 of 2 with 1 MutationType op
+undo all catalog changes within txn #1
+persist all catalog changes to storage
+## PreCommitPhase stage 2 of 2 with 12 MutationType ops
+delete object namespace entry {100 101 salary} -> 104
+delete object namespace entry {100 101 _salary} -> 105
+add object namespace entry {100 106 salary} -> 104
+add object namespace entry {100 106 _salary} -> 105
+upsert descriptor #104
+  ...
+     name: salary
+     parentId: 100
+  -  parentSchemaId: 101
+  +  parentSchemaId: 106
+     privileges:
+       ownerProto: root
+  ...
+     referencingDescriptorIds:
+     - 107
+  -  version: "2"
+  +  version: "3"
+upsert descriptor #105
+  ...
+     name: _salary
+     parentId: 100
+  -  parentSchemaId: 101
+  +  parentSchemaId: 106
+     privileges:
+       ownerProto: root
+  ...
+     - 104
+     - 107
+  -  version: "2"
+  +  version: "3"
+upsert descriptor #106
+  ...
+         withGrantOption: "2"
+       version: 3
+  -  version: "1"
+  +  version: "2"
+persist all catalog changes to storage
+# end PreCommitPhase
+commit transaction #1

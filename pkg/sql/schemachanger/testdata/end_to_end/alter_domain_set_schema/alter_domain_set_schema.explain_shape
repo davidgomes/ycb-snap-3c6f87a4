@@ -1,0 +1,11 @@
+/* setup */
+CREATE DOMAIN salary AS INT CHECK (VALUE > 0);
+CREATE SCHEMA payroll;
+CREATE TABLE employees (id INT PRIMARY KEY, pay salary);
+INSERT INTO employees VALUES (1, 100);
+
+/* test */
+EXPLAIN (DDL, SHAPE) ALTER DOMAIN salary SET SCHEMA payroll;
+----
+Schema change plan for ALTER DOMAIN ‹defaultdb›.‹public›.‹salary› SET SCHEMA ‹payroll›;
+ └── execute 1 system table mutations transaction

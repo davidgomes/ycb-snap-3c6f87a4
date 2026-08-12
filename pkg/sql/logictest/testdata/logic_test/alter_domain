@@ -259,7 +259,7 @@ statement ok
 ALTER DOMAIN d_sc SET SCHEMA sc1
 
 # The domain should be resolvable in the new schema.
-query I
+query T
 SELECT 5::sc1.d_sc
 ----
 5
@@ -285,7 +285,7 @@ ALTER DOMAIN sc1.d_sc SET SCHEMA sc1
 statement ok
 ALTER DOMAIN sc1.d_sc SET SCHEMA sc2
 
-query I
+query T
 SELECT 7::sc2.d_sc
 ----
 7
@@ -320,7 +320,7 @@ INSERT INTO t_dom_ref VALUES (1)
 statement ok
 ALTER DOMAIN sc2.d_sc SET SCHEMA public
 
-query I
+query T
 SELECT x FROM t_dom_ref
 ----
 1
@@ -332,7 +332,7 @@ INSERT INTO t_dom_ref VALUES (2)
 statement error pgcode 23514 value for domain d_sc violates check constraint
 INSERT INTO t_dom_ref VALUES (-1)
 
-query I rowsort
+query T rowsort
 SELECT x FROM t_dom_ref
 ----
 1
