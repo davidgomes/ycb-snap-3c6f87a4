@@ -1673,6 +1673,8 @@ void sunionCardCommand(client *c) {
     robj *dstset = approximate ? NULL : createSetObject();
     void *hll = approximate ? hllRawCreate() : NULL;
     unsigned long cardinality = 0;
+    unsigned long hll_changes = 0;
+    unsigned long hll_check_interval = limit < 64 ? limit : 64;
     int reached_limit = 0;
 
     for (long j = 0; j < numkeys && !reached_limit; j++) {
@@ -1693,8 +1695,12 @@ void sunionCardCommand(client *c) {
                     str = buf;
                 }
                 if (hllRawAdd(hll, (unsigned char *)str, len) && limit) {
-                    cardinality = hllRawCount(hll);
-                    reached_limit = cardinality >= (unsigned long)limit;
+                    hll_changes++;
+                    if (hll_changes >= hll_check_interval) {
+                        cardinality = hllRawCount(hll);
+                        reached_limit = cardinality >= (unsigned long)limit;
+                        hll_changes = 0;
+                    }
                 }
             } else {
                 cardinality += setTypeAddAux(dstset, str, len, llval,
