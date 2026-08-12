@@ -242,8 +242,8 @@ public class ImplClassWriterTests extends ProcessorTestCase {
         assertTrue("Expected compilation to succeed but got errors: " + result.errors(), result.success());
 
         // Loading with init runs the whole downcall-handle build path for both methods:
-        // Linker.nativeLinker().downcallHandle(FakeResolver.resolve(...), descriptor,
-        // [captureCallState("errno"), firstVariadicArg(1)])
+        // DefaultMethodHandleResolver.resolve(FakeResolver.resolve(...), descriptor,
+        // Linker.nativeLinker(), [captureCallState("errno"), firstVariadicArg(1)])
         // A descriptor mismatch (e.g. captureCallState declared as varargs but emitted as
         // (String)) throws NoSuchMethodError from <clinit>.
         Class<?> implClass = result.loadClass("test.ErrnoLib$Impl");
