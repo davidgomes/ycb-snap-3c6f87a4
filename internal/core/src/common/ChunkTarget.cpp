@@ -1,0 +1,86 @@
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License
+
+#include <common/ChunkTarget.h>
+#include "common/FastMem.h"
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+
+#include "File.h"
+#include "common/EasyAssert.h"
+
+const uint32_t SYS_PAGE_SIZE = sysconf(_SC_PAGE_SIZE);
+namespace milvus {
+void
+MemChunkTarget::write(const void* data, size_t size) {
+    AssertInfo(size + size_ <= cap_, "can not exceed target capacity");
+    milvus::fastmem::FastMemcpy(data_ + size_, data, size);
+    size_ += size;
+}
+
+char*
+MemChunkTarget::release() {
+    return data_;
+}
+
+size_t
+MemChunkTarget::tell() {
+    return size_;
+}
+
+void
+MmapChunkTarget::flush() {
+    if (cap_ > size_) {
+        static constexpr size_t kBufSize = 4096;
+        char zeros[kBufSize] = {};
+        auto remaining = cap_ - size_;
+        while (remaining > 0) {
+            auto to_write = std::min(remaining, kBufSize);
+            file_writer_->Write(zeros, to_write);
+            remaining -= to_write;
+        }
+        size_ = cap_;
+    }
+    file_writer_->Finish();
+}
+
+void
+MmapChunkTarget::write(const void* data, size_t size) {
+    file_writer_->Write(data, size);
+    size_ += size;
+}
+
+char*
+MmapChunkTarget::release() {
+    flush();
+
+    auto file = File::Open(file_path_, O_RDWR);
+    auto mmap_flag = MAP_SHARED;
+    if (populate_) {
+        mmap_flag |= MAP_POPULATE;
+    }
+    auto m = mmap(nullptr, cap_, PROT_READ, mmap_flag, file.Descriptor(), 0);
+    AssertInfo(m != MAP_FAILED,
+               "failed to map: {}, map_size={}",
+               strerror(errno),
+               cap_);
+    return static_cast<char*>(m);
+}
+
+size_t
+MmapChunkTarget::tell() {
+    return size_;
+}
+}  // namespace milvus

@@ -1,0 +1,318 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package segments
+
+/*
+#cgo pkg-config: milvus_core
+
+#include <stdlib.h>
+#include <stdint.h>
+#include "common/init_c.h"
+#include "segcore/segcore_init_c.h"
+*/
+import "C"
+
+import (
+	"context"
+	"math"
+	"runtime"
+	"sync"
+
+	"go.uber.org/atomic"
+
+	"github.com/milvus-io/milvus/pkg/v3/config"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/util/conc"
+	"github.com/milvus-io/milvus/pkg/v3/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+)
+
+var (
+	// Use separate pool for search/query
+	// and other operations (insert/delete/statistics/etc.)
+	// since in concurrent situation, there operation may block each other in high payload
+
+	sqp        atomic.Pointer[conc.Pool[any]]
+	sqOnce     sync.Once
+	dp         atomic.Pointer[conc.Pool[any]]
+	dynOnce    sync.Once
+	loadPool   atomic.Pointer[conc.Pool[any]]
+	loadOnce   sync.Once
+	warmupPool atomic.Pointer[conc.Pool[any]]
+	warmupOnce sync.Once
+
+	deletePool     atomic.Pointer[conc.Pool[struct{}]]
+	deletePoolOnce sync.Once
+
+	bfPool      atomic.Pointer[conc.Pool[any]]
+	bfApplyOnce sync.Once
+
+	bm25LoadPool atomic.Pointer[conc.Pool[any]]
+	bm25PoolOnce sync.Once
+
+	// intentionally leaked CGO tag names
+	cgoTagSQ      = C.CString("CGO_SQ")
+	cgoTagLoad    = C.CString("CGO_LOAD")
+	cgoTagDynamic = C.CString("CGO_DYN")
+	cgoTagWarmup  = C.CString("CGO_WARMUP")
+)
+
+// initSQPool initialize
+func initSQPool() {
+	sqOnce.Do(func() {
+		pt := paramtable.Get()
+		initPoolSize := int(math.Ceil(pt.QueryNodeCfg.MaxReadConcurrency.GetAsFloat() * pt.QueryNodeCfg.CGOPoolSizeRatio.GetAsFloat()))
+		pool := conc.NewPool[any](
+			initPoolSize,
+			conc.WithPreAlloc(false), // pre alloc must be false to resize pool dynamically, use warmup to alloc worker here
+			conc.WithDisablePurge(true),
+		)
+		conc.WarmupPool(pool, func() {
+			runtime.LockOSThread()
+			C.SetThreadName(cgoTagSQ)
+		})
+		sqp.Store(pool)
+
+		pt.Watch(pt.QueryNodeCfg.MaxReadConcurrency.Key, config.NewHandler("qn.sqpool.maxconc", ResizeSQPool))
+		pt.Watch(pt.QueryNodeCfg.CGOPoolSizeRatio.Key, config.NewHandler("qn.sqpool.cgopoolratio", ResizeSQPool))
+		mlog.Info(context.TODO(), "init SQPool done", mlog.Int("size", initPoolSize))
+	})
+}
+
+func initDynamicPool() {
+	dynOnce.Do(func() {
+		size := hardware.GetCPUNum()
+		pool := conc.NewPool[any](
+			size,
+			conc.WithPreAlloc(false),
+			conc.WithDisablePurge(false),
+			conc.WithPreHandler(func() {
+				runtime.LockOSThread()
+				C.SetThreadName(cgoTagDynamic)
+			}), // lock os thread for cgo thread disposal
+		)
+
+		dp.Store(pool)
+		mlog.Info(context.TODO(), "init dynamicPool done", mlog.Int("size", size))
+	})
+}
+
+func initLoadPool() {
+	loadOnce.Do(func() {
+		pt := paramtable.Get()
+		poolSize := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
+		pool := conc.NewPool[any](
+			poolSize,
+			conc.WithPreAlloc(false),
+			conc.WithDisablePurge(false),
+			conc.WithPreHandler(func() {
+				runtime.LockOSThread()
+				C.SetThreadName(cgoTagLoad)
+			}), // lock os thread for cgo thread disposal
+		)
+
+		loadPool.Store(pool)
+
+		pt.Watch(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key, config.NewHandler("qn.loadpool.middlepriority", ResizeLoadPool))
+		mlog.Info(context.TODO(), "init loadPool done", mlog.Int("size", poolSize))
+	})
+}
+
+func initBM25LoadPool() {
+	bm25PoolOnce.Do(func() {
+		pt := paramtable.Get()
+		poolSize := float64(hardware.GetCPUNum()) * pt.CommonCfg.BM25LoadThreadCoreCoefficient.GetAsFloat()
+		pool := conc.NewPool[any](int(poolSize))
+		bm25LoadPool.Store(pool)
+
+		pt.Watch(pt.CommonCfg.BM25LoadThreadCoreCoefficient.Key, config.NewHandler("qn.bm25loadpool.bm25loadthreadcorecoefficient", ResizeBM25LoadPool))
+		mlog.Info(context.TODO(), "init BM25LoadPool done", mlog.Int("size", int(poolSize)))
+	})
+}
+
+func initWarmupPool() {
+	warmupOnce.Do(func() {
+		pt := paramtable.Get()
+		poolSize := hardware.GetCPUNum() * pt.CommonCfg.LowPriorityThreadCoreCoefficient.GetAsInt()
+		pool := conc.NewPool[any](
+			poolSize,
+			conc.WithPreAlloc(false),
+			conc.WithDisablePurge(false),
+			conc.WithPreHandler(func() {
+				runtime.LockOSThread()
+				C.SetThreadName(cgoTagWarmup)
+			}), // lock os thread for cgo thread disposal
+			conc.WithNonBlocking(false),
+		)
+
+		warmupPool.Store(pool)
+		pt.Watch(pt.CommonCfg.LowPriorityThreadCoreCoefficient.Key, config.NewHandler("qn.warmpool.lowpriority", ResizeWarmupPool))
+	})
+}
+
+func initBFApplyPool() {
+	bfApplyOnce.Do(func() {
+		pt := paramtable.Get()
+		poolSize := hardware.GetCPUNum() * pt.QueryNodeCfg.BloomFilterApplyParallelFactor.GetAsInt()
+		pool := conc.NewPool[any](
+			poolSize,
+		)
+
+		bfPool.Store(pool)
+		pt.Watch(pt.QueryNodeCfg.BloomFilterApplyParallelFactor.Key, config.NewHandler("qn.bfapply.parallel", ResizeBFApplyPool))
+	})
+}
+
+func initDeletePool() {
+	deletePoolOnce.Do(func() {
+		pool := conc.NewPool[struct{}](runtime.GOMAXPROCS(0))
+		deletePool.Store(pool)
+	})
+}
+
+// GetSQPool returns the singleton pool instance for search/query operations.
+func GetSQPool() *conc.Pool[any] {
+	initSQPool()
+	return sqp.Load()
+}
+
+// GetDynamicPool returns the singleton pool for dynamic cgo operations.
+func GetDynamicPool() *conc.Pool[any] {
+	initDynamicPool()
+	return dp.Load()
+}
+
+func GetLoadPool() *conc.Pool[any] {
+	initLoadPool()
+	return loadPool.Load()
+}
+
+func GetWarmupPool() *conc.Pool[any] {
+	initWarmupPool()
+	return warmupPool.Load()
+}
+
+func GetBFApplyPool() *conc.Pool[any] {
+	initBFApplyPool()
+	return bfPool.Load()
+}
+
+func GetDeletePool() *conc.Pool[struct{}] {
+	initDeletePool()
+	return deletePool.Load()
+}
+
+func GetBM25LoadPool() *conc.Pool[any] {
+	initBM25LoadPool()
+	return bm25LoadPool.Load()
+}
+
+func ResizeSQPool(evt *config.Event) {
+	if evt.HasUpdated {
+		pt := paramtable.Get()
+		newSize := int(math.Ceil(pt.QueryNodeCfg.MaxReadConcurrency.GetAsFloat() * pt.QueryNodeCfg.CGOPoolSizeRatio.GetAsFloat()))
+		pool := GetSQPool()
+		resizePool(pool, newSize, "SQPool")
+		conc.WarmupPool(pool, runtime.LockOSThread)
+	}
+}
+
+func ResizeLoadPool(evt *config.Event) {
+	if evt.HasUpdated {
+		pt := paramtable.Get()
+		newSize := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
+		resizePool(GetLoadPool(), newSize, "LoadPool")
+	}
+}
+
+func ResizeWarmupPool(evt *config.Event) {
+	if evt.HasUpdated {
+		pt := paramtable.Get()
+		newSize := hardware.GetCPUNum() * pt.CommonCfg.LowPriorityThreadCoreCoefficient.GetAsInt()
+		resizePool(GetWarmupPool(), newSize, "WarmupPool")
+	}
+}
+
+func ResizeBFApplyPool(evt *config.Event) {
+	if evt.HasUpdated {
+		pt := paramtable.Get()
+		newSize := hardware.GetCPUNum() * pt.QueryNodeCfg.BloomFilterApplyParallelFactor.GetAsInt()
+		resizePool(GetBFApplyPool(), newSize, "BFApplyPool")
+	}
+}
+
+func ResizeBM25LoadPool(evt *config.Event) {
+	if evt.HasUpdated {
+		pt := paramtable.Get()
+		newSize := float64(hardware.GetCPUNum()) * pt.CommonCfg.BM25LoadThreadCoreCoefficient.GetAsFloat()
+		resizePool(GetBM25LoadPool(), int(newSize), "BM25LoadPool")
+	}
+}
+
+// CollectPoolStats returns current stats for all goroutine pools.
+// Called by PoolMetricsCollector at Prometheus scrape time (pull model).
+func CollectPoolStats() []metrics.PoolStats {
+	type poolRef struct {
+		name string
+		pool interface {
+			Cap() int
+			Running() int
+			Waiting() int
+		}
+	}
+
+	refs := []poolRef{
+		{"SQPool", GetSQPool()},
+		{"DynamicPool", GetDynamicPool()},
+		{"LoadPool", GetLoadPool()},
+		{"WarmupPool", GetWarmupPool()},
+		{"BFApplyPool", GetBFApplyPool()},
+		{"BM25LoadPool", GetBM25LoadPool()},
+		{"DeletePool", GetDeletePool()},
+	}
+
+	stats := make([]metrics.PoolStats, 0, len(refs))
+	for _, r := range refs {
+		stats = append(stats, metrics.PoolStats{
+			Name:    r.name,
+			Cap:     r.pool.Cap(),
+			Running: r.pool.Running(),
+			Waiting: r.pool.Waiting(),
+		})
+	}
+	return stats
+}
+
+func resizePool(pool *conc.Pool[any], newSize int, tag string) {
+	log := mlog.With(
+		mlog.String("poolTag", tag),
+		mlog.Int("newSize", newSize),
+	)
+
+	if newSize <= 0 {
+		log.Warn(context.TODO(), "cannot set pool size to non-positive value")
+		return
+	}
+
+	err := pool.Resize(newSize)
+	if err != nil {
+		log.Warn(context.TODO(), "failed to resize pool", mlog.Err(err))
+		return
+	}
+	log.Info(context.TODO(), "pool resize successfully")
+}

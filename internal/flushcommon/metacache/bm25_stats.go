@@ -1,0 +1,89 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package metacache
+
+import (
+	"context"
+	"sync"
+
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+)
+
+type SegmentBM25Stats struct {
+	mut   sync.RWMutex
+	stats map[int64]*storage.BM25Stats
+}
+
+func (s *SegmentBM25Stats) Merge(stats map[int64]*storage.BM25Stats) {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+
+	for fieldID, current := range stats {
+		if history, ok := s.stats[fieldID]; !ok {
+			s.stats[fieldID] = current.Clone()
+		} else {
+			history.Merge(current)
+		}
+	}
+}
+
+func (s *SegmentBM25Stats) Serialize() (map[int64][]byte, map[int64]int64, error) {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+
+	result := make(map[int64][]byte)
+	numRow := make(map[int64]int64)
+	for fieldID, stats := range s.stats {
+		bytes, err := stats.Serialize()
+		if err != nil {
+			mlog.Warn(context.TODO(), "serialize history bm25 stats failed", mlog.FieldFieldID(fieldID))
+			return nil, nil, err
+		}
+		result[fieldID] = bytes
+		numRow[fieldID] = stats.NumRow()
+	}
+	return result, numRow, nil
+}
+
+// Clone returns a deep copy of the SegmentBM25Stats. Used by callers that
+// need to compute a hypothetical merged result without mutating the metacache
+// copy (e.g. BulkPackWriterV3 retry path needs to serialize merged stats
+// including the current batch before the metacache RollStats action has been
+// committed).
+func (s *SegmentBM25Stats) Clone() *SegmentBM25Stats {
+	s.mut.RLock()
+	defer s.mut.RUnlock()
+
+	cloned := make(map[int64]*storage.BM25Stats, len(s.stats))
+	for fieldID, stats := range s.stats {
+		cloned[fieldID] = stats.Clone()
+	}
+	return &SegmentBM25Stats{stats: cloned}
+}
+
+func NewEmptySegmentBM25Stats() *SegmentBM25Stats {
+	return &SegmentBM25Stats{
+		stats: make(map[int64]*storage.BM25Stats),
+	}
+}
+
+func NewSegmentBM25Stats(stats map[int64]*storage.BM25Stats) *SegmentBM25Stats {
+	return &SegmentBM25Stats{
+		stats: stats,
+	}
+}

@@ -1,0 +1,21 @@
+repos:
+  - repo: https://github.com/dnephin/pre-commit-golang
+    rev: v0.5.0
+    hooks:
+      - id: golangci-lint
+        args: [--config=.golangci.yml, --timeout=3m]
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.16.10
+    hooks:
+      - id: typos
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.11
+    hooks:
+      - id: ruff-check
+        name: ruff-check (tests/)
+        args: [--config=tests/ruff.toml, --fix]
+        files: ^tests/.*\.py$
+      - id: ruff-format
+        name: ruff-format (tests/)
+        args: [--config=tests/ruff.toml]
+        files: ^tests/.*\.py$

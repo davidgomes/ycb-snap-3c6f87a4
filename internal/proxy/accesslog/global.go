@@ -1,0 +1,208 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package accesslog
+
+import (
+	"context"
+	"io"
+	"os"
+	"sync"
+	"time"
+
+	"go.uber.org/atomic"
+
+	"github.com/milvus-io/milvus/internal/proxy/accesslog/info"
+	configEvent "github.com/milvus-io/milvus/pkg/v3/config"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+)
+
+var (
+	_globalL *AccessLogger
+	once     sync.Once
+)
+
+type AccessLogger struct {
+	enable     atomic.Bool
+	writer     io.Writer
+	formatters *FormatterManger
+	mu         sync.RWMutex
+}
+
+func NewAccessLogger() *AccessLogger {
+	return &AccessLogger{}
+}
+
+func (l *AccessLogger) init(params *paramtable.ComponentParam) error {
+	formatters, err := initFormatter(&params.ProxyCfg.AccessLog)
+	if err != nil {
+		return err
+	}
+	l.formatters = formatters
+
+	writer, err := initWriter(&params.ProxyCfg.AccessLog, &params.MinioCfg)
+	if err != nil {
+		return err
+	}
+	l.writer = writer
+	return nil
+}
+
+func (l *AccessLogger) Init(params *paramtable.ComponentParam) error {
+	if params.ProxyCfg.AccessLog.Enable.GetAsBool() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+
+		err := l.init(params)
+		if err != nil {
+			return err
+		}
+		l.enable.Store(true)
+	}
+	return nil
+}
+
+func (l *AccessLogger) Update(enable bool) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// close logger
+	if !enable {
+		if l.enable.Load() != enable {
+			mlog.Info(context.TODO(), "start close access log")
+			if write, ok := l.writer.(*RotateWriter); ok {
+				write.Close()
+				l.writer = nil
+			}
+			l.enable.Store(enable)
+		}
+		return nil
+	}
+
+	// close old writer before re-init
+	if l.writer != nil {
+		if rw, ok := l.writer.(*RotateWriter); ok {
+			rw.Close()
+		}
+	}
+
+	// update access log params
+	mlog.Info(context.TODO(), "start update access log params")
+	params := paramtable.Get()
+	err := l.init(params)
+	if err != nil {
+		mlog.Warn(context.TODO(), "enable access log failed", mlog.Err(err))
+		return err
+	}
+
+	l.enable.Store(enable)
+	return nil
+}
+
+func (l *AccessLogger) Write(info info.AccessInfo) bool {
+	if !l.enable.Load() {
+		return false
+	}
+
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	method := info.MethodName()
+	formatter, ok := l.formatters.GetByMethod(method)
+	if !ok {
+		return false
+	}
+	_, err := l.writer.Write([]byte(formatter.Format(info)))
+	if err != nil {
+		mlog.Warn(context.TODO(), "write access log failed", mlog.Err(err))
+		return false
+	}
+	return true
+}
+
+func InitAccessLogger(params *paramtable.ComponentParam) {
+	once.Do(func() {
+		logger := NewAccessLogger()
+		// support dynamic param
+		params.WatchKeyPrefix("proxy.accessLog", configEvent.NewHandler("update accesslog", func(event *configEvent.Event) {
+			enable := params.ProxyCfg.AccessLog.Enable.GetAsBool()
+			if err := logger.Update(enable); err != nil {
+				mlog.Warn(context.TODO(), "update access log failed", mlog.Err(err))
+			}
+		}))
+
+		err := logger.Init(params)
+		if err != nil {
+			mlog.Warn(context.TODO(), "Init access logger failed", mlog.Err(err))
+		}
+		_globalL = logger
+		info.ClusterPrefix.Store(params.CommonCfg.ClusterPrefix.GetValue())
+		mlog.Info(context.TODO(), "Init access logger success")
+	})
+}
+
+func initFormatter(logCfg *paramtable.AccessLogConfig) (*FormatterManger, error) {
+	formatterManger := NewFormatterManger()
+	formatMap := make(map[string]string)   // fommatter name -> formatter format
+	methodMap := make(map[string][]string) // fommatter name -> formatter owner method
+	for key, value := range logCfg.Formatter.GetValue() {
+		formatterName, option, err := parseConfigKey(key)
+		if err != nil {
+			return nil, err
+		}
+
+		switch option {
+		case fomaterkey:
+			formatMap[formatterName] = value
+		case methodKey:
+			methodMap[formatterName] = paramtable.ParseAsStings(value)
+		}
+	}
+
+	for name, format := range formatMap {
+		formatterManger.Add(name, format)
+		if methods, ok := methodMap[name]; ok {
+			formatterManger.SetMethod(name, methods...)
+		}
+	}
+
+	return formatterManger, nil
+}
+
+// initAccessLogger initializes a zap access logger for proxy
+func initWriter(logCfg *paramtable.AccessLogConfig, minioCfg *paramtable.MinioConfig) (io.Writer, error) {
+	if len(logCfg.Filename.GetValue()) > 0 {
+		lg, err := NewRotateWriter(logCfg, minioCfg)
+		if err != nil {
+			return nil, err
+		}
+
+		if logCfg.CacheSize.GetAsInt() > 0 {
+			clg := NewCacheWriterWithCloser(lg, lg, logCfg.CacheSize.GetAsInt(), logCfg.CacheFlushInterval.GetAsDuration(time.Second))
+			return clg, nil
+		}
+		return lg, nil
+	}
+
+	// wirte to stdout when filename = ""
+	if logCfg.CacheSize.GetAsInt() > 0 {
+		lg := NewCacheWriter(os.Stdout, logCfg.CacheSize.GetAsInt(), logCfg.CacheFlushInterval.GetAsDuration(time.Second))
+		return lg, nil
+	}
+
+	return os.Stdout, nil
+}

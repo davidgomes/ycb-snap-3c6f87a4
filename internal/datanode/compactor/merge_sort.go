@@ -1,0 +1,186 @@
+package compactor
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"go.opentelemetry.io/otel"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/allocator"
+	"github.com/milvus-io/milvus/internal/compaction"
+	"github.com/milvus-io/milvus/internal/flushcommon/io"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+func mergeSortMultipleSegments(ctx context.Context,
+	plan *datapb.CompactionPlan,
+	collectionID, partitionID, maxRows int64,
+	binlogIO io.BinlogIO,
+	binlogs []*datapb.CompactionSegmentBinlogs,
+	tr *timerecord.TimeRecorder,
+	currentTime time.Time,
+	collectionTTL int64,
+	compactionParams compaction.Params,
+	writerOpts []storage.RwOption,
+	lobContext *compaction.LOBCompactionContext,
+	sortByFields []int64,
+) ([]*datapb.CompactionSegment, error) {
+	_ = tr.RecordSpan()
+
+	ctx, span := otel.Tracer(typeutil.DataNodeRole).Start(ctx, "mergeSortMultipleSegments")
+	defer span.End()
+
+	log := mlog.With(mlog.Int64("planID", plan.GetPlanID()))
+
+	writerSchema := plan.GetSchema()
+
+	segIDAlloc := allocator.NewLocalAllocator(plan.GetPreAllocatedSegmentIDs().GetBegin(), plan.GetPreAllocatedSegmentIDs().GetEnd())
+	logIDAlloc := allocator.NewLocalAllocator(plan.GetPreAllocatedLogIDs().GetBegin(), plan.GetPreAllocatedLogIDs().GetEnd())
+	compAlloc := NewCompactionAllocator(segIDAlloc, logIDAlloc)
+	writer, err := NewMultiSegmentWriter(ctx, binlogIO, compAlloc, plan.GetMaxSize(), writerSchema, compactionParams, maxRows, partitionID, collectionID, plan.GetChannel(), 4096,
+		writerOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	pkField, err := typeutil.GetPrimaryFieldSchema(plan.GetSchema())
+	if err != nil {
+		log.Warn(ctx, "failed to get pk field from schema")
+		return nil, err
+	}
+
+	ttlFieldID := getTTLFieldID(plan.GetSchema())
+	hasTTLField := ttlFieldID >= common.StartOfUserFieldID
+
+	segmentReaders := make([]storage.RecordReader, len(binlogs))
+	defer func() {
+		for _, r := range segmentReaders {
+			if r != nil {
+				r.Close()
+			}
+		}
+	}()
+
+	segmentFilters := make([]compaction.EntityFilter, len(binlogs))
+	for i, s := range binlogs {
+		reader, existingFields, err := newCompactionSegmentRecordReader(ctx, s, plan.GetSchema(), compactionParams.StorageConfig,
+			storage.WithCollectionID(collectionID),
+			storage.WithDownloader(binlogIO.Download),
+			storage.WithVersion(s.StorageVersion),
+			storage.WithStorageConfig(compactionParams.StorageConfig),
+		)
+		if err != nil {
+			return nil, err
+		}
+		materializer, err := NewRecordMaterializer(writerSchema, writerSchema.GetFunctions(), existingFields)
+		if err != nil {
+			reader.Close()
+			return nil, err
+		}
+		reader = newMaterializedRecordReader(reader, materializer)
+		segmentReaders[i] = wrapReaderWithTimestampOverwrite(reader, s.GetCommitTimestamp())
+		delta, err := compaction.ComposeDeleteFromDeltalogs(ctx, pkField.DataType, s,
+			storage.WithDownloader(binlogIO.Download),
+			storage.WithStorageConfig(compactionParams.StorageConfig))
+		if err != nil {
+			return nil, err
+		}
+		segmentFilters[i] = compaction.NewEntityFilter(delta, collectionTTL, currentTime, s.GetCommitTimestamp())
+	}
+
+	var predicate func(r storage.Record, ri, i int) bool
+	segmentTotalRows := make([]int64, len(binlogs))
+	switch pkField.DataType {
+	case schemapb.DataType_Int64:
+		predicate = func(r storage.Record, ri, i int) bool {
+			segmentTotalRows[ri]++
+			pk := r.Column(pkField.FieldID).(*array.Int64).Value(i)
+			ts := r.Column(common.TimeStampField).(*array.Int64).Value(i)
+			expireTs := int64(-1)
+			if hasTTLField {
+				col := r.Column(ttlFieldID).(*array.Int64)
+				if col.IsValid(i) {
+					expireTs = col.Value(i)
+				}
+			}
+			return !segmentFilters[ri].Filtered(pk, uint64(ts), expireTs)
+		}
+	case schemapb.DataType_VarChar:
+		predicate = func(r storage.Record, ri, i int) bool {
+			segmentTotalRows[ri]++
+			pk := r.Column(pkField.FieldID).(*array.String).Value(i)
+			ts := r.Column(common.TimeStampField).(*array.Int64).Value(i)
+			expireTs := int64(-1)
+			if hasTTLField {
+				col := r.Column(ttlFieldID).(*array.Int64)
+				if col.IsValid(i) {
+					expireTs = col.Value(i)
+				}
+			}
+			return !segmentFilters[ri].Filtered(pk, uint64(ts), expireTs)
+		}
+	default:
+		log.Warn(ctx, "compaction only support int64 and varchar pk field")
+	}
+
+	if _, err = storage.MergeSort(compactionParams.BinLogMaxSize, writerSchema, segmentReaders, writer, predicate, sortByFields); err != nil {
+		if closeErr := writer.Close(); closeErr != nil {
+			log.Warn(ctx, "failed to close writer after merge sort error", mlog.Err(closeErr))
+		}
+		return nil, err
+	}
+
+	if lobContext != nil && lobContext.HasReuseAllFields() {
+		for i, segment := range binlogs {
+			totalDeleted := int64(segmentFilters[i].GetDeletedCount() + segmentFilters[i].GetExpiredCount())
+			lobContext.SetSegmentRowStats(segment.GetSegmentID(), segmentTotalRows[i], totalDeleted)
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		log.Warn(ctx, "compact wrong, failed to finish writer", mlog.Err(err))
+		return nil, err
+	}
+
+	res := writer.GetCompactionSegments()
+	isNamespaceSorted := plan.GetSchema().GetEnableNamespace()
+	for _, seg := range res {
+		seg.IsSorted = !isNamespaceSorted
+		seg.IsSortedByNamespace = isNamespaceSorted
+	}
+
+	var (
+		deletedRowCount            int
+		expiredRowCount            int
+		missingDeleteCount         int
+		deltalogDeleteEntriesCount int
+	)
+
+	for _, filter := range segmentFilters {
+		deletedRowCount += filter.GetDeletedCount()
+		expiredRowCount += filter.GetExpiredCount()
+		missingDeleteCount += filter.GetMissingDeleteCount()
+		deltalogDeleteEntriesCount += filter.GetDeltalogDeleteCount()
+	}
+
+	totalElapse := tr.RecordSpan()
+	log.Info(ctx, "compact mergeSortMultipleSegments end",
+		mlog.Int("deleted row count", deletedRowCount),
+		mlog.Int("expired entities", expiredRowCount),
+		mlog.Int("missing deletes", missingDeleteCount),
+		mlog.Duration("total elapse", totalElapse))
+
+	metrics.DataNodeCompactionDeleteCount.WithLabelValues(fmt.Sprint(collectionID)).Add(float64(deltalogDeleteEntriesCount))
+	metrics.DataNodeCompactionMissingDeleteCount.WithLabelValues(fmt.Sprint(collectionID)).Add(float64(missingDeleteCount))
+
+	return res, nil
+}

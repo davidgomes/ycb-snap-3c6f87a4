@@ -1,0 +1,256 @@
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
+
+package retry
+
+import (
+	"context"
+	"runtime"
+	"strconv"
+	"time"
+
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+)
+
+func getCaller(skip int) string {
+	_, file, line, ok := runtime.Caller(skip)
+	if !ok {
+		return "unknown"
+	}
+	return file + ":" + strconv.Itoa(line)
+}
+
+// Do will run function with retry mechanism.
+// fn is the func to run.
+// Option can control the retry times and timeout.
+func Do(ctx context.Context, fn func() error, opts ...Option) error {
+	if !funcutil.CheckCtxValid(ctx) {
+		return ctx.Err()
+	}
+
+	c := newDefaultConfig()
+
+	for _, opt := range opts {
+		opt(c)
+	}
+
+	var lastErr error
+
+	for i := uint(0); c.attempts == 0 || i < c.attempts; i++ {
+		if err := fn(); err != nil {
+			if i%4 == 0 {
+				mlog.Warn(ctx, "retry func failed",
+					mlog.Uint("retried", i),
+					mlog.Err(err),
+					mlog.String("caller", getCaller(2)))
+			}
+
+			if !IsRecoverable(err) {
+				isContextErr := errors.IsAny(err, context.Canceled, context.DeadlineExceeded)
+				mlog.Warn(ctx, "retry func failed, not be recoverable",
+					mlog.Uint("retried", i),
+					mlog.Uint("attempt", c.attempts),
+					mlog.Bool("isContextErr", isContextErr),
+					mlog.String("caller", getCaller(2)),
+				)
+				if isContextErr && lastErr != nil {
+					return lastErr
+				}
+				return err
+			}
+
+			// Caller-explicit RetryErr predicate takes precedence over the
+			// default InputError abort: when caller passes RetryErr they have
+			// decided which errors are retriable, framework must not override.
+			if c.isRetryErr != nil {
+				if !c.isRetryErr(err) {
+					mlog.Warn(context.TODO(), "retry func failed, not be retryable",
+						mlog.Uint("retried", i),
+						mlog.Uint("attempt", c.attempts),
+						mlog.String("caller", getCaller(2)),
+					)
+					return err
+				}
+			} else if merr.GetErrorType(err) == merr.InputError {
+				mlog.Warn(context.TODO(), "retry func failed, input error is non-retriable",
+					mlog.Uint("retried", i),
+					mlog.Err(err),
+					mlog.String("caller", getCaller(2)),
+				)
+				return err
+			}
+
+			deadline, ok := ctx.Deadline()
+			if ok && time.Until(deadline) < c.sleep {
+				isContextErr := errors.IsAny(err, context.Canceled, context.DeadlineExceeded)
+				mlog.Warn(context.TODO(), "retry func failed, deadline",
+					mlog.Uint("retried", i),
+					mlog.Uint("attempt", c.attempts),
+					mlog.Bool("isContextErr", isContextErr),
+					mlog.String("caller", getCaller(2)),
+				)
+				if isContextErr && lastErr != nil {
+					return lastErr
+				}
+				return err
+			}
+
+			lastErr = err
+
+			select {
+			case <-time.After(c.sleep):
+			case <-ctx.Done():
+				mlog.Warn(context.TODO(), "retry func failed, ctx done",
+					mlog.Uint("retried", i),
+					mlog.Uint("attempt", c.attempts),
+					mlog.String("caller", getCaller(2)),
+				)
+				return lastErr
+			}
+
+			c.sleep *= 2
+			if c.sleep > c.maxSleepTime {
+				c.sleep = c.maxSleepTime
+			}
+		} else {
+			return nil
+		}
+	}
+	if lastErr != nil {
+		mlog.Warn(ctx, "retry func failed, reach max retry",
+			mlog.Uint("attempt", c.attempts),
+		)
+	}
+	return lastErr
+}
+
+// Do will run function with retry mechanism.
+// fn is the func to run, return err and shouldRetry flag.
+// Option can control the retry times and timeout.
+func Handle(ctx context.Context, fn func() (bool, error), opts ...Option) error {
+	if !funcutil.CheckCtxValid(ctx) {
+		return ctx.Err()
+	}
+
+	c := newDefaultConfig()
+
+	for _, opt := range opts {
+		opt(c)
+	}
+
+	var lastErr error
+	for i := uint(0); c.attempts == 0 || i < c.attempts; i++ {
+		if shouldRetry, err := fn(); err != nil {
+			if i%4 == 0 {
+				mlog.Warn(context.TODO(), "retry func failed",
+					mlog.Uint("retried", i),
+					mlog.String("caller", getCaller(2)),
+					mlog.Err(err),
+				)
+			}
+
+			if !shouldRetry {
+				isContextErr := errors.IsAny(err, context.Canceled, context.DeadlineExceeded)
+				mlog.Warn(context.TODO(), "retry func failed, not be recoverable",
+					mlog.Uint("retried", i),
+					mlog.Uint("attempt", c.attempts),
+					mlog.Bool("isContextErr", isContextErr),
+					mlog.String("caller", getCaller(2)),
+				)
+				if isContextErr && lastErr != nil {
+					return lastErr
+				}
+				return err
+			}
+
+			// shouldRetry=true is the caller's explicit affirmative. Honor
+			// it. The optional RetryErr predicate is still consulted as a
+			// second gate, but unlike retry.Do the InputError default abort
+			// is intentionally not applied here: in retry.Handle the caller
+			// signals abort via shouldRetry=false, not via the error type,
+			// otherwise client-side cache-eviction patterns like
+			// retryIfSchemaError become unreachable for errors classified
+			// server-side as InputError (e.g. ErrCollectionSchemaMismatch).
+			if c.isRetryErr != nil && !c.isRetryErr(err) {
+				mlog.Warn(context.TODO(), "retry func failed, not be retryable",
+					mlog.Uint("retried", i),
+					mlog.Uint("attempt", c.attempts),
+					mlog.String("caller", getCaller(2)),
+				)
+				return err
+			}
+
+			deadline, ok := ctx.Deadline()
+			if ok && time.Until(deadline) < c.sleep {
+				isContextErr := errors.IsAny(err, context.Canceled, context.DeadlineExceeded)
+				mlog.Warn(context.TODO(), "retry func failed, deadline",
+					mlog.Uint("retried", i),
+					mlog.Uint("attempt", c.attempts),
+					mlog.Bool("isContextErr", isContextErr),
+					mlog.String("caller", getCaller(2)),
+				)
+				if isContextErr && lastErr != nil {
+					return lastErr
+				}
+				return err
+			}
+
+			lastErr = err
+
+			select {
+			case <-time.After(c.sleep):
+			case <-ctx.Done():
+				mlog.Warn(context.TODO(), "retry func failed, ctx done",
+					mlog.Uint("retried", i),
+					mlog.Uint("attempt", c.attempts),
+					mlog.String("caller", getCaller(2)),
+				)
+				return lastErr
+			}
+
+			c.sleep *= 2
+			if c.sleep > c.maxSleepTime {
+				c.sleep = c.maxSleepTime
+			}
+		} else {
+			return nil
+		}
+	}
+	if lastErr != nil {
+		mlog.Warn(context.TODO(), "retry func failed, reach max retry",
+			mlog.Uint("attempt", c.attempts),
+			mlog.String("caller", getCaller(2)),
+		)
+	}
+	return lastErr
+}
+
+// errUnrecoverable is a private identity sentinel used only as a marker by
+// Unrecoverable/IsRecoverable. It must NOT be a typed merr error: milvusError.Is
+// compares by error code, so giving it a real code (e.g. ParameterInvalid) makes
+// every error of that code spuriously match errUnrecoverable and corrupts the
+// retriable/InputError classification of whatever was wrapped.
+var errUnrecoverable = errors.New("unrecoverable error")
+
+// Unrecoverable method wrap an error to unrecoverableError. This will make retry
+// quick return.
+func Unrecoverable(err error) error {
+	return merr.Combine(err, errUnrecoverable)
+}
+
+// IsRecoverable is used to judge whether the error is wrapped by unrecoverableError.
+func IsRecoverable(err error) bool {
+	return !errors.Is(err, errUnrecoverable)
+}

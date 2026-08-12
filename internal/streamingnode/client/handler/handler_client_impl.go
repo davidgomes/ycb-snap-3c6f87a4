@@ -1,0 +1,426 @@
+package handler
+
+import (
+	"context"
+	"time"
+
+	"github.com/cenkalti/backoff/v4"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/assignment"
+	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/consumer"
+	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/producer"
+	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/registry"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/utility"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/service/balancer/picker"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/service/contextutil"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/service/lazygrpc"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/service/resolver"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/options"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+var (
+	errWaitNextBackoff                   = errors.New("wait for next backoff")
+	_                  producer.Producer = wal.WAL(nil)
+	_                  consumer.Consumer = wal.Scanner(nil)
+)
+
+type handlerClientImpl struct {
+	lifetime         *typeutil.Lifetime
+	service          lazygrpc.Service[streamingpb.StreamingNodeHandlerServiceClient]
+	rb               resolver.Builder
+	watcher          assignment.Watcher
+	rebalanceTrigger types.AssignmentRebalanceTrigger
+	newProducer      func(ctx context.Context, opts *producer.ProducerOptions, handler streamingpb.StreamingNodeHandlerServiceClient) (Producer, error)
+	newConsumer      func(ctx context.Context, opts *consumer.ConsumerOptions, handlerClient streamingpb.StreamingNodeHandlerServiceClient) (Consumer, error)
+}
+
+// GetLatestMVCCTimestampIfLocal gets the latest mvcc timestamp of the vchannel.
+func (hc *handlerClientImpl) GetLatestMVCCTimestampIfLocal(ctx context.Context, vchannel string) (uint64, error) {
+	if !hc.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return 0, ErrClientClosed
+	}
+	defer hc.lifetime.Done()
+
+	pchannel := funcutil.ToPhysicalChannel(vchannel)
+	// Get current assignment of pchannel.
+	assign := hc.watcher.Get(ctx, pchannel)
+	if assign == nil {
+		return 0, ErrClientAssignmentNotReady
+	}
+
+	// Get the wal at local registry.
+	w, err := registry.GetLocalAvailableWAL(assign.Channel)
+	if err != nil {
+		return 0, err
+	}
+	if w.Channel().AccessMode != types.AccessModeRW {
+		return 0, ErrReadOnlyWAL
+	}
+	return w.GetLatestMVCCTimestamp(ctx, vchannel)
+}
+
+// GetReplicateCheckpoint gets the replicate checkpoint of the wal.
+func (hc *handlerClientImpl) GetReplicateCheckpoint(ctx context.Context, pchannel string) (*wal.ReplicateCheckpoint, error) {
+	if !hc.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return nil, ErrClientClosed
+	}
+	defer hc.lifetime.Done()
+
+	logger := mlog.With(mlog.FieldPChannel(pchannel), mlog.String("handler", "replicate checkpoint"))
+	cp, err := hc.createHandlerAfterStreamingNodeReady(ctx, logger, pchannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error) {
+		if assign.Channel.AccessMode != types.AccessModeRW {
+			return nil, status.NewInvalidArgument("replicate checkpoint can only be read for RW channel")
+		}
+		localWAL, err := registry.GetLocalAvailableWAL(assign.Channel)
+		if err == nil {
+			return localWAL.GetReplicateCheckpoint()
+		}
+		if !shouldUseRemoteWAL(err) {
+			return nil, err
+		}
+		handlerService, err := hc.service.GetService(ctx)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := handlerService.GetReplicateCheckpoint(ctx, &streamingpb.GetReplicateCheckpointRequest{
+			Pchannel: types.NewProtoFromPChannelInfo(assign.Channel),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return utility.NewReplicateCheckpointFromProto(resp.Checkpoint), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cp.(*wal.ReplicateCheckpoint), nil
+}
+
+// GetSalvageCheckpoint gets all salvage checkpoints of the wal.
+func (hc *handlerClientImpl) GetSalvageCheckpoint(ctx context.Context, pchannel string) ([]*wal.ReplicateCheckpoint, error) {
+	if !hc.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return nil, ErrClientClosed
+	}
+	defer hc.lifetime.Done()
+
+	logger := mlog.With(mlog.FieldPChannel(pchannel), mlog.String("handler", "salvage checkpoint"))
+	cps, err := hc.createHandlerAfterStreamingNodeReady(ctx, logger, pchannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error) {
+		if assign.Channel.AccessMode != types.AccessModeRW {
+			return nil, status.NewInvalidArgument("salvage checkpoint can only be read for RW channel")
+		}
+		localWAL, err := registry.GetLocalAvailableWAL(assign.Channel)
+		if err == nil {
+			// Local WAL - get salvage checkpoints directly
+			return localWAL.GetSalvageCheckpoint(), nil
+		}
+		if !shouldUseRemoteWAL(err) {
+			return nil, err
+		}
+		handlerService, err := hc.service.GetService(ctx)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := handlerService.GetSalvageCheckpoint(ctx, &streamingpb.GetSalvageCheckpointRequest{
+			Pchannel: types.NewProtoFromPChannelInfo(assign.Channel),
+		})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]*wal.ReplicateCheckpoint, 0, len(resp.GetCheckpoints()))
+		for _, cp := range resp.GetCheckpoints() {
+			result = append(result, utility.NewReplicateCheckpointFromProto(cp))
+		}
+		return result, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if cps == nil {
+		return nil, nil
+	}
+	return cps.([]*wal.ReplicateCheckpoint), nil
+}
+
+// PrepareReleaseManualFlush appends a normal ManualFlush and prepares local growing-source retention.
+func (hc *handlerClientImpl) PrepareReleaseManualFlush(ctx context.Context, collectionID int64, vchannel string, releaseSegmentIDs []int64) (bool, error) {
+	if !hc.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return false, ErrClientClosed
+	}
+	defer hc.lifetime.Done()
+
+	pchannel := funcutil.ToPhysicalChannel(vchannel)
+	logger := mlog.With(
+		mlog.String("pchannel", pchannel),
+		mlog.String("vchannel", vchannel),
+		mlog.Int64("collectionID", collectionID),
+		mlog.Int64s("releaseSegmentIDs", releaseSegmentIDs),
+		mlog.String("handler", "prepare release manual flush"),
+	)
+	result, err := hc.createHandlerAfterStreamingNodeReady(ctx, logger, pchannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error) {
+		if assign.Channel.AccessMode != types.AccessModeRW {
+			logger.Info(ctx, "skip release manual flush prepare because channel is not RW",
+				mlog.String("accessMode", assign.Channel.AccessMode.String()))
+			return false, nil
+		}
+
+		_, err := registry.GetLocalAvailableWAL(assign.Channel)
+		if err != nil {
+			if errors.Is(err, registry.ErrNoStreamingNodeDeployed) ||
+				status.AsStreamingError(err).IsWrongStreamingNode() {
+				logger.Info(ctx, "skip release manual flush prepare because channel is not owned by local streaming node",
+					mlog.Err(err))
+				return false, nil
+			}
+			return false, err
+		}
+
+		preparer, err := registry.GetLocalReleaseManualFlushPreparer()
+		if err != nil {
+			return false, err
+		}
+		return preparer.PrepareReleaseManualFlush(ctx, assign.Channel, collectionID, vchannel, releaseSegmentIDs)
+	})
+	if err != nil {
+		return false, err
+	}
+	if result == nil {
+		return false, nil
+	}
+	return result.(bool), nil
+}
+
+// GetWALMetricsIfLocal gets the metrics of the local wal.
+func (hc *handlerClientImpl) GetWALMetricsIfLocal(ctx context.Context) (*types.StreamingNodeMetrics, error) {
+	if !hc.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return nil, ErrClientClosed
+	}
+	defer hc.lifetime.Done()
+
+	return registry.GetLocalWALMetrics()
+}
+
+// CreateProducer creates a producer.
+func (hc *handlerClientImpl) CreateProducer(ctx context.Context, opts *ProducerOptions) (Producer, error) {
+	if !hc.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return nil, ErrClientClosed
+	}
+	defer hc.lifetime.Done()
+
+	logger := mlog.With(mlog.FieldPChannel(opts.PChannel), mlog.String("handler", "producer"))
+	p, err := hc.createHandlerAfterStreamingNodeReady(ctx, logger, opts.PChannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error) {
+		if assign.Channel.AccessMode != types.AccessModeRW {
+			return nil, status.NewInvalidArgument("producer can only be created for RW channel")
+		}
+		// Check if the localWAL is assigned at local
+		localWAL, err := registry.GetLocalAvailableWAL(assign.Channel)
+		if err == nil {
+			return localWAL, nil
+		}
+		if !shouldUseRemoteWAL(err) {
+			return nil, err
+		}
+		// Wait for handler service is ready.
+		handlerService, err := hc.service.GetService(ctx)
+		if err != nil {
+			return nil, err
+		}
+		remoteWAL, err := hc.newProducer(ctx, &producer.ProducerOptions{
+			Assignment: assign,
+		}, handlerService)
+		if err != nil {
+			return nil, err
+		}
+		return remoteWAL, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	newProducer := p.(Producer)
+	newProducer.Register(opts.RateLimitObserver)
+	return newProducer, nil
+}
+
+// CreateConsumer creates a consumer.
+func (hc *handlerClientImpl) CreateConsumer(ctx context.Context, opts *ConsumerOptions) (Consumer, error) {
+	if !hc.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return nil, ErrClientClosed
+	}
+	defer hc.lifetime.Done()
+
+	logger := mlog.With(mlog.FieldPChannel(opts.PChannel), mlog.FieldVChannel(opts.VChannel), mlog.String("handler", "consumer"))
+	// Use a local variable to track DeliverPolicy, so modifications in the closure don't affect the original opts
+	deliverPolicy := opts.DeliverPolicy
+	c, err := hc.createHandlerAfterStreamingNodeReady(ctx, logger, opts.PChannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error) {
+		// Check if the localWAL is assigned at local
+		localWAL, err := registry.GetLocalAvailableWAL(assign.Channel)
+		if err == nil {
+			localScanner, err := localWAL.Read(ctx, wal.ReadOption{
+				VChannel:               opts.VChannel,
+				DeliverPolicy:          deliverPolicy,
+				MessageFilter:          opts.DeliverFilters,
+				MesasgeHandler:         opts.MessageHandler,
+				IgnorePauseConsumption: opts.IgnorePauseConsumption,
+			})
+			// If the error is WALNameMismatch, change deliver policy to DeliverPolicyAll for next retry
+			if err != nil && status.AsStreamingError(err).IsWALNameMismatch() {
+				deliverPolicy = options.DeliverPolicyAll()
+				logger.Info(ctx, "change deliver policy to DeliverPolicyAll because of WALNameMismatch", mlog.Err(err))
+				return nil, err
+			}
+			if err != nil {
+				return nil, err
+			}
+			return localScanner, nil
+		}
+		if !shouldUseRemoteWAL(err) {
+			return nil, err
+		}
+
+		// Wait for handler service is ready.
+		handlerService, err := hc.service.GetService(ctx)
+		if err != nil {
+			return nil, err
+		}
+		remoteScanner, err := hc.newConsumer(ctx, &consumer.ConsumerOptions{
+			Assignment:             assign,
+			VChannel:               opts.VChannel,
+			DeliverPolicy:          deliverPolicy,
+			DeliverFilters:         opts.DeliverFilters,
+			MessageHandler:         opts.MessageHandler,
+			IgnorePauseConsumption: opts.IgnorePauseConsumption,
+		}, handlerService)
+
+		// If the error is WALNameMismatch, change deliver policy to DeliverPolicyAll for next retry
+		if err != nil && status.AsStreamingError(err).IsWALNameMismatch() {
+			deliverPolicy = options.DeliverPolicyAll()
+			logger.Info(ctx, "change deliver policy to DeliverPolicyAll because of WALNameMismatch", mlog.Err(err))
+			return nil, err
+		}
+
+		if err != nil {
+			return nil, err
+		}
+		return remoteScanner, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return c.(Consumer), nil
+}
+
+type handlerCreateFunc func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error)
+
+// createHandlerAfterStreamingNodeReady creates a handler until streaming node ready.
+// If streaming node is not ready, it will block until new assignment term is coming or context timeout.
+func (hc *handlerClientImpl) createHandlerAfterStreamingNodeReady(ctx context.Context, logger *mlog.Logger, pchannel string, create handlerCreateFunc) (any, error) {
+	// TODO: backoff should be configurable.
+	backoff := backoff.NewExponentialBackOff()
+	backoff.InitialInterval = 100 * time.Millisecond
+	backoff.MaxInterval = 10 * time.Second
+	backoff.MaxElapsedTime = 0
+	backoff.Reset()
+
+	for {
+		assign := hc.watcher.Get(ctx, pchannel)
+		if assign != nil {
+			// Find assignment, try to create producer on this assignment.
+			// pick the target streaming node to serve.
+			ctx = contextutil.WithPickServerID(ctx, assign.Node.ServerID)
+			createResult, err := create(ctx, assign)
+			if err == nil {
+				logger.Info(ctx, "create handler success", mlog.Any("assignment", assign), mlog.Bool("isLocal", registry.IsLocal(createResult)))
+				return createResult, nil
+			}
+			logger.Warn(ctx, "create handler failed", mlog.Any("assignment", assign), mlog.Err(err))
+
+			// Unrecoverable errors (e.g. replicate violation when the WAL is no longer
+			// a secondary cluster) won't change by retrying the same WAL role. Surface
+			// them immediately so callers get a typed error within RTT instead of
+			// retrying until their context deadline.
+			if status.AsStreamingError(err).IsUnrecoverable() {
+				logger.Warn(ctx, "create handler failed with unrecoverable error, stop retrying", mlog.Err(err))
+				return nil, err
+			}
+
+			// Check if the error is permanent failure until new assignment.
+			if isPermanentFailureUntilNewAssignment(err) {
+				reportErr := hc.rebalanceTrigger.ReportAssignmentError(ctx, assign.Channel, err)
+				logger.Info(ctx, "report assignment error", mlog.NamedError("assignmentError", err), mlog.Err(reportErr))
+			}
+		} else {
+			mlog.Warn(ctx, "assignment not found")
+		}
+
+		start := time.Now()
+		nextBackoff := backoff.NextBackOff()
+		logger.Info(ctx, "wait for next backoff", mlog.Duration("nextBackoff", nextBackoff))
+		isAssignemtChange, err := hc.waitForNextBackoff(ctx, pchannel, assign, nextBackoff)
+		cost := time.Since(start)
+		if err != nil {
+			logger.Warn(ctx, "wait for next backoff failed", mlog.Err(err), mlog.Duration("cost", cost))
+			return nil, err
+		}
+		logger.Info(ctx, "wait for next backoff done", mlog.Bool("isAssignmentChange", isAssignemtChange), mlog.Duration("cost", cost))
+	}
+}
+
+// waitForNextBackoff waits for next backoff.
+func (hc *handlerClientImpl) waitForNextBackoff(ctx context.Context, pchannel string, assign *types.PChannelInfoAssigned, nextBackoff time.Duration) (bool, error) {
+	ctx, cancel := context.WithTimeoutCause(ctx, nextBackoff, errWaitNextBackoff)
+	defer cancel()
+	// Block until new assignment term is coming.
+	err := hc.watcher.Watch(ctx, pchannel, assign)
+	if err == nil || errors.Is(context.Cause(ctx), errWaitNextBackoff) {
+		return err == nil, nil
+	}
+	return false, err
+}
+
+// Close closes the handler client.
+func (hc *handlerClientImpl) Close() {
+	hc.lifetime.SetState(typeutil.LifetimeStateStopped)
+	hc.lifetime.Wait()
+
+	hc.watcher.Close()
+	hc.service.Close()
+	hc.rb.Close()
+}
+
+// isPermanentFailureUntilNewAssignment checks if the error is permanent failure until new assignment.
+// If the encounter this error, client should notify the assignment service to rebalance the assignment and update discovery result.
+// block until new assignment term is coming or context timeout.
+func isPermanentFailureUntilNewAssignment(err error) bool {
+	if err == nil {
+		return false
+	}
+	// The error is reported by grpc balancer at client that the sub connection is not exist (remote server is down at view of session).
+	if picker.IsErrSubConnNoExist(err) {
+		return true
+	}
+	// The error is reported by remote server that the wal is not exist at remote server.
+	streamingServiceErr := status.AsStreamingError(err)
+	return streamingServiceErr.IsWrongStreamingNode()
+}
+
+// shouldUseRemoteWAL checks if use remote wal when given error happens.
+func shouldUseRemoteWAL(err error) bool {
+	if err == nil {
+		panic("the incoming error should never be nil")
+	}
+	// When following error happens, we should try to make a remote wal fetch.
+	// 1. If current node didn't deploy any streaming node.
+	if errors.Is(err, registry.ErrNoStreamingNodeDeployed) {
+		return true
+	}
+	// 2. If the wal is not exist at current streaming node or the local wal is shutdown.
+	streamingServiceErr := status.AsStreamingError(err)
+	return streamingServiceErr.IsWrongStreamingNode() || streamingServiceErr.IsOnShutdown()
+}

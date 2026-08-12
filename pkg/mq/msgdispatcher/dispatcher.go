@@ -1,0 +1,376 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package msgdispatcher
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/atomic"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/mq/common"
+	"github.com/milvus-io/milvus/pkg/v3/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+type signal int32
+
+const (
+	start     signal = 0
+	pause     signal = 1
+	resume    signal = 2
+	terminate signal = 3
+)
+
+var signalString = map[int32]string{
+	0: "start",
+	1: "pause",
+	2: "resume",
+	3: "terminate",
+}
+
+func (s signal) String() string {
+	return signalString[int32(s)]
+}
+
+type Dispatcher struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	id int64
+
+	pullbackEndTs        typeutil.Timestamp
+	pullbackDone         bool
+	pullbackDoneNotifier *syncutil.AsyncTaskNotifier[struct{}]
+
+	done chan struct{}
+	wg   sync.WaitGroup
+	once sync.Once
+
+	pchannel string
+	curTs    atomic.Uint64
+
+	targets *typeutil.ConcurrentMap[string, *target]
+
+	stream msgstream.MsgStream
+
+	includeSkipWhenSplit bool
+}
+
+func NewDispatcher(
+	ctx context.Context,
+	factory msgstream.Factory,
+	id int64,
+	pchannel string,
+	position *Pos,
+	subPos SubPos,
+	pullbackEndTs typeutil.Timestamp,
+	includeSkipWhenSplit bool,
+) (*Dispatcher, error) {
+	subName := fmt.Sprintf("%s-%d-%d", pchannel, id, time.Now().UnixNano())
+
+	log := mlog.With(mlog.FieldPChannel(pchannel),
+		mlog.Int64("id", id), mlog.String("subName", subName))
+	log.Info(ctx, "creating dispatcher...", mlog.Uint64("pullbackEndTs", pullbackEndTs))
+
+	var stream msgstream.MsgStream
+	var err error
+	defer func() {
+		if err != nil && stream != nil {
+			stream.Close()
+		}
+	}()
+
+	stream, err = factory.NewTtMsgStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Note: Only the earliest msgId of WP can be empty bytes
+	if position != nil && (len(position.MsgID) != 0 || position.WALName == commonpb.WALName_WoodPecker) {
+		position = typeutil.Clone(position)
+		position.ChannelName = funcutil.ToPhysicalChannel(position.ChannelName)
+		err = stream.AsConsumer(ctx, []string{pchannel}, subName, common.SubscriptionPositionUnknown)
+		if err != nil {
+			log.Error(ctx, "asConsumer failed", mlog.Err(err))
+			return nil, err
+		}
+		log.Info(ctx, "as consumer done", mlog.Any("position", position))
+		err = stream.Seek(ctx, []*Pos{position}, true)
+		if err != nil {
+			log.Error(ctx, "seek failed", mlog.Err(err))
+			return nil, err
+		}
+		posTime := tsoutil.PhysicalTime(position.GetTimestamp())
+		log.Info(ctx, "seek successfully", mlog.Uint64("posTs", position.GetTimestamp()),
+			mlog.Time("posTime", posTime), mlog.Duration("tsLag", time.Since(posTime)))
+	} else {
+		err = stream.AsConsumer(ctx, []string{pchannel}, subName, subPos)
+		if err != nil {
+			log.Error(ctx, "asConsumer failed", mlog.Err(err))
+			return nil, err
+		}
+		log.Info(ctx, "asConsumer successfully")
+	}
+
+	d := &Dispatcher{
+		id:                   id,
+		pullbackEndTs:        pullbackEndTs,
+		pullbackDoneNotifier: syncutil.NewAsyncTaskNotifier[struct{}](),
+		done:                 make(chan struct{}, 1),
+		pchannel:             pchannel,
+		targets:              typeutil.NewConcurrentMap[string, *target](),
+		stream:               stream,
+		includeSkipWhenSplit: includeSkipWhenSplit,
+	}
+
+	metrics.NumConsumers.WithLabelValues(paramtable.GetRole(), fmt.Sprint(paramtable.GetNodeID())).Inc()
+	return d, nil
+}
+
+func (d *Dispatcher) ID() int64 {
+	return d.id
+}
+
+func (d *Dispatcher) CurTs() typeutil.Timestamp {
+	return d.curTs.Load()
+}
+
+func (d *Dispatcher) AddTarget(t *target) {
+	log := mlog.With(mlog.FieldVChannel(t.vchannel), mlog.Int64("id", d.ID()), mlog.Uint64("ts", t.pos.GetTimestamp()))
+	if _, ok := d.targets.GetOrInsert(t.vchannel, t); ok {
+		log.Warn(d.ctx, "target exists")
+		return
+	}
+	log.Info(d.ctx, "add new target")
+}
+
+func (d *Dispatcher) GetTarget(vchannel string) (*target, error) {
+	if t, ok := d.targets.Get(vchannel); ok {
+		return t, nil
+	}
+	return nil, merr.WrapErrMqInternalMsg("cannot find target, vchannel=%s", vchannel)
+}
+
+func (d *Dispatcher) GetTargets() []*target {
+	return d.targets.Values()
+}
+
+func (d *Dispatcher) HasTarget(vchannel string) bool {
+	return d.targets.Contain(vchannel)
+}
+
+func (d *Dispatcher) RemoveTarget(vchannel string) {
+	log := mlog.With(mlog.FieldVChannel(vchannel), mlog.Int64("id", d.ID()))
+	if _, ok := d.targets.GetAndRemove(vchannel); ok {
+		log.Info(d.ctx, "target removed")
+	} else {
+		log.Warn(d.ctx, "target not exist")
+	}
+}
+
+func (d *Dispatcher) TargetNum() int {
+	return d.targets.Len()
+}
+
+func (d *Dispatcher) BlockUtilPullbackDone() {
+	select {
+	case <-d.ctx.Done():
+	case <-d.pullbackDoneNotifier.FinishChan():
+	}
+}
+
+func (d *Dispatcher) Handle(signal signal) {
+	log := mlog.With(mlog.FieldPChannel(d.pchannel), mlog.Int64("id", d.ID()),
+		mlog.String("signal", signal.String()))
+	log.Debug(d.ctx, "get signal")
+	switch signal {
+	case start:
+		d.ctx, d.cancel = context.WithCancel(context.Background()) //nolint:gosec // G118: cancel is stored in d.cancel and called in pause/terminate cases
+		d.wg.Add(1)
+		go d.work()
+	case pause:
+		d.done <- struct{}{}
+		d.cancel()
+		d.wg.Wait()
+	case resume:
+		d.ctx, d.cancel = context.WithCancel(context.Background()) //nolint:gosec // G118: cancel is stored in d.cancel and called in pause/terminate cases
+		d.wg.Add(1)
+		go d.work()
+	case terminate:
+		d.done <- struct{}{}
+		d.cancel()
+		d.wg.Wait()
+		d.once.Do(func() {
+			metrics.NumConsumers.WithLabelValues(paramtable.GetRole(), fmt.Sprint(paramtable.GetNodeID())).Dec()
+			d.stream.Close()
+		})
+	}
+	log.Info(d.ctx, "handle signal done")
+}
+
+func (d *Dispatcher) work() {
+	log := mlog.With(mlog.FieldPChannel(d.pchannel), mlog.Int64("id", d.ID()))
+	log.Info(d.ctx, "begin to work")
+	defer d.wg.Done()
+	for {
+		select {
+		case <-d.done:
+			log.Info(d.ctx, "stop working")
+			return
+		case pack := <-d.stream.Chan():
+			if pack == nil || len(pack.EndPositions) != 1 {
+				log.Error(d.ctx, "consumed invalid msgPack", mlog.Any("pack", pack))
+				continue
+			}
+			d.curTs.Store(pack.EndPositions[0].GetTimestamp())
+
+			targetPacks := d.groupAndParseMsgs(pack, d.stream.GetUnmarshalDispatcher())
+			for vchannel, p := range targetPacks {
+				var err error
+				t, _ := d.targets.Get(vchannel)
+				// The dispatcher seeks from the oldest target,
+				// so for each target, msg before the target position must be filtered out.
+				//
+				// From 2.6.0, every message has a unique timetick, so we can filter out the msg by < but not <=.
+				if (d.includeSkipWhenSplit && p.EndTs < t.pos.GetTimestamp()) ||
+					(!d.includeSkipWhenSplit && p.EndTs <= t.pos.GetTimestamp()) {
+					log.Info(d.ctx, "skip msg",
+						mlog.FieldVChannel(vchannel),
+						mlog.Int("msgCount", len(p.Msgs)),
+						mlog.Uint64("packBeginTs", p.BeginTs),
+						mlog.Uint64("packEndTs", p.EndTs),
+						mlog.Uint64("posTs", t.pos.GetTimestamp()),
+					)
+					for _, msg := range p.Msgs {
+						log.Debug(d.ctx, "skip msg info",
+							mlog.FieldVChannel(vchannel),
+							mlog.String("msgType", msg.Type().String()),
+							mlog.Uint64("msgBeginTs", msg.BeginTs()),
+							mlog.Uint64("msgEndTs", msg.EndTs()),
+							mlog.Uint64("packBeginTs", p.BeginTs),
+							mlog.Uint64("packEndTs", p.EndTs),
+							mlog.Uint64("posTs", t.pos.GetTimestamp()),
+						)
+					}
+					continue
+				}
+				if d.targets.Len() > 1 {
+					// for dispatcher with multiple targets, split target if err occurs
+					err = t.send(p)
+				} else {
+					// for dispatcher with only one target,
+					// keep retrying if err occurs, unless it paused or terminated.
+					for {
+						err = t.send(p)
+						if err == nil || !funcutil.CheckCtxValid(d.ctx) {
+							break
+						}
+					}
+				}
+				if err != nil {
+					t.pos = typeutil.Clone(pack.StartPositions[0])
+					// replace the pChannel with vChannel
+					t.pos.ChannelName = t.vchannel
+					d.targets.GetAndRemove(vchannel)
+					log.Warn(d.ctx, "lag target", mlog.Err(err))
+				}
+			}
+
+			if !d.pullbackDone && pack.EndPositions[0].GetTimestamp() >= d.pullbackEndTs {
+				d.pullbackDoneNotifier.Finish(struct{}{})
+				log.Info(d.ctx, "dispatcher pullback done",
+					mlog.Uint64("pullbackEndTs", d.pullbackEndTs),
+					mlog.Time("pullbackTime", tsoutil.PhysicalTime(d.pullbackEndTs)),
+				)
+				d.pullbackDone = true
+			}
+		}
+	}
+}
+
+func (d *Dispatcher) groupAndParseMsgs(pack *msgstream.ConsumeMsgPack, unmarshalDispatcher msgstream.UnmarshalDispatcher) map[string]*MsgPack {
+	// init packs for all targets, even though there's no msg in pack,
+	// but we still need to dispatch time ticks to the targets.
+	targetPacks := make(map[string]*MsgPack)
+	d.targets.Range(func(vchannel string, t *target) bool {
+		targetPacks[vchannel] = &MsgPack{
+			BeginTs:        pack.BeginTs,
+			EndTs:          pack.EndTs,
+			Msgs:           make([]msgstream.TsMsg, 0),
+			StartPositions: pack.StartPositions,
+			EndPositions:   pack.EndPositions,
+		}
+		return true
+	})
+	// group messages by vchannel
+	for _, msg := range pack.Msgs {
+		var vchannel, collectionID string
+
+		if msg.GetType() == commonpb.MsgType_Insert || msg.GetType() == commonpb.MsgType_Delete {
+			vchannel = msg.GetVChannel()
+		} else if msg.GetType() == commonpb.MsgType_CreateCollection ||
+			msg.GetType() == commonpb.MsgType_DropCollection ||
+			msg.GetType() == commonpb.MsgType_CreatePartition ||
+			msg.GetType() == commonpb.MsgType_DropPartition {
+			collectionID = msg.GetCollectionID()
+		}
+
+		if vchannel == "" {
+			// we need to dispatch it to the vchannel of this collection
+			targets := []string{}
+			for k := range targetPacks {
+				if !strings.Contains(k, collectionID) {
+					continue
+				}
+				targets = append(targets, k)
+			}
+			if len(targets) > 0 {
+				tsMsg, err := msg.Unmarshal(unmarshalDispatcher)
+				if err != nil {
+					mlog.Warn(d.ctx, "unmarshl message failed", mlog.Err(err))
+					continue
+				}
+				// TODO: There's data race when non-dml msg is sent to different flow graph.
+				// Wrong open-trancing information is generated, Fix in future.
+				for _, target := range targets {
+					targetPacks[target].Msgs = append(targetPacks[target].Msgs, tsMsg)
+				}
+			}
+			continue
+		}
+		if _, ok := targetPacks[vchannel]; ok {
+			tsMsg, err := msg.Unmarshal(unmarshalDispatcher)
+			if err != nil {
+				mlog.Warn(d.ctx, "unmarshl message failed", mlog.Err(err))
+				continue
+			}
+			targetPacks[vchannel].Msgs = append(targetPacks[vchannel].Msgs, tsMsg)
+		}
+	}
+	return targetPacks
+}

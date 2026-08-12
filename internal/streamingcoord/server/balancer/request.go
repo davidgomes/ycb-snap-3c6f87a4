@@ -1,0 +1,93 @@
+package balancer
+
+import (
+	"context"
+	"strconv"
+
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
+)
+
+type response struct {
+	resp any
+	err  error
+}
+
+// request is a operation request.
+type request struct {
+	ctx    context.Context
+	apply  requestApply
+	future *syncutil.Future[response]
+}
+
+// requestApply is a request operation to be executed.
+type requestApply func(impl *balancerImpl)
+
+// newOpUpdateBalancePolicy is a operation to update the balance policy.
+func newOpUpdateBalancePolicy(ctx context.Context, req *types.UpdateWALBalancePolicyRequest) *request {
+	future := syncutil.NewFuture[response]()
+	return &request{
+		ctx: ctx,
+		apply: func(impl *balancerImpl) {
+			if req.UpdateMask != nil {
+				// if there's a update mask, only update the fields in the update mask.
+				for _, field := range req.UpdateMask.Paths {
+					switch field {
+					case types.UpdateMaskPathWALBalancePolicyAllowRebalance:
+						updateAllowRebalance(ctx, impl, req.GetConfig().GetAllowRebalance())
+					}
+				}
+			} else {
+				// otherwise update all fields.
+				updateAllowRebalance(ctx, impl, req.GetConfig().GetAllowRebalance())
+			}
+			// apply the freeze streaming nodes.
+			if len(req.GetNodes().GetFreezeNodeIds()) > 0 || len(req.GetNodes().GetDefreezeNodeIds()) > 0 {
+				impl.Logger().Info(ctx, "update freeze nodes", mlog.Int64s("freezeNodeIDs", req.GetNodes().GetFreezeNodeIds()), mlog.Int64s("defreezeNodeIDs", req.GetNodes().GetDefreezeNodeIds()))
+				impl.freezeNodes.Upsert(req.GetNodes().GetFreezeNodeIds()...)
+				impl.freezeNodes.Remove(req.GetNodes().GetDefreezeNodeIds()...)
+			}
+			future.Set(response{resp: &types.UpdateWALBalancePolicyResponse{
+				Config: &streamingpb.WALBalancePolicyConfig{
+					AllowRebalance: paramtable.Get().StreamingCfg.WALBalancerPolicyAllowRebalance.GetAsBool(),
+				},
+				FreezeNodeIds: impl.freezeNodes.Collect(),
+			}, err: nil})
+		},
+		future: future,
+	}
+}
+
+// updateAllowRebalance update the allow rebalance.
+func updateAllowRebalance(ctx context.Context, impl *balancerImpl, allowRebalance bool) {
+	old := paramtable.Get().StreamingCfg.WALBalancerPolicyAllowRebalance.SwapTempValue(strconv.FormatBool(allowRebalance))
+	impl.Logger().Info(ctx, "update allow_rebalance", mlog.Bool("new", allowRebalance), mlog.String("old", old))
+}
+
+// newOpMarkAsUnavailable is a operation to mark some channels as unavailable.
+func newOpMarkAsUnavailable(ctx context.Context, pChannels []types.PChannelInfo) *request {
+	future := syncutil.NewFuture[response]()
+	return &request{
+		ctx: ctx,
+		apply: func(impl *balancerImpl) {
+			err := impl.channelMetaManager.MarkAsUnavailable(ctx, pChannels)
+			future.Set(response{err: err})
+		},
+		future: future,
+	}
+}
+
+// newOpTrigger is a operation to trigger a re-balance operation.
+func newOpTrigger(ctx context.Context) *request {
+	future := syncutil.NewFuture[response]()
+	return &request{
+		ctx: ctx,
+		apply: func(impl *balancerImpl) {
+			future.Set(response{})
+		},
+		future: future,
+	}
+}

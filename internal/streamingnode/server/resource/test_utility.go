@@ -1,0 +1,50 @@
+//go:build test
+// +build test
+
+package resource
+
+import (
+	"testing"
+
+	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
+	"github.com/milvus-io/milvus/internal/flushcommon/writebuffer"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/stats"
+	tinspector "github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/timetick/inspector"
+	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/idalloc"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
+)
+
+// OptWriteBufferManager provides a write buffer manager to the resource (test only).
+func OptWriteBufferManager(wbMgr writebuffer.BufferManager) optResourceInit {
+	return func(r *resourceImpl) {
+		r.wbMgr = wbMgr
+	}
+}
+
+// InitForTest initializes the singleton of resources for test.
+func InitForTest(t *testing.T, opts ...optResourceInit) {
+	r = &resourceImpl{
+		logger: mlog.With(),
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	if r.wbMgr == nil && r.chunkManager != nil {
+		r.syncMgr = syncmgr.NewSyncManager(r.chunkManager)
+		r.wbMgr = writebuffer.NewManager(r.syncMgr)
+	}
+	if r.mixCoordClient != nil {
+		r.timestampAllocator = idalloc.NewTSOAllocator(r.mixCoordClient)
+		r.idAllocator = idalloc.NewIDAllocator(r.mixCoordClient)
+	} else {
+		f := syncutil.NewFuture[types.MixCoordClient]()
+		f.Set(idalloc.NewMockRootCoordClient(t))
+		r.mixCoordClient = f
+		r.timestampAllocator = idalloc.NewTSOAllocator(r.mixCoordClient)
+		r.idAllocator = idalloc.NewIDAllocator(r.mixCoordClient)
+	}
+	r.segmentStatsManager = stats.NewStatsManager()
+	r.timeTickInspector = tinspector.NewTimeTickSyncInspector()
+}

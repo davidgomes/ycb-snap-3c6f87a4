@@ -1,0 +1,352 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package info
+
+import (
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/samber/lo"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/requestutil"
+)
+
+const (
+	ContextUsername      = "username"
+	ContextReturnCode    = "code"
+	ContextReturnMessage = "message"
+	ContextRequest       = "request"
+	// ContextErrorType carries the merr classification (input_error/system_error)
+	// set by the REST handler when it holds the error object; must match the key
+	// written in internal/distributed/proxy/httpserver.
+	ContextErrorType = "error_type"
+	ContextToken     = "token"
+)
+
+type RestfulInfo struct {
+	ctx    *gin.Context
+	params *gin.LogFormatterParams
+	start  time.Time
+	req    interface{}
+
+	// runtime set info
+	actualConsistencyLevel *commonpb.ConsistencyLevel
+}
+
+func NewRestfulInfo(ctx *gin.Context) *RestfulInfo {
+	return &RestfulInfo{ctx: ctx, start: time.Now(), params: &gin.LogFormatterParams{}}
+}
+
+func (i *RestfulInfo) SetParams(p *gin.LogFormatterParams) {
+	i.params = p
+}
+
+func (i *RestfulInfo) InitReq() {
+	req, ok := i.ctx.Get(ContextRequest)
+	if !ok {
+		return
+	}
+	i.req = req
+}
+
+func (i *RestfulInfo) TimeCost() string {
+	return fmt.Sprint(i.params.Latency)
+}
+
+func (i *RestfulInfo) TimeNow() string {
+	return time.Now().Format(timeFormat)
+}
+
+func (i *RestfulInfo) TimeStart() string {
+	if i.start.IsZero() {
+		return Unknown
+	}
+	return i.start.Format(timeFormat)
+}
+
+// Start returns the request-entry timestamp captured by the access middleware.
+// Exposed so downstream consumers (e.g. audit plugins) can measure end-to-end
+// request latency instead of their own instantiation time.
+func (i *RestfulInfo) Start() time.Time {
+	return i.start
+}
+
+func (i *RestfulInfo) TimeEnd() string {
+	return i.params.TimeStamp.Format(timeFormat)
+}
+
+func (i *RestfulInfo) MethodName() string {
+	return i.params.Path
+}
+
+func (i *RestfulInfo) Address() string {
+	return i.params.ClientIP
+}
+
+func (i *RestfulInfo) TraceID() string {
+	traceID, ok := i.ctx.Get("traceID")
+	if !ok {
+		return Unknown
+	}
+	return traceID.(string)
+}
+
+func (i *RestfulInfo) MethodStatus() string {
+	if i.params.StatusCode != http.StatusOK {
+		return fmt.Sprintf("HttpError%d", i.params.StatusCode)
+	}
+
+	value, ok := i.ctx.Get(ContextReturnCode)
+	if !ok {
+		return Unknown
+	}
+
+	code, ok := value.(int32)
+	if ok {
+		if code != 0 {
+			return "Failed"
+		}
+
+		return "Successful"
+	}
+
+	return Unknown
+}
+
+func (i *RestfulInfo) UserName() string {
+	username, ok := i.ctx.Get(ContextUsername)
+	if !ok || username == "" {
+		return Unknown
+	}
+
+	return username.(string)
+}
+
+func (i *RestfulInfo) ResponseSize() string {
+	return fmt.Sprint(i.params.BodySize)
+}
+
+func (i *RestfulInfo) ErrorCode() string {
+	code, ok := i.ctx.Get(ContextReturnCode)
+	if !ok {
+		return Unknown
+	}
+	return fmt.Sprint(code)
+}
+
+func (i *RestfulInfo) ErrorMsg() string {
+	message, ok := i.ctx.Get(ContextReturnMessage)
+	if !ok {
+		return ""
+	}
+	return strings.ReplaceAll(message.(string), "\n", "\\n")
+}
+
+func (i *RestfulInfo) ErrorType() string {
+	if et, ok := i.ctx.Get(ContextErrorType); ok {
+		if s, ok := et.(string); ok {
+			return s
+		}
+	}
+	// Aborts that never reached the proxy call (request binding / local
+	// validation) only stored the wire code; recover the sentinel's baked
+	// classification from it. Success rows report "" like the gRPC access log.
+	if code, ok := i.ctx.Get(ContextReturnCode); ok {
+		if c, ok := code.(int32); ok && c != 0 {
+			return merr.ErrorTypeOfCode(c).String()
+		}
+	}
+	return ""
+}
+
+func (i *RestfulInfo) SdkVersion() string {
+	return "Restful"
+}
+
+func (i *RestfulInfo) DbName() string {
+	name, ok := requestutil.GetDbNameFromRequest(i.req)
+	if !ok {
+		return Unknown
+	}
+	return name.(string)
+}
+
+func (i *RestfulInfo) CollectionName() string {
+	name, ok := requestutil.GetCollectionNameFromRequest(i.req)
+	if ok {
+		return name.(string)
+	}
+
+	// requests such as Flush/ShowCollections carry a list of collection names
+	names, ok := requestutil.GetCollectionNamesFromRequest(i.req)
+	if ok {
+		return fmt.Sprint(names.([]string))
+	}
+
+	// requests that reference collections via non-standard fields
+	switch req := i.req.(type) {
+	case *milvuspb.RenameCollectionRequest:
+		// rename references both the source and target collection
+		return fmt.Sprintf("%s->%s", req.GetOldName(), req.GetNewName())
+	case *milvuspb.BatchDescribeCollectionRequest:
+		return fmt.Sprint(req.GetCollectionName())
+	}
+
+	return Unknown
+}
+
+func (i *RestfulInfo) PartitionName() string {
+	name, ok := requestutil.GetPartitionNameFromRequest(i.req)
+	if ok {
+		return name.(string)
+	}
+
+	names, ok := requestutil.GetPartitionNamesFromRequest(i.req)
+	if ok {
+		return fmt.Sprint(names.([]string))
+	}
+
+	return Unknown
+}
+
+func (i *RestfulInfo) Expression() string {
+	expr, ok := requestutil.GetExprFromRequest(i.req)
+	if ok {
+		return expr.(string)
+	}
+
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		return listToString(lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return req.GetDsl() }))
+	}
+
+	dsl, ok := requestutil.GetDSLFromRequest(i.req)
+	if ok {
+		return dsl.(string)
+	}
+	return Unknown
+}
+
+func (i *RestfulInfo) OutputFields() string {
+	fields, ok := requestutil.GetOutputFieldsFromRequest(i.req)
+	if ok {
+		return fmt.Sprint(fields.([]string))
+	}
+	return Unknown
+}
+
+func (i *RestfulInfo) ConsistencyLevel() string {
+	// return actual consistency level if set
+	if i.actualConsistencyLevel != nil {
+		return i.actualConsistencyLevel.String()
+	}
+	level, ok := requestutil.GetConsistencyLevelFromRequst(i.req)
+	if ok {
+		return level.String()
+	}
+	return Unknown
+}
+
+func (i *RestfulInfo) AnnsField() string {
+	if req, ok := i.req.(*milvuspb.SearchRequest); ok {
+		return getAnnsFieldFromKvs(req.GetSearchParams())
+	}
+
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		return listToString(lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return getAnnsFieldFromKvs(req.GetSearchParams()) }))
+	}
+	return Unknown
+}
+
+func (i *RestfulInfo) NQ() string {
+	if req, ok := i.req.(*milvuspb.SearchRequest); ok {
+		return fmt.Sprint(req.GetNq())
+	}
+
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		return listToString(lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return fmt.Sprint(req.GetNq()) }))
+	}
+	return Unknown
+}
+
+func (i *RestfulInfo) SearchParams() string {
+	if req, ok := i.req.(*milvuspb.SearchRequest); ok {
+		return kvsToString(req.GetSearchParams())
+	}
+
+	if req, ok := i.req.(*milvuspb.HybridSearchRequest); ok {
+		return listToString(lo.Map(req.GetRequests(), func(req *milvuspb.SearchRequest, _ int) string { return kvsToString(req.GetSearchParams()) }))
+	}
+	return Unknown
+}
+
+func (i *RestfulInfo) QueryParams() string {
+	if req, ok := i.req.(*milvuspb.QueryRequest); ok {
+		return kvsToString(req.GetQueryParams())
+	}
+	return Unknown
+}
+
+// ClientRequestTime returns client-side request time string.
+// REST clients pass it via the same key as gRPC metadata, but as an HTTP header.
+func (i *RestfulInfo) ClientRequestTime() string {
+	if i.ctx == nil || i.ctx.Request == nil {
+		return Unknown
+	}
+	timestamp := i.ctx.GetHeader(common.ClientRequestMsecKey)
+	if timestamp == "" {
+		return Unknown
+	}
+	unixmsec, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return Unknown
+	}
+	return time.UnixMilli(unixmsec).Format(timeFormat)
+}
+
+func (i *RestfulInfo) SetActualConsistencyLevel(acl commonpb.ConsistencyLevel) {
+	i.actualConsistencyLevel = &acl
+}
+
+func (i *RestfulInfo) TemplateValueLength() string {
+	templateValues, ok := requestutil.GetExprTemplateValues(i.req)
+	if !ok {
+		return NotAny
+	}
+
+	// get length only
+	m := lo.MapValues(templateValues, func(tv *schemapb.TemplateValue, _ string) int {
+		return getLengthFromTemplateValue(tv)
+	})
+
+	return fmt.Sprint(m)
+}
+
+func (i *RestfulInfo) PartialUpdate() string {
+	if req, ok := i.req.(*milvuspb.UpsertRequest); ok {
+		return fmt.Sprint(req.GetPartialUpdate())
+	}
+	return NotAny
+}

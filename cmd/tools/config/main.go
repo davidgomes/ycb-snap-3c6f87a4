@@ -1,0 +1,52 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+)
+
+const (
+	generateCsv  = "gen-csv"
+	generateYaml = "gen-yaml"
+	showYaml     = "show-yaml"
+)
+
+func main() {
+	args := os.Args
+
+	if len(args) < 2 {
+		mlog.Error(context.TODO(), "len of args should large than 2")
+		os.Exit(-1)
+	}
+	switch args[1] {
+	case generateCsv:
+		f, err := os.Create("configs.csv")
+		defer f.Close()
+		if err != nil {
+			mlog.Error(context.TODO(), "create file failed", mlog.Err(err))
+			os.Exit(-2)
+		}
+		WriteCsv(f)
+	case generateYaml:
+		f, err := os.Create("milvus.yaml")
+		defer f.Close()
+		if err != nil {
+			mlog.Error(context.TODO(), "create file failed", mlog.Err(err))
+			os.Exit(-2)
+		}
+		WriteYaml(f)
+	case showYaml:
+		var f string
+		if len(args) == 2 {
+			f = "configs/milvus.yaml"
+		} else {
+			f = args[2]
+		}
+		ShowYaml(f)
+	default:
+		mlog.Error(context.TODO(), fmt.Sprintf("unknown argument %s", args[1]))
+	}
+}

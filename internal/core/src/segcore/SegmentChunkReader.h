@@ -1,0 +1,194 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#pragma once
+
+#include <stdint.h>
+#include <functional>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include <boost/core/span.hpp>
+#include "boost/variant/variant.hpp"
+#include "cachinglayer/CacheSlot.h"
+#include "common/OpContext.h"
+#include "common/Types.h"
+#include "common/protobuf_utils.h"
+#include "index/Index.h"
+#include "segcore/SegmentInterface.h"
+
+namespace milvus::segcore {
+
+using data_access_type = std::optional<boost::variant<bool,
+                                                      int8_t,
+                                                      int16_t,
+                                                      int32_t,
+                                                      int64_t,
+                                                      float,
+                                                      double,
+                                                      std::string,
+                                                      std::string_view>>;
+
+using ChunkDataAccessor = std::function<const data_access_type(int)>;
+using MultipleChunkDataAccessor = std::function<const data_access_type()>;
+using PinnedIndexView = boost::span<const PinWrapper<const index::IndexBase*>>;
+
+// Helper to extract a value of type T from data_access_type.
+// For std::string, handles both std::string and std::string_view in the variant.
+// Uses boost::apply_visitor to avoid ADL conflicts between boost::variant::get
+// and boost::array::get.
+namespace detail {
+template <typename T>
+struct ValueExtractor : public boost::static_visitor<T> {
+    ValueExtractor() = default;
+
+    T
+    operator()(const T& val) const {
+        return val;
+    }
+    template <typename U>
+    T
+    operator()(const U&) const {
+        ThrowInfo(DataTypeInvalid, "unexpected type in data_access_type");
+    }
+};
+
+template <>
+struct ValueExtractor<std::string> : public boost::static_visitor<std::string> {
+    ValueExtractor() = default;
+
+    std::string
+    operator()(const std::string& s) const {
+        return s;
+    }
+    std::string
+    operator()(std::string_view sv) const {
+        return std::string(sv);
+    }
+    template <typename U>
+    std::string
+    operator()(const U&) const {
+        ThrowInfo(DataTypeInvalid, "unexpected type in data_access_type");
+    }
+};
+}  // namespace detail
+
+template <typename T>
+T
+get_from_variant(const data_access_type& opt) {
+    return boost::apply_visitor(detail::ValueExtractor<T>{}, opt.value());
+}
+
+class SegmentChunkReader {
+ public:
+    SegmentChunkReader(milvus::OpContext* op_ctx,
+                       const segcore::SegmentInternalInterface* segment,
+                       int64_t active_count)
+        : segment_(segment),
+          active_count_(active_count),
+          size_per_chunk_(segment->size_per_chunk()),
+          op_ctx_(op_ctx) {
+    }
+
+    MultipleChunkDataAccessor
+    GetMultipleChunkDataAccessor(DataType data_type,
+                                 FieldId field_id,
+                                 int64_t& current_chunk_id,
+                                 int64_t& current_chunk_pos,
+                                 PinnedIndexView pinned_index) const;
+
+    ChunkDataAccessor
+    GetChunkDataAccessor(DataType data_type,
+                         FieldId field_id,
+                         int chunk_id,
+                         PinnedIndexView pinned_index) const;
+
+    void
+    MoveCursorForMultipleChunk(int64_t& current_chunk_id,
+                               int64_t& current_chunk_pos,
+                               const FieldId field_id,
+                               const int64_t num_chunk,
+                               const int64_t batch_size) const {
+        int64_t segment_row_count = segment_->get_row_count();
+        int64_t current_offset =
+            segment_->num_rows_until_chunk(field_id, current_chunk_id) +
+            current_chunk_pos;
+        int64_t target_offset = current_offset + batch_size;
+
+        if (target_offset >= segment_row_count) {
+            current_chunk_id = num_chunk - 1;
+            current_chunk_pos =
+                segment_row_count -
+                segment_->num_rows_until_chunk(field_id, current_chunk_id);
+            return;
+        }
+        auto [chunk_id, chunk_pos] =
+            segment_->get_chunk_by_offset(field_id, target_offset);
+        current_chunk_id = chunk_id;
+        current_chunk_pos = chunk_pos;
+    }
+
+    void
+    MoveCursorForSingleChunk(int64_t& current_chunk_id,
+                             int64_t& current_chunk_pos,
+                             const int64_t num_chunk,
+                             const int64_t batch_size) const {
+        int64_t processed_rows = 0;
+        for (int64_t chunk_id = current_chunk_id; chunk_id < num_chunk;
+             ++chunk_id) {
+            auto chunk_size = chunk_id == num_chunk - 1
+                                  ? active_count_ - chunk_id * SizePerChunk()
+                                  : SizePerChunk();
+
+            for (int64_t i = chunk_id == current_chunk_id ? current_chunk_pos
+                                                          : 0;
+                 i < chunk_size;
+                 ++i) {
+                if (++processed_rows >= batch_size) {
+                    current_chunk_id = chunk_id;
+                    current_chunk_pos = i + 1;
+                }
+            }
+        }
+    }
+
+    int64_t
+    SizePerChunk() const {
+        return size_per_chunk_;
+    }
+
+    const int64_t active_count_;
+    const segcore::SegmentInternalInterface* segment_;
+
+ private:
+    template <typename T>
+    MultipleChunkDataAccessor
+    GetMultipleChunkDataAccessor(FieldId field_id,
+                                 int64_t& current_chunk_id,
+                                 int64_t& current_chunk_pos,
+                                 PinnedIndexView pinned_index) const;
+
+    template <typename T>
+    ChunkDataAccessor
+    GetChunkDataAccessor(FieldId field_id,
+                         int chunk_id,
+                         PinnedIndexView pinned_index) const;
+
+    const int64_t size_per_chunk_;
+    milvus::OpContext* op_ctx_;
+};
+
+}  // namespace milvus::segcore

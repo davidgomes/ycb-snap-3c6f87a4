@@ -1,0 +1,309 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package rootcoord
+
+import (
+	"context"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+type watchInfo struct {
+	ts             Timestamp
+	collectionID   UniqueID
+	partitionID    UniqueID
+	vChannels      []string
+	startPositions []*commonpb.KeyDataPair
+	schema         *schemapb.CollectionSchema
+	dbProperties   []*commonpb.KeyValuePair
+}
+
+// Broker communicates with other components.
+type Broker interface {
+	ReleaseCollection(ctx context.Context, collectionID UniqueID) error
+	ReleasePartitions(ctx context.Context, collectionID UniqueID, partitionIDs ...UniqueID) error
+	SyncNewCreatedPartition(ctx context.Context, collectionID UniqueID, partitionID UniqueID) error
+	GetQuerySegmentInfo(ctx context.Context, collectionID int64, segIDs []int64) (retResp *querypb.GetSegmentInfoResponse, retErr error)
+
+	WatchChannels(ctx context.Context, info *watchInfo) error
+	UnwatchChannels(ctx context.Context, info *watchInfo) error
+	GetSegmentStates(context.Context, *datapb.GetSegmentStatesRequest) (*datapb.GetSegmentStatesResponse, error)
+	GcConfirm(ctx context.Context, collectionID, partitionID UniqueID) bool
+
+	DropCollectionIndex(ctx context.Context, collID UniqueID, partIDs []UniqueID) error
+	// notify observer to clean their meta cache
+	BroadcastAlteredCollection(ctx context.Context, collectionID UniqueID) error
+	ShowResourceGroups(ctx context.Context) ([]string, error)
+}
+
+type ServerBroker struct {
+	s *Core
+}
+
+func newServerBroker(s *Core) *ServerBroker {
+	return &ServerBroker{s: s}
+}
+
+func (b *ServerBroker) ReleaseCollection(ctx context.Context, collectionID UniqueID) error {
+	mlog.Info(ctx, "releasing collection", mlog.Int64("collection", collectionID))
+
+	resp, err := b.s.mixCoord.ReleaseCollection(ctx, &querypb.ReleaseCollectionRequest{
+		Base:         commonpbutil.NewMsgBase(commonpbutil.WithMsgType(commonpb.MsgType_ReleaseCollection)),
+		CollectionID: collectionID,
+		NodeID:       b.s.session.GetServerID(),
+	})
+	if err != nil {
+		return err
+	}
+
+	if resp.GetErrorCode() != commonpb.ErrorCode_Success {
+		return merr.Error(resp)
+	}
+
+	mlog.Info(ctx, "done to release collection", mlog.Int64("collection", collectionID))
+	return nil
+}
+
+func (b *ServerBroker) ReleasePartitions(ctx context.Context, collectionID UniqueID, partitionIDs ...UniqueID) error {
+	if len(partitionIDs) == 0 {
+		return nil
+	}
+	log := mlog.With(mlog.Int64("collection", collectionID), mlog.Int64s("partitionIDs", partitionIDs))
+	log.Info(ctx, "releasing partitions")
+	resp, err := b.s.mixCoord.ReleasePartitions(ctx, &querypb.ReleasePartitionsRequest{
+		Base:         commonpbutil.NewMsgBase(commonpbutil.WithMsgType(commonpb.MsgType_ReleasePartitions)),
+		CollectionID: collectionID,
+		PartitionIDs: partitionIDs,
+	})
+	if err != nil {
+		return err
+	}
+
+	if resp.GetErrorCode() != commonpb.ErrorCode_Success {
+		return merr.Error(resp)
+	}
+
+	log.Info(ctx, "release partitions done")
+	return nil
+}
+
+func (b *ServerBroker) SyncNewCreatedPartition(ctx context.Context, collectionID UniqueID, partitionID UniqueID) error {
+	log := mlog.With(mlog.Int64("collection", collectionID), mlog.Int64("partitionID", partitionID))
+	log.Info(ctx, "begin to sync new partition")
+	resp, err := b.s.mixCoord.SyncNewCreatedPartition(ctx, &querypb.SyncNewCreatedPartitionRequest{
+		Base:         commonpbutil.NewMsgBase(commonpbutil.WithMsgType(commonpb.MsgType_ReleasePartitions)),
+		CollectionID: collectionID,
+		PartitionID:  partitionID,
+	})
+	if err != nil {
+		return err
+	}
+
+	if resp.GetErrorCode() != commonpb.ErrorCode_Success {
+		return merr.Error(resp)
+	}
+
+	log.Info(ctx, "sync new partition done")
+	return nil
+}
+
+func (b *ServerBroker) GetQuerySegmentInfo(ctx context.Context, collectionID int64, segIDs []int64) (retResp *querypb.GetSegmentInfoResponse, retErr error) {
+	resp, err := b.s.mixCoord.GetLoadSegmentInfo(ctx, &querypb.GetSegmentInfoRequest{
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_GetSegmentState),
+			commonpbutil.WithSourceID(b.s.session.GetServerID()),
+		),
+		CollectionID: collectionID,
+		SegmentIDs:   segIDs,
+	})
+	return resp, err
+}
+
+func toKeyDataPairs(m map[string][]byte) []*commonpb.KeyDataPair {
+	ret := make([]*commonpb.KeyDataPair, 0, len(m))
+	for k, data := range m {
+		ret = append(ret, &commonpb.KeyDataPair{
+			Key:  k,
+			Data: data,
+		})
+	}
+	return ret
+}
+
+// toMap converts []*commonpb.KeyDataPair to map[string][]byte.
+func toMap(pairs []*commonpb.KeyDataPair) map[string][]byte {
+	m := make(map[string][]byte, len(pairs))
+	for _, pair := range pairs {
+		m[pair.Key] = pair.Data
+	}
+	return m
+}
+
+func (b *ServerBroker) WatchChannels(ctx context.Context, info *watchInfo) error {
+	mlog.Info(ctx, "watching channels", mlog.Uint64("ts", info.ts), mlog.Int64("collection", info.collectionID), mlog.Strings("vChannels", info.vChannels))
+
+	resp, err := b.s.mixCoord.WatchChannels(ctx, &datapb.WatchChannelsRequest{
+		CollectionID:    info.collectionID,
+		ChannelNames:    info.vChannels,
+		StartPositions:  info.startPositions,
+		Schema:          info.schema,
+		CreateTimestamp: info.ts,
+		DbProperties:    info.dbProperties,
+	})
+	if err != nil {
+		return err
+	}
+
+	if resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
+		return merr.Error(resp.GetStatus())
+	}
+
+	mlog.Info(ctx, "done to watch channels", mlog.Uint64("ts", info.ts), mlog.Int64("collection", info.collectionID), mlog.Strings("vChannels", info.vChannels))
+	return nil
+}
+
+func (b *ServerBroker) UnwatchChannels(ctx context.Context, info *watchInfo) error {
+	// TODO: release flowgraph on datanodes.
+	return nil
+}
+
+func (b *ServerBroker) GetSegmentStates(ctx context.Context, req *datapb.GetSegmentStatesRequest) (*datapb.GetSegmentStatesResponse, error) {
+	return b.s.mixCoord.GetSegmentStates(ctx, req)
+}
+
+func (b *ServerBroker) DropCollectionIndex(ctx context.Context, collID UniqueID, partIDs []UniqueID) error {
+	mlog.Info(ctx, "dropping collection index", mlog.Int64("collection", collID), mlog.Int64s("partitions", partIDs))
+
+	rsp, err := b.s.mixCoord.DropIndex(ctx, &indexpb.DropIndexRequest{
+		CollectionID: collID,
+		PartitionIDs: partIDs,
+		IndexName:    "",
+		DropAll:      true,
+	})
+	if err != nil {
+		return err
+	}
+	if rsp.ErrorCode != commonpb.ErrorCode_Success {
+		return merr.Error(rsp)
+	}
+
+	mlog.Info(ctx, "done to drop collection index", mlog.Int64("collection", collID), mlog.Int64s("partitions", partIDs))
+
+	return nil
+}
+
+func (b *ServerBroker) GetSegmentIndexState(ctx context.Context, collID UniqueID, indexName string, segIDs []UniqueID) ([]*indexpb.SegmentIndexState, error) {
+	resp, err := b.s.mixCoord.GetSegmentIndexState(ctx, &indexpb.GetSegmentIndexStateRequest{
+		CollectionID: collID,
+		IndexName:    indexName,
+		SegmentIDs:   segIDs,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
+		return nil, merr.Error(resp.GetStatus())
+	}
+
+	return resp.GetStates(), nil
+}
+
+func (b *ServerBroker) BroadcastAlteredCollection(ctx context.Context, collectionID UniqueID) error {
+	mlog.Info(ctx, "broadcasting request to alter collection",
+		mlog.Int64("collectionID", collectionID))
+
+	colMeta, err := b.s.meta.GetCollectionByID(ctx, "", collectionID, typeutil.MaxTimestamp, false)
+	if err != nil {
+		return err
+	}
+
+	db, err := b.s.meta.GetDatabaseByName(ctx, colMeta.DBName, typeutil.MaxTimestamp)
+	if err != nil {
+		return err
+	}
+
+	partitionIDs := make([]int64, len(colMeta.Partitions))
+	for _, p := range colMeta.Partitions {
+		partitionIDs = append(partitionIDs, p.PartitionID)
+	}
+	dcReq := &datapb.AlterCollectionRequest{
+		CollectionID:   collectionID,
+		Schema:         colMeta.ToCollectionSchemaPB(),
+		PartitionIDs:   partitionIDs,
+		StartPositions: colMeta.StartPositions,
+		Properties:     colMeta.Properties,
+		DbID:           db.ID,
+		VChannels:      colMeta.VirtualChannelNames,
+	}
+	resp, err := b.s.mixCoord.BroadcastAlteredCollection(ctx, dcReq)
+	if err != nil {
+		return err
+	}
+
+	if resp.ErrorCode != commonpb.ErrorCode_Success {
+		return merr.Error(resp)
+	}
+	mlog.Info(ctx, "done to broadcast request to alter collection",
+		mlog.String("collectionName", colMeta.Name), mlog.Int64("collectionID", dcReq.GetCollectionID()),
+		mlog.Any("props", colMeta.Properties), mlog.Any("fields", colMeta.Fields),
+		mlog.Int32("schemaVersion", colMeta.SchemaVersion))
+	return nil
+}
+
+func (b *ServerBroker) ShowResourceGroups(ctx context.Context) ([]string, error) {
+	resp, err := b.s.mixCoord.ListResourceGroups(ctx, &milvuspb.ListResourceGroupsRequest{
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_ListResourceGroups),
+			commonpbutil.WithSourceID(b.s.session.GetServerID()),
+		),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := merr.CheckRPCCall(resp, err); err != nil {
+		return nil, err
+	}
+	return resp.GetResourceGroups(), nil
+}
+
+func (b *ServerBroker) GcConfirm(ctx context.Context, collectionID, partitionID UniqueID) bool {
+	log := mlog.With(mlog.Int64("collection", collectionID), mlog.Int64("partition", partitionID))
+
+	req := &datapb.GcConfirmRequest{CollectionId: collectionID, PartitionId: partitionID}
+	resp, err := b.s.mixCoord.GcConfirm(ctx, req)
+	if err != nil {
+		log.Warn(ctx, "gc is not finished", mlog.Err(err))
+		return false
+	}
+
+	if resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
+		log.Warn(ctx, "gc is not finished", mlog.String("code", resp.GetStatus().GetErrorCode().String()),
+			mlog.String("reason", resp.GetStatus().GetReason()))
+		return false
+	}
+
+	return resp.GetGcFinished()
+}

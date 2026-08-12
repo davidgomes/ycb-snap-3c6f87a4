@@ -1,0 +1,1023 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package datanode implements data persistence logic.
+//
+// Data node persists insert logs into persistent storage like minIO/S3.
+package datanode
+
+import (
+	"context"
+	"fmt"
+
+	"golang.org/x/time/rate"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus/internal/compaction"
+	"github.com/milvus-io/milvus/internal/datanode/compactor"
+	"github.com/milvus-io/milvus/internal/datanode/external"
+	"github.com/milvus-io/milvus/internal/datanode/importv2"
+	"github.com/milvus-io/milvus/internal/datanode/index"
+	"github.com/milvus-io/milvus/internal/flushcommon/io"
+	"github.com/milvus-io/milvus/internal/util/fileresource"
+	"github.com/milvus-io/milvus/internal/util/hookutil"
+	"github.com/milvus-io/milvus/internal/util/importutilv2"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/workerpb"
+	"github.com/milvus-io/milvus/pkg/v3/taskcommon"
+	"github.com/milvus-io/milvus/pkg/v3/tracer"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+// importStateV2ToCopySegmentTaskState converts ImportTaskStateV2 to CopySegmentTaskState
+func importStateV2ToCopySegmentTaskState(state datapb.ImportTaskStateV2) datapb.CopySegmentTaskState {
+	switch state {
+	case datapb.ImportTaskStateV2_Pending:
+		return datapb.CopySegmentTaskState_CopySegmentTaskPending
+	case datapb.ImportTaskStateV2_InProgress:
+		return datapb.CopySegmentTaskState_CopySegmentTaskInProgress
+	case datapb.ImportTaskStateV2_Completed:
+		return datapb.CopySegmentTaskState_CopySegmentTaskCompleted
+	case datapb.ImportTaskStateV2_Failed, datapb.ImportTaskStateV2_Retry:
+		return datapb.CopySegmentTaskState_CopySegmentTaskFailed
+	default:
+		return datapb.CopySegmentTaskState_CopySegmentTaskNone
+	}
+}
+
+// WatchDmChannels is not in use
+func (node *DataNode) WatchDmChannels(ctx context.Context, in *datapb.WatchDmChannelsRequest) (*commonpb.Status, error) {
+	mlog.Warn(ctx, "DataNode WatchDmChannels is not in use")
+
+	// TODO ERROR OF GRPC NOT IN USE
+	return merr.Success(), nil
+}
+
+// GetComponentStates will return current state of DataNode
+func (node *DataNode) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
+	nodeID := common.NotRegisteredID
+	state := node.GetStateCode()
+	mlog.Debug(ctx, "DataNode current state", mlog.String("State", state.String()))
+	if node.GetSession() != nil && node.session.Registered() {
+		nodeID = node.GetSession().ServerID
+	}
+	states := &milvuspb.ComponentStates{
+		State: &milvuspb.ComponentInfo{
+			// NodeID:    Params.NodeID, // will race with DataNode.Register()
+			NodeID:    nodeID,
+			Role:      node.Role,
+			StateCode: state,
+		},
+		SubcomponentStates: make([]*milvuspb.ComponentInfo, 0),
+		Status:             merr.Success(),
+	}
+	return states, nil
+}
+
+// Deprecated after v2.6.0
+func (node *DataNode) FlushSegments(ctx context.Context, req *datapb.FlushSegmentsRequest) (*commonpb.Status, error) {
+	mlog.Info(ctx, "FlushSegments was deprecated after v2.6.0, return success")
+	return merr.Success(), nil
+}
+
+// ResendSegmentStats . ResendSegmentStats resend un-flushed segment stats back upstream to DataCoord by resending DataNode time tick message.
+// It returns a list of segments to be sent.
+// Deprecated in 2.3.2, reversed it just for compatibility during rolling back
+func (node *DataNode) ResendSegmentStats(ctx context.Context, req *datapb.ResendSegmentStatsRequest) (*datapb.ResendSegmentStatsResponse, error) {
+	return &datapb.ResendSegmentStatsResponse{
+		Status:    merr.Success(),
+		SegResent: make([]int64, 0),
+	}, nil
+}
+
+// GetTimeTickChannel currently do nothing
+func (node *DataNode) GetTimeTickChannel(ctx context.Context, req *internalpb.GetTimeTickChannelRequest) (*milvuspb.StringResponse, error) {
+	return &milvuspb.StringResponse{
+		Status: merr.Success(),
+	}, nil
+}
+
+// GetStatisticsChannel currently do nothing
+func (node *DataNode) GetStatisticsChannel(ctx context.Context, req *internalpb.GetStatisticsChannelRequest) (*milvuspb.StringResponse, error) {
+	return &milvuspb.StringResponse{
+		Status: merr.Success(),
+	}, nil
+}
+
+// ShowConfigurations returns the configurations of DataNode matching req.Pattern
+func (node *DataNode) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	mlog.Debug(ctx, "DataNode.ShowConfigurations", mlog.String("pattern", req.Pattern))
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		mlog.Warn(ctx, "DataNode.ShowConfigurations failed", mlog.Int64("nodeId", node.GetNodeID()), mlog.Err(err))
+
+		return &internalpb.ShowConfigurationsResponse{
+			Status:        merr.Status(err),
+			Configuations: nil,
+		}, nil
+	}
+	configList := make([]*commonpb.KeyValuePair, 0)
+	for key, value := range Params.GetComponentConfigurations("datanode", req.Pattern) {
+		configList = append(configList,
+			&commonpb.KeyValuePair{
+				Key:   key,
+				Value: value,
+			})
+	}
+
+	return &internalpb.ShowConfigurationsResponse{
+		Status:        merr.Success(),
+		Configuations: configList,
+	}, nil
+}
+
+// GetMetrics return datanode metrics
+func (node *DataNode) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		mlog.Warn(ctx, "DataNode.GetMetrics failed", mlog.Int64("nodeId", node.GetNodeID()), mlog.Err(err))
+
+		return &milvuspb.GetMetricsResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	resp := &milvuspb.GetMetricsResponse{
+		Status: merr.Success(),
+		ComponentName: metricsinfo.ConstructComponentName(typeutil.DataNodeRole,
+			paramtable.GetNodeID()),
+	}
+
+	ret, err := node.metricsRequest.ExecuteMetricsRequest(ctx, req)
+	if err != nil {
+		resp.Status = merr.Status(err)
+		return resp, nil
+	}
+
+	resp.Response = ret
+	return resp, nil
+}
+
+// CompactionV2 handles compaction request from DataCoord
+// returns status as long as compaction task enqueued or invalid
+func (node *DataNode) CompactionV2(ctx context.Context, req *datapb.CompactionPlan) (*commonpb.Status, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		mlog.Warn(context.TODO(), "DataNode.Compaction failed", mlog.Int64("nodeId", node.GetNodeID()), mlog.Err(err))
+		return merr.Status(err), nil
+	}
+
+	if len(req.GetSegmentBinlogs()) == 0 {
+		mlog.Info(context.TODO(), "no segments to compact")
+		return merr.Success(), nil
+	}
+
+	if req.GetBeginLogID() == 0 {
+		return merr.Status(merr.WrapErrServiceInternalMsg("invalid beginLogID")), nil
+	}
+
+	if req.GetPreAllocatedLogIDs().GetBegin() == 0 || req.GetPreAllocatedLogIDs().GetEnd() == 0 {
+		return merr.Status(merr.WrapErrServiceInternalMsg(fmt.Sprintf("invalid beginID %d or invalid endID %d", req.GetPreAllocatedLogIDs().GetBegin(), req.GetPreAllocatedLogIDs().GetEnd()))), nil
+	}
+
+	/*
+		spanCtx := trace.SpanContextFromContext(ctx)
+
+		taskCtx := trace.ContextWithSpanContext(node.ctx, spanCtx)*/
+	taskCtx := tracer.Propagate(ctx, node.ctx)
+	compactionParams, err := compaction.ParseParamsFromJSON(req.GetJsonParams())
+	if err != nil {
+		return merr.Status(err), err
+	}
+	cm, err := node.storageFactory.NewChunkManager(node.ctx, compactionParams.StorageConfig)
+	if err != nil {
+		mlog.Error(context.TODO(), "create chunk manager failed",
+			mlog.String("bucket", compactionParams.StorageConfig.GetBucketName()),
+			mlog.String("ROOTPATH", compactionParams.StorageConfig.GetRootPath()),
+			mlog.Err(err),
+		)
+		return merr.Status(err), err
+	}
+	var task compactor.Compactor
+	binlogIO := io.NewBinlogIO(cm)
+	namespaceEnabled := req.GetSchema().GetEnableNamespace()
+	switch req.GetType() {
+	case datapb.CompactionType_Level0DeleteCompaction:
+		task = compactor.NewLevelZeroCompactionTask(
+			taskCtx,
+			io.NewBinlogIO(cm),
+			cm,
+			req,
+			compactionParams,
+		)
+	case datapb.CompactionType_MixCompaction:
+		if req.GetPreAllocatedSegmentIDs() == nil || req.GetPreAllocatedSegmentIDs().GetBegin() == 0 {
+			return merr.Status(merr.WrapErrServiceInternalMsg("invalid pre-allocated segmentID range")), nil
+		}
+		pk, err := typeutil.GetPrimaryFieldSchema(req.GetSchema())
+		if err != nil {
+			return merr.Status(err), err
+		}
+		sortFields := []int64{pk.GetFieldID()}
+		if namespaceEnabled {
+			partitionKey, err := typeutil.GetPartitionKeyFieldSchema(req.GetSchema())
+			if err != nil {
+				return merr.Status(err), err
+			}
+			sortFields = append([]int64{partitionKey.GetFieldID()}, sortFields...)
+		}
+		task = compactor.NewMixCompactionTask(
+			taskCtx,
+			io.NewBinlogIO(cm),
+			cm,
+			req,
+			compactionParams,
+			sortFields,
+		)
+	case datapb.CompactionType_ClusteringCompaction:
+		if req.GetPreAllocatedSegmentIDs() == nil || req.GetPreAllocatedSegmentIDs().GetBegin() == 0 {
+			return merr.Status(merr.WrapErrServiceInternalMsg("invalid pre-allocated segmentID range")), nil
+		}
+		if namespaceEnabled {
+			var sortFields []int64
+			partitionKey, err := typeutil.GetPartitionKeyFieldSchema(req.GetSchema())
+			if err != nil {
+				return merr.Status(err), err
+			}
+			sortFields = append(sortFields, partitionKey.GetFieldID())
+			pk, err := typeutil.GetPrimaryFieldSchema(req.GetSchema())
+			if err != nil {
+				return merr.Status(err), err
+			}
+			sortFields = append(sortFields, pk.GetFieldID())
+			task = compactor.NewNamespaceCompactor(taskCtx, req, binlogIO, cm, compactionParams, sortFields)
+		} else {
+			task = compactor.NewClusteringCompactionTask(
+				taskCtx,
+				binlogIO,
+				req,
+				compactionParams,
+			)
+		}
+	case datapb.CompactionType_SortCompaction:
+		if req.GetPreAllocatedSegmentIDs() == nil || req.GetPreAllocatedSegmentIDs().GetBegin() == 0 {
+			return merr.Status(merr.WrapErrServiceInternalMsg("invalid pre-allocated segmentID range")), nil
+		}
+		pk, err := typeutil.GetPrimaryFieldSchema(req.GetSchema())
+		if err != nil {
+			return merr.Status(err), err
+		}
+		sortFields := []int64{pk.GetFieldID()}
+		if namespaceEnabled {
+			partitionKey, err := typeutil.GetPartitionKeyFieldSchema(req.GetSchema())
+			if err != nil {
+				return merr.Status(err), err
+			}
+			sortFields = append([]int64{partitionKey.GetFieldID()}, sortFields...)
+		}
+		task = compactor.NewSortCompactionTask(
+			taskCtx,
+			cm,
+			req,
+			compactionParams,
+			sortFields,
+		)
+	case datapb.CompactionType_BumpSchemaVersionCompaction:
+		task = compactor.NewBumpSchemaVersionCompactionTask(taskCtx, cm, req, compactionParams)
+	default:
+		mlog.Warn(context.TODO(), "Unknown compaction type", mlog.String("type", req.GetType().String()))
+		return merr.Status(merr.WrapErrServiceInternalMsg("Unknown compaction type: %v", req.GetType().String())), nil
+	}
+
+	succeed, err := node.compactionExecutor.Enqueue(task)
+	if succeed {
+		return merr.Success(), nil
+	} else {
+		return merr.Status(err), nil
+	}
+}
+
+// GetCompactionState called by DataCoord return status of all compaction plans
+// Deprecated after v2.6.0
+func (node *DataNode) GetCompactionState(ctx context.Context, req *datapb.CompactionStateRequest) (*datapb.CompactionStateResponse, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		mlog.Warn(ctx, "DataNode.GetCompactionState failed", mlog.Int64("nodeId", node.GetNodeID()), mlog.Err(err))
+		return &datapb.CompactionStateResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	results := node.compactionExecutor.GetResults(req.GetPlanID())
+	return &datapb.CompactionStateResponse{
+		Status:  merr.Success(),
+		Results: results,
+	}, nil
+}
+
+// SyncSegments called by DataCoord, sync the compacted segments' meta between DC and DN
+// Deprecated after v2.6.0
+func (node *DataNode) SyncSegments(ctx context.Context, req *datapb.SyncSegmentsRequest) (*commonpb.Status, error) {
+	mlog.Info(ctx, "DataNode deprecated SyncSegments after v2.6.0, return success")
+	return merr.Success(), nil
+}
+
+// Deprecated after v2.6.0
+func (node *DataNode) NotifyChannelOperation(ctx context.Context, req *datapb.ChannelOperationsRequest) (*commonpb.Status, error) {
+	mlog.Info(ctx, "DataNode deprecated NotifyChannelOperation after v2.6.0, return success")
+	return merr.Success(), nil
+}
+
+// Deprecated after v2.6.0
+func (node *DataNode) CheckChannelOperationProgress(ctx context.Context, req *datapb.ChannelWatchInfo) (*datapb.ChannelOperationProgressResponse, error) {
+	mlog.Info(ctx, "DataNode deprecated CheckChannelOperationProgress after v2.6.0, return success")
+	return &datapb.ChannelOperationProgressResponse{
+		Status: merr.Success(),
+	}, nil
+}
+
+// Deprecated after v2.6.0
+func (node *DataNode) FlushChannels(ctx context.Context, req *datapb.FlushChannelsRequest) (*commonpb.Status, error) {
+	mlog.Info(ctx, "DataNode deprecated FlushChannels after v2.6.0, return success")
+	return merr.Success(), nil
+}
+
+func (node *DataNode) PreImport(ctx context.Context, req *datapb.PreImportRequest) (*commonpb.Status, error) {
+	mlog.Info(context.TODO(), "datanode receive preimport request")
+
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	cm, err := node.storageFactory.NewChunkManager(node.ctx, req.GetStorageConfig())
+	if err != nil {
+		mlog.Error(context.TODO(), "create chunk manager failed", mlog.String("bucket", req.GetStorageConfig().GetBucketName()),
+			mlog.String("accessKey", req.GetStorageConfig().GetAccessKeyID()),
+			mlog.Err(err),
+		)
+		return merr.Status(err), nil
+	}
+
+	var task importv2.Task
+	if importutilv2.IsL0Import(req.GetOptions()) {
+		task = importv2.NewL0PreImportTask(req, node.importTaskMgr, cm)
+	} else {
+		task = importv2.NewPreImportTask(req, node.importTaskMgr, cm)
+	}
+	node.importTaskMgr.Add(task)
+
+	mlog.Info(context.TODO(), "datanode added preimport task")
+	return merr.Success(), nil
+}
+
+func (node *DataNode) ImportV2(ctx context.Context, req *datapb.ImportRequest) (*commonpb.Status, error) {
+	mlog.Info(context.TODO(), "datanode receive import request")
+
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	cm, err := node.storageFactory.NewChunkManager(node.ctx, req.GetStorageConfig())
+	if err != nil {
+		mlog.Error(context.TODO(), "create chunk manager failed", mlog.String("bucket", req.GetStorageConfig().GetBucketName()),
+			mlog.String("accessKey", req.GetStorageConfig().GetAccessKeyID()),
+			mlog.Err(err),
+		)
+		return merr.Status(err), nil
+	}
+	var task importv2.Task
+	if importutilv2.IsL0Import(req.GetOptions()) {
+		task = importv2.NewL0ImportTask(req, node.importTaskMgr, node.syncMgr, cm)
+	} else {
+		task = importv2.NewImportTask(req, node.importTaskMgr, node.syncMgr, cm)
+	}
+	node.importTaskMgr.Add(task)
+
+	mlog.Info(context.TODO(), "datanode added import task")
+	return merr.Success(), nil
+}
+
+func (node *DataNode) QueryPreImport(ctx context.Context, req *datapb.QueryPreImportRequest) (*datapb.QueryPreImportResponse, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return &datapb.QueryPreImportResponse{Status: merr.Status(err)}, nil
+	}
+	task := node.importTaskMgr.Get(req.GetTaskID())
+	if task == nil {
+		return &datapb.QueryPreImportResponse{
+			Status: merr.Status(importv2.WrapTaskNotFoundError(req.GetTaskID())),
+		}, nil
+	}
+	fileStats := task.(interface {
+		GetFileStats() []*datapb.ImportFileStats
+	}).GetFileStats()
+	logFields := []mlog.Field{
+		mlog.Int64("taskID", task.GetTaskID()),
+		mlog.Int64("jobID", task.GetJobID()),
+		mlog.String("state", task.GetState().String()),
+		mlog.String("reason", task.GetReason()),
+		mlog.Int64("nodeID", node.GetNodeID()),
+		mlog.Any("fileStats", fileStats),
+	}
+	if task.GetState() == datapb.ImportTaskStateV2_InProgress {
+		mlog.RatedInfo(context.TODO(), rate.Limit(30), "datanode query preimport", logFields...)
+	} else {
+		mlog.Info(context.TODO(), "datanode query preimport", logFields...)
+	}
+
+	return &datapb.QueryPreImportResponse{
+		Status:    merr.Success(),
+		TaskID:    task.GetTaskID(),
+		State:     task.GetState(),
+		Reason:    task.GetReason(),
+		FileStats: fileStats,
+	}, nil
+}
+
+func (node *DataNode) QueryImport(ctx context.Context, req *datapb.QueryImportRequest) (*datapb.QueryImportResponse, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return &datapb.QueryImportResponse{Status: merr.Status(err)}, nil
+	}
+
+	// query slot
+	if req.GetQuerySlot() {
+		return &datapb.QueryImportResponse{
+			Status: merr.Success(),
+			Slots:  node.importScheduler.Slots(),
+		}, nil
+	}
+
+	// query import
+	task := node.importTaskMgr.Get(req.GetTaskID())
+	if task == nil {
+		return &datapb.QueryImportResponse{
+			Status: merr.Status(importv2.WrapTaskNotFoundError(req.GetTaskID())),
+		}, nil
+	}
+	segmentsInfo := task.(interface {
+		GetSegmentsInfo() []*datapb.ImportSegmentInfo
+	}).GetSegmentsInfo()
+	logFields := []mlog.Field{
+		mlog.Int64("taskID", task.GetTaskID()),
+		mlog.Int64("jobID", task.GetJobID()),
+		mlog.String("state", task.GetState().String()),
+		mlog.String("reason", task.GetReason()),
+		mlog.Int64("nodeID", node.GetNodeID()),
+		mlog.Any("segmentsInfo", segmentsInfo),
+	}
+	if task.GetState() == datapb.ImportTaskStateV2_InProgress {
+		mlog.RatedInfo(context.TODO(), rate.Limit(30), "datanode query import", logFields...)
+	} else {
+		mlog.Info(context.TODO(), "datanode query import", logFields...)
+	}
+	return &datapb.QueryImportResponse{
+		Status:             merr.Success(),
+		TaskID:             task.GetTaskID(),
+		State:              task.GetState(),
+		Reason:             task.GetReason(),
+		ImportSegmentsInfo: segmentsInfo,
+	}, nil
+}
+
+func (node *DataNode) DropImport(ctx context.Context, req *datapb.DropImportRequest) (*commonpb.Status, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	node.importTaskMgr.Remove(req.GetTaskID())
+
+	mlog.Info(context.TODO(), "datanode drop import done")
+
+	return merr.Success(), nil
+}
+
+func (node *DataNode) CopySegment(ctx context.Context, req *datapb.CopySegmentRequest) (*commonpb.Status, error) {
+	mlog.Info(context.TODO(), "datanode receive copy segment request")
+
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	cm, err := node.storageFactory.NewChunkManager(node.ctx, req.GetStorageConfig())
+	if err != nil {
+		mlog.Error(context.TODO(), "create chunk manager failed",
+			mlog.String("bucket", req.GetStorageConfig().GetBucketName()),
+			mlog.String("accessKey", req.GetStorageConfig().GetAccessKeyID()),
+			mlog.Err(err),
+		)
+		return merr.Status(err), nil
+	}
+
+	task := importv2.NewCopySegmentTask(req, node.importTaskMgr, cm)
+	node.importTaskMgr.Add(task)
+
+	mlog.Info(context.TODO(), "datanode added copy segment task")
+	return merr.Success(), nil
+}
+
+func (node *DataNode) QueryCopySegment(ctx context.Context, req *datapb.QueryCopySegmentRequest) (*datapb.QueryCopySegmentResponse, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return &datapb.QueryCopySegmentResponse{Status: merr.Status(err)}, nil
+	}
+
+	task := node.importTaskMgr.Get(req.GetTaskID())
+	if task == nil {
+		return &datapb.QueryCopySegmentResponse{
+			Status: merr.Status(importv2.WrapTaskNotFoundError(req.GetTaskID())),
+		}, nil
+	}
+
+	logFields := []mlog.Field{
+		mlog.Int64("taskID", task.GetTaskID()),
+		mlog.Int64("jobID", task.GetJobID()),
+		mlog.String("state", task.GetState().String()),
+		mlog.String("reason", task.GetReason()),
+		mlog.Int64("nodeID", node.GetNodeID()),
+	}
+
+	if task.GetState() == datapb.ImportTaskStateV2_InProgress {
+		mlog.RatedInfo(context.TODO(), rate.Limit(30), "datanode query copy segment", logFields...)
+	} else {
+		mlog.Info(context.TODO(), "datanode query copy segment", logFields...)
+	}
+
+	// Collect segment results from CopySegmentTask
+	var segmentResults []*datapb.CopySegmentResult
+	if copyTask, ok := task.(*importv2.CopySegmentTask); ok {
+		for _, result := range copyTask.GetSegmentResults() {
+			segmentResults = append(segmentResults, result)
+		}
+	}
+
+	return &datapb.QueryCopySegmentResponse{
+		Status:         merr.Success(),
+		TaskID:         task.GetTaskID(),
+		State:          importStateV2ToCopySegmentTaskState(task.GetState()),
+		Reason:         task.GetReason(),
+		SegmentResults: segmentResults,
+		Slots:          task.GetSlots(),
+	}, nil
+}
+
+func (node *DataNode) DropCopySegment(ctx context.Context, req *datapb.DropCopySegmentRequest) (*commonpb.Status, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	// Check task state before removal
+	task := node.importTaskMgr.Get(req.GetTaskID())
+	if task != nil {
+		// If the task is a failed CopySegmentTask, cleanup copied files
+		if copyTask, ok := task.(*importv2.CopySegmentTask); ok {
+			taskState := copyTask.GetState()
+			if taskState == datapb.ImportTaskStateV2_Failed {
+				mlog.Info(context.TODO(), "task failed, triggering cleanup of copied files",
+					mlog.String("state", taskState.String()),
+					mlog.String("reason", copyTask.GetReason()))
+
+				// Call task's cleanup method
+				copyTask.CleanupCopiedFiles()
+			}
+		}
+	}
+
+	// Remove task from manager
+	node.importTaskMgr.Remove(req.GetTaskID())
+
+	mlog.Info(context.TODO(), "datanode drop copy segment done")
+
+	return merr.Success(), nil
+}
+
+func (node *DataNode) QuerySlot(ctx context.Context, req *datapb.QuerySlotRequest) (*datapb.QuerySlotResponse, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return &datapb.QuerySlotResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	var (
+		totalSlots     = index.CalculateNodeSlots()
+		indexStatsUsed = node.taskScheduler.TaskQueue.GetUsingSlot()
+		compactionUsed = node.compactionExecutor.Slots()
+		importUsed     = node.importScheduler.Slots()
+	)
+
+	availableSlots := totalSlots - indexStatsUsed - compactionUsed - importUsed
+	if availableSlots < 0 {
+		availableSlots = 0
+	}
+
+	mlog.Info(ctx, "query slots done",
+		mlog.Int64("totalSlots", totalSlots),
+		mlog.Int64("availableSlots", availableSlots),
+		mlog.Int64("indexStatsUsed", indexStatsUsed),
+		mlog.Int64("compactionUsed", compactionUsed),
+		mlog.Int64("importUsed", importUsed),
+	)
+
+	metrics.DataNodeSlot.WithLabelValues(fmt.Sprint(node.GetNodeID()), "available").Set(float64(availableSlots))
+	metrics.DataNodeSlot.WithLabelValues(fmt.Sprint(node.GetNodeID()), "total").Set(float64(totalSlots))
+	metrics.DataNodeSlot.WithLabelValues(fmt.Sprint(node.GetNodeID()), "indexStatsUsed").Set(float64(indexStatsUsed))
+	metrics.DataNodeSlot.WithLabelValues(fmt.Sprint(node.GetNodeID()), "compactionUsed").Set(float64(compactionUsed))
+	metrics.DataNodeSlot.WithLabelValues(fmt.Sprint(node.GetNodeID()), "importUsed").Set(float64(importUsed))
+
+	return &datapb.QuerySlotResponse{
+		Status:         merr.Success(),
+		AvailableSlots: availableSlots,
+	}, nil
+}
+
+// Not in used now
+func (node *DataNode) DropCompactionPlan(ctx context.Context, req *datapb.DropCompactionPlanRequest) (*commonpb.Status, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	node.compactionExecutor.RemoveTask(req.GetPlanID())
+	mlog.Info(ctx, "DropCompactionPlans success", mlog.Int64("planID", req.GetPlanID()))
+	return merr.Success(), nil
+}
+
+// CreateTask creates different types of tasks based on task type
+func (node *DataNode) CreateTask(ctx context.Context, request *workerpb.CreateTaskRequest) (*commonpb.Status, error) {
+	mlog.Info(ctx, "CreateTask received", mlog.Any("properties", request.GetProperties()))
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+	properties := taskcommon.NewProperties(request.GetProperties())
+	taskType, err := properties.GetTaskType()
+	if err != nil {
+		return merr.Status(err), nil
+	}
+	switch taskType {
+	case taskcommon.PreImport:
+		req := &datapb.PreImportRequest{}
+		if err := proto.Unmarshal(request.GetPayload(), req); err != nil {
+			return merr.Status(err), nil
+		}
+		if err := hookutil.RegisterEZsFromPluginContext(req.GetPluginContext()); err != nil {
+			return merr.Status(err), nil
+		}
+		return node.PreImport(ctx, req)
+	case taskcommon.Import:
+		req := &datapb.ImportRequest{}
+		if err := proto.Unmarshal(request.GetPayload(), req); err != nil {
+			return merr.Status(err), nil
+		}
+		if err := hookutil.RegisterEZsFromPluginContext(req.GetPluginContext()); err != nil {
+			return merr.Status(err), nil
+		}
+		return node.ImportV2(ctx, req)
+	case taskcommon.Compaction:
+		req := &datapb.CompactionPlan{}
+		if err := proto.Unmarshal(request.GetPayload(), req); err != nil {
+			return merr.Status(err), nil
+		}
+		if err := hookutil.RegisterEZsFromPluginContext(req.GetPluginContext()); err != nil {
+			return merr.Status(err), nil
+		}
+		return node.CompactionV2(ctx, req)
+	case taskcommon.Index:
+		req := &workerpb.CreateJobRequest{}
+		if err := proto.Unmarshal(request.GetPayload(), req); err != nil {
+			return merr.Status(err), nil
+		}
+		if err := hookutil.RegisterEZsFromPluginContext(req.GetPluginContext()); err != nil {
+			return merr.Status(err), nil
+		}
+		return node.createIndexTask(ctx, req)
+	case taskcommon.Stats:
+		req := &workerpb.CreateStatsRequest{}
+		if err := proto.Unmarshal(request.GetPayload(), req); err != nil {
+			return merr.Status(err), nil
+		}
+		if err := hookutil.RegisterEZsFromPluginContext(req.GetPluginContext()); err != nil {
+			return merr.Status(err), nil
+		}
+		return node.createStatsTask(ctx, req)
+	case taskcommon.Analyze:
+		req := &workerpb.AnalyzeRequest{}
+		if err := proto.Unmarshal(request.GetPayload(), req); err != nil {
+			return merr.Status(err), nil
+		}
+		if err := hookutil.RegisterEZsFromPluginContext(req.GetPluginContext()); err != nil {
+			return merr.Status(err), nil
+		}
+		return node.createAnalyzeTask(ctx, req)
+	case taskcommon.RefreshExternalCollection:
+		req := &datapb.RefreshExternalCollectionTaskRequest{}
+		if err := proto.Unmarshal(request.GetPayload(), req); err != nil {
+			return merr.Status(err), nil
+		}
+		clusterID, err := properties.GetClusterID()
+		if err != nil {
+			return merr.Status(err), nil
+		}
+		return node.createRefreshExternalCollectionTask(ctx, clusterID, req)
+	case taskcommon.CopySegment:
+		req := &datapb.CopySegmentRequest{}
+		if err := proto.Unmarshal(request.GetPayload(), req); err != nil {
+			return merr.Status(err), nil
+		}
+		return node.CopySegment(ctx, req)
+	default:
+		err := merr.WrapErrServiceInternalMsg("unrecognized task type '%s', properties=%v", taskType, request.GetProperties())
+		mlog.Warn(ctx, "CreateTask failed", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+}
+
+type ResponseWithStatus interface {
+	GetStatus() *commonpb.Status
+}
+
+func wrapQueryTaskResult[Resp proto.Message](resp Resp, properties taskcommon.Properties) (*workerpb.QueryTaskResponse, error) {
+	payload, err := proto.Marshal(resp)
+	if err != nil {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(err)}, nil
+	}
+	statusResp, ok := any(resp).(ResponseWithStatus)
+	if !ok {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(merr.WrapErrServiceInternalMsg("response does not implement GetStatus"))}, nil
+	}
+	return &workerpb.QueryTaskResponse{
+		Status:     statusResp.GetStatus(),
+		Payload:    payload,
+		Properties: properties,
+	}, nil
+}
+
+// QueryTask queries task status
+func (node *DataNode) QueryTask(ctx context.Context, request *workerpb.QueryTaskRequest) (*workerpb.QueryTaskResponse, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(err)}, nil
+	}
+	reqProperties := taskcommon.NewProperties(request.GetProperties())
+	clusterID, err := reqProperties.GetClusterID()
+	if err != nil {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(err)}, nil
+	}
+	taskType, err := reqProperties.GetTaskType()
+	if err != nil {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(err)}, nil
+	}
+	taskID, err := reqProperties.GetTaskID()
+	if err != nil {
+		return &workerpb.QueryTaskResponse{Status: merr.Status(err)}, nil
+	}
+	switch taskType {
+	case taskcommon.PreImport:
+		resp, err := node.QueryPreImport(ctx, &datapb.QueryPreImportRequest{ClusterID: clusterID, TaskID: taskID})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		resProperties.AppendTaskState(taskcommon.FromImportState(resp.GetState()))
+		resProperties.AppendReason(resp.GetReason())
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.Import:
+		resp, err := node.QueryImport(ctx, &datapb.QueryImportRequest{ClusterID: clusterID, TaskID: taskID})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		resProperties.AppendTaskState(taskcommon.FromImportState(resp.GetState()))
+		resProperties.AppendReason(resp.GetReason())
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.Compaction:
+		resp, err := node.GetCompactionState(ctx, &datapb.CompactionStateRequest{PlanID: taskID})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		if len(resp.GetResults()) > 0 {
+			resProperties.AppendTaskState(taskcommon.FromCompactionState(resp.GetResults()[0].GetState()))
+		}
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.Index:
+		resp, err := node.queryIndexTask(ctx, &workerpb.QueryJobsRequest{ClusterID: clusterID, TaskIDs: []int64{taskID}})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		results := resp.GetIndexJobResults().GetResults()
+		if len(results) > 0 {
+			resProperties.AppendTaskState(taskcommon.State(results[0].GetState()))
+			resProperties.AppendReason(results[0].GetFailReason())
+		}
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.Stats:
+		resp, err := node.queryStatsTask(ctx, &workerpb.QueryJobsRequest{ClusterID: clusterID, TaskIDs: []int64{taskID}})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		results := resp.GetStatsJobResults().GetResults()
+		if len(results) > 0 {
+			resProperties.AppendTaskState(results[0].GetState())
+			resProperties.AppendReason(results[0].GetFailReason())
+		}
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.Analyze:
+		resp, err := node.queryAnalyzeTask(ctx, &workerpb.QueryJobsRequest{ClusterID: clusterID, TaskIDs: []int64{taskID}})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		results := resp.GetAnalyzeJobResults().GetResults()
+		if len(results) > 0 {
+			resProperties.AppendTaskState(results[0].GetState())
+			resProperties.AppendReason(results[0].GetFailReason())
+		}
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.RefreshExternalCollection:
+		// Query task state from external collection manager
+		info := node.externalCollectionManager.Get(clusterID, taskID)
+		if info == nil {
+			resp := &datapb.RefreshExternalCollectionTaskResponse{
+				Status:     merr.Success(),
+				State:      indexpb.JobState_JobStateFailed,
+				FailReason: "task result not found",
+			}
+			resProperties := taskcommon.NewProperties(nil)
+			resProperties.AppendTaskState(taskcommon.Failed)
+			resProperties.AppendReason("task result not found")
+			return wrapQueryTaskResult(resp, resProperties)
+		}
+		resp := &datapb.RefreshExternalCollectionTaskResponse{
+			Status:          merr.Success(),
+			State:           info.State,
+			FailReason:      info.FailReason,
+			KeptSegments:    info.KeptSegments,
+			UpdatedSegments: info.UpdatedSegments,
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		resProperties.AppendTaskState(info.State)
+		resProperties.AppendReason(info.FailReason)
+		return wrapQueryTaskResult(resp, resProperties)
+	case taskcommon.CopySegment:
+		resp, err := node.QueryCopySegment(ctx, &datapb.QueryCopySegmentRequest{
+			ClusterID: clusterID,
+			TaskID:    taskID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		resProperties := taskcommon.NewProperties(nil)
+		resProperties.AppendTaskState(taskcommon.FromCopySegmentState(resp.GetState()))
+		resProperties.AppendReason(resp.GetReason())
+		return wrapQueryTaskResult(resp, resProperties)
+	default:
+		err := merr.WrapErrServiceInternalMsg("unrecognized task type '%s', properties=%v", taskType, request.GetProperties())
+		mlog.Warn(ctx, "QueryTask failed", mlog.Err(err))
+		return &workerpb.QueryTaskResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+}
+
+// DropTask deletes specified type of task
+func (node *DataNode) DropTask(ctx context.Context, request *workerpb.DropTaskRequest) (*commonpb.Status, error) {
+	mlog.Info(ctx, "DropTask received", mlog.Any("properties", request.GetProperties()))
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+	properties := taskcommon.NewProperties(request.GetProperties())
+	taskType, err := properties.GetTaskType()
+	if err != nil {
+		return merr.Status(err), nil
+	}
+	taskID, err := properties.GetTaskID()
+	if err != nil {
+		return merr.Status(err), nil
+	}
+	switch taskType {
+	case taskcommon.PreImport, taskcommon.Import:
+		return node.DropImport(ctx, &datapb.DropImportRequest{TaskID: taskID})
+	case taskcommon.CopySegment:
+		return node.DropCopySegment(ctx, &datapb.DropCopySegmentRequest{TaskID: taskID})
+	case taskcommon.Compaction:
+		return node.DropCompactionPlan(ctx, &datapb.DropCompactionPlanRequest{PlanID: taskID})
+	case taskcommon.Index, taskcommon.Stats, taskcommon.Analyze:
+		jobType, err := properties.GetJobType()
+		if err != nil {
+			return merr.Status(err), nil
+		}
+		clusterID, err := properties.GetClusterID()
+		if err != nil {
+			return merr.Status(err), nil
+		}
+		return node.DropJobsV2(ctx, &workerpb.DropJobsV2Request{
+			ClusterID: clusterID,
+			TaskIDs:   []int64{taskID},
+			JobType:   jobType,
+		})
+	case taskcommon.RefreshExternalCollection:
+		// Drop external collection task from external collection manager
+		clusterID, err := properties.GetClusterID()
+		if err != nil {
+			return merr.Status(err), nil
+		}
+		canceled := node.externalCollectionManager.CancelTask(clusterID, taskID)
+		info := node.externalCollectionManager.Delete(clusterID, taskID)
+		if !canceled && info != nil && info.Cancel != nil {
+			info.Cancel()
+		}
+		mlog.Info(ctx, "DropTask for external collection completed",
+			mlog.Int64("taskID", taskID),
+			mlog.String("clusterID", clusterID))
+		return merr.Success(), nil
+	default:
+		err := merr.WrapErrServiceInternalMsg("unrecognized task type '%s', properties=%v", taskType, request.GetProperties())
+		mlog.Warn(ctx, "DropTask failed", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+}
+
+func (node *DataNode) SyncFileResource(ctx context.Context, req *internalpb.SyncFileResourceRequest) (*commonpb.Status, error) {
+	mlog.Info(context.TODO(), "sync file resource", mlog.Any("resources", req.Resources))
+
+	if !node.isHealthy() {
+		mlog.Warn(context.TODO(), "failed to sync file resource, DataNode is not healthy")
+		return merr.Status(merr.ErrServiceNotReady), nil
+	}
+
+	err := fileresource.Sync(req.GetVersion(), req.GetResources())
+	if err != nil {
+		return merr.Status(err), nil
+	}
+	return merr.Success(), nil
+}
+
+// createRefreshExternalCollectionTask handles a refresh-external-collection task dispatched from DataCoord.
+// This submits the task to the external collection manager for async execution.
+// clusterID is the caller's cluster identifier (from CreateTask properties),
+// used as the task key so that QueryTask from the same caller can locate the result.
+func (node *DataNode) createRefreshExternalCollectionTask(ctx context.Context, clusterID string, req *datapb.RefreshExternalCollectionTaskRequest) (*commonpb.Status, error) {
+	mlog.Info(context.TODO(), "createRefreshExternalCollectionTask received",
+		mlog.Int("currentSegments", len(req.GetCurrentSegments())),
+		mlog.String("externalSource", req.GetExternalSource()))
+
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	// Submit task to external collection manager
+	// The task will execute asynchronously in the manager's goroutine pool
+	err := node.externalCollectionManager.SubmitTask(clusterID, req, func(taskCtx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+		task := external.NewRefreshExternalCollectionTask(taskCtx, req)
+
+		if err := task.PreExecute(taskCtx); err != nil {
+			mlog.Warn(context.TODO(), "external collection task PreExecute failed", mlog.Err(err))
+			return nil, err
+		}
+
+		if err := task.Execute(taskCtx); err != nil {
+			mlog.Warn(context.TODO(), "external collection task Execute failed", mlog.Err(err))
+			return nil, err
+		}
+
+		if err := task.PostExecute(taskCtx); err != nil {
+			mlog.Warn(context.TODO(), "external collection task PostExecute failed", mlog.Err(err))
+			return nil, err
+		}
+
+		mlog.Info(context.TODO(), "external collection task completed successfully",
+			mlog.Int("updatedSegments", len(task.GetUpdatedSegments())))
+
+		resp := &datapb.RefreshExternalCollectionTaskResponse{
+			Status:          merr.Success(),
+			State:           indexpb.JobState_JobStateFinished,
+			KeptSegments:    task.GetKeptSegmentIDs(),
+			UpdatedSegments: task.GetUpdatedSegments(),
+		}
+
+		return resp, nil
+	})
+	if err != nil {
+		mlog.Warn(context.TODO(), "failed to submit external collection task", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+
+	mlog.Info(context.TODO(), "external collection task submitted to manager")
+	return merr.Success(), nil
+}

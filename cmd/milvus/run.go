@@ -1,0 +1,111 @@
+package milvus
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
+)
+
+type run struct{}
+
+func (c *run) execute(args []string, flags *flag.FlagSet) {
+	if len(args) < 3 {
+		fmt.Fprintln(os.Stderr, getHelp())
+		return
+	}
+	flags.Usage = func() {
+		fmt.Fprintln(os.Stderr, getHelp())
+	}
+	// make go ignore SIGPIPE when all cgo thread set mask SIGPIPE
+	signal.Ignore(syscall.SIGPIPE)
+
+	serverType := args[2]
+	roles := GetMilvusRoles(args, flags)
+	// setup config for embedded milvus
+
+	runtimeDir := createRuntimeDir(serverType)
+	filename := getPidFileName(serverType, roles.Alias)
+
+	maybeEnableOpenSSLFIPS()
+	c.printBanner(flags.Output())
+	c.injectVariablesToEnv()
+	c.printHardwareInfo(flags.Output())
+	lock, err := createPidFile(flags.Output(), filename, runtimeDir)
+	if err != nil {
+		panic(err)
+	}
+	defer removePidFile(lock)
+	roles.Run()
+}
+
+func (c *run) printBanner(w io.Writer) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "    __  _________ _   ____  ______    ")
+	fmt.Fprintln(w, "   /  |/  /  _/ /| | / / / / / __/    ")
+	fmt.Fprintln(w, "  / /|_/ // // /_| |/ / /_/ /\\ \\    ")
+	fmt.Fprintln(w, " /_/  /_/___/____/___/\\____/___/     ")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Welcome to Milvus!")
+	fmt.Fprintln(w, "Version:   "+getEffectiveVersion())
+	fmt.Fprintln(w, "Built:     "+BuildTime)
+	fmt.Fprintln(w, "GitCommit: "+GitCommit)
+	fmt.Fprintln(w, "GoVersion: "+GoVersion)
+	fmt.Fprintf(w, "Milvus FIPS in Go: BoringCrypto %v\n", boringEnabled())
+	fmt.Fprintln(w)
+	metrics.BuildInfo.WithLabelValues(getEffectiveVersion(), BuildTime, GitCommit).Set(1)
+}
+
+func (c *run) printHardwareInfo(w io.Writer) {
+	totalMem := hardware.GetMemoryCount()
+	usedMem := hardware.GetUsedMemoryCount()
+	fmt.Fprintf(w, "TotalMem: %d\n", totalMem)
+	fmt.Fprintf(w, "UsedMem: %d\n", usedMem)
+	fmt.Fprintln(w)
+}
+
+func getEffectiveVersion() string {
+	if MilvusVersion != "" && MilvusVersion != "unknown" {
+		return MilvusVersion
+	}
+	return common.Version.String()
+}
+
+func (c *run) injectVariablesToEnv() {
+	// inject in need
+
+	var err error
+
+	err = os.Setenv(metricsinfo.GitCommitEnvKey, GitCommit)
+	if err != nil {
+		mlog.Warn(context.TODO(), fmt.Sprintf("failed to inject %s to environment variable", metricsinfo.GitCommitEnvKey),
+			mlog.Err(err))
+	}
+
+	err = os.Setenv(metricsinfo.GitBuildTagsEnvKey, getEffectiveVersion())
+	if err != nil {
+		mlog.Warn(context.TODO(), fmt.Sprintf("failed to inject %s to environment variable", metricsinfo.GitBuildTagsEnvKey),
+			mlog.Err(err))
+	}
+
+	err = os.Setenv(metricsinfo.MilvusBuildTimeEnvKey, BuildTime)
+	if err != nil {
+		mlog.Warn(context.TODO(), fmt.Sprintf("failed to inject %s to environment variable", metricsinfo.MilvusBuildTimeEnvKey),
+			mlog.Err(err))
+	}
+
+	err = os.Setenv(metricsinfo.MilvusUsedGoVersion, GoVersion)
+	if err != nil {
+		mlog.Warn(context.TODO(), fmt.Sprintf("failed to inject %s to environment variable", metricsinfo.MilvusUsedGoVersion),
+			mlog.Err(err))
+	}
+}

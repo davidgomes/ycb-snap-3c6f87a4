@@ -1,0 +1,18 @@
+package interfaces
+
+import "github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+
+//go:generate mockery --name=TokenStream --with-expecter
+type TokenStream interface {
+	Advance() bool
+	Token() string
+	DetailedToken() *milvuspb.AnalyzerToken
+	Destroy()
+}
+
+//go:generate mockery --name=Analyzer --with-expecter --inpackage --filename=mock_analyzer.go --structname=MockAnalyzer
+type Analyzer interface {
+	NewTokenStream(text string) TokenStream
+	Clone() (Analyzer, error)
+	Destroy()
+}

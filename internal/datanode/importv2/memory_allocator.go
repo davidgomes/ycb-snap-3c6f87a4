@@ -1,0 +1,117 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package importv2
+
+import (
+	"context"
+	"sync"
+
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+)
+
+var (
+	globalMemoryAllocator     MemoryAllocator
+	globalMemoryAllocatorOnce sync.Once
+)
+
+// GetMemoryAllocator returns the global memory allocator instance
+func GetMemoryAllocator() MemoryAllocator {
+	globalMemoryAllocatorOnce.Do(func() {
+		globalMemoryAllocator = NewMemoryAllocator(int64(hardware.GetMemoryCount()))
+	})
+	return globalMemoryAllocator
+}
+
+// MemoryAllocator handles memory allocation and deallocation for import tasks
+type MemoryAllocator interface {
+	// BlockingAllocate blocks until memory is available and then allocates
+	// This method will block until memory becomes available
+	BlockingAllocate(taskID int64, size int64)
+
+	// Release releases memory of the specified size
+	Release(taskID int64, size int64)
+}
+
+type memoryAllocator struct {
+	systemTotalMemory int64
+	usedMemory        int64
+	mutex             sync.RWMutex
+	cond              *sync.Cond
+}
+
+// NewMemoryAllocator creates a new MemoryAllocator instance
+func NewMemoryAllocator(systemTotalMemory int64) MemoryAllocator {
+	mlog.Info(context.TODO(), "new import memory allocator", mlog.Int64("systemTotalMemory", systemTotalMemory))
+	ma := &memoryAllocator{
+		systemTotalMemory: systemTotalMemory,
+		usedMemory:        0,
+	}
+	ma.cond = sync.NewCond(&ma.mutex)
+	return ma
+}
+
+// BlockingAllocate blocks until memory is available and then allocates
+func (ma *memoryAllocator) BlockingAllocate(taskID int64, size int64) {
+	ma.mutex.Lock()
+	defer ma.mutex.Unlock()
+
+	percentage := paramtable.Get().DataNodeCfg.ImportMemoryLimitPercentage.GetAsFloat()
+	memoryLimit := int64(float64(ma.systemTotalMemory) * percentage / 100.0)
+
+	// Wait until enough memory is available
+	for ma.usedMemory+size > memoryLimit {
+		mlog.Warn(context.TODO(), "task waiting for memory allocation...",
+			mlog.FieldTaskID(taskID),
+			mlog.Int64("requestedSize", size),
+			mlog.Int64("usedMemory", ma.usedMemory),
+			mlog.Int64("availableMemory", memoryLimit-ma.usedMemory))
+
+		ma.cond.Wait()
+	}
+
+	// Allocate memory
+	ma.usedMemory += size
+	mlog.Info(context.TODO(), "memory allocated successfully",
+		mlog.FieldTaskID(taskID),
+		mlog.Int64("allocatedSize", size),
+		mlog.Int64("usedMemory", ma.usedMemory),
+		mlog.Int64("availableMemory", memoryLimit-ma.usedMemory))
+}
+
+// Release releases memory of the specified size
+func (ma *memoryAllocator) Release(taskID int64, size int64) {
+	ma.mutex.Lock()
+	defer ma.mutex.Unlock()
+
+	ma.usedMemory -= size
+	if ma.usedMemory < 0 {
+		ma.usedMemory = 0 // Prevent negative memory usage
+		mlog.Warn(context.TODO(), "memory release resulted in negative usage, reset to 0",
+			mlog.FieldTaskID(taskID),
+			mlog.Int64("releaseSize", size))
+	}
+
+	mlog.Info(context.TODO(), "memory released successfully",
+		mlog.FieldTaskID(taskID),
+		mlog.Int64("releasedSize", size),
+		mlog.Int64("usedMemory", ma.usedMemory))
+
+	// Wake up waiting tasks after memory is released
+	ma.cond.Broadcast()
+}

@@ -1,0 +1,342 @@
+package broadcaster
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/cenkalti/backoff/v4"
+
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
+)
+
+// newAckCallbackScheduler creates a new ack callback scheduler.
+func newAckCallbackScheduler(logger *mlog.Logger) *ackCallbackScheduler {
+	s := &ackCallbackScheduler{
+		notifier:           syncutil.NewAsyncTaskNotifier[struct{}](),
+		pending:            make(chan *broadcastTask, 16),
+		triggerChan:        make(chan struct{}, 1),
+		rkLockerMu:         sync.Mutex{},
+		rkLocker:           newResourceKeyLocker(),
+		tombstoneScheduler: newTombstoneScheduler(logger),
+	}
+	s.SetLogger(logger)
+	return s
+}
+
+type ackCallbackScheduler struct {
+	mlog.Binder
+
+	notifier           *syncutil.AsyncTaskNotifier[struct{}]
+	pending            chan *broadcastTask
+	triggerChan        chan struct{}
+	tombstoneScheduler *tombstoneScheduler
+	pendingAckedTasks  []*broadcastTask // should already sorted by the broadcastID
+	// For the task that hold the conflicted resource-key (which is protected by the resource-key lock),
+	// broadcastID is always increasing,
+	// the task which broadcastID is smaller happens before the task which broadcastID is larger.
+	// Meanwhile the timetick order of any vchannel of those two tasks are same with the order of broadcastID,
+	// so the smaller broadcastID task is always acked before the larger broadcastID task.
+	// so we can exeucte the tasks by the order of the broadcastID to promise the ack order is same with wal order.
+	rkLockerMu sync.Mutex // because batch lock operation will be executed on rkLocker,
+	// so we may encounter following cases:
+	// 1. task A, B, C are competing with rkLocker, and we want the operation is executed in order of A -> B -> C.
+	// 2. A is on running, and B, C are waiting for the lock.
+	// 3. When triggerAckCallback, B is failed to acquire the lock, C is pending to call FastLock.
+	// 4. Then A is done, the lock is released, C acquires the lock and executes the ack callback, the order is broken as A -> C -> B.
+	// To avoid the order broken, we need to use a mutex to protect the batch lock operation.
+	rkLocker *resourceKeyLocker // it is used to lock the resource-key of ack operation.
+	// it is not same instance with the resourceKeyLocker in the broadcastTaskManager.
+	// because it is just used to check if the resource-key is locked when acked.
+	// For primary milvus cluster, it makes no sense, because the execution order is already protected by the broadcastTaskManager.
+	// But for secondary milvus cluster, it is necessary to use this rkLocker to protect the resource-key when acked to avoid the execution order broken.
+
+	bm *broadcastTaskManager // reference to the broadcast task manager for accessing incomplete tasks
+}
+
+// Initialize initializes the ack scheduler with a list of broadcast tasks.
+func (s *ackCallbackScheduler) Initialize(tasks []*broadcastTask, tombstoneIDs []uint64, bm *broadcastTaskManager) {
+	// when initializing, the tasks in recovery info may be out of order, so we need to sort them by the broadcastID.
+	sortByControlChannelTimeTick(tasks)
+	s.tombstoneScheduler.Initialize(bm, tombstoneIDs)
+	// Mark all tasks as already joined the ack callback scheduler to prevent duplicate scheduling.
+	// Without this, when fixIncompleteBroadcastsForForcePromote calls FastAck → ack on a recovered task,
+	// ack() would re-add the task to the scheduler (since joinAckCallbackScheduled was false),
+	// causing two concurrent doAckCallback goroutines on the same task (data race on taskMetricsGuard).
+	for _, task := range tasks {
+		task.mu.Lock()
+		task.joinAckCallbackScheduled = true
+		task.mu.Unlock()
+	}
+	s.pendingAckedTasks = tasks
+	go s.background()
+}
+
+// AddTask adds a new broadcast task into the ack scheduler.
+func (s *ackCallbackScheduler) AddTask(task *broadcastTask) {
+	select {
+	case <-s.notifier.Context().Done():
+		panic("unreachable: ack scheduler is closing when adding new task")
+	case s.pending <- task:
+	}
+}
+
+// Close closes the ack scheduler.
+func (s *ackCallbackScheduler) Close() {
+	s.notifier.Cancel()
+	s.notifier.BlockUntilFinish()
+
+	// close the tombstone scheduler after the ack scheduler is closed.
+	s.tombstoneScheduler.Close()
+}
+
+// background is the background task of the ack scheduler.
+func (s *ackCallbackScheduler) background() {
+	defer func() {
+		s.notifier.Finish(struct{}{})
+		s.Logger().Info(context.TODO(),
+
+			"ack scheduler background exit")
+	}()
+	s.Logger().Info(context.TODO(),
+
+		"ack scheduler background start")
+
+	// it's weired to find that FastLock may be failure even if there's no resource-key locked,
+	// also see: #45285
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var triggerTicker <-chan time.Time
+	for {
+		s.triggerAckCallback()
+		if len(s.pendingAckedTasks) > 0 {
+			// if there's pending tasks, trigger the ack callback after a delay.
+			triggerTicker = ticker.C
+		} else {
+			triggerTicker = nil
+		}
+		select {
+		case <-s.notifier.Context().Done():
+			return
+		case task := <-s.pending:
+			s.addBroadcastTask(task)
+		case <-s.triggerChan:
+		case <-triggerTicker:
+		}
+	}
+}
+
+// addBroadcastTask adds a broadcast task into the pending acked tasks.
+func (s *ackCallbackScheduler) addBroadcastTask(task *broadcastTask) error {
+	s.pendingAckedTasks = append(s.pendingAckedTasks, task)
+	return nil
+}
+
+// triggerAckCallback triggers the ack callback.
+func (s *ackCallbackScheduler) triggerAckCallback() {
+	s.rkLockerMu.Lock()
+	defer s.rkLockerMu.Unlock()
+
+	pendingTasks := make([]*broadcastTask, 0, len(s.pendingAckedTasks))
+	for _, task := range s.pendingAckedTasks {
+		if task.IsForcePromoteMessage() {
+			// Force promote: handle fix + ack callback entirely in background goroutine.
+			// No FastLock needed upfront — fix doesn't require resource key lock,
+			// and the goroutine acquires the lock itself before running ack callback.
+			go s.doForcePromoteFixIncompleteBroadcasts(task)
+			continue
+		}
+
+		g, err := s.rkLocker.FastLock(task.Header().ResourceKeys.Collect()...)
+		if err != nil {
+			s.Logger().Warn(context.TODO(),
+
+				"lock is occupied, delay the ack callback", mlog.Uint64("broadcastID", task.Header().BroadcastID), mlog.Err(err))
+			pendingTasks = append(pendingTasks, task)
+			continue
+		}
+
+		// Execute the ack callback in background.
+		go s.doAckCallback(task, g)
+	}
+	s.pendingAckedTasks = pendingTasks
+}
+
+// doForcePromoteFixIncompleteBroadcasts handles the full force promote lifecycle:
+// 1. Wait for all vchannels to ack the force promote message (replicate messages are fenced after this)
+// 2. Fix incomplete broadcasts by delegating to broadcastScheduler (WAL append + ack + callback + tombstone)
+// 3. Acquire resource key lock and execute ack callback (close done channel → unblock RPC)
+func (s *ackCallbackScheduler) doForcePromoteFixIncompleteBroadcasts(bt *broadcastTask) {
+	logger := s.Logger().With(mlog.Uint64("broadcastID", bt.Header().BroadcastID))
+	ctx := s.notifier.Context()
+
+	if err := bt.BlockUntilAllAck(ctx); err != nil {
+		logger.Warn(context.TODO(), "force promote BlockUntilAllAck failed", mlog.Err(err))
+		return
+	}
+
+	if err := s.fixIncompleteBroadcastsForForcePromote(ctx); err != nil {
+		logger.Warn(context.TODO(), "force promote fix incomplete broadcasts aborted", mlog.Err(err))
+		return
+	}
+	logger.Info(context.TODO(), "completed fixing incomplete broadcasts for force promote")
+
+	// Acquire resource key lock before executing ack callback.
+	g := s.rkLocker.Lock(bt.Header().ResourceKeys.Collect()...)
+	s.doAckCallback(bt, g)
+}
+
+// fixIncompleteBroadcastsForForcePromote fixes incomplete broadcasts for force promote.
+// It marks incomplete AlterReplicateConfig messages with ignore=true, then delegates
+// all incomplete tasks to broadcastScheduler for WAL append, ack, callback, and tombstone.
+func (s *ackCallbackScheduler) fixIncompleteBroadcastsForForcePromote(ctx context.Context) error {
+	incompleteTasks := s.bm.getIncompleteBroadcastTasks()
+
+	// Sort by broadcastID to preserve the original order of DDL messages.
+	sort.Slice(incompleteTasks, func(i, j int) bool {
+		return incompleteTasks[i].Header().BroadcastID < incompleteTasks[j].Header().BroadcastID
+	})
+
+	if len(incompleteTasks) == 0 {
+		s.Logger().Info(ctx,
+
+			"No incomplete broadcasts to fix for force promote")
+		return nil
+	}
+
+	s.Logger().Info(ctx,
+
+		"Fixing incomplete broadcasts for force promote",
+		mlog.Int("incompleteTasks", len(incompleteTasks)))
+
+	// Mark AlterReplicateConfig tasks with ignore=true (to prevent old config overwriting force promote config)
+	// MarkIgnore is a memory-only operation. It only runs on tasks where IsAlterReplicateConfigMessage() == true,
+	// so the parse inside MarkIgnore cannot fail — panic if it does.
+	for _, task := range incompleteTasks {
+		if !task.IsAlterReplicateConfigMessage() {
+			continue
+		}
+		s.Logger().Info(ctx,
+
+			"Marking AlterReplicateConfig task with ignore=true",
+			mlog.Uint64("broadcastID", task.Header().BroadcastID))
+
+		if err := task.MarkIgnore(); err != nil {
+			panic(fmt.Sprintf("unreachable: MarkIgnore failed on AlterReplicateConfig task %d: %v", task.Header().BroadcastID, err))
+		}
+	}
+
+	// Delegate all incomplete tasks to broadcastScheduler for supplement.
+	// broadcastScheduler handles WAL append with retry; AddTask blocks until the task
+	// reaches tombstone (broadcast → ack → callback → tombstone).
+	for _, task := range incompleteTasks {
+		pending := newPendingBroadcastTask(task)
+		if pending == nil {
+			continue // no pending messages for this task
+		}
+		for i, msg := range pending.pendingMessages {
+			pending.pendingMessages[i] = message.ClearReplicateHeader(msg)
+		}
+		s.Logger().Info(ctx,
+
+			"Delegating incomplete task to broadcastScheduler",
+			mlog.Uint64("broadcastID", task.Header().BroadcastID),
+			mlog.String("messageType", task.msg.MessageType().String()),
+			mlog.Int("pendingVChannels", len(pending.pendingMessages)))
+		if _, err := s.bm.broadcastScheduler.AddTask(ctx, pending); err != nil {
+			return merr.Wrapf(err, "failed to supplement task %d via broadcastScheduler", task.Header().BroadcastID)
+		}
+	}
+	s.Logger().Info(ctx,
+
+		"All incomplete broadcasts fixed and tombstoned")
+	return nil
+}
+
+// doAckCallback executes the ack callback.
+func (s *ackCallbackScheduler) doAckCallback(bt *broadcastTask, g *lockGuards) (err error) {
+	logger := s.Logger().With(mlog.Uint64("broadcastID", bt.Header().BroadcastID))
+	defer func() {
+		s.rkLockerMu.Lock()
+		g.Unlock()
+		s.rkLockerMu.Unlock()
+
+		s.triggerChan <- struct{}{}
+		if err == nil {
+			logger.Info(context.TODO(), "execute ack callback done")
+		} else {
+			logger.Warn(context.TODO(), "execute ack callback failed", mlog.Err(err))
+		}
+	}()
+	logger.Info(context.TODO(), "start to execute ack callback")
+	if err := bt.BlockUntilAllAck(s.notifier.Context()); err != nil {
+		return err
+	}
+	logger.Debug(context.TODO(), "all vchannels are acked")
+
+	msg, result := bt.BroadcastResult()
+	makeMap := make(map[string]*message.AppendResult, len(result))
+	for vchannel, result := range result {
+		makeMap[vchannel] = &message.AppendResult{
+			MessageID:              result.MessageID,
+			LastConfirmedMessageID: result.LastConfirmedMessageID,
+			TimeTick:               result.TimeTick,
+		}
+	}
+	// call the ack callback until done.
+	bt.ObserveAckCallbackBegin()
+	if err := s.callMessageAckCallbackUntilDone(s.notifier.Context(), msg, makeMap); err != nil {
+		return err
+	}
+	bt.ObserveAckCallbackDone()
+
+	logger.Debug(context.TODO(), "ack callback done")
+	if err := bt.MarkAckCallbackDone(s.notifier.Context()); err != nil {
+		// The catalog is reliable to write, so we can mark the ack callback done without retrying.
+		return err
+	}
+	s.tombstoneScheduler.AddPending(bt.Header().BroadcastID)
+	return nil
+}
+
+// callMessageAckCallbackUntilDone calls the message ack callback until done.
+func (s *ackCallbackScheduler) callMessageAckCallbackUntilDone(ctx context.Context, msg message.BroadcastMutableMessage, result map[string]*message.AppendResult) error {
+	backoff := backoff.NewExponentialBackOff()
+	backoff.InitialInterval = 10 * time.Millisecond
+	backoff.MaxInterval = 10 * time.Second
+	backoff.MaxElapsedTime = 0
+	backoff.Reset()
+
+	for {
+		err := registry.CallMessageAckCallback(ctx, msg, result)
+		if err == nil {
+			return nil
+		}
+		nextInterval := backoff.NextBackOff()
+		s.Logger().Warn(ctx,
+
+			"failed to call message ack callback, wait for retry...",
+			mlog.FieldMessage(msg),
+			mlog.Duration("nextInterval", nextInterval),
+			mlog.Err(err))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(nextInterval):
+		}
+	}
+}
+
+// sortByControlChannelTimeTick sorts the tasks by the time tick of the control channel.
+func sortByControlChannelTimeTick(tasks []*broadcastTask) {
+	sort.Slice(tasks, func(i, j int) bool {
+		return tasks[i].ControlChannelTimeTick() < tasks[j].ControlChannelTimeTick()
+	})
+}

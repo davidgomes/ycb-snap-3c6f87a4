@@ -1,0 +1,251 @@
+package shards
+
+import (
+	"go.uber.org/atomic"
+
+	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/stats"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/utils"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
+)
+
+// AssignSegmentRequest is a request to allocate segment.
+type AssignSegmentRequest struct {
+	CollectionID          int64
+	PartitionID           int64
+	ModifiedMetrics       stats.ModifiedMetrics
+	TimeTick              uint64
+	TxnSession            TxnSession
+	SchemaVersion         int32
+	UseGrowingSourceFlush bool
+}
+
+// AssignSegmentResult is a result of segment allocation.
+// The sum of Results.Row is equal to InserMetrics.NumRows.
+type AssignSegmentResult struct {
+	SegmentID   int64
+	Acknowledge *atomic.Int32 // used to ack the segment assign result has been consumed
+}
+
+// Ack acks the segment assign result has been consumed.
+// Must be only call once after the segment assign result has been consumed.
+func (r *AssignSegmentResult) Ack() {
+	r.Acknowledge.Dec()
+}
+
+// CheckIfSegmentCanBeCreated checks if a segment can be created for the specified collection and partition.
+func (m *shardManagerImpl) CheckIfSegmentCanBeCreated(uniquePartitionKey PartitionUniqueKey, segmentID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.checkIfSegmentCanBeCreated(uniquePartitionKey, segmentID)
+}
+
+// checkIfSegmentCanBeCreated checks if a segment can be created for the specified collection and partition.
+func (m *shardManagerImpl) checkIfSegmentCanBeCreated(uniquePartitionKey PartitionUniqueKey, segmentID int64) error {
+	// segment can be created only if the collection and partition exists.
+	if err := m.checkIfPartitionExists(uniquePartitionKey); err != nil {
+		return err
+	}
+
+	if m := m.partitionManagers[uniquePartitionKey].GetSegmentManager(segmentID); m != nil {
+		return ErrSegmentExists
+	}
+	return nil
+}
+
+// CheckIfSegmentCanBeDropped checks if a segment can be flushed.
+func (m *shardManagerImpl) CheckIfSegmentCanBeFlushed(uniquePartitionKey PartitionUniqueKey, segmentID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.checkIfSegmentCanBeFlushed(uniquePartitionKey, segmentID)
+}
+
+// checkIfSegmentCanBeFlushed checks if a segment can be flushed.
+func (m *shardManagerImpl) checkIfSegmentCanBeFlushed(uniquePartitionKey PartitionUniqueKey, segmentID int64) error {
+	if err := m.checkIfPartitionExists(uniquePartitionKey); err != nil {
+		return err
+	}
+
+	// segment can be flushed only if the segment exists, and its state is flushed.
+	// pm must exists, because we have checked the partition exists.
+	pm := m.partitionManagers[uniquePartitionKey]
+	sm := pm.GetSegmentManager(segmentID)
+	if sm == nil {
+		return ErrSegmentNotFound
+	}
+	if !sm.IsFlushed() {
+		return ErrSegmentOnGrowing
+	}
+	return nil
+}
+
+// CreateSegment creates a new segment manager when create segment message is written into wal.
+func (m *shardManagerImpl) CreateSegment(msg message.ImmutableCreateSegmentMessageV2) {
+	logger := m.Logger().With(mlog.FieldMessage(msg))
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	uniquePartitionKey := PartitionUniqueKey{CollectionID: msg.Header().CollectionId, PartitionID: msg.Header().PartitionId}
+	if err := m.checkIfSegmentCanBeCreated(uniquePartitionKey, msg.Header().SegmentId); err != nil {
+		logger.Warn(m.ctx, "segment already exists")
+		return
+	}
+
+	s := newSegmentAllocManager(m.pchannel, msg)
+	pm, ok := m.partitionManagers[uniquePartitionKey]
+	if !ok {
+		panic("critical error: partition manager not found when a segment is created")
+	}
+	pm.AddSegment(s)
+}
+
+// FlushSegment flushes the segment when flush message is written into wal.
+func (m *shardManagerImpl) FlushSegment(msg message.ImmutableFlushMessageV2) {
+	collectionID := msg.Header().CollectionId
+	partitionID := msg.Header().PartitionId
+	segmentID := msg.Header().SegmentId
+	logger := m.Logger().With(mlog.FieldMessage(msg))
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	uniquePartitionKey := PartitionUniqueKey{CollectionID: collectionID, PartitionID: partitionID}
+	if err := m.checkIfSegmentCanBeFlushed(uniquePartitionKey, segmentID); err != nil {
+		logger.Warn(m.ctx, "segment can not be flushed", mlog.Err(err))
+		return
+	}
+
+	pm, ok := m.partitionManagers[uniquePartitionKey]
+	if !ok {
+		logger.Warn(m.ctx, "partition not found when FlushSegment")
+		return
+	}
+	pm.MustRemoveFlushedSegment(segmentID)
+}
+
+// AssignSegment assigns a segment for a assign segment request.
+// It uses the latest schema version from collection info.
+func (m *shardManagerImpl) AssignSegment(req *AssignSegmentRequest) (*AssignSegmentResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	uniqueKey := PartitionUniqueKey{CollectionID: req.CollectionID, PartitionID: req.PartitionID}
+	pm, ok := m.partitionManagers[uniqueKey]
+	if !ok {
+		return nil, ErrPartitionNotFound
+	}
+
+	// Populate SchemaVersion from the current collection info into req.
+	// Callers construct req without knowing the schema version; this is the
+	// single place that resolves and stamps it before forwarding to partitionManager.
+	if info := m.collections[req.CollectionID]; info != nil {
+		req.SchemaVersion = info.SchemaVersion()
+		req.UseGrowingSourceFlush = info.UseGrowingSourceFlush()
+	}
+
+	result, err := pm.AssignSegment(req)
+	if err == nil {
+		m.metrics.ObserveInsert(req.ModifiedMetrics.Rows, req.ModifiedMetrics.BinarySize)
+		return result, nil
+	}
+	return nil, err
+}
+
+// ApplyDelete: TODO move the L0 flush operation here.
+func (m *shardManagerImpl) ApplyDelete(msg message.MutableDeleteMessageV1) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rows := msg.Header().GetRows()
+	m.metrics.ObserveDelete(rows)
+	resource.Resource().SegmentStatsManager().RecordDelete(m.pchannel.Name, msg.VChannel(), msg.TimeTick(), rows, uint64(msg.EstimateSize()))
+	return nil
+}
+
+// WaitUntilGrowingSegmentReady waits until the growing segment is ready.
+func (m *shardManagerImpl) WaitUntilGrowingSegmentReady(uniquePartitionKey PartitionUniqueKey) (<-chan struct{}, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := m.checkIfPartitionExists(uniquePartitionKey); err != nil {
+		return nil, err
+	}
+	return m.partitionManagers[uniquePartitionKey].WaitPendingGrowingSegmentReady(), nil
+}
+
+// FlushAndFenceSegmentAllocUntil flush all segment that contains the message which timetick is less than the incoming timetick.
+// It will be used for message like ManualFlush, SchemaChange, TruncateCollection operations that want the exists segment to be flushed.
+// !!! The returned segmentIDs may be is on-flushing state(which is on-flushing, a segmentFlushWorker is running, but not send into wal yet)
+// !!! The caller should promise the returned segmentIDs to be flushed.
+func (m *shardManagerImpl) FlushAndFenceSegmentAllocUntil(collectionID int64, timetick uint64) ([]int64, error) {
+	logger := m.Logger().With(mlog.FieldCollectionID(collectionID), mlog.Uint64("timetick", timetick))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	segmentIDs, err := m.flushAndFenceSegmentAllocUntil(collectionID, timetick)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info(m.ctx, "segments should be flushed when FlushAndFenceSegmentAllocUntil", mlog.Int64s("segmentIDs", segmentIDs))
+	return segmentIDs, nil
+}
+
+func (m *shardManagerImpl) FlushAllAndFenceSegmentAllocUntil(timetick uint64) ([]int64, error) {
+	logger := m.Logger().With(mlog.Uint64("timetick", timetick))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	segmentIDs := make([]int64, 0)
+	for collectionID := range m.collections {
+		ids, _ := m.flushAndFenceSegmentAllocUntil(collectionID, timetick)
+		segmentIDs = append(segmentIDs, ids...)
+	}
+	logger.Info(m.ctx, "segments should be flushed when FlushAllAndFenceSegmentAllocUntil", mlog.Int64s("segmentIDs", segmentIDs))
+	return segmentIDs, nil
+}
+
+func (m *shardManagerImpl) flushAndFenceSegmentAllocUntil(collectionID int64, timetick uint64) ([]int64, error) {
+	logger := m.Logger().With(mlog.FieldCollectionID(collectionID), mlog.Uint64("timetick", timetick))
+
+	if err := m.checkIfCollectionExists(collectionID); err != nil {
+		logger.Warn(m.ctx, "collection not found when FlushAndFenceSegmentAllocUntil", mlog.Err(err))
+		return nil, err
+	}
+
+	collectionInfo := m.collections[collectionID]
+	segmentIDs := make([]int64, 0, len(collectionInfo.PartitionIDs))
+	// collect all partitions
+	for partitionID := range collectionInfo.PartitionIDs {
+		// Seal all segments and fence assign to the partition manager.
+		uniqueKey := PartitionUniqueKey{CollectionID: collectionID, PartitionID: partitionID}
+		pm, ok := m.partitionManagers[uniqueKey]
+		if !ok {
+			logger.Warn(m.ctx, "partition not found when FlushAndFenceSegmentAllocUntil", mlog.FieldPartitionID(partitionID))
+			continue
+		}
+		newSealedSegments := pm.FlushAndFenceSegmentUntil(timetick)
+		segmentIDs = append(segmentIDs, newSealedSegments...)
+	}
+	return segmentIDs, nil
+}
+
+// AsyncFlushSegment triggers the segment to be flushed when flush message is written into wal.
+func (m *shardManagerImpl) AsyncFlushSegment(signal utils.SealSegmentSignal) {
+	logger := m.Logger().With(
+		mlog.FieldCollectionID(signal.SegmentBelongs.CollectionID),
+		mlog.FieldPartitionID(signal.SegmentBelongs.PartitionID),
+		mlog.FieldSegmentID(signal.SegmentBelongs.SegmentID),
+	)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	pm, ok := m.partitionManagers[signal.SegmentBelongs.PartitionUniqueKey()]
+	if !ok {
+		logger.Warn(m.ctx, "partition not found when AsyncMustSeal, may be already dropped")
+		return
+	}
+	if err := pm.AsyncFlushSegment(signal); err != nil {
+		logger.Warn(m.ctx, "segment not found when AsyncMustSeal, may be already sealed", mlog.Err(err))
+	}
+}

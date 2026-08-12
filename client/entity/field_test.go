@@ -1,0 +1,254 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package entity
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestFieldSchema(t *testing.T) {
+	fields := []*Field{
+		NewField().WithName("int_field").WithDataType(FieldTypeInt64).WithIsAutoID(true).WithIsPrimaryKey(true).WithDescription("int_field desc"),
+		NewField().WithName("string_field").WithDataType(FieldTypeString).WithIsAutoID(false).WithIsPrimaryKey(true).WithIsDynamic(false).WithTypeParams("max_len", "32").WithDescription("string_field desc"),
+		NewField().WithName("partition_key").WithDataType(FieldTypeInt32).WithIsPartitionKey(true),
+		NewField().WithName("array_field").WithDataType(FieldTypeArray).WithElementType(FieldTypeBool).WithMaxCapacity(128),
+		NewField().WithName("clustering_key").WithDataType(FieldTypeInt32).WithIsClusteringKey(true),
+		NewField().WithName("varchar_text").WithDataType(FieldTypeVarChar).WithMaxLength(65535).WithEnableAnalyzer(true).WithAnalyzerParams(map[string]any{}).WithMultiAnalyzerParams(map[string]any{}).WithEnableMatch(true),
+
+		NewField().WithName("default_value_bool").WithDataType(FieldTypeBool).WithDefaultValueBool(true),
+		NewField().WithName("default_value_int").WithDataType(FieldTypeInt32).WithDefaultValueInt(1),
+		NewField().WithName("default_value_long").WithDataType(FieldTypeInt64).WithDefaultValueLong(1),
+		NewField().WithName("default_value_float").WithDataType(FieldTypeFloat).WithDefaultValueFloat(1),
+		NewField().WithName("default_value_double").WithDataType(FieldTypeDouble).WithDefaultValueDouble(1),
+		NewField().WithName("default_value_string").WithDataType(FieldTypeString).WithDefaultValueString("a"),
+	}
+
+	for _, field := range fields {
+		fieldSchema := field.ProtoMessage()
+		assert.Equal(t, field.ID, fieldSchema.GetFieldID())
+		assert.Equal(t, field.Name, fieldSchema.GetName())
+		assert.EqualValues(t, field.DataType, fieldSchema.GetDataType())
+		assert.Equal(t, field.AutoID, fieldSchema.GetAutoID())
+		assert.Equal(t, field.PrimaryKey, fieldSchema.GetIsPrimaryKey())
+		assert.Equal(t, field.IsPartitionKey, fieldSchema.GetIsPartitionKey())
+		assert.Equal(t, field.IsClusteringKey, fieldSchema.GetIsClusteringKey())
+		assert.Equal(t, field.IsDynamic, fieldSchema.GetIsDynamic())
+		assert.Equal(t, field.Description, fieldSchema.GetDescription())
+		assert.Equal(t, field.TypeParams, KvPairsMap(fieldSchema.GetTypeParams()))
+		assert.EqualValues(t, field.ElementType, fieldSchema.GetElementType())
+		// marshal & unmarshal, still equals
+		nf := &Field{}
+		nf = nf.ReadProto(fieldSchema)
+		assert.Equal(t, field.ID, nf.ID)
+		assert.Equal(t, field.Name, nf.Name)
+		assert.EqualValues(t, field.DataType, nf.DataType)
+		assert.Equal(t, field.AutoID, nf.AutoID)
+		assert.Equal(t, field.PrimaryKey, nf.PrimaryKey)
+		assert.Equal(t, field.Description, nf.Description)
+		assert.Equal(t, field.IsDynamic, nf.IsDynamic)
+		assert.Equal(t, field.IsPartitionKey, nf.IsPartitionKey)
+		assert.Equal(t, field.IsClusteringKey, nf.IsClusteringKey)
+		assert.EqualValues(t, field.TypeParams, nf.TypeParams)
+		assert.EqualValues(t, field.ElementType, nf.ElementType)
+	}
+
+	assert.NotPanics(t, func() {
+		(&Field{}).WithTypeParams("a", "b")
+	})
+}
+
+func TestStructSchema(t *testing.T) {
+	// Test NewStructSchema
+	schema := NewStructSchema()
+	assert.NotNil(t, schema)
+	assert.Empty(t, schema.Fields)
+
+	// Test WithField
+	field1 := NewField().WithName("age").WithDataType(FieldTypeInt32)
+	field2 := NewField().WithName("name").WithDataType(FieldTypeVarChar).WithMaxLength(100)
+	field3 := NewField().WithName("score").WithDataType(FieldTypeFloat)
+
+	schema.WithField(field1).WithField(field2).WithField(field3)
+	assert.Equal(t, 3, len(schema.Fields))
+	assert.Equal(t, "age", schema.Fields[0].Name)
+	assert.Equal(t, FieldTypeInt32, schema.Fields[0].DataType)
+	assert.Equal(t, "name", schema.Fields[1].Name)
+	assert.Equal(t, FieldTypeVarChar, schema.Fields[1].DataType)
+	assert.Equal(t, "score", schema.Fields[2].Name)
+	assert.Equal(t, FieldTypeFloat, schema.Fields[2].DataType)
+}
+
+func TestStructSchemaValidate(t *testing.T) {
+	t.Run("ok: mixed scalar and vector sub-fields", func(t *testing.T) {
+		ss := NewStructSchema().
+			WithField(NewField().WithName("tag").WithDataType(FieldTypeVarChar).WithMaxLength(64)).
+			WithField(NewField().WithName("emb").WithDataType(FieldTypeFloatVector).WithDim(8))
+		assert.NoError(t, ss.Validate("clips"))
+	})
+
+	t.Run("empty sub-fields", func(t *testing.T) {
+		assert.Error(t, NewStructSchema().Validate("clips"))
+	})
+
+	t.Run("duplicate sub-field name", func(t *testing.T) {
+		ss := NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeInt32)).
+			WithField(NewField().WithName("a").WithDataType(FieldTypeInt32))
+		assert.Error(t, ss.Validate("clips"))
+	})
+
+	t.Run("reject nested array", func(t *testing.T) {
+		ss := NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeArray).WithElementType(FieldTypeInt32))
+		assert.Error(t, ss.Validate("clips"))
+	})
+
+	t.Run("reject primary key / nullable / autoID", func(t *testing.T) {
+		assert.Error(t, NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeInt32).WithIsPrimaryKey(true)).
+			Validate("clips"))
+		assert.Error(t, NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeInt32).WithNullable(true)).
+			Validate("clips"))
+		assert.Error(t, NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeInt32).WithIsAutoID(true)).
+			Validate("clips"))
+	})
+
+	t.Run("nil struct schema", func(t *testing.T) {
+		var ss *StructSchema
+		assert.Error(t, ss.Validate("clips"))
+	})
+
+	t.Run("nil sub-field", func(t *testing.T) {
+		ss := &StructSchema{Fields: []*Field{nil}}
+		assert.Error(t, ss.Validate("clips"))
+	})
+
+	t.Run("sub-field with empty name", func(t *testing.T) {
+		ss := NewStructSchema().WithField(NewField().WithDataType(FieldTypeInt32))
+		assert.Error(t, ss.Validate("clips"))
+	})
+
+	t.Run("reject nested struct sub-field", func(t *testing.T) {
+		ss := NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeStruct))
+		assert.Error(t, ss.Validate("clips"))
+	})
+
+	t.Run("reject sparse vector sub-field", func(t *testing.T) {
+		ss := NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeSparseVector))
+		assert.Error(t, ss.Validate("clips"))
+	})
+
+	t.Run("reject partition key sub-field", func(t *testing.T) {
+		ss := NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeInt64).WithIsPartitionKey(true))
+		assert.Error(t, ss.Validate("clips"))
+	})
+
+	t.Run("reject clustering key sub-field", func(t *testing.T) {
+		ss := NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeInt64).WithIsClusteringKey(true))
+		assert.Error(t, ss.Validate("clips"))
+	})
+
+	t.Run("reject dynamic sub-field", func(t *testing.T) {
+		ss := NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeInt64).WithIsDynamic(true))
+		assert.Error(t, ss.Validate("clips"))
+	})
+
+	t.Run("reject default value sub-field", func(t *testing.T) {
+		ss := NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeInt64).WithDefaultValueLong(7))
+		assert.Error(t, ss.Validate("clips"))
+	})
+
+	t.Run("reject nested struct schema inside sub-field", func(t *testing.T) {
+		inner := NewStructSchema().WithField(NewField().WithName("x").WithDataType(FieldTypeInt32))
+		ss := NewStructSchema().
+			WithField(NewField().WithName("a").WithDataType(FieldTypeInt64).WithStructSchema(inner))
+		assert.Error(t, ss.Validate("clips"))
+	})
+}
+
+func TestSchemaValidateExtra(t *testing.T) {
+	t.Run("nil schema", func(t *testing.T) {
+		var s *Schema
+		assert.Error(t, s.Validate())
+	})
+
+	t.Run("schema with nil field", func(t *testing.T) {
+		s := &Schema{Fields: []*Field{nil}}
+		assert.Error(t, s.Validate())
+	})
+
+	t.Run("non-struct fields are skipped", func(t *testing.T) {
+		// Only FieldTypeArray + ElementType=FieldTypeStruct triggers StructSchema validation.
+		s := NewSchema().WithName("c").
+			WithField(NewField().WithName("id").WithDataType(FieldTypeInt64).WithIsPrimaryKey(true)).
+			WithField(NewField().WithName("tags").WithDataType(FieldTypeArray).WithElementType(FieldTypeInt32))
+		assert.NoError(t, s.Validate())
+	})
+}
+
+func TestSchemaValidateStructArray(t *testing.T) {
+	// valid schema passes
+	s := NewSchema().WithName("c").
+		WithField(NewField().WithName("id").WithDataType(FieldTypeInt64).WithIsPrimaryKey(true)).
+		WithField(NewField().WithName("clips").
+			WithDataType(FieldTypeArray).WithElementType(FieldTypeStruct).
+			WithMaxCapacity(32).
+			WithStructSchema(NewStructSchema().
+				WithField(NewField().WithName("tag").WithDataType(FieldTypeVarChar).WithMaxLength(64)).
+				WithField(NewField().WithName("emb").WithDataType(FieldTypeFloatVector).WithDim(8))))
+	assert.NoError(t, s.Validate())
+
+	// schema with invalid struct sub-field fails
+	bad := NewSchema().WithName("c").
+		WithField(NewField().WithName("id").WithDataType(FieldTypeInt64).WithIsPrimaryKey(true)).
+		WithField(NewField().WithName("clips").
+			WithDataType(FieldTypeArray).WithElementType(FieldTypeStruct).
+			WithStructSchema(NewStructSchema().
+				WithField(NewField().WithName("a").WithDataType(FieldTypeStruct))))
+	assert.Error(t, bad.Validate())
+}
+
+func TestFieldWithStructSchema(t *testing.T) {
+	// Create a struct schema
+	structSchema := NewStructSchema().
+		WithField(NewField().WithName("id").WithDataType(FieldTypeInt64)).
+		WithField(NewField().WithName("value").WithDataType(FieldTypeDouble))
+
+	// Create a field with struct schema
+	field := NewField().
+		WithName("struct_array_field").
+		WithDataType(FieldTypeArray).
+		WithElementType(FieldTypeStruct).
+		WithStructSchema(structSchema)
+
+	assert.NotNil(t, field.StructSchema)
+	assert.Equal(t, 2, len(field.StructSchema.Fields))
+	assert.Equal(t, "id", field.StructSchema.Fields[0].Name)
+	assert.Equal(t, FieldTypeInt64, field.StructSchema.Fields[0].DataType)
+	assert.Equal(t, "value", field.StructSchema.Fields[1].Name)
+	assert.Equal(t, FieldTypeDouble, field.StructSchema.Fields[1].DataType)
+}

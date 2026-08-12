@@ -1,0 +1,30 @@
+# LeakSanitizer suppressions for Milvus C++ unit tests
+#
+# These suppress known false positives caused by C++ runtime exception
+# object caching in uninstrumented shared libraries (protobuf, abseil,
+# grpc, etc.). The exception objects are properly caught and handled
+# during execution, but their thread-local caches appear as leaks
+# at program exit because LeakSanitizer cannot track allocations
+# across shared library boundaries without frame pointers.
+#
+# See: https://github.com/google/sanitizers/wiki/AddressSanitizerLeakSanitizer#suppressions
+
+leak:__cxa_allocate_exception
+
+# gRPC global singletons (e.g. AuditLoggerRegistry) are intentionally
+# never destroyed to avoid the static destruction order fiasco.
+# When gRPC is dynamically linked (libgrpc.so), LSAN cannot scan the
+# .bss segment of uninstrumented shared libraries, so these reachable
+# pointers appear as leaks. This is a known gRPC design choice, not a bug.
+# See: https://github.com/grpc/grpc/issues/40389
+#      https://github.com/grpc/grpc/issues/24488
+leak:_GLOBAL__sub_I_audit_logging.cc
+leak:grpc_core::experimental::AuditLoggerRegistry
+
+# libcurl "share" handle: milvus-storage's S3 client initializes a global CURLSH
+# (shared connection/DNS cache) once and intentionally never calls
+# curl_share_cleanup, so it lives for the whole process. In the uninstrumented
+# libmilvus-storage.so this reachable global is reported as a leak at exit.
+# Not a bug.
+leak:curl_share_init
+leak:curl_share_setopt

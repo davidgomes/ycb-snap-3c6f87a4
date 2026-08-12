@@ -1,0 +1,378 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package streamingnode
+
+import (
+	"context"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/cockroachdb/errors"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	"github.com/tikv/client-go/v2/txnkv"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	mix "github.com/milvus-io/milvus/internal/distributed/mixcoord/client"
+	"github.com/milvus-io/milvus/internal/distributed/utils"
+	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
+	tikvkv "github.com/milvus-io/milvus/internal/kv/tikv"
+	"github.com/milvus-io/milvus/internal/storage"
+	streamingnodeserver "github.com/milvus-io/milvus/internal/streamingnode/server"
+	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/componentutil"
+	"github.com/milvus-io/milvus/internal/util/dependency"
+	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	streamingserviceinterceptor "github.com/milvus-io/milvus/internal/util/streamingutil/service/interceptor"
+	"github.com/milvus-io/milvus/pkg/v3/kv"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
+	"github.com/milvus-io/milvus/pkg/v3/tracer"
+	"github.com/milvus-io/milvus/pkg/v3/util"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/interceptor"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/netutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/retry"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/tikv"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+// Server is the grpc server of streamingnode.
+type Server struct {
+	stopOnce       sync.Once
+	grpcServerChan chan struct{}
+
+	// session of current server.
+	session *sessionutil.Session
+	metaKV  kv.MetaKv
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// server
+	streamingnode *streamingnodeserver.Server
+
+	// rpc
+	grpcServer *grpc.Server
+	listener   *netutil.NetListener
+
+	factory dependency.Factory
+
+	// component client
+	etcdCli        *clientv3.Client
+	tikvCli        *txnkv.Client
+	mixCoord       *syncutil.Future[types.MixCoordClient]
+	chunkManager   storage.ChunkManager
+	componentState *componentutil.ComponentStateService
+}
+
+// NewServer create a new StreamingNode server.
+func NewServer(ctx context.Context, f dependency.Factory) (*Server, error) {
+	ctx1, cancel := context.WithCancel(ctx)
+	return &Server{
+		stopOnce:       sync.Once{},
+		factory:        f,
+		mixCoord:       syncutil.NewFuture[types.MixCoordClient](),
+		grpcServerChan: make(chan struct{}),
+		componentState: componentutil.NewComponentStateService(typeutil.StreamingNodeRole),
+		ctx:            ctx1,
+		cancel:         cancel,
+	}, nil
+}
+
+func (s *Server) Prepare() error {
+	listener, err := netutil.NewListener(
+		netutil.OptIP(paramtable.Get().StreamingNodeGrpcServerCfg.IP),
+		netutil.OptHighPriorityToUsePort(paramtable.Get().StreamingNodeGrpcServerCfg.Port.GetAsInt()),
+	)
+	if err != nil {
+		mlog.Warn(s.ctx, "StreamingNode fail to create net listener", mlog.Err(err))
+		return err
+	}
+	s.listener = listener
+	mlog.Info(s.ctx, "StreamingNode listen on", mlog.String("address", listener.Addr().String()), mlog.Int("port", listener.Port()))
+	paramtable.Get().Save(
+		paramtable.Get().StreamingNodeGrpcServerCfg.Port.Key,
+		strconv.FormatInt(int64(listener.Port()), 10))
+	return nil
+}
+
+// Run runs the server.
+func (s *Server) Run() error {
+	if err := s.init(); err != nil {
+		return err
+	}
+	mlog.Info(s.ctx, "streamingnode init done ...")
+
+	if err := s.start(); err != nil {
+		return err
+	}
+	mlog.Info(s.ctx, "streamingnode start done ...")
+	return nil
+}
+
+// Stop stops the server, should be call after Run returned.
+func (s *Server) Stop() (err error) {
+	s.stopOnce.Do(s.stop)
+	return nil
+}
+
+// stop stops the server.
+func (s *Server) stop() {
+	s.componentState.OnStopping()
+
+	mlog.Info(context.TODO(), "streamingnode stop", mlog.String("Address", s.listener.Address()))
+
+	// Unregister current server from etcd.
+	mlog.Info(context.TODO(), "streamingnode unregister session from etcd...")
+	if err := s.session.GoingStop(); err != nil {
+		mlog.Warn(context.TODO(), "streamingnode unregister session failed", mlog.Err(err))
+	}
+
+	// Stop StreamingNode service.
+	mlog.Info(context.TODO(), "streamingnode stop service...")
+	s.streamingnode.Stop()
+
+	// Stop grpc server.
+	mlog.Info(context.TODO(), "streamingnode stop grpc server...")
+	s.grpcServer.GracefulStop()
+
+	// Stop all session
+	mlog.Info(context.TODO(), "streamingnode stop session...")
+	s.session.Stop()
+
+	// Stop rootCoord client.
+	mlog.Info(context.TODO(), "streamingnode stop mixCoord client...")
+
+	if s.mixCoord.Ready() {
+		if err := s.mixCoord.Get().Close(); err != nil {
+			mlog.Warn(context.TODO(), "streamingnode stop mixCoord client failed", mlog.Err(err))
+		}
+	}
+
+	// Stop tikv
+	if s.tikvCli != nil {
+		if err := s.tikvCli.Close(); err != nil {
+			mlog.Warn(context.TODO(), "streamingnode stop tikv client failed", mlog.Err(err))
+		}
+	}
+
+	// Wait for grpc server to stop.
+	mlog.Info(context.TODO(), "wait for grpc server stop...")
+	<-s.grpcServerChan
+	mlog.Info(context.TODO(), "streamingnode stop done")
+
+	s.cancel()
+	if err := s.listener.Close(); err != nil {
+		mlog.Warn(context.TODO(), "streamingnode stop listener failed", mlog.Err(err))
+	}
+}
+
+// Health check the health status of streamingnode.
+func (s *Server) Health(ctx context.Context) commonpb.StateCode {
+	resp, _ := s.componentState.GetComponentStates(ctx, &milvuspb.GetComponentStatesRequest{})
+	return resp.GetState().StateCode
+}
+
+func (s *Server) init() (err error) {
+	defer func() {
+		if err != nil {
+			mlog.Error(context.TODO(), "StreamingNode init failed", mlog.Err(err))
+			return
+		}
+		mlog.Info(context.TODO(), "init StreamingNode server finished")
+	}()
+
+	// Create etcd client.
+	s.etcdCli, _ = kvfactory.GetEtcdAndPath()
+
+	if err := s.initMeta(); err != nil {
+		return err
+	}
+	if err := s.initChunkManager(); err != nil {
+		return err
+	}
+	if err := s.initSession(); err != nil {
+		return err
+	}
+
+	s.initMixCoord()
+	s.initGRPCServer()
+	// Create StreamingNode service.
+	s.streamingnode = streamingnodeserver.NewServerBuilder().
+		WithETCD(s.etcdCli).
+		WithChunkManager(s.chunkManager).
+		WithGRPCServer(s.grpcServer).
+		WithMixCoordClient(s.mixCoord).
+		WithSession(s.session).
+		WithMetaKV(s.metaKV).
+		Build()
+	return nil
+}
+
+func (s *Server) start() (err error) {
+	defer func() {
+		if err != nil {
+			mlog.Error(context.TODO(), "StreamingNode start failed", mlog.Err(err))
+			return
+		}
+		mlog.Info(context.TODO(), "start StreamingNode server finished")
+	}()
+
+	// Start grpc server.
+	if err := s.startGPRCServer(s.ctx); err != nil {
+		return errors.Wrap(err, "StreamingNode start gRPC server fail")
+	}
+	// Register current server to etcd.
+	s.session.Register()
+
+	s.componentState.OnInitialized(s.session.ServerID)
+	return nil
+}
+
+func (s *Server) initSession() error {
+	s.session = sessionutil.NewSession(s.ctx)
+	if s.session == nil {
+		return merr.WrapErrServiceUnavailable("session is nil, the etcd client connection may have failed")
+	}
+	s.session.Init(typeutil.StreamingNodeRole, s.listener.Address(), false)
+	paramtable.SetNodeID(s.session.ServerID)
+	mlog.Info(s.ctx, "StreamingNode init session", mlog.Int64("nodeID", paramtable.GetNodeID()), mlog.String("node address", s.listener.Address()))
+	return nil
+}
+
+func (s *Server) initMeta() error {
+	params := paramtable.Get()
+	metaType := params.MetaStoreCfg.MetaStoreType.GetValue()
+	mlog.Info(context.TODO(), "data coordinator connecting to metadata store", mlog.String("metaType", metaType))
+	metaRootPath := ""
+	switch metaType {
+	case util.MetaStoreTypeTiKV:
+		var err error
+		s.tikvCli, err = tikv.GetTiKVClient(&paramtable.Get().TiKVCfg)
+		if err != nil {
+			mlog.Warn(context.TODO(), "Streamingnode init tikv client failed", mlog.Err(err))
+			return err
+		}
+		metaRootPath = params.TiKVCfg.MetaRootPath.GetValue()
+		s.metaKV = tikvkv.NewTiKV(s.tikvCli, metaRootPath,
+			tikvkv.WithRequestTimeout(paramtable.Get().TiKVCfg.RequestTimeout.GetAsDuration(time.Millisecond)))
+	case util.MetaStoreTypeEtcd:
+		metaRootPath = params.EtcdCfg.MetaRootPath.GetValue()
+		s.metaKV = etcdkv.NewEtcdKV(s.etcdCli, metaRootPath,
+			etcdkv.WithRequestTimeout(paramtable.Get().EtcdCfg.RequestTimeout.GetAsDuration(time.Millisecond)))
+	}
+	return nil
+}
+
+func (s *Server) initMixCoord() {
+	go func() {
+		retry.Do(s.ctx, func() error {
+			mlog.Info(context.TODO(), "StreamingNode connect to mixCoord...")
+			mixCoord, err := mix.NewClient(s.ctx)
+			if err != nil {
+				return errors.Wrap(err, "StreamingNode try to new mixCoord client failed")
+			}
+
+			mlog.Info(context.TODO(), "StreamingNode try to wait for mixCoord ready")
+			err = componentutil.WaitForComponentHealthy(s.ctx, mixCoord, "mixCoord", 1000000, time.Millisecond*200)
+			if err != nil {
+				return errors.Wrap(err, "StreamingNode wait for mixCoord ready failed")
+			}
+			mlog.Info(context.TODO(), "StreamingNode wait for mixCoord ready")
+			s.mixCoord.Set(mixCoord)
+			return nil
+		}, retry.AttemptAlways())
+	}()
+}
+
+func (s *Server) initChunkManager() (err error) {
+	mlog.Info(s.ctx, "StreamingNode init chunk manager...")
+	s.factory.Init(paramtable.Get())
+	manager, err := s.factory.NewPersistentStorageChunkManager(s.ctx)
+	if err != nil {
+		return errors.Wrap(err, "StreamingNode try to new chunk manager failed")
+	}
+	s.chunkManager = manager
+	return nil
+}
+
+func (s *Server) initGRPCServer() {
+	mlog.Info(s.ctx, "create StreamingNode server...")
+	cfg := &paramtable.Get().StreamingNodeGrpcServerCfg
+	kaep := keepalive.EnforcementPolicy{
+		MinTime:             5 * time.Second, // If a client pings more than once every 5 seconds, terminate the connection
+		PermitWithoutStream: true,            // Allow pings even when there are no active streams
+	}
+	kasp := keepalive.ServerParameters{
+		Time:    60 * time.Second, // Ping the client if it is idle for 60 seconds to ensure the connection is still active
+		Timeout: 10 * time.Second, // Wait 10 second for the ping ack before assuming the connection is dead
+	}
+
+	serverIDGetter := func() int64 {
+		return s.session.ServerID
+	}
+	s.grpcServer = grpc.NewServer(
+		grpc.KeepaliveEnforcementPolicy(kaep),
+		grpc.KeepaliveParams(kasp),
+		grpc.MaxRecvMsgSize(cfg.ServerMaxRecvSize.GetAsInt()),
+		grpc.MaxSendMsgSize(cfg.ServerMaxSendSize.GetAsInt()),
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			mlog.UnaryServerInterceptor(typeutil.StreamingNodeRole),
+			streamingserviceinterceptor.NewStreamingServiceUnaryServerInterceptor(),
+			interceptor.ClusterValidationUnaryServerInterceptor(),
+			interceptor.ServerIDValidationUnaryServerInterceptor(serverIDGetter),
+		)),
+		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
+			mlog.StreamServerInterceptor(typeutil.StreamingNodeRole),
+			streamingserviceinterceptor.NewStreamingServiceStreamServerInterceptor(),
+			interceptor.ClusterValidationStreamServerInterceptor(),
+			interceptor.ServerIDValidationStreamServerInterceptor(serverIDGetter),
+		)),
+		grpc.StatsHandler(tracer.GetDynamicOtelGrpcServerStatsHandler()),
+		utils.EnableInternalTLS("StreamingNode"),
+	)
+	streamingpb.RegisterStreamingNodeStateServiceServer(s.grpcServer, s.componentState)
+}
+
+// startGRPCServer starts the grpc server.
+func (s *Server) startGPRCServer(ctx context.Context) error {
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(s.grpcServerChan)
+
+		if err := s.grpcServer.Serve(s.listener); err != nil {
+			select {
+			case errCh <- err:
+				// failure at initial startup.
+			default:
+				// failure at runtime.
+				panic(errors.Wrapf(err, "grpc server stop with unexpected error"))
+			}
+		}
+	}()
+	funcutil.CheckGrpcReady(ctx, errCh)
+	return <-errCh
+}

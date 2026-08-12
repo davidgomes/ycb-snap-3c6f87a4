@@ -1,0 +1,417 @@
+package kafka
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"fmt"
+	"math/rand"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/config"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	mqcommon "github.com/milvus-io/milvus/pkg/v3/mq/common"
+	"github.com/milvus-io/milvus/pkg/v3/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+)
+
+var Params = paramtable.Get()
+
+func TestMain(m *testing.M) {
+	paramtable.Init()
+	mockCluster, err := kafka.NewMockCluster(1)
+	if err != nil {
+		// nolint
+		fmt.Printf("Failed to create MockCluster: %s\n", err)
+		os.Exit(1)
+	}
+	defer mockCluster.Close()
+
+	broker := mockCluster.BootstrapServers()
+	Params.Save("kafka.brokerList", broker)
+	mlog.Info(context.TODO(), "start testing kafka broker", mlog.String("address", broker))
+
+	exitCode := m.Run()
+	os.Exit(exitCode)
+}
+
+func getKafkaBrokerList() string {
+	brokerList := Params.KafkaCfg.Address.GetValue()
+	mlog.Info(context.TODO(), "get kafka broker list.", mlog.String("address", brokerList))
+	return brokerList
+}
+
+func IntToBytes(n int) []byte {
+	tmp := int32(n)
+	bytesBuffer := bytes.NewBuffer([]byte{})
+	binary.Write(bytesBuffer, common.Endian, tmp)
+	return bytesBuffer.Bytes()
+}
+
+func BytesToInt(b []byte) int {
+	bytesBuffer := bytes.NewBuffer(b)
+	var tmp int32
+	binary.Read(bytesBuffer, common.Endian, &tmp)
+	return int(tmp)
+}
+
+// Consume1 will consume random messages and record the last MessageID it received
+func Consume1(ctx context.Context, t *testing.T, kc *kafkaClient, topic string, subName string, c chan mqcommon.MessageID, total *int) {
+	consumer, err := kc.Subscribe(ctx, mqwrapper.ConsumerOptions{
+		Topic:                       topic,
+		SubscriptionName:            subName,
+		BufSize:                     1024,
+		SubscriptionInitialPosition: mqcommon.SubscriptionPositionEarliest,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, consumer)
+	defer consumer.Close()
+
+	// get random number between 1 ~ 5
+	rand.Seed(time.Now().UnixNano())
+	cnt := 1 + rand.Int()%5
+
+	mlog.Info(ctx, "Consume1 start")
+	var msg mqcommon.Message
+	for i := 0; i < cnt; i++ {
+		select {
+		case <-ctx.Done():
+			mlog.Info(ctx, "Consume1 channel closed")
+			return
+		case msg = <-consumer.Chan():
+			if msg == nil {
+				return
+			}
+
+			mlog.Info(ctx, "Consume1 RECV", mlog.Any("v", BytesToInt(msg.Payload())))
+			consumer.Ack(msg)
+			(*total)++
+		}
+	}
+
+	c <- msg.ID()
+	mlog.Info(ctx, "Consume1 randomly RECV", mlog.Any("number", cnt))
+	mlog.Info(ctx, "Consume1 done")
+}
+
+// Consume2 will consume messages from specified MessageID
+func Consume2(ctx context.Context, t *testing.T, kc *kafkaClient, topic string, subName string, msgID mqcommon.MessageID, total *int) {
+	consumer, err := kc.Subscribe(ctx, mqwrapper.ConsumerOptions{
+		Topic:                       topic,
+		SubscriptionName:            subName,
+		BufSize:                     1024,
+		SubscriptionInitialPosition: mqcommon.SubscriptionPositionUnknown,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, consumer)
+	defer consumer.Close()
+
+	err = consumer.Seek(msgID, true)
+	assert.NoError(t, err)
+
+	mm := <-consumer.Chan()
+	consumer.Ack(mm)
+	mlog.Info(ctx, "skip the last received message", mlog.Any("skip msg", mm.ID()))
+
+	mlog.Info(ctx, "Consume2 start")
+	for {
+		select {
+		case <-ctx.Done():
+			mlog.Info(ctx, "Consume2 channel closed")
+			return
+		case msg, ok := <-consumer.Chan():
+			if msg == nil || !ok {
+				return
+			}
+
+			mlog.Info(ctx, "Consume2 RECV", mlog.Any("v", BytesToInt(msg.Payload())))
+			consumer.Ack(msg)
+			(*total)++
+		}
+	}
+}
+
+func Consume3(ctx context.Context, t *testing.T, kc *kafkaClient, topic string, subName string, total *int) {
+	consumer, err := kc.Subscribe(ctx, mqwrapper.ConsumerOptions{
+		Topic:                       topic,
+		SubscriptionName:            subName,
+		BufSize:                     1024,
+		SubscriptionInitialPosition: mqcommon.SubscriptionPositionEarliest,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, consumer)
+	defer consumer.Close()
+
+	mlog.Info(ctx, "Consume3 start")
+	for {
+		select {
+		case <-ctx.Done():
+			mlog.Info(ctx, "Consume3 channel closed")
+			return
+		case msg, ok := <-consumer.Chan():
+			if msg == nil || !ok {
+				return
+			}
+
+			consumer.Ack(msg)
+			(*total)++
+			mlog.Info(ctx, "Consume3 RECV", mlog.Any("v", BytesToInt(msg.Payload())), mlog.Int("total", *total))
+		}
+	}
+}
+
+func TestKafkaClient_ConsumeWithAck(t *testing.T) {
+	kc := createKafkaClient(t)
+	defer kc.Close()
+	assert.NotNil(t, kc)
+
+	rand.Seed(time.Now().UnixNano())
+	topic := fmt.Sprintf("test-topic-%d", rand.Int())
+	subName := fmt.Sprintf("test-subname-%d", rand.Int())
+	arr1 := []int{111, 222, 333, 444, 555, 666, 777}
+	arr2 := []string{"111", "222", "333", "444", "555", "666", "777"}
+
+	c := make(chan mqcommon.MessageID, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var total1 int
+	var total2 int
+	var total3 int
+
+	producer := createProducer(t, kc, topic)
+	defer producer.Close()
+	produceData(ctx, t, producer, arr1, arr2)
+	time.Sleep(100 * time.Millisecond)
+
+	ctx1, cancel1 := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel1()
+	Consume1(ctx1, t, kc, topic, subName, c, &total1)
+
+	lastMsgID := <-c
+	mlog.Info(context.TODO(), "lastMsgID", mlog.Any("lastMsgID", lastMsgID.(*KafkaID).MessageID))
+
+	ctx2, cancel2 := context.WithTimeout(ctx, 3*time.Second)
+	Consume2(ctx2, t, kc, topic, subName, lastMsgID, &total2)
+	cancel2()
+
+	time.Sleep(5 * time.Second)
+	ctx3, cancel3 := context.WithTimeout(ctx, 3*time.Second)
+	Consume3(ctx3, t, kc, topic, subName, &total3)
+	cancel3()
+
+	cancel()
+	assert.Equal(t, len(arr1), total1+total2)
+
+	assert.Equal(t, len(arr1), total3)
+}
+
+func TestKafkaClient_SeekPosition(t *testing.T) {
+	kc := createKafkaClient(t)
+	defer kc.Close()
+
+	rand.Seed(time.Now().UnixNano())
+	ctx := context.Background()
+	topic := fmt.Sprintf("test-topic-%d", rand.Int())
+	subName := fmt.Sprintf("test-subname-%d", rand.Int())
+
+	producer := createProducer(t, kc, topic)
+	defer producer.Close()
+
+	data1 := []int{1, 2, 3}
+	data2 := []string{"1", "2", "3"}
+	ids := produceData(ctx, t, producer, data1, data2)
+
+	consumer := createConsumer(t, kc, topic, subName, mqcommon.SubscriptionPositionUnknown)
+	defer consumer.Close()
+
+	err := consumer.Seek(ids[2], true)
+	assert.NoError(t, err)
+
+	select {
+	case msg := <-consumer.Chan():
+		consumer.Ack(msg)
+		assert.Equal(t, 3, BytesToInt(msg.Payload()))
+		assert.Equal(t, "3", msg.Properties()[common.TraceIDKey])
+	case <-time.After(10 * time.Second):
+		assert.FailNow(t, "should not wait")
+	}
+}
+
+func TestKafkaClient_ConsumeFromLatest(t *testing.T) {
+	kc := createKafkaClient(t)
+	defer kc.Close()
+
+	rand.Seed(time.Now().UnixNano())
+	ctx := context.Background()
+	topic := fmt.Sprintf("test-topic-%d", rand.Int())
+	subName := fmt.Sprintf("test-subname-%d", rand.Int())
+
+	producer := createProducer(t, kc, topic)
+	defer producer.Close()
+
+	data1 := []int{1, 2}
+	data2 := []string{"1", "2"}
+	produceData(ctx, t, producer, data1, data2)
+
+	consumer := createConsumer(t, kc, topic, subName, mqcommon.SubscriptionPositionLatest)
+	defer consumer.Close()
+
+	go func() {
+		time.Sleep(time.Second * 2)
+		data1 := []int{3}
+		data2 := []string{"3"}
+		produceData(ctx, t, producer, data1, data2)
+	}()
+
+	select {
+	case msg := <-consumer.Chan():
+		consumer.Ack(msg)
+		assert.Equal(t, 3, BytesToInt(msg.Payload()))
+		assert.Equal(t, "3", msg.Properties()[common.TraceIDKey])
+	case <-time.After(5 * time.Second):
+		assert.FailNow(t, "should not wait")
+	}
+}
+
+func TestKafkaClient_EarliestMessageID(t *testing.T) {
+	kafkaAddress := getKafkaBrokerList()
+	kc := NewKafkaClientInstance(kafkaAddress)
+	defer kc.Close()
+
+	mid := kc.EarliestMessageID()
+	assert.NotNil(t, mid)
+}
+
+func TestKafkaClient_MsgSerializAndDeserialize(t *testing.T) {
+	kafkaAddress := getKafkaBrokerList()
+	kc := NewKafkaClientInstance(kafkaAddress)
+	defer kc.Close()
+
+	mid := kc.EarliestMessageID()
+	msgID, err := kc.BytesToMsgID(mid.Serialize())
+	assert.NoError(t, err)
+	assert.True(t, msgID.AtEarliestPosition())
+
+	msgID, err = kc.StringToMsgID("1")
+	assert.NoError(t, err)
+	assert.NotNil(t, msgID)
+
+	msgID, err = kc.StringToMsgID("1.0")
+	assert.Error(t, err)
+	assert.Nil(t, msgID)
+}
+
+/*
+func createParamItem(v string) paramtable.ParamItem {
+	item := paramtable.ParamItem{
+		Formatter: func(originValue string) string { return v },
+	}
+	item.Init(config.NewManager())
+	return item
+}*/
+
+func initParamItem(item *paramtable.ParamItem, v string) {
+	item.Formatter = func(originValue string) string { return v }
+	item.Init(config.NewManager())
+}
+
+type kafkaCfgOption func(cfg *paramtable.KafkaConfig)
+
+func withAddr(v string) kafkaCfgOption {
+	return func(cfg *paramtable.KafkaConfig) {
+		initParamItem(&cfg.Address, v)
+	}
+}
+
+func withUsername(v string) kafkaCfgOption {
+	return func(cfg *paramtable.KafkaConfig) {
+		initParamItem(&cfg.SaslUsername, v)
+	}
+}
+
+func withPasswd(v string) kafkaCfgOption {
+	return func(cfg *paramtable.KafkaConfig) {
+		initParamItem(&cfg.SaslPassword, v)
+	}
+}
+
+func withMechanism(v string) kafkaCfgOption {
+	return func(cfg *paramtable.KafkaConfig) {
+		initParamItem(&cfg.SaslMechanisms, v)
+	}
+}
+
+func withProtocol(v string) kafkaCfgOption {
+	return func(cfg *paramtable.KafkaConfig) {
+		initParamItem(&cfg.SecurityProtocol, v)
+	}
+}
+
+func withKafkaUseSSL(v string) kafkaCfgOption {
+	return func(cfg *paramtable.KafkaConfig) {
+		initParamItem(&cfg.KafkaUseSSL, v)
+	}
+}
+
+func createKafkaConfig(opts ...kafkaCfgOption) *paramtable.KafkaConfig {
+	cfg := &paramtable.KafkaConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	return cfg
+}
+
+func createKafkaClient(t *testing.T) *kafkaClient {
+	kafkaAddress := getKafkaBrokerList()
+	kc := NewKafkaClientInstance(kafkaAddress)
+	assert.NotNil(t, kc)
+	return kc
+}
+
+func createConsumer(t *testing.T,
+	kc *kafkaClient,
+	topic string,
+	groupID string,
+	initPosition mqcommon.SubscriptionInitialPosition,
+) mqwrapper.Consumer {
+	consumer, err := kc.Subscribe(context.TODO(), mqwrapper.ConsumerOptions{
+		Topic:                       topic,
+		SubscriptionName:            groupID,
+		BufSize:                     1024,
+		SubscriptionInitialPosition: initPosition,
+	})
+	assert.NoError(t, err)
+	return consumer
+}
+
+func createProducer(t *testing.T, kc *kafkaClient, topic string) mqwrapper.Producer {
+	producer, err := kc.CreateProducer(context.TODO(), mqcommon.ProducerOptions{Topic: topic})
+	assert.NoError(t, err)
+	assert.NotNil(t, producer)
+	return producer
+}
+
+func produceData(ctx context.Context, t *testing.T, producer mqwrapper.Producer, arr []int, pArr []string) []mqcommon.MessageID {
+	var msgIDs []mqcommon.MessageID
+	for k, v := range arr {
+		msg := &mqcommon.ProducerMessage{
+			Payload: IntToBytes(v),
+			Properties: map[string]string{
+				common.TraceIDKey: pArr[k],
+			},
+		}
+		msgID, err := producer.Send(ctx, msg)
+		msgIDs = append(msgIDs, msgID)
+		assert.NoError(t, err)
+	}
+
+	producer.(*kafkaProducer).p.Flush(500)
+	return msgIDs
+}

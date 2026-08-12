@@ -1,0 +1,209 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config
+
+import (
+	"context"
+	"path"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"golang.org/x/time/rate"
+
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/util/etcd"
+)
+
+const (
+	ReadConfigTimeout = 3 * time.Second
+)
+
+type EtcdSource struct {
+	sync.RWMutex
+	etcdCli        *clientv3.Client
+	ctx            context.Context
+	currentConfigs map[string]string
+	keyPrefix      string
+
+	updateMu        sync.Mutex
+	configRefresher *refresher
+	manager         ConfigManager
+}
+
+func NewEtcdSource(etcdInfo *EtcdInfo) (*EtcdSource, error) {
+	mlog.Debug(context.TODO(), "init etcd source", mlog.Any("etcdInfo", etcdInfo))
+	etcdCli, err := etcd.CreateEtcdClient(
+		etcdInfo.UseEmbed,
+		etcdInfo.EnableAuth,
+		etcdInfo.UserName,
+		etcdInfo.PassWord,
+		etcdInfo.UseSSL,
+		etcdInfo.Endpoints,
+		etcdInfo.CertFile,
+		etcdInfo.KeyFile,
+		etcdInfo.CaCertFile,
+		etcdInfo.MinVersion)
+	if err != nil {
+		return nil, err
+	}
+	es := &EtcdSource{
+		etcdCli:        etcdCli,
+		ctx:            context.Background(),
+		currentConfigs: make(map[string]string),
+		keyPrefix:      etcdInfo.KeyPrefix,
+	}
+	es.configRefresher = newRefresher(etcdInfo.RefreshInterval, es.refreshConfigurations)
+	es.configRefresher.start(es.GetSourceName())
+	return es, nil
+}
+
+// GetConfigurationByKey implements ConfigSource
+func (es *EtcdSource) GetConfigurationByKey(key string) (string, error) {
+	es.RLock()
+	v, ok := es.currentConfigs[key]
+	es.RUnlock()
+	if !ok {
+		return "", errors.Wrap(ErrKeyNotFound, key) // fmt.Errorf("key not found: %s", key)
+	}
+	return v, nil
+}
+
+// GetConfigurations implements ConfigSource
+func (es *EtcdSource) GetConfigurations() (map[string]string, error) {
+	configMap := make(map[string]string)
+	err := es.refreshConfigurations()
+	if err != nil {
+		return nil, err
+	}
+	es.RLock()
+	for key, value := range es.currentConfigs {
+		configMap[key] = value
+	}
+	es.RUnlock()
+
+	return configMap, nil
+}
+
+// GetPriority implements ConfigSource
+func (es *EtcdSource) GetPriority() int {
+	return HighPriority
+}
+
+// GetSourceName implements ConfigSource
+func (es *EtcdSource) GetSourceName() string {
+	return "EtcdSource"
+}
+
+func (es *EtcdSource) Close() {
+	// cannot close client here, since client is shared with components
+	es.configRefresher.stop()
+}
+
+func (es *EtcdSource) SetManager(m ConfigManager) {
+	es.Lock()
+	defer es.Unlock()
+	es.manager = m
+}
+
+func (es *EtcdSource) SetEventHandler(eh EventHandler) {
+	es.configRefresher.SetEventHandler(eh)
+}
+
+func (es *EtcdSource) UpdateOptions(opts Options) {
+	if opts.EtcdInfo == nil {
+		return
+	}
+	es.Lock()
+	defer es.Unlock()
+	es.keyPrefix = opts.EtcdInfo.KeyPrefix
+	if es.configRefresher.refreshInterval != opts.EtcdInfo.RefreshInterval {
+		es.configRefresher.stop()
+		eh := es.configRefresher.GetEventHandler()
+		es.configRefresher = newRefresher(opts.EtcdInfo.RefreshInterval, es.refreshConfigurations)
+		es.configRefresher.SetEventHandler(eh)
+		es.configRefresher.start(es.GetSourceName())
+	}
+}
+
+// refreshConfigurations is the serializable-read variant used by the periodic async
+// refresher. Registered as a func() error callback via newRefresher(...), so the
+// signature must stay no-arg. WithSerializable lets the locally-connected etcd member
+// answer from its own applied state without a ReadIndex round-trip to the leader —
+// acceptable for an async poll where sub-ms staleness is harmless (see #23907).
+func (es *EtcdSource) refreshConfigurations() error {
+	return es.refreshConfigurationsWithOpts(clientv3.WithSerializable())
+}
+
+// RefreshConfigurationsLinearizable is the linearizable-read variant for
+// post-write "read-your-own-write" paths (e.g., AlterConfigsInEtcd). Issues one
+// extra ReadIndex round-trip to the etcd leader per call, guaranteeing that the
+// read reflects every committed entry — including the one the caller just wrote.
+// Without this, the follower the client is connected to can legitimately return
+// the pre-write value because apply is not synchronized with commit.
+func (es *EtcdSource) RefreshConfigurationsLinearizable() error {
+	return es.refreshConfigurationsWithOpts()
+}
+
+func (es *EtcdSource) refreshConfigurationsWithOpts(extraOpts ...clientv3.OpOption) error {
+	es.RLock()
+	prefix := path.Join(es.keyPrefix, "config")
+	es.RUnlock()
+
+	ctx, cancel := context.WithTimeout(es.ctx, ReadConfigTimeout)
+	defer cancel()
+	mlog.RatedDebug(es.ctx, rate.Limit(10), "etcd refreshConfigurations", mlog.String("prefix", prefix), mlog.Any("endpoints", es.etcdCli.Endpoints()))
+	opts := append([]clientv3.OpOption{clientv3.WithPrefix()}, extraOpts...)
+	response, err := es.etcdCli.Get(ctx, prefix, opts...)
+	if err != nil {
+		return err
+	}
+	newConfig := make(map[string]string, len(response.Kvs))
+	for _, kv := range response.Kvs {
+		key := string(kv.Key)
+		key = strings.TrimPrefix(key, prefix+"/")
+		newConfig[key] = string(kv.Value)
+		newConfig[formatKey(key)] = string(kv.Value)
+		mlog.Debug(es.ctx, "got config from etcd", mlog.String("key", string(kv.Key)), mlog.String("value", string(kv.Value)))
+	}
+	return es.update(newConfig)
+}
+
+func (es *EtcdSource) update(configs map[string]string) error {
+	// make sure config not change when fire event
+	es.updateMu.Lock()
+	defer es.updateMu.Unlock()
+
+	es.Lock()
+	events, err := PopulateEvents(es.GetSourceName(), es.currentConfigs, configs)
+	if err != nil {
+		es.Unlock()
+		mlog.Warn(es.ctx, "generating event error", mlog.Err(err))
+		return err
+	}
+	es.currentConfigs = configs
+	es.Unlock()
+	if es.manager != nil {
+		es.manager.EvictCacheValueByFormat(lo.Map(events, func(event *Event, _ int) string { return event.Key })...)
+	}
+
+	es.configRefresher.fireEvents(events...)
+	return nil
+}

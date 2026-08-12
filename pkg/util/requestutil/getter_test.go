@@ -1,0 +1,570 @@
+/*
+ * Licensed to the LF AI & Data foundation under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package requestutil
+
+import (
+	"context"
+	"reflect"
+	"testing"
+
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+)
+
+func TestGetCollectionNameFromRequest(t *testing.T) {
+	type args struct {
+		req any
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want  any
+		want1 bool
+	}{
+		{
+			name: "true",
+			args: args{
+				req: &milvuspb.CreateCollectionRequest{
+					CollectionName: "foo",
+				},
+			},
+			want:  "foo",
+			want1: true,
+		},
+		{
+			name: "fail",
+			args: args{
+				req: &commonpb.Status{},
+			},
+			want1: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1 := GetCollectionNameFromRequest(tt.args.req)
+			if got1 && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetCollectionNameFromRequest() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("GetCollectionNameFromRequest() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestGetDbNameFromRequest(t *testing.T) {
+	type args struct {
+		req interface{}
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want  any
+		want1 bool
+	}{
+		{
+			name: "true",
+			args: args{
+				req: &milvuspb.CreateDatabaseRequest{
+					DbName: "foo",
+				},
+			},
+			want:  "foo",
+			want1: true,
+		},
+		{
+			name: "fail",
+			args: args{
+				req: &commonpb.Status{},
+			},
+			want1: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1 := GetDbNameFromRequest(tt.args.req)
+			if got1 && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetDbNameFromRequest() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("GetDbNameFromRequest() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestGetPartitionNameFromRequest(t *testing.T) {
+	type args struct {
+		req interface{}
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want  any
+		want1 bool
+	}{
+		{
+			name: "true",
+			args: args{
+				req: &milvuspb.CreatePartitionRequest{
+					PartitionName: "baz",
+				},
+			},
+			want:  "baz",
+			want1: true,
+		},
+		{
+			name: "fail",
+			args: args{
+				req: &commonpb.Status{},
+			},
+			want1: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1 := GetPartitionNameFromRequest(tt.args.req)
+			if got1 && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetPartitionNameFromRequest() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("GetPartitionNameFromRequest() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestGetPartitionNamesFromRequest(t *testing.T) {
+	type args struct {
+		req interface{}
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want  any
+		want1 bool
+	}{
+		{
+			name: "true",
+			args: args{
+				req: &milvuspb.SearchRequest{
+					PartitionNames: []string{"baz", "faz"},
+				},
+			},
+			want:  []string{"baz", "faz"},
+			want1: true,
+		},
+		{
+			name: "fail",
+			args: args{
+				req: &commonpb.Status{},
+			},
+			want1: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1 := GetPartitionNamesFromRequest(tt.args.req)
+			if got1 && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetPartitionNamesFromRequest() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("GetPartitionNamesFromRequest() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestGetFieldNameFromRequest(t *testing.T) {
+	type args struct {
+		req interface{}
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want  any
+		want1 bool
+	}{
+		{
+			name: "ok",
+			args: args{
+				req: &milvuspb.CreateIndexRequest{
+					FieldName: "foo",
+				},
+			},
+			want:  "foo",
+			want1: true,
+		},
+		{
+			name: "fail",
+			args: args{
+				req: &commonpb.Status{},
+			},
+			want1: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1 := GetFieldNameFromRequest(tt.args.req)
+			if got1 && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetFieldNameFromRequest() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("GetFieldNameFromRequest() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestGetOutputFieldsFromRequest(t *testing.T) {
+	type args struct {
+		req interface{}
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want  any
+		want1 bool
+	}{
+		{
+			name: "ok",
+			args: args{
+				req: &milvuspb.SearchRequest{
+					OutputFields: []string{"foo", "bar"},
+				},
+			},
+			want:  []string{"foo", "bar"},
+			want1: true,
+		},
+		{
+			name: "fail",
+			args: args{
+				req: &commonpb.Status{},
+			},
+			want1: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1 := GetOutputFieldsFromRequest(tt.args.req)
+			if got1 && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetOutputFieldsFromRequest() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("GetOutputFieldsFromRequest() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestGetQueryParamsFromRequest(t *testing.T) {
+	type args struct {
+		req interface{}
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want  any
+		want1 bool
+	}{
+		{
+			name: "ok",
+			args: args{
+				req: &milvuspb.QueryRequest{
+					QueryParams: []*commonpb.KeyValuePair{
+						{
+							Key:   "foo",
+							Value: "bar",
+						},
+					},
+				},
+			},
+			want: []*commonpb.KeyValuePair{
+				{
+					Key:   "foo",
+					Value: "bar",
+				},
+			},
+			want1: true,
+		},
+		{
+			name: "fail",
+			args: args{
+				req: &commonpb.Status{},
+			},
+			want1: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1 := GetQueryParamsFromRequest(tt.args.req)
+			if got1 && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetQueryParamsFromRequest() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("GetQueryParamsFromRequest() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestGetExprFromRequest(t *testing.T) {
+	type args struct {
+		req interface{}
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want  any
+		want1 bool
+	}{
+		{
+			name: "ok",
+			args: args{
+				req: &milvuspb.QueryRequest{
+					Expr: "foo",
+				},
+			},
+			want:  "foo",
+			want1: true,
+		},
+		{
+			name: "fail",
+			args: args{
+				req: &commonpb.Status{},
+			},
+			want1: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1 := GetExprFromRequest(tt.args.req)
+			if got1 && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetExprFromRequest() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("GetExprFromRequest() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestGetSearchParamsFromRequest(t *testing.T) {
+	type args struct {
+		req interface{}
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want  any
+		want1 bool
+	}{
+		{
+			name: "ok",
+			args: args{
+				req: &milvuspb.SearchRequest{
+					SearchParams: []*commonpb.KeyValuePair{
+						{
+							Key:   "foo",
+							Value: "bar",
+						},
+					},
+				},
+			},
+			want: []*commonpb.KeyValuePair{
+				{
+					Key:   "foo",
+					Value: "bar",
+				},
+			},
+			want1: true,
+		},
+		{
+			name: "fail",
+			args: args{
+				req: &commonpb.Status{},
+			},
+			want1: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1 := GetSearchParamsFromRequest(tt.args.req)
+			if got1 && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetSearchParamsFromRequest() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("GetSearchParamsFromRequest() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestGetDSLFromRequest(t *testing.T) {
+	type args struct {
+		req interface{}
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want  any
+		want1 bool
+	}{
+		{
+			name: "ok",
+			args: args{
+				req: &milvuspb.SearchRequest{
+					Dsl: "foo",
+				},
+			},
+			want:  "foo",
+			want1: true,
+		},
+		{
+			name: "fail",
+			args: args{
+				req: &commonpb.Status{},
+			},
+			want1: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1 := GetDSLFromRequest(tt.args.req)
+			if got1 && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetDSLFromRequest() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("GetDSLFromRequest() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestGetStatusFromResponse(t *testing.T) {
+	type args struct {
+		resp interface{}
+	}
+	tests := []struct {
+		name  string
+		args  args
+		want  *commonpb.Status
+		want1 bool
+	}{
+		{
+			name: "describe collection response",
+			args: args{
+				resp: &milvuspb.DescribeCollectionResponse{
+					Status: &commonpb.Status{
+						ErrorCode: commonpb.ErrorCode_Success,
+					},
+				},
+			},
+			want: &commonpb.Status{
+				ErrorCode: commonpb.ErrorCode_Success,
+			},
+			want1: true,
+		},
+		{
+			name: "common status",
+			args: args{
+				resp: &commonpb.Status{},
+			},
+			want:  &commonpb.Status{},
+			want1: true,
+		},
+		{
+			name: "invalid response",
+			args: args{
+				resp: "foo",
+			},
+			want1: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1 := GetStatusFromResponse(tt.args.resp)
+			if got1 && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetStatusFromResponse() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("GetStatusFromResponse() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestParseMetricLabel(t *testing.T) {
+	// transport / interceptor error -> rejected_system (highest priority)
+	assert.Equal(t, metrics.RejectedSystemLabel,
+		ParseMetricLabel(&commonpb.Status{}, errors.New("transport failed")))
+
+	// success
+	assert.Equal(t, metrics.SuccessLabel,
+		ParseMetricLabel(&commonpb.Status{}, nil))
+
+	// retryable hard failure -> retry (retryability beats classification)
+	assert.Equal(t, metrics.RetryLabel,
+		ParseMetricLabel(merr.Status(merr.ErrServiceRateLimit), nil))
+
+	// hard failure, system error -> fail_system
+	assert.Equal(t, metrics.FailSystemLabel,
+		ParseMetricLabel(merr.Status(merr.ErrSegcore), nil))
+
+	// hard failure, input error -> fail_input
+	inputErr := merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg("bad param"))
+	assert.Equal(t, metrics.FailInputLabel,
+		ParseMetricLabel(merr.Status(inputErr), nil))
+
+	// response that itself implements GetStatus
+	assert.Equal(t, metrics.FailInputLabel,
+		ParseMetricLabel(&milvuspb.BoolResponse{Status: merr.Status(inputErr)}, nil))
+
+	// merr input error through the err path (REST v2 handlers abort with merr
+	// directly; no GRPCStatus, so the gRPC switch alone would misbucket it as
+	// rejected_system) -> rejected_user
+	assert.Equal(t, metrics.RejectedUserLabel,
+		ParseMetricLabel(&commonpb.Status{}, merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg("bad param"))))
+
+	// merr system error through the err path -> rejected_system
+	assert.Equal(t, metrics.RejectedSystemLabel,
+		ParseMetricLabel(&commonpb.Status{}, merr.WrapErrServiceInternalMsg("boom")))
+
+	// client cancellation through the err path -> cancel, not a system rejection
+	assert.Equal(t, metrics.CancelLabel,
+		ParseMetricLabel(&commonpb.Status{}, context.Canceled))
+	assert.Equal(t, metrics.CancelLabel,
+		ParseMetricLabel(&commonpb.Status{}, errors.Wrap(context.Canceled, "rpc aborted")))
+
+	// REST v2 wrapper shape: the response carries the failed status AND the
+	// wrapper reconstructs err from it. Processed failures must classify by
+	// the status (fail_*), not be misrouted into the rejected_* buckets.
+	restSys := merr.Status(merr.ErrSegcore)
+	assert.Equal(t, metrics.FailSystemLabel, ParseMetricLabel(restSys, merr.Error(restSys)))
+	restInput := merr.Status(merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg("bad param")))
+	assert.Equal(t, metrics.FailInputLabel, ParseMetricLabel(restInput, merr.Error(restInput)))
+	// Cancellation surfaced through the response status stays out of fail_system.
+	restCancel := merr.Status(context.Canceled)
+	assert.Equal(t, metrics.CancelLabel, ParseMetricLabel(restCancel, merr.Error(restCancel)))
+}

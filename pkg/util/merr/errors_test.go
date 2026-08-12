@@ -1,0 +1,384 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package merr
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"testing"
+
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+)
+
+type ErrSuite struct {
+	suite.Suite
+}
+
+func (s *ErrSuite) SetupSuite() {
+}
+
+func (s *ErrSuite) TestCode() {
+	err := WrapErrCollectionNotFound(1)
+	errors.Wrap(err, "failed to get collection")
+	s.ErrorIs(err, ErrCollectionNotFound)
+	s.Equal(Code(ErrCollectionNotFound), Code(err))
+	s.Equal(TimeoutCode, Code(context.DeadlineExceeded))
+	s.Equal(CanceledCode, Code(context.Canceled))
+	s.Equal(errUnexpected.errCode, Code(errUnexpected))
+
+	sameCodeErr := makeMilvusError("new error", ErrCollectionNotFound.errCode, false)
+	s.True(sameCodeErr.Is(ErrCollectionNotFound))
+}
+
+func (s *ErrSuite) TestDuplicateSentinelCodePanics() {
+	// milvusError.Is matches by code alone, so defining a second sentinel on an
+	// occupied code must fail loudly at init instead of silently satisfying
+	// errors.Is against an unrelated sentinel.
+	s.PanicsWithValue(
+		fmt.Sprintf("merr: duplicate sentinel error code %d: %q vs %q",
+			ErrCollectionNotFound.errCode, ErrCollectionNotFound.msg, "duplicate probe"),
+		func() { newMilvusError("duplicate probe", ErrCollectionNotFound.errCode, false) },
+	)
+}
+
+func (s *ErrSuite) TestStatus() {
+	err := WrapErrCollectionNotFound(1)
+	status := Status(err)
+	restoredErr := Error(status)
+
+	s.ErrorIs(err, restoredErr)
+	s.Equal(int32(0), Status(nil).Code)
+	s.Nil(Error(&commonpb.Status{}))
+}
+
+func (s *ErrSuite) TestStatusWithCode() {
+	err := WrapErrCollectionNotFound(1)
+	status := StatusWithErrorCode(err, commonpb.ErrorCode_CollectionNotExists)
+	restoredErr := Error(status)
+
+	s.ErrorIs(err, restoredErr)
+	s.Equal(commonpb.ErrorCode_CollectionNotExists, status.ErrorCode)
+	s.Equal(int32(0), StatusWithErrorCode(nil, commonpb.ErrorCode_CollectionNotExists).Code)
+}
+
+func (s *ErrSuite) TestWrap() {
+	// Service related
+	s.ErrorIs(WrapErrServiceNotReady("test", 0, "test init..."), ErrServiceNotReady)
+	s.ErrorIs(WrapErrServiceUnavailable("test", "test init"), ErrServiceUnavailable)
+	s.ErrorIs(WrapErrServiceMemoryLimitExceeded(110, 100, "MLE"), ErrServiceMemoryLimitExceeded)
+	s.ErrorIs(WrapErrTooManyRequests(100, "too many requests"), ErrServiceTooManyRequests)
+	s.ErrorIs(WrapErrServiceInternal("never throw out"), ErrServiceInternal)
+	s.ErrorIs(WrapErrServiceCrossClusterRouting("ins-0", "ins-1"), ErrServiceCrossClusterRouting)
+	s.ErrorIs(WrapErrServiceDiskLimitExceeded(110, 100, "DLE"), ErrServiceDiskLimitExceeded)
+	s.ErrorIs(WrapErrNodeNotMatch(0, 1, "SIM"), ErrNodeNotMatch)
+	s.ErrorIs(WrapErrServiceUnimplemented(errors.New("mock grpc err")), ErrServiceUnimplemented)
+
+	// Collection related
+	s.ErrorIs(WrapErrCollectionNotFound("test_collection", "failed to get collection"), ErrCollectionNotFound)
+	s.ErrorIs(WrapErrCollectionNotLoaded("test_collection", "failed to query"), ErrCollectionNotLoaded)
+	s.ErrorIs(WrapErrCollectionNotFullyLoaded("test_collection", "failed to query"), ErrCollectionNotFullyLoaded)
+	s.ErrorIs(WrapErrCollectionNotLoaded("test_collection", "failed to alter index %s", "hnsw"), ErrCollectionNotLoaded)
+	s.ErrorIs(WrapErrCollectionOnRecovering("test_collection", "channel lost %s", "dev"), ErrCollectionOnRecovering)
+	s.ErrorIs(WrapErrCollectionVectorClusteringKeyNotAllowed("test_collection", "field"), ErrCollectionVectorClusteringKeyNotAllowed)
+	s.ErrorIs(WrapErrCollectionSchemaMisMatch("schema mismatch", "field"), ErrCollectionSchemaMismatch)
+	s.ErrorIs(WrapErrCollectionSchemaVersionNotReady("test_collection", 1, 3), ErrCollectionSchemaVersionNotReady)
+	s.True(Status(WrapErrCollectionSchemaVersionNotReady("test_collection", 1, 3)).GetRetriable())
+	s.Equal(commonpb.ErrorCode_NotReadyServe, Status(WrapErrCollectionSchemaVersionNotReady("test_collection", 1, 3)).GetErrorCode())
+	// Partition related
+	s.ErrorIs(WrapErrPartitionNotFound("test_partition", "failed to get partition"), ErrPartitionNotFound)
+	s.ErrorIs(WrapErrPartitionNotLoaded("test_partition", "failed to query"), ErrPartitionNotLoaded)
+	s.ErrorIs(WrapErrPartitionNotFullyLoaded("test_partition", "failed to query"), ErrPartitionNotFullyLoaded)
+
+	// ResourceGroup related
+	s.ErrorIs(WrapErrResourceGroupNotFound("test_ResourceGroup", "failed to get ResourceGroup"), ErrResourceGroupNotFound)
+	s.ErrorIs(WrapErrResourceGroupAlreadyExist("test_ResourceGroup", "failed to get ResourceGroup"), ErrResourceGroupAlreadyExist)
+	s.ErrorIs(WrapErrResourceGroupReachLimit("test_ResourceGroup", 1, "failed to get ResourceGroup"), ErrResourceGroupReachLimit)
+	s.ErrorIs(WrapErrResourceGroupIllegalConfig("test_ResourceGroup", nil, "failed to get ResourceGroup"), ErrResourceGroupIllegalConfig)
+	s.ErrorIs(WrapErrResourceGroupNodeNotEnough("test_ResourceGroup", 1, 2, "failed to get ResourceGroup"), ErrResourceGroupNodeNotEnough)
+	s.ErrorIs(WrapErrResourceGroupServiceUnAvailable("test_ResourceGroup", "failed to get ResourceGroup"), ErrResourceGroupServiceUnAvailable)
+
+	// Replica related
+	s.ErrorIs(WrapErrReplicaNotFound(1, "failed to get replica"), ErrReplicaNotFound)
+	s.ErrorIs(WrapErrReplicaNotAvailable(1, "failed to get replica"), ErrReplicaNotAvailable)
+
+	// Channel related
+	s.ErrorIs(WrapErrChannelNotFound("test_Channel", "failed to get Channel"), ErrChannelNotFound)
+	s.ErrorIs(WrapErrChannelLack("test_Channel", "failed to get Channel"), ErrChannelLack)
+	s.ErrorIs(WrapErrChannelReduplicate("test_Channel", "failed to get Channel"), ErrChannelReduplicate)
+	s.ErrorIs(WrapErrChannelDroppedSentinel("test_Channel", "refuse to build next target"), ErrChannelDroppedSentinel)
+	// Dropped-sentinel and not-available are distinct: matching one must not match the other.
+	s.False(errors.Is(WrapErrChannelDroppedSentinel("test_Channel"), ErrChannelNotAvailable))
+	s.False(errors.Is(WrapErrChannelNotAvailable("test_Channel"), ErrChannelDroppedSentinel))
+
+	// Segment related
+	s.ErrorIs(WrapErrSegmentNotFound(1, "failed to get Segment"), ErrSegmentNotFound)
+	s.ErrorIs(WrapErrSegmentNotLoaded(1, "failed to query"), ErrSegmentNotLoaded)
+	s.ErrorIs(WrapErrSegmentLack(1, "lack of segment"), ErrSegmentLack)
+	s.ErrorIs(WrapErrSegmentReduplicate(1, "redundancy of segment"), ErrSegmentReduplicate)
+	s.ErrorIs(WrapErrSegmentRequestResourceFailed("Memory"), ErrSegmentRequestResourceFailed)
+
+	// Index related
+	s.ErrorIs(WrapErrIndexNotFound("failed to get Index"), ErrIndexNotFound)
+	s.ErrorIs(WrapErrIndexNotFoundForCollection("milvus_hello", "failed to get collection index"), ErrIndexNotFound)
+	s.ErrorIs(WrapErrIndexNotFoundForSegments([]int64{100}, "failed to get collection index"), ErrIndexNotFound)
+	s.ErrorIs(WrapErrIndexNotSupported("wsnh", "failed to create index"), ErrIndexNotSupported)
+
+	// Node related
+	s.ErrorIs(WrapErrNodeNotFound(1, "failed to get node"), ErrNodeNotFound)
+	s.ErrorIs(WrapErrNodeOffline(1, "failed to access node"), ErrNodeOffline)
+	s.ErrorIs(WrapErrNodeLack(3, 1, "need more nodes"), ErrNodeLack)
+	s.ErrorIs(WrapErrNodeStateUnexpected(1, "Stopping", "failed to suspend node"), ErrNodeStateUnexpected)
+
+	// IO related
+	s.ErrorIs(WrapErrIoKeyNotFound("test_key", "failed to read"), ErrIoKeyNotFound)
+	s.ErrorIs(WrapErrIoFailed("test_key", os.ErrClosed), ErrIoFailed)
+	s.ErrorIs(WrapErrIoUnexpectEOF("test_key", os.ErrClosed), ErrIoUnexpectEOF)
+
+	// Parameter related
+	s.ErrorIs(WrapErrParameterInvalid(8, 1, "failed to create"), ErrParameterInvalid)
+	s.ErrorIs(WrapErrParameterInvalidRange(1, 1<<16, 0, "topk should be in range"), ErrParameterInvalid)
+	s.ErrorIs(WrapErrParameterMissing("alias_name", "no alias parameter"), ErrParameterMissing)
+	s.ErrorIs(WrapErrParameterTooLarge("unit test"), ErrParameterTooLarge)
+
+	// Metrics related
+	s.ErrorIs(WrapErrMetricNotFound("unknown", "failed to get metric"), ErrMetricNotFound)
+
+	// Message queue related
+	s.ErrorIs(WrapErrMqTopicNotFound("unknown", "failed to get topic"), ErrMqTopicNotFound)
+	s.ErrorIs(WrapErrMqTopicNotEmpty("unknown", "topic is not empty"), ErrMqTopicNotEmpty)
+	s.ErrorIs(WrapErrMqInternal(errors.New("unknown"), "failed to consume"), ErrMqInternal)
+
+	// field related
+	s.ErrorIs(WrapErrFieldNotFound("meta", "failed to get field"), ErrFieldNotFound)
+
+	// alias related
+	s.ErrorIs(WrapErrAliasNotFound("alias", "failed to get collection id"), ErrAliasNotFound)
+	s.ErrorIs(WrapErrCollectionIDOfAliasNotFound(1000, "failed to get collection id"), ErrCollectionIDOfAliasNotFound)
+
+	// Search/Query related
+	s.ErrorIs(WrapErrInconsistentRequery("unknown"), ErrInconsistentRequery)
+}
+
+func (s *ErrSuite) TestOldCode() {
+	s.ErrorIs(OldCodeToMerr(commonpb.ErrorCode_NotReadyServe), ErrServiceNotReady)
+	s.ErrorIs(OldCodeToMerr(commonpb.ErrorCode_CollectionNotExists), ErrCollectionNotFound)
+	s.ErrorIs(OldCodeToMerr(commonpb.ErrorCode_IllegalArgument), ErrParameterInvalid)
+	s.ErrorIs(OldCodeToMerr(commonpb.ErrorCode_NodeIDNotMatch), ErrNodeNotMatch)
+	s.ErrorIs(OldCodeToMerr(commonpb.ErrorCode_InsufficientMemoryToLoad), ErrServiceMemoryLimitExceeded)
+	s.ErrorIs(OldCodeToMerr(commonpb.ErrorCode_MemoryQuotaExhausted), ErrServiceMemoryLimitExceeded)
+	s.ErrorIs(OldCodeToMerr(commonpb.ErrorCode_DiskQuotaExhausted), ErrServiceDiskLimitExceeded)
+	s.ErrorIs(OldCodeToMerr(commonpb.ErrorCode_RateLimit), ErrServiceRateLimit)
+	s.ErrorIs(OldCodeToMerr(commonpb.ErrorCode_ForceDeny), ErrServiceQuotaExceeded)
+	s.ErrorIs(OldCodeToMerr(commonpb.ErrorCode_UnexpectedError), errUnexpected)
+
+	// Every parameter-class error must project to IllegalArgument for old SDKs
+	// that still read the deprecated ErrorCode; otherwise the finer-grained
+	// ParameterMissing/ParameterTooLarge codes regress them to UnexpectedError.
+	s.Equal(commonpb.ErrorCode_IllegalArgument, Status(ErrParameterInvalid).GetErrorCode())
+	s.Equal(commonpb.ErrorCode_IllegalArgument, Status(ErrParameterMissing).GetErrorCode())
+	s.Equal(commonpb.ErrorCode_IllegalArgument, Status(ErrParameterTooLarge).GetErrorCode())
+	s.Equal(commonpb.ErrorCode_IllegalArgument, Status(WrapErrParameterMissingMsg("collection names cannot be empty")).GetErrorCode())
+}
+
+func (s *ErrSuite) TestCombine() {
+	var (
+		errFirst  = errors.New("first")
+		errSecond = errors.New("second")
+		errThird  = errors.New("third")
+	)
+
+	err := Combine(errFirst, errSecond)
+	s.True(errors.Is(err, errFirst))
+	s.True(errors.Is(err, errSecond))
+	s.False(errors.Is(err, errThird))
+
+	s.Equal("first: second", err.Error())
+}
+
+func (s *ErrSuite) TestCombineWithNil() {
+	err := errors.New("non-nil")
+
+	err = Combine(nil, err)
+	s.NotNil(err)
+}
+
+func (s *ErrSuite) TestCombineOnlyNil() {
+	err := Combine(nil, nil)
+	s.Nil(err)
+}
+
+func (s *ErrSuite) TestCombineCode() {
+	err := Combine(WrapErrPartitionNotFound(10), WrapErrCollectionNotFound(1))
+	s.Equal(Code(ErrCollectionNotFound), Code(err))
+}
+
+func (s *ErrSuite) TestIsHealthy() {
+	type testCase struct {
+		code   commonpb.StateCode
+		expect bool
+	}
+
+	cases := []testCase{
+		{commonpb.StateCode_Healthy, true},
+		{commonpb.StateCode_Initializing, false},
+		{commonpb.StateCode_Abnormal, false},
+		{commonpb.StateCode_StandBy, false},
+		{commonpb.StateCode_Stopping, false},
+	}
+	for _, tc := range cases {
+		s.Run(tc.code.String(), func() {
+			s.Equal(tc.expect, CheckHealthy(tc.code) == nil)
+		})
+	}
+}
+
+func (s *ErrSuite) TestIsHealthyOrStopping() {
+	type testCase struct {
+		code   commonpb.StateCode
+		expect bool
+	}
+
+	cases := []testCase{
+		{commonpb.StateCode_Healthy, true},
+		{commonpb.StateCode_Initializing, false},
+		{commonpb.StateCode_Abnormal, false},
+		{commonpb.StateCode_StandBy, false},
+		{commonpb.StateCode_Stopping, true},
+	}
+	for _, tc := range cases {
+		s.Run(tc.code.String(), func() {
+			s.Equal(tc.expect, IsHealthyOrStopping(tc.code) == nil)
+		})
+	}
+}
+
+func TestNewIOErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       milvusError
+		code      int32
+		retriable bool
+	}{
+		{"PermissionDenied", ErrIoPermissionDenied, 1005, false},
+		{"BucketNotFound", ErrIoBucketNotFound, 1006, false},
+		{"InvalidCredentials", ErrIoInvalidCredentials, 1007, false},
+		{"InvalidArgument", ErrIoInvalidArgument, 1010, false},
+		{"InvalidRange", ErrIoInvalidRange, 1011, false},
+		{"EntityTooLarge", ErrIoEntityTooLarge, 1012, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.code, tt.err.errCode)
+			assert.Equal(t, tt.retriable, tt.err.retriable)
+		})
+	}
+}
+
+func TestErrors(t *testing.T) {
+	suite.Run(t, new(ErrSuite))
+}
+
+// TestWrapErrPreservesInnerChain locks in the contract that WrapErr*Err helpers
+// keep the inner error chain reachable via errors.Is while still attributing
+// the milvus sentinel for code lookup. Regression guard against the previous
+// implementation that string-flattened the inner error and lost its identity.
+func TestWrapErrPreservesInnerChain(t *testing.T) {
+	inner := errors.New("inner-error")
+
+	for _, tc := range []struct {
+		name     string
+		wrap     func() error
+		sentinel error
+		other    error
+		code     int32
+	}{
+		{
+			name:     "ServiceInternal",
+			wrap:     func() error { return WrapErrServiceInternalErr(inner, "ctx %s", "test") },
+			sentinel: ErrServiceInternal,
+			other:    ErrParameterInvalid,
+			code:     ErrServiceInternal.errCode,
+		},
+		{
+			name:     "ParameterInvalid",
+			wrap:     func() error { return WrapErrParameterInvalidErr(inner, "ctx %d", 42) },
+			sentinel: ErrParameterInvalid,
+			other:    ErrServiceInternal,
+			code:     ErrParameterInvalid.errCode,
+		},
+		{
+			name:     "MqInternal",
+			wrap:     func() error { return WrapErrMqInternal(inner, "step1", "step2") },
+			sentinel: ErrMqInternal,
+			other:    ErrServiceInternal,
+			code:     ErrMqInternal.errCode,
+		},
+		{
+			name:     "BuildCompactionRequestFail",
+			wrap:     func() error { return WrapErrBuildCompactionRequestFail(inner) },
+			sentinel: ErrBuildCompactionRequestFail,
+			other:    ErrServiceInternal,
+			code:     ErrBuildCompactionRequestFail.errCode,
+		},
+		{
+			name:     "GetCompactionPlanResultFail",
+			wrap:     func() error { return WrapErrGetCompactionPlanResultFail(inner) },
+			sentinel: ErrGetCompactionPlanResultFail,
+			other:    ErrServiceInternal,
+			code:     ErrGetCompactionPlanResultFail.errCode,
+		},
+		{
+			name:     "OperationNotSupported",
+			wrap:     func() error { return WrapErrOperationNotSupported(inner, "op %s", "drop") },
+			sentinel: ErrOperationNotSupported,
+			other:    ErrServiceInternal,
+			code:     ErrOperationNotSupported.errCode,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := tc.wrap()
+			assert.True(t, errors.Is(w, tc.sentinel), "must match its sentinel")
+			assert.True(t, errors.Is(w, inner), "must preserve inner chain")
+			assert.False(t, errors.Is(w, tc.other), "must not match unrelated sentinel")
+			assert.Equal(t, tc.code, Code(w), "Code() must report sentinel's code")
+			assert.Contains(t, w.Error(), inner.Error(), "message must include inner")
+
+			// The wrapped error must carry the SENTINEL's classification, not the
+			// inner error's. These walk via errors.As(err, &milvusError); without
+			// wrappedMilvusError.As they would resolve to the inner error and drop
+			// the sentinel's InputError / retriable marks.
+			assert.Equal(t, GetErrorType(tc.sentinel), GetErrorType(w),
+				"GetErrorType must match the sentinel's classification")
+			assert.Equal(t, IsRetryableErr(tc.sentinel), IsRetryableErr(w),
+				"IsRetryableErr must match the sentinel's retriable flag")
+			if GetErrorType(tc.sentinel) == InputError {
+				assert.Equal(t, "true", Status(w).ExtraInfo[InputErrorFlagKey],
+					"Status must surface is_input_error for an InputError sentinel")
+				assert.False(t, Status(w).Retriable, "InputError status must be non-retriable")
+			}
+		})
+	}
+
+	// nil err falls back to the Msg variant; just make sure that still works.
+	assert.True(t, errors.Is(WrapErrServiceInternalErr(nil, "no underlying err"), ErrServiceInternal))
+}

@@ -1,0 +1,144 @@
+## Tests
+
+### E2E Test
+
+#### Configuration Requirements
+
+##### Operating System
+
+| Operating System | Version        |
+| ---------------- | -------------- |
+| Amazon Linux     | 2023 or above  |
+| Ubuntu           | 20.04 or above |
+| Mac              | 10.14 or above |
+
+##### Hardware
+
+| Hardware Type | Recommended Configuration                                                                                                                            |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| CPU           | x86_64 architecture <br> Intel CPU Sandy Bridge or above<br> CPU Instruction Set<br> - SSE4_2<br> - AVX<br> - AVX2<br> - AVX512 or arm64 Linux/MacOS |
+| Memory        | 16 GB or more                                                                                                                                        |
+
+##### Software
+
+| Software Name  | Version         |
+| -------------- | --------------- |
+| Docker         | 19.05 or above  |
+| Docker Compose | 1.25.5 or above |
+| jq             | 1.3 or above    |
+| kubectl        | 1.14 or above   |
+| helm           | 3.0 or above    |
+| kind           | 0.10.0 or above |
+
+#### Installing Dependencies
+
+##### Troubleshooting Docker and Docker Compose
+
+1. Confirm that Docker Daemon is running：
+
+```shell
+$ docker info
+```
+
+- Ensure that Docker is installed. Refer to the official installation instructions for [Docker CE/EE](https://docs.docker.com/get-docker/).
+
+- Start the Docker Daemon if it is not already started.
+
+- To run Docker without `root` privileges, create a user group labeled `docker`, then add a user to the group with `sudo usermod -aG docker $USER`. Log out and log back into the terminal for the changes to take effect. For more information, see the official Docker documentation for [Managing Docker as a Non-Root User](https://docs.docker.com/engine/install/linux-postinstall/#manage-docker-as-a-non-root-user).
+
+2. Check the version of Docker-Compose
+
+```shell
+$ docker compose version
+
+docker compose version 1.25.5, build 8a1c60f6
+docker-py version: 4.1.0
+CPython version: 3.7.5
+OpenSSL version: OpenSSL 1.1.1f  31 Mar 2020
+```
+
+- To install Docker-Compose, see [Install Docker Compose](https://docs.docker.com/compose/install/)
+
+##### Install jq
+
+- Refer to <https://stedolan.github.io/jq/download/>
+
+##### Install kubectl
+
+- Refer to <https://kubernetes.io/docs/tasks/tools/>
+
+##### Install helm
+
+- Refer to <https://helm.sh/docs/intro/install/>
+
+##### Install kind
+
+- Refer to <https://kind.sigs.k8s.io/docs/user/quick-start/#installation>
+
+#### Run E2E Tests
+
+```shell
+$ cd tests/scripts
+$ ./e2e-k8s.sh
+```
+
+> Getting help
+>
+> You can get help with the following command:
+>
+> ```shell
+> $ ./e2e-k8s.sh --help
+> ```
+
+### Python Code Quality (ruff via uv)
+
+Ruff is configured at `tests/ruff.toml` and covers all Python code under `tests/`
+(`python_client/`, `restful_client/`, `restful_client_v2/`, `benchmark/`, `scripts/`).
+Each sub-directory continues to manage its runtime dependencies via its own
+`requirements.txt`.
+
+```shell
+$ cd tests/
+$ ruff check .                  # lint
+$ ruff check . --fix            # lint with auto-fix
+$ ruff format .                 # format in place
+$ ruff format --check .         # format check only (CI-friendly)
+```
+
+Rules enabled: `E`, `F`, `W`, `I`, `UP`. Target Python version: `3.12`.
+
+#### Lint only PR-changed files (Python Lint CI parity)
+
+The GitHub Actions workflow `.github/workflows/python-lint.yaml` (job
+**"Python Lint (tests/) / Ruff (changed files only)"**) runs `ruff check`
+and `ruff format --check` against the *changed* `tests/**/*.py` set on
+every PR. Running `uv run ruff check .` over the whole tree is too coarse
+because the historical contents of many files predate the lint config and
+will fail unrelated rules.
+
+To reproduce the CI step locally, use the `Makefile` shipped in this directory:
+
+```shell
+$ cd tests/
+$ make ci             # ruff check + format --check on PR-changed *.py (CI equivalent)
+$ make lint-fix       # ruff check --fix on PR-changed *.py
+$ make format         # ruff format on PR-changed *.py
+$ make help           # show all targets and the detected BASE_REF
+```
+
+`BASE_REF` is auto-detected from the current branch's open PR via `gh pr view`:
+the PR URL is parsed to discover the base `<owner>/<repo>` and matched against
+your local git remotes, producing e.g. `upstream/master`, `upstream/2.x`, or
+`origin/main` for direct clones.
+
+If no open PR exists for the branch, you **must** set `BASE_REF` explicitly
+(no guessing — a wrong base diffs against unrelated commits):
+
+```shell
+$ make ci BASE_REF=upstream/master
+```
+
+Requires `uv` (provides `uvx`) and `gh` authenticated against GitHub
+(`gh auth status`). The ruff version is pinned in the `Makefile` via
+`RUFF_VERSION` to match the workflow.
+

@@ -1,0 +1,141 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package msgdispatcher
+
+import (
+	"context"
+	"time"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/mq/common"
+	"github.com/milvus-io/milvus/pkg/v3/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/lock"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+type (
+	Pos     = msgpb.MsgPosition
+	MsgPack = msgstream.MsgPack
+	SubPos  = common.SubscriptionInitialPosition
+)
+
+type StreamConfig struct {
+	VChannel string
+	Pos      *Pos
+	SubPos   SubPos
+}
+
+func NewStreamConfig(vchannel string, pos *Pos, subPos SubPos) *StreamConfig {
+	return &StreamConfig{
+		VChannel: vchannel,
+		Pos:      pos,
+		SubPos:   subPos,
+	}
+}
+
+type Client interface {
+	Register(ctx context.Context, streamConfig *StreamConfig) (<-chan *MsgPack, error)
+	Deregister(vchannel string)
+	Close()
+}
+
+var _ Client = (*client)(nil)
+
+type client struct {
+	role                 string
+	nodeID               int64
+	managers             *typeutil.ConcurrentMap[string, DispatcherManager]
+	managerMut           *lock.KeyLock[string]
+	factory              msgstream.Factory
+	includeSkipWhenSplit bool
+}
+
+func NewClientWithIncludeSkipWhenSplit(factory msgstream.Factory, role string, nodeID int64) Client {
+	c := NewClient(factory, role, nodeID)
+	c.(*client).includeSkipWhenSplit = true
+	return c
+}
+
+func NewClient(factory msgstream.Factory, role string, nodeID int64) Client {
+	return &client{
+		role:                 role,
+		nodeID:               nodeID,
+		factory:              factory,
+		managers:             typeutil.NewConcurrentMap[string, DispatcherManager](),
+		managerMut:           lock.NewKeyLock[string](),
+		includeSkipWhenSplit: false,
+	}
+}
+
+func (c *client) Register(ctx context.Context, streamConfig *StreamConfig) (<-chan *MsgPack, error) {
+	start := time.Now()
+	vchannel := streamConfig.VChannel
+	pchannel := funcutil.ToPhysicalChannel(vchannel)
+
+	log := mlog.With(mlog.String("role", c.role), mlog.FieldNodeID(c.nodeID), mlog.FieldVChannel(vchannel))
+
+	c.managerMut.Lock(pchannel)
+	defer c.managerMut.Unlock(pchannel)
+
+	var manager DispatcherManager
+	manager, ok := c.managers.Get(pchannel)
+	if !ok {
+		manager = NewDispatcherManager(pchannel, c.role, c.nodeID, c.factory, c.includeSkipWhenSplit)
+		c.managers.Insert(pchannel, manager)
+		go manager.Run()
+	}
+
+	// Begin to register
+	ch, err := manager.Add(ctx, streamConfig)
+	if err != nil {
+		log.Error(ctx, "register failed", mlog.Err(err))
+		return nil, err
+	}
+	log.Info(ctx, "register done", mlog.Duration("dur", time.Since(start)))
+	return ch, nil
+}
+
+func (c *client) Deregister(vchannel string) {
+	start := time.Now()
+	pchannel := funcutil.ToPhysicalChannel(vchannel)
+
+	c.managerMut.Lock(pchannel)
+	defer c.managerMut.Unlock(pchannel)
+
+	if manager, ok := c.managers.Get(pchannel); ok {
+		manager.Remove(vchannel)
+		mlog.Info(context.TODO(), "deregister done", mlog.String("role", c.role), mlog.FieldNodeID(c.nodeID),
+			mlog.FieldVChannel(vchannel), mlog.Duration("dur", time.Since(start)))
+	}
+}
+
+func (c *client) Close() {
+	log := mlog.With(mlog.String("role", c.role), mlog.FieldNodeID(c.nodeID))
+
+	c.managers.Range(func(pchannel string, manager DispatcherManager) bool {
+		c.managerMut.Lock(pchannel)
+		defer c.managerMut.Unlock(pchannel)
+
+		log.Info(context.TODO(), "close manager", mlog.String("channel", pchannel))
+		c.managers.Remove(pchannel)
+		manager.Close()
+		return true
+	})
+	log.Info(context.TODO(), "dispatcher client closed")
+}

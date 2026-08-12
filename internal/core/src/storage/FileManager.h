@@ -1,0 +1,389 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <exception>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+
+#include <boost/filesystem/path.hpp>
+
+#include "common/Consts.h"
+#include "common/type_c.h"
+#include "index/Meta.h"
+#include "filemanager/FileManager.h"
+#include "log/Log.h"
+#include "milvus-storage/filesystem/fs.h"
+#include "milvus-storage/properties.h"
+#include "storage/ChunkManager.h"
+#include "storage/LocalChunkManager.h"
+#include "storage/LocalChunkManagerSingleton.h"
+#include "storage/IndexEntryDirectStreamWriter.h"
+#include "storage/IndexEntryEncryptedLocalWriter.h"
+#include "storage/IndexEntryWriter.h"
+#include "storage/PluginLoader.h"
+#include "storage/RemoteInputStream.h"
+#include "storage/RemoteOutputStream.h"
+#include "pb/index_coord.pb.h"
+#include "storage/Types.h"
+
+namespace milvus::storage {
+
+// Normalize path to be consistent with Go's path.Join behavior.
+// This handles two issues:
+// 1. Removes leading "./" when root_path is "."
+// 2. Removes trailing "/." that lexically_normal() may produce
+inline std::string
+NormalizePath(const boost::filesystem::path& path) {
+    auto result = path.lexically_normal().string();
+    // Remove trailing "/." if present
+    if (result.size() >= 2 && result.substr(result.size() - 2) == "/.") {
+        result = result.substr(0, result.size() - 1);
+    }
+    return result;
+}
+
+struct FileManagerContext {
+    FileManagerContext() : chunkManagerPtr(nullptr) {
+    }
+    explicit FileManagerContext(const ChunkManagerPtr& chunkManagerPtr)
+        : chunkManagerPtr(chunkManagerPtr) {
+    }
+    FileManagerContext(const FieldDataMeta& fieldDataMeta,
+                       const IndexMeta& indexMeta,
+                       const ChunkManagerPtr& chunkManagerPtr,
+                       milvus_storage::ArrowFileSystemPtr fs)
+        : fieldDataMeta(fieldDataMeta),
+          indexMeta(indexMeta),
+          chunkManagerPtr(chunkManagerPtr),
+          fs(std::move(fs)) {
+    }
+
+    bool
+    Valid() const {
+        return chunkManagerPtr != nullptr;
+    }
+
+    void
+    set_for_loading_index(bool value) {
+        for_loading_index = value;
+    }
+
+    void
+    set_plugin_context(std::shared_ptr<CPluginContext> context) {
+        plugin_context = context;
+    }
+
+    /**
+     * @brief Set the loon FFI properties for storage access
+     *
+     * Configures the properties used for accessing loon storage through
+     * the FFI interface. These properties contain storage configuration
+     * such as endpoints, credentials, and connection settings.
+     *
+     * @param properties Shared pointer to Properties object
+     */
+    void
+    set_loon_ffi_properties(
+        std::shared_ptr<milvus_storage::api::Properties> properties) {
+        loon_ffi_properties = std::move(properties);
+    }
+
+    void
+    set_stats_base_path(const std::string& path) {
+        stats_base_path = path;
+    }
+
+    void
+    set_storage_column_mapping(int64_t field_id, StorageColumnMapping mapping) {
+        storage_column_mappings[field_id] = std::move(mapping);
+    }
+
+    FieldDataMeta fieldDataMeta;
+    IndexMeta indexMeta;
+    ChunkManagerPtr chunkManagerPtr;
+    milvus_storage::ArrowFileSystemPtr fs;
+    bool for_loading_index{false};
+    std::shared_ptr<CPluginContext> plugin_context;
+    std::shared_ptr<milvus_storage::api::Properties> loon_ffi_properties;
+    std::string stats_base_path;
+    StorageColumnMappings storage_column_mappings;
+};
+
+#define FILEMANAGER_TRY try {
+#define FILEMANAGER_CATCH                                                   \
+    }                                                                       \
+    catch (SegcoreError & e) {                                              \
+        LOG_ERROR("SegcoreError:{} code {}", e.what(), e.get_error_code()); \
+        return false;                                                       \
+    }                                                                       \
+    catch (std::exception & e) {                                            \
+        LOG_ERROR("Exception:{}", e.what());                                \
+        return false;
+#define FILEMANAGER_END }
+
+class FileManagerImpl : public milvus::FileManager {
+ public:
+    explicit FileManagerImpl(const FieldDataMeta& field_mata,
+                             IndexMeta index_meta)
+        : field_meta_(field_mata), index_meta_(std::move(index_meta)) {
+    }
+
+ public:
+    /**
+     * @brief Load a file to the local disk, so we can use stl lib to operate it.
+     *
+     * @param filename
+     * @return false if any error, or return true.
+     */
+    virtual bool
+    LoadFile(const std::string& filename) override = 0;
+
+    /**
+     * @brief Add file to FileManager to manipulate it.
+     *
+     * @param filename
+     * @return false if any error, or return true.
+     */
+    virtual bool
+    AddFile(const std::string& filename) override = 0;
+
+    /**
+     * @brief Check if a file exists.
+     *
+     * @param filename
+     * @return std::nullopt if any error, or return if the file exists.
+     */
+    virtual std::optional<bool>
+    IsExisted(const std::string& filename) override = 0;
+
+    /**
+     * @brief Delete a file from FileManager.
+     *
+     * @param filename
+     * @return false if any error, or return true.
+     */
+    virtual bool
+    RemoveFile(const std::string& filename) override = 0;
+
+    virtual bool
+    AddFileMeta(const FileMeta& file_meta) override = 0;
+
+    /**
+     * @brief Open an input stream for loading an index file from remote storage.
+     *
+     * @param local_full_file_path Local full file path. The local file may not
+     * exist yet; FileManager uses its basename and index metadata to resolve the
+     * remote object path.
+     */
+    std::shared_ptr<InputStream>
+    OpenInputStream(const std::string& local_full_file_path) override final {
+        return OpenInputStream(local_full_file_path, /*is_index_file=*/true);
+    }
+
+    /**
+     * @brief Open an output stream for uploading a built local index file to
+     * remote storage.
+     *
+     * @param local_full_file_path Local full path of the already-built index
+     * file. FileManager uses its basename and index metadata to resolve the
+     * remote object path.
+     */
+    std::shared_ptr<OutputStream>
+    OpenOutputStream(const std::string& local_full_file_path) override final {
+        return OpenOutputStream(local_full_file_path, /*is_index_file=*/true);
+    }
+
+    std::shared_ptr<InputStream>
+    OpenInputStream(const std::string& local_full_file_path,
+                    bool is_index_file) {
+        AssertInfo(fs_, "fs_ is nullptr, cannot open input stream");
+        auto local_file_name = GetFileName(local_full_file_path);
+        auto remote_file_path = is_index_file ? GetRemoteIndexObjectPrefix()
+                                              : GetRemoteTextLogPrefix();
+        remote_file_path += "/" + local_file_name;
+        auto remote_file = fs_->OpenInputFile(remote_file_path);
+        AssertInfo(remote_file.ok(),
+                   "failed to open remote file, reason: {}",
+                   remote_file.status().ToString());
+        return std::static_pointer_cast<milvus::InputStream>(
+            std::make_shared<milvus::storage::RemoteInputStream>(
+                std::move(remote_file.ValueOrDie())));
+    }
+
+    std::shared_ptr<OutputStream>
+    OpenOutputStream(const std::string& local_full_file_path,
+                     bool is_index_file) {
+        AssertInfo(fs_, "fs_ is nullptr, cannot open output stream");
+        auto local_file_name = GetFileName(local_full_file_path);
+        auto remote_file_path = is_index_file ? GetRemoteIndexObjectPrefix()
+                                              : GetRemoteTextLogPrefix();
+        remote_file_path += "/" + local_file_name;
+        // Ensure parent directory exists before opening the output stream.
+        // Only needed for local filesystems; object stores don't require
+        // explicit directory creation and the call would waste I/O.
+        if (milvus_storage::IsLocalFileSystem(fs_)) {
+            auto dir_path =
+                remote_file_path.substr(0, remote_file_path.find_last_of('/'));
+            if (!dir_path.empty()) {
+                auto status = fs_->CreateDir(dir_path, /*recursive=*/true);
+                AssertInfo(status.ok(),
+                           "failed to create directory {}, reason: {}",
+                           dir_path,
+                           status.ToString());
+            }
+        }
+        auto remote_stream = fs_->OpenOutputStream(remote_file_path);
+        AssertInfo(remote_stream.ok(),
+                   "failed to open remote stream, reason: {}",
+                   remote_stream.status().ToString());
+        return std::make_shared<milvus::storage::RemoteOutputStream>(
+            std::move(remote_stream.ValueOrDie()));
+    }
+
+    std::unique_ptr<IndexEntryWriter>
+    CreateIndexEntryWriterUnified(const std::string& filename,
+                                  bool is_index_file = true) {
+        if (plugin_context_) {
+            auto cipher_plugin = PluginLoader::GetInstance().getCipherPlugin();
+            if (cipher_plugin) {
+                auto local_file_name = GetFileName(filename);
+                auto remote_path = is_index_file ? GetRemoteIndexObjectPrefix()
+                                                 : GetRemoteTextLogPrefix();
+                remote_path += "/" + local_file_name;
+                return std::make_unique<IndexEntryEncryptedLocalWriter>(
+                    remote_path,
+                    fs_,
+                    cipher_plugin,
+                    plugin_context_->ez_id,
+                    plugin_context_->collection_id,
+                    GetLocalTempDir());
+            }
+        }
+        return std::make_unique<IndexEntryDirectStreamWriter>(
+            OpenOutputStream(filename, is_index_file));
+    }
+
+ public:
+    virtual std::string
+    GetName() const = 0;
+
+    virtual FieldDataMeta
+    GetFieldDataMeta() const {
+        return field_meta_;
+    }
+
+    virtual IndexMeta
+    GetIndexMeta() const {
+        return index_meta_;
+    }
+
+    virtual ChunkManagerPtr
+    GetChunkManager() const {
+        return rcm_;
+    }
+
+    virtual std::string
+    GetRemoteIndexObjectPrefix() const {
+        boost::filesystem::path prefix = index::kOverrideRootPathForUT.empty()
+                                             ? rcm_->GetRootPath()
+                                             : index::kOverrideRootPathForUT;
+        if (index_meta_.index_store_path_version >=
+            ::milvus::proto::index::IndexStorePathVersion::
+                INDEX_STORE_PATH_VERSION_COLLECTION_ROOTED) {
+            // {root}/index_v1/{coll}/{part}/{seg}/{build}/{ver}
+            return NormalizePath(prefix / std::string(INDEX_ROOT_PATH_V1) /
+                                 std::to_string(field_meta_.collection_id) /
+                                 std::to_string(field_meta_.partition_id) /
+                                 std::to_string(field_meta_.segment_id) /
+                                 std::to_string(index_meta_.build_id) /
+                                 std::to_string(index_meta_.index_version));
+        }
+        // {root}/index_files/{build}/{ver}/{part}/{seg}
+        return NormalizePath(prefix / std::string(INDEX_ROOT_PATH) /
+                             std::to_string(index_meta_.build_id) /
+                             std::to_string(index_meta_.index_version) /
+                             std::to_string(field_meta_.partition_id) /
+                             std::to_string(field_meta_.segment_id));
+    }
+
+    virtual std::string
+    GetRemoteTextLogPrefix() const {
+        if (!stats_base_path_.empty()) {
+            return stats_base_path_;
+        }
+        boost::filesystem::path prefix = index::kOverrideRootPathForUT.empty()
+                                             ? rcm_->GetRootPath()
+                                             : index::kOverrideRootPathForUT;
+        boost::filesystem::path path = std::string(TEXT_LOG_ROOT_PATH);
+        boost::filesystem::path path1 =
+            std::to_string(index_meta_.build_id) + "/" +
+            std::to_string(index_meta_.index_version) + "/" +
+            std::to_string(field_meta_.collection_id) + "/" +
+            std::to_string(field_meta_.partition_id) + "/" +
+            std::to_string(field_meta_.segment_id) + "/" +
+            std::to_string(field_meta_.field_id);
+        return NormalizePath(prefix / path / path1);
+    }
+
+    static std::string
+    GetFileName(const std::string& filepath) {
+        return boost::filesystem::path(filepath).filename().string();
+    }
+
+    std::string
+    GetLocalTempDir() const {
+        auto local_cm =
+            LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+        if (local_cm) {
+            return local_cm->GetRootPath();
+        }
+        return "";
+    }
+
+    std::optional<StorageColumnMapping>
+    GetStorageColumnMapping(int64_t field_id) const {
+        auto it = storage_column_mappings_.find(field_id);
+        if (it == storage_column_mappings_.end()) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
+ protected:
+    // collection meta
+    FieldDataMeta field_meta_;
+
+    // index meta
+    IndexMeta index_meta_;
+    ChunkManagerPtr rcm_;
+    milvus_storage::ArrowFileSystemPtr fs_;
+    std::shared_ptr<milvus_storage::api::Properties> loon_ffi_properties_;
+    std::shared_ptr<CPluginContext> plugin_context_;
+    StorageColumnMappings storage_column_mappings_;
+
+    // stats base path computed by Go caller; when non-empty, overrides
+    // the internally computed remote prefix for text/json stats files.
+    std::string stats_base_path_;
+};
+
+using FileManagerImplPtr = std::shared_ptr<FileManagerImpl>;
+
+}  // namespace milvus::storage

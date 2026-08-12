@@ -1,0 +1,344 @@
+package writebuffer
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
+	"github.com/milvus-io/milvus/internal/flushcommon/metacache"
+	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v3/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v3/util/lifetime"
+	"github.com/milvus-io/milvus/pkg/v3/util/logutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+// BufferManager is the interface for WriteBuffer management.
+//
+//go:generate mockery --name=BufferManager --structname=MockBufferManager --output=./  --filename=mock_manager.go --with-expecter --inpackage
+type BufferManager interface {
+	// Register adds a WriteBuffer with provided schema & options.
+	Register(channel string, metacache metacache.MetaCache, opts ...WriteBufferOption) error
+	// CreateNewGrowingSegment notifies writeBuffer to create a new growing segment.
+	CreateNewGrowingSegment(ctx context.Context, channel string, partition int64, segmentID int64, schemaVersion int32) error
+	// SealSegments notifies writeBuffer corresponding to provided channel to seal segments.
+	// which will cause segment start flush procedure.
+	SealSegments(ctx context.Context, channel string, segmentIDs []int64) error
+	// SealAllSegments notifies writeBuffer to seal all segments.
+	SealAllSegments(ctx context.Context, channel string) error
+	// FlushChannel set the flushTs of the provided write buffer.
+	FlushChannel(ctx context.Context, channel string, flushTs uint64) error
+	// RemoveChannel removes a write buffer from manager.
+	RemoveChannel(channel string)
+	// DropChannel remove write buffer and perform drop.
+	DropChannel(channel string)
+	DropPartitions(channel string, partitionIDs []int64)
+	// BufferData put data into channel write buffer.
+	BufferData(channel string, insertData []*InsertData, deleteMsgs []*msgstream.DeleteMsg, startPos, endPos *msgpb.MsgPosition, schemaVersion int32) error
+	// GetCheckpoint returns checkpoint for provided channel.
+	GetCheckpoint(channel string) (*msgpb.MsgPosition, bool, error)
+	// NotifyCheckpointUpdated notify write buffer checkpoint updated to reset flushTs.
+	NotifyCheckpointUpdated(channel string, ts uint64)
+
+	// UseGrowingSourceFlush returns true if the collection on this channel has growing-source fields.
+	UseGrowingSourceFlush(channel string) bool
+	// GetGrowingFlushProgress returns growing-source progress for the given channel.
+	// If segmentIDs is empty, all tracked growing-source segments are returned.
+	GetGrowingFlushProgress(ctx context.Context, channel string, segmentIDs []int64, fenceTs uint64) ([]GrowingFlushSegmentProgress, error)
+
+	// Start makes the background check start to work.
+	Start()
+	// Stop the background checker and wait for worker goroutine quit.
+	Stop()
+}
+
+type ReleaseManualFlushNeedChecker interface {
+	CheckReleaseManualFlushNeed(ctx context.Context, channel string, segmentIDs []int64) (bool, error)
+}
+
+// NewManager returns initialized manager as `Manager`
+func NewManager(syncMgr syncmgr.SyncManager) BufferManager {
+	return &bufferManager{
+		syncMgr: syncMgr,
+		buffers: typeutil.NewConcurrentMap[string, WriteBuffer](),
+
+		ch: lifetime.NewSafeChan(),
+	}
+}
+
+type bufferManager struct {
+	syncMgr syncmgr.SyncManager
+	buffers *typeutil.ConcurrentMap[string, WriteBuffer]
+
+	wg sync.WaitGroup
+	ch lifetime.SafeChan
+}
+
+func (m *bufferManager) Start() {
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.check()
+	}()
+}
+
+func (m *bufferManager) check() {
+	timer := time.NewTimer(paramtable.Get().DataNodeCfg.MemoryCheckInterval.GetAsDuration(time.Millisecond))
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			m.memoryCheck()
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(paramtable.Get().DataNodeCfg.MemoryCheckInterval.GetAsDuration(time.Millisecond))
+		case <-m.ch.CloseCh():
+			mlog.Info(context.TODO(), "buffer manager memory check stopped")
+			return
+		}
+	}
+}
+
+// memoryCheck performs check based on current memory usage & configuration.
+func (m *bufferManager) memoryCheck() {
+	if !paramtable.Get().DataNodeCfg.MemoryForceSyncEnable.GetAsBool() {
+		return
+	}
+	startTime := time.Now()
+	defer func() {
+		dur := time.Since(startTime)
+		if dur > 30*time.Second {
+			mlog.Warn(context.TODO(), "memory check takes too long", mlog.Duration("time", dur))
+		}
+	}()
+
+	for {
+		var total int64
+		var candidate WriteBuffer
+		var candiSize int64
+		var candiChan string
+
+		select {
+		case <-m.ch.CloseCh():
+			mlog.Info(context.TODO(), "stop memory check due to manager stop")
+			return
+		default:
+		}
+
+		m.buffers.Range(func(chanName string, buf WriteBuffer) bool {
+			size := buf.MemorySize()
+			total += size
+			if size > candiSize {
+				candiSize = size
+				candidate = buf
+				candiChan = chanName
+			}
+			return true
+		})
+
+		totalMemory := hardware.GetMemoryCount()
+		memoryWatermark := float64(totalMemory) * paramtable.Get().DataNodeCfg.MemoryForceSyncWatermark.GetAsFloat()
+		if float64(total) < memoryWatermark {
+			mlog.RatedDebug(context.TODO(), rate.Limit(20), "skip force sync because memory level is not high enough",
+				mlog.Float64("current_total_memory_usage", logutil.ToMB(float64(total))),
+				mlog.Float64("current_memory_watermark", logutil.ToMB(memoryWatermark)))
+			return
+		}
+
+		if candidate != nil {
+			candidate.EvictBuffer(GetOldestBufferPolicy(paramtable.Get().DataNodeCfg.MemoryForceSyncSegmentNum.GetAsInt()))
+			mlog.Info(context.TODO(), "notify writebuffer to sync",
+				mlog.String("channel", candiChan), mlog.Float64("bufferSize(MB)", logutil.ToMB(float64(candiSize))))
+		}
+	}
+}
+
+func (m *bufferManager) Stop() {
+	m.ch.Close()
+	m.wg.Wait()
+}
+
+// Register a new WriteBuffer for channel.
+func (m *bufferManager) Register(channel string, metacache metacache.MetaCache, opts ...WriteBufferOption) error {
+	buf, err := NewWriteBuffer(channel, metacache, m.syncMgr, opts...)
+	if err != nil {
+		return err
+	}
+
+	_, loaded := m.buffers.GetOrInsert(channel, buf)
+	if loaded {
+		buf.Close(context.Background(), false)
+		return merr.WrapErrChannelReduplicate(channel)
+	}
+	return nil
+}
+
+// CreateNewGrowingSegment notifies writeBuffer to create a new growing segment.
+func (m *bufferManager) CreateNewGrowingSegment(ctx context.Context, channel string, partitionID int64, segmentID int64, schemaVersion int32) error {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		mlog.Warn(ctx, "write buffer not found when create new growing segment",
+			mlog.String("channel", channel),
+			mlog.FieldPartitionID(partitionID),
+			mlog.FieldSegmentID(segmentID))
+		return merr.WrapErrChannelNotFound(channel)
+	}
+	buf.CreateNewGrowingSegment(partitionID, segmentID, nil, schemaVersion)
+	return nil
+}
+
+// SealSegments call sync segment and change segments state to Flushed.
+func (m *bufferManager) SealSegments(ctx context.Context, channel string, segmentIDs []int64) error {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		mlog.Warn(ctx, "write buffer not found when flush segments",
+			mlog.String("channel", channel),
+			mlog.Int64s("segmentIDs", segmentIDs))
+		return merr.WrapErrChannelNotFound(channel)
+	}
+
+	return buf.SealSegments(ctx, segmentIDs)
+}
+
+// SealAllSegments seal all segments in the write buffer.
+func (m *bufferManager) SealAllSegments(ctx context.Context, channel string) error {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		mlog.Warn(ctx, "write buffer not found",
+			mlog.String("channel", channel))
+		return merr.WrapErrChannelNotFound(channel)
+	}
+
+	buf.SealAllSegments(ctx)
+	return nil
+}
+
+func (m *bufferManager) FlushChannel(ctx context.Context, channel string, flushTs uint64) error {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		mlog.Warn(ctx, "write buffer not found when flush channel",
+			mlog.String("channel", channel),
+			mlog.Uint64("flushTs", flushTs))
+		return merr.WrapErrChannelNotFound(channel)
+	}
+	buf.SetFlushTimestamp(flushTs)
+	return nil
+}
+
+// BufferData put data into channel write buffer.
+func (m *bufferManager) BufferData(channel string, insertData []*InsertData, deleteMsgs []*msgstream.DeleteMsg, startPos, endPos *msgpb.MsgPosition, schemaVersion int32) error {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		mlog.Warn(context.TODO(), "write buffer not found when buffer data",
+			mlog.String("channel", channel))
+		return merr.WrapErrChannelNotFound(channel)
+	}
+
+	return buf.BufferData(insertData, deleteMsgs, startPos, endPos, schemaVersion)
+}
+
+func (m *bufferManager) UseGrowingSourceFlush(channel string) bool {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		return false
+	}
+	return buf.UseGrowingSourceFlush()
+}
+
+func (m *bufferManager) CheckReleaseManualFlushNeed(ctx context.Context, channel string, segmentIDs []int64) (bool, error) {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		mlog.Warn(ctx, "write buffer not found when checking release manual flush",
+			mlog.String("channel", channel),
+			mlog.Int64s("segmentIDs", segmentIDs))
+		return true, merr.WrapErrChannelNotFound(channel)
+	}
+	checker, ok := buf.(interface {
+		CheckReleaseManualFlushNeed(segmentIDs []int64) bool
+	})
+	if !ok {
+		return true, nil
+	}
+	return checker.CheckReleaseManualFlushNeed(segmentIDs), nil
+}
+
+func (m *bufferManager) GetGrowingFlushProgress(ctx context.Context, channel string, segmentIDs []int64, fenceTs uint64) ([]GrowingFlushSegmentProgress, error) {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		mlog.Warn(ctx, "write buffer not found when get growing flush progress",
+			mlog.String("channel", channel),
+			mlog.Int64s("segmentIDs", segmentIDs),
+			mlog.Uint64("fenceTs", fenceTs))
+		return nil, merr.WrapErrChannelNotFound(channel)
+	}
+	return buf.GetGrowingFlushProgress(ctx, segmentIDs, fenceTs)
+}
+
+// GetCheckpoint returns checkpoint for provided channel.
+func (m *bufferManager) GetCheckpoint(channel string) (*msgpb.MsgPosition, bool, error) {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		return nil, false, merr.WrapErrChannelNotFound(channel)
+	}
+	cp := buf.GetCheckpoint()
+	flushTs := buf.GetFlushTimestamp()
+
+	return cp, flushTs != nonFlushTS && cp.GetTimestamp() >= flushTs, nil
+}
+
+func (m *bufferManager) NotifyCheckpointUpdated(channel string, ts uint64) {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		return
+	}
+	flushTs := buf.GetFlushTimestamp()
+	if flushTs != nonFlushTS && ts > flushTs {
+		mlog.Info(context.TODO(), "reset channel flushTs", mlog.String("channel", channel))
+		buf.SetFlushTimestamp(nonFlushTS)
+	}
+}
+
+// RemoveChannel remove channel WriteBuffer from manager.
+// this method discards all buffered data since datanode no longer has the ownership
+func (m *bufferManager) RemoveChannel(channel string) {
+	buf, loaded := m.buffers.GetAndRemove(channel)
+	if !loaded {
+		mlog.Warn(context.TODO(), "failed to remove channel, channel not maintained in manager", mlog.String("channel", channel))
+		return
+	}
+
+	buf.Close(context.Background(), false)
+}
+
+// DropChannel removes channel WriteBuffer and process `DropChannel`
+// this method will save all buffered data
+func (m *bufferManager) DropChannel(channel string) {
+	buf, loaded := m.buffers.GetAndRemove(channel)
+	if !loaded {
+		mlog.Warn(context.TODO(), "failed to drop channel, channel not maintained in manager", mlog.String("channel", channel))
+		return
+	}
+
+	buf.Close(context.Background(), true)
+}
+
+func (m *bufferManager) DropPartitions(channel string, partitionIDs []int64) {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		mlog.Warn(context.TODO(), "failed to drop partition, channel not maintained in manager", mlog.String("channel", channel), mlog.Int64s("partitionIDs", partitionIDs))
+		return
+	}
+
+	buf.DropPartitions(partitionIDs)
+}

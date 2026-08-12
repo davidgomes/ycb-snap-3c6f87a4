@@ -1,0 +1,359 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package metautil
+
+import (
+	"path"
+	"reflect"
+	"testing"
+
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+func TestParseInsertLogPath(t *testing.T) {
+	type args struct {
+		path string
+	}
+	tests := []struct {
+		name             string
+		args             args
+		wantCollectionID typeutil.UniqueID
+		wantPartitionID  typeutil.UniqueID
+		wantSegmentID    typeutil.UniqueID
+		wantFieldID      typeutil.UniqueID
+		wantLogID        typeutil.UniqueID
+		wantOk           bool
+	}{
+		{
+			"test parse insert log path",
+			args{path: "8a8c3ac2298b12f/insert_log/446266956600703270/446266956600703326/447985737531772787/102/447985737523710526"},
+			446266956600703270,
+			446266956600703326,
+			447985737531772787,
+			102,
+			447985737523710526,
+			true,
+		},
+
+		{
+			"test parse insert log path negative1",
+			args{path: "foobar"},
+			0,
+			0,
+			0,
+			0,
+			0,
+			false,
+		},
+
+		{
+			"test parse insert log path negative2",
+			args{path: "8a8c3ac2298b12f/insert_log/446266956600703270/446266956600703326/447985737531772787/102/foo"},
+			0,
+			0,
+			0,
+			0,
+			0,
+			false,
+		},
+
+		{
+			"test parse insert log path negative3",
+			args{path: "8a8c3ac2298b12f/insert_log/446266956600703270/446266956600703326/447985737531772787/foo/447985737523710526"},
+			0,
+			0,
+			0,
+			0,
+			0,
+			false,
+		},
+
+		{
+			"test parse insert log path negative4",
+			args{path: "8a8c3ac2298b12f/insert_log/446266956600703270/446266956600703326/foo/102/447985737523710526"},
+			0,
+			0,
+			0,
+			0,
+			0,
+			false,
+		},
+
+		{
+			"test parse insert log path negative5",
+			args{path: "8a8c3ac2298b12f/insert_log/446266956600703270/foo/447985737531772787/102/447985737523710526"},
+			0,
+			0,
+			0,
+			0,
+			0,
+			false,
+		},
+
+		{
+			"test parse insert log path negative6",
+			args{path: "8a8c3ac2298b12f/insert_log/foo/446266956600703326/447985737531772787/102/447985737523710526"},
+			0,
+			0,
+			0,
+			0,
+			0,
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotCollectionID, gotPartitionID, gotSegmentID, gotFieldID, gotLogID, gotOk := ParseInsertLogPath(tt.args.path)
+			if !reflect.DeepEqual(gotCollectionID, tt.wantCollectionID) {
+				t.Errorf("ParseInsertLogPath() gotCollectionID = %v, want %v", gotCollectionID, tt.wantCollectionID)
+			}
+			if !reflect.DeepEqual(gotPartitionID, tt.wantPartitionID) {
+				t.Errorf("ParseInsertLogPath() gotPartitionID = %v, want %v", gotPartitionID, tt.wantPartitionID)
+			}
+			if !reflect.DeepEqual(gotSegmentID, tt.wantSegmentID) {
+				t.Errorf("ParseInsertLogPath() gotSegmentID = %v, want %v", gotSegmentID, tt.wantSegmentID)
+			}
+			if !reflect.DeepEqual(gotFieldID, tt.wantFieldID) {
+				t.Errorf("ParseInsertLogPath() gotFieldID = %v, want %v", gotFieldID, tt.wantFieldID)
+			}
+			if !reflect.DeepEqual(gotLogID, tt.wantLogID) {
+				t.Errorf("ParseInsertLogPath() gotLogID = %v, want %v", gotLogID, tt.wantLogID)
+			}
+			if gotOk != tt.wantOk {
+				t.Errorf("ParseInsertLogPath() gotOk = %v, want %v", gotOk, tt.wantOk)
+			}
+		})
+	}
+}
+
+func TestBuildDeltaLogPathV3(t *testing.T) {
+	tests := []struct {
+		name     string
+		basePath string
+		logID    typeutil.UniqueID
+		expected string
+	}{
+		{
+			name:     "basic path",
+			basePath: "rootPath/insert_log/123/456/789",
+			logID:    1001,
+			expected: "rootPath/insert_log/123/456/789/_delta/1001",
+		},
+		{
+			name:     "absolute path",
+			basePath: "/data/insert_log/100/200/300",
+			logID:    42,
+			expected: "/data/insert_log/100/200/300/_delta/42",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := BuildDeltaLogPathV3(tt.basePath, tt.logID)
+			if result != tt.expected {
+				t.Errorf("BuildDeltaLogPathV3() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractTextLogFilenames(t *testing.T) {
+	textStatsLogs := map[int64]*datapb.TextIndexStats{
+		100: {
+			FieldID: 100,
+			Files: []string{
+				"/root/text_log/1/2/10/20/30/100/file1.txt",
+				"/root/text_log/1/2/10/20/30/100/file2.txt",
+			},
+		},
+	}
+
+	ExtractTextLogFilenames(textStatsLogs)
+
+	wantFiles := []string{"file1.txt", "file2.txt"}
+	if !reflect.DeepEqual(textStatsLogs[100].Files, wantFiles) {
+		t.Errorf("ExtractTextLogFilenames() Files = %v, want %v", textStatsLogs[100].Files, wantFiles)
+	}
+}
+
+func TestBuildTextLogPaths(t *testing.T) {
+	rootPath := "/root"
+	collectionID := typeutil.UniqueID(10)
+	partitionID := typeutil.UniqueID(20)
+	segmentID := typeutil.UniqueID(30)
+
+	// Test building paths from filenames (new version)
+	textStatsLogs := map[int64]*datapb.TextIndexStats{
+		100: {
+			FieldID: 100,
+			BuildID: 1,
+			Version: 2,
+			Files:   []string{"file1.txt", "file2.txt"},
+		},
+	}
+
+	BuildTextLogPaths(rootPath, collectionID, partitionID, segmentID, textStatsLogs)
+
+	wantFiles := []string{
+		path.Join(rootPath, common.TextIndexPath, "1", "2", "10", "20", "30", "100", "file1.txt"),
+		path.Join(rootPath, common.TextIndexPath, "1", "2", "10", "20", "30", "100", "file2.txt"),
+	}
+	if !reflect.DeepEqual(textStatsLogs[100].Files, wantFiles) {
+		t.Errorf("BuildTextLogPaths() Files = %v, want %v", textStatsLogs[100].Files, wantFiles)
+	}
+
+	// Test old version compatibility (already full paths)
+	fullPath := path.Join(rootPath, common.TextIndexPath, "1", "2", "10", "20", "30", "100", "file3.txt")
+	textStatsLogs[100].Files = []string{fullPath}
+	BuildTextLogPaths(rootPath, collectionID, partitionID, segmentID, textStatsLogs)
+	if textStatsLogs[100].Files[0] != fullPath {
+		t.Errorf("BuildTextLogPaths() should keep full path unchanged, got %v", textStatsLogs[100].Files[0])
+	}
+}
+
+func TestBuildStatsFilePaths(t *testing.T) {
+	basePath := "/root/_stats/text_index.100"
+	fullPath := path.Join(basePath, ".managed.json_0")
+
+	got := BuildStatsFilePaths(basePath, []string{".managed.json_0", "nested/file", fullPath})
+	want := []string{
+		fullPath,
+		path.Join(basePath, "nested/file"),
+		fullPath,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("BuildStatsFilePaths() = %v, want %v", got, want)
+	}
+
+	got = BuildStatsFilePaths("", []string{".managed.json_0"})
+	want = []string{".managed.json_0"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("BuildStatsFilePaths() with empty basePath = %v, want %v", got, want)
+	}
+}
+
+type mockJSONStatsSegment struct {
+	collectionID int64
+	partitionID  int64
+	segmentID    int64
+	manifestPath string
+}
+
+func (m mockJSONStatsSegment) GetCollectionID() int64 { return m.collectionID }
+func (m mockJSONStatsSegment) GetPartitionID() int64  { return m.partitionID }
+func (m mockJSONStatsSegment) GetID() int64           { return m.segmentID }
+func (m mockJSONStatsSegment) GetManifestPath() string {
+	return m.manifestPath
+}
+
+func TestExtractJSONKeyStatsRelativePaths(t *testing.T) {
+	stats := map[int64]*datapb.JsonKeyStats{
+		100: {
+			FieldID: 100,
+			Files: []string{
+				"files/json_stats/3/10/2/1/2/3/100/meta.json",
+				"files/json_stats/3/10/2/1/2/3/100/shared_key_index/.managed.json_0",
+				"files/insert_log/1/2/3/_stats/json_stats.100/shredding_data/data.parquet",
+				"shared_key_index/already-relative",
+			},
+		},
+	}
+
+	ExtractJSONKeyStatsRelativePaths(stats)
+
+	wantFiles := []string{
+		"meta.json",
+		"shared_key_index/.managed.json_0",
+		"shredding_data/data.parquet",
+		"shared_key_index/already-relative",
+	}
+	if !reflect.DeepEqual(stats[100].Files, wantFiles) {
+		t.Errorf("ExtractJSONKeyStatsRelativePaths() Files = %v, want %v", stats[100].Files, wantFiles)
+	}
+}
+
+func TestBuildJSONKeyStatsPathsV2(t *testing.T) {
+	seg := mockJSONStatsSegment{collectionID: 1, partitionID: 2, segmentID: 3}
+	stats := map[int64]*datapb.JsonKeyStats{
+		100: {
+			FieldID:                100,
+			BuildID:                10,
+			Version:                2,
+			JsonKeyStatsDataFormat: 3,
+			Files:                  []string{"meta.json", "shared_key_index/.managed.json_0"},
+		},
+	}
+
+	BuildJSONKeyStatsPaths("files", seg, stats)
+
+	wantFiles := []string{
+		"files/json_stats/3/10/2/1/2/3/100/meta.json",
+		"files/json_stats/3/10/2/1/2/3/100/shared_key_index/.managed.json_0",
+	}
+	if !reflect.DeepEqual(stats[100].Files, wantFiles) {
+		t.Errorf("BuildJSONKeyStatsPaths() V2 Files = %v, want %v", stats[100].Files, wantFiles)
+	}
+}
+
+func TestBuildJSONKeyStatsPathsV3(t *testing.T) {
+	seg := mockJSONStatsSegment{
+		collectionID: 1,
+		partitionID:  2,
+		segmentID:    3,
+		manifestPath: `{"ver":7,"base_path":"files/insert_log/1/2/3"}`,
+	}
+	stats := map[int64]*datapb.JsonKeyStats{
+		100: {
+			FieldID: 100,
+			Files:   []string{"meta.json", "shared_key_index/.managed.json_0"},
+		},
+	}
+
+	BuildJSONKeyStatsPaths("files", seg, stats)
+
+	wantFiles := []string{
+		"files/insert_log/1/2/3/_stats/json_stats.100/meta.json",
+		"files/insert_log/1/2/3/_stats/json_stats.100/shared_key_index/.managed.json_0",
+	}
+	if !reflect.DeepEqual(stats[100].Files, wantFiles) {
+		t.Errorf("BuildJSONKeyStatsPaths() V3 Files = %v, want %v", stats[100].Files, wantFiles)
+	}
+}
+
+func TestBuildJSONKeyStatsPathsKeepsFullPaths(t *testing.T) {
+	seg := mockJSONStatsSegment{collectionID: 1, partitionID: 2, segmentID: 3}
+	fullV2 := "files/json_stats/3/10/2/1/2/3/100/shared_key_index/.managed.json_0"
+	fullV3 := "files/insert_log/1/2/3/_stats/json_stats.100/shared_key_index/.managed.json_1"
+	stats := map[int64]*datapb.JsonKeyStats{
+		100: {
+			FieldID:                100,
+			BuildID:                10,
+			Version:                2,
+			JsonKeyStatsDataFormat: 3,
+			Files:                  []string{fullV2, fullV3},
+		},
+	}
+
+	BuildJSONKeyStatsPaths("files", seg, stats)
+
+	wantFiles := []string{fullV2, fullV3}
+	if !reflect.DeepEqual(stats[100].Files, wantFiles) {
+		t.Errorf("BuildJSONKeyStatsPaths() full paths = %v, want %v", stats[100].Files, wantFiles)
+	}
+}

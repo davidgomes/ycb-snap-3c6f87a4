@@ -1,0 +1,4311 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package typeutil
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"math"
+	"reflect"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"unsafe"
+
+	"github.com/samber/lo"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/util/externalspec/specutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+)
+
+type getVariableFieldLengthPolicy int
+
+const (
+	max    getVariableFieldLengthPolicy = 0
+	avg    getVariableFieldLengthPolicy = 1
+	custom getVariableFieldLengthPolicy = 2
+)
+
+func getVarFieldLength(fieldSchema *schemapb.FieldSchema, policy getVariableFieldLengthPolicy) (int, error) {
+	maxLength := 0
+	var err error
+
+	paramsMap := make(map[string]string)
+	for _, p := range fieldSchema.TypeParams {
+		paramsMap[p.Key] = p.Value
+	}
+
+	switch fieldSchema.DataType {
+	case schemapb.DataType_VarChar:
+		maxLengthPerRowValue, ok := paramsMap[common.MaxLengthKey]
+		if !ok {
+			return 0, merr.WrapErrParameterMissingMsg("the max_length was not specified, field type is %s", fieldSchema.DataType.String())
+		}
+		maxLength, err = strconv.Atoi(maxLengthPerRowValue)
+		if err != nil {
+			return 0, err
+		}
+		switch policy {
+		case max:
+			return maxLength, nil
+		case avg:
+			return maxLength / 2, nil
+		case custom:
+			// TODO this is a hack and may not accurate, we should rely on estimate size per record
+			// However we should report size and datacoord calculate based on size
+			// https://github.com/milvus-io/milvus/issues/17687
+			estimateLimit := GetVarCharEstimateLength()
+			if maxLength > estimateLimit {
+				return estimateLimit, nil
+			}
+			return maxLength, nil
+		default:
+			return 0, merr.WrapErrServiceInternalMsg("unrecognized getVariableFieldLengthPolicy %v", policy)
+		}
+		// Text type does not require max_length, use the same estimate as JSON/Array fields
+	case schemapb.DataType_Text:
+		return GetDynamicFieldEstimateLength(), nil
+		// geometry field max length now consider the same as json field, which is 512 bytes
+	case schemapb.DataType_Array, schemapb.DataType_JSON, schemapb.DataType_Geometry:
+		return GetDynamicFieldEstimateLength(), nil
+	default:
+		return 0, merr.WrapErrParameterInvalidMsg("field %s is not a variable-length type", fieldSchema.DataType.String())
+	}
+}
+
+// HasTextField returns whether schema contains a TEXT field.
+func HasTextField(schema *schemapb.CollectionSchema) bool {
+	if schema == nil {
+		return false
+	}
+	for _, field := range schema.GetFields() {
+		if field.GetDataType() == schemapb.DataType_Text {
+			return true
+		}
+	}
+	return false
+}
+
+func ValidateTextRequiresStorageV3(schema *schemapb.CollectionSchema, storageV3Enabled bool) error {
+	if HasTextField(schema) && !storageV3Enabled {
+		return merr.WrapErrParameterInvalidMsg("TEXT field requires StorageV3; enable common.storage.useLoonFFI")
+	}
+	return nil
+}
+
+// UseGrowingSourceFlush returns whether insert payload for the schema should
+// be flushed from QueryNode growing source when available.
+func UseGrowingSourceFlush(schema *schemapb.CollectionSchema, storageV3Enabled bool, enableGrowingSourceFlush bool) bool {
+	if !storageV3Enabled {
+		return false
+	}
+	return HasTextField(schema) || enableGrowingSourceFlush
+}
+
+// EstimateSizePerRecord returns the estimate size of a record in a collection
+func EstimateSizePerRecord(schema *schemapb.CollectionSchema) (int, error) {
+	return estimateSizeBy(schema, custom)
+}
+
+func EstimateMaxSizePerRecord(schema *schemapb.CollectionSchema) (int, error) {
+	return estimateSizeBy(schema, max)
+}
+
+func EstimateAvgSizePerRecord(schema *schemapb.CollectionSchema) (int, error) {
+	return estimateSizeBy(schema, avg)
+}
+
+func estimateSizeBy(schema *schemapb.CollectionSchema, policy getVariableFieldLengthPolicy) (int, error) {
+	res := 0
+	allFields := GetAllFieldSchemas(schema)
+	for _, fs := range allFields {
+		switch fs.DataType {
+		case schemapb.DataType_Bool, schemapb.DataType_Int8:
+			res++
+		case schemapb.DataType_Int16:
+			res += 2
+		case schemapb.DataType_Int32, schemapb.DataType_Float:
+			res += 4
+		case schemapb.DataType_Int64, schemapb.DataType_Double, schemapb.DataType_Timestamptz:
+			res += 8
+		case schemapb.DataType_VarChar, schemapb.DataType_Text, schemapb.DataType_Array, schemapb.DataType_JSON, schemapb.DataType_Geometry:
+			maxLengthPerRow, err := getVarFieldLength(fs, policy)
+			if err != nil {
+				return 0, err
+			}
+			res += maxLengthPerRow
+		case schemapb.DataType_BinaryVector:
+			for _, kv := range fs.TypeParams {
+				if kv.Key == common.DimKey {
+					v, err := strconv.Atoi(kv.Value)
+					if err != nil {
+						return -1, err
+					}
+					res += v / 8
+					break
+				}
+			}
+		case schemapb.DataType_FloatVector:
+			for _, kv := range fs.TypeParams {
+				if kv.Key == common.DimKey {
+					v, err := strconv.Atoi(kv.Value)
+					if err != nil {
+						return -1, err
+					}
+					res += v * 4
+					break
+				}
+			}
+		case schemapb.DataType_Float16Vector, schemapb.DataType_BFloat16Vector:
+			for _, kv := range fs.TypeParams {
+				if kv.Key == common.DimKey {
+					v, err := strconv.Atoi(kv.Value)
+					if err != nil {
+						return -1, err
+					}
+					res += v * 2
+					break
+				}
+			}
+		case schemapb.DataType_SparseFloatVector:
+			// TODO(SPARSE, zhengbuqian): size of sparse flaot vector
+			// varies depending on the number of non-zeros. Using sparse vector
+			// generated by SPLADE as reference and returning size of a sparse
+			// vector with 150 non-zeros.
+			res += GetSparseFloatVectorEstimateLength()
+		case schemapb.DataType_Int8Vector:
+			for _, kv := range fs.TypeParams {
+				if kv.Key == common.DimKey {
+					v, err := strconv.Atoi(kv.Value)
+					if err != nil {
+						return -1, err
+					}
+					res += v
+					break
+				}
+			}
+		case schemapb.DataType_ArrayOfVector:
+			dim := 0
+			for _, kv := range fs.TypeParams {
+				if kv.Key == common.DimKey {
+					v, err := strconv.Atoi(kv.Value)
+					if err != nil {
+						return -1, err
+					}
+					dim = v
+				}
+			}
+			assumedArrayLen := 10
+			// Estimate size based on element type
+			switch fs.ElementType {
+			case schemapb.DataType_FloatVector:
+				res += assumedArrayLen * dim * 4
+			case schemapb.DataType_BinaryVector:
+				res += assumedArrayLen * (dim / 8)
+			case schemapb.DataType_Float16Vector, schemapb.DataType_BFloat16Vector:
+				res += assumedArrayLen * dim * 2
+			case schemapb.DataType_Int8Vector:
+				res += assumedArrayLen * dim
+			default:
+				return 0, merr.WrapErrParameterInvalidMsg("unsupported element type in VectorArray: %s", fs.ElementType.String())
+			}
+		}
+	}
+	return res, nil
+}
+
+func CalcScalarSize(column *schemapb.FieldData) int {
+	res := 0
+	switch column.GetType() {
+	case schemapb.DataType_Bool:
+		res += len(column.GetScalars().GetBoolData().GetData())
+	case schemapb.DataType_Int8:
+		res += len(column.GetScalars().GetIntData().GetData())
+	case schemapb.DataType_Int16:
+		res += len(column.GetScalars().GetIntData().GetData()) * 2
+	case schemapb.DataType_Int32:
+		res += len(column.GetScalars().GetIntData().GetData()) * 4
+	case schemapb.DataType_Int64:
+		res += len(column.GetScalars().GetLongData().GetData()) * 8
+	case schemapb.DataType_Float:
+		res += len(column.GetScalars().GetFloatData().GetData()) * 4
+	case schemapb.DataType_Double:
+		res += len(column.GetScalars().GetDoubleData().GetData()) * 8
+	case schemapb.DataType_Timestamptz:
+		res += len(column.GetScalars().GetTimestamptzData().GetData()) * 8
+	case schemapb.DataType_VarChar, schemapb.DataType_Text:
+		for _, str := range column.GetScalars().GetStringData().GetData() {
+			res += len(str)
+		}
+	case schemapb.DataType_Array:
+		for _, array := range column.GetScalars().GetArrayData().GetData() {
+			res += CalcScalarSize(&schemapb.FieldData{
+				Field: &schemapb.FieldData_Scalars{Scalars: array},
+				Type:  column.GetScalars().GetArrayData().GetElementType(),
+			})
+		}
+	case schemapb.DataType_JSON:
+		for _, str := range column.GetScalars().GetJsonData().GetData() {
+			res += len(str)
+		}
+	case schemapb.DataType_Geometry:
+		for _, str := range column.GetScalars().GetGeometryData().GetData() {
+			res += len(str)
+		}
+	default:
+		panic("Unknown data type:" + column.Type.String())
+	}
+	return res
+}
+
+func calcVectorSize(column *schemapb.VectorField, vectorType schemapb.DataType) int {
+	res := 0
+	switch vectorType {
+	case schemapb.DataType_BinaryVector:
+		res += len(column.GetBinaryVector())
+	case schemapb.DataType_FloatVector:
+		res += len(column.GetFloatVector().Data) * 4
+	case schemapb.DataType_Float16Vector:
+		res += len(column.GetFloat16Vector()) * 2
+	case schemapb.DataType_BFloat16Vector:
+		res += len(column.GetBfloat16Vector()) * 2
+	case schemapb.DataType_SparseFloatVector:
+		panic("unimplemented")
+	case schemapb.DataType_Int8Vector:
+		res += len(column.GetInt8Vector())
+	case schemapb.DataType_ArrayOfVector:
+		panic("unreachable")
+	default:
+		panic("Unknown data type:" + vectorType.String())
+	}
+	return res
+}
+
+func EstimateEntitySize(fieldsData []*schemapb.FieldData, rowOffset int, fieldIdxs ...int64) (int, error) {
+	res := 0
+	for i, fs := range fieldsData {
+		fieldIdx := int64(rowOffset)
+		if i < len(fieldIdxs) {
+			fieldIdx = fieldIdxs[i]
+		}
+		switch fs.GetType() {
+		case schemapb.DataType_Bool, schemapb.DataType_Int8:
+			res++
+		case schemapb.DataType_Int16:
+			res += 2
+		case schemapb.DataType_Int32, schemapb.DataType_Float:
+			res += 4
+		case schemapb.DataType_Int64, schemapb.DataType_Double, schemapb.DataType_Timestamptz:
+			res += 8
+		case schemapb.DataType_VarChar, schemapb.DataType_Text:
+			if rowOffset >= len(fs.GetScalars().GetStringData().GetData()) {
+				return 0, merr.WrapErrParameterInvalidMsg("offset out range of field datas")
+			}
+			res += len(fs.GetScalars().GetStringData().Data[rowOffset])
+		case schemapb.DataType_Array:
+			if rowOffset >= len(fs.GetScalars().GetArrayData().GetData()) {
+				return 0, merr.WrapErrParameterInvalidMsg("offset out range of field datas")
+			}
+			array := fs.GetScalars().GetArrayData().GetData()[rowOffset]
+			res += CalcScalarSize(&schemapb.FieldData{
+				Field: &schemapb.FieldData_Scalars{Scalars: array},
+				Type:  fs.GetScalars().GetArrayData().GetElementType(),
+			})
+		case schemapb.DataType_JSON:
+			if rowOffset >= len(fs.GetScalars().GetJsonData().GetData()) {
+				return 0, merr.WrapErrParameterInvalidMsg("offset out range of field datas")
+			}
+			res += len(fs.GetScalars().GetJsonData().GetData()[rowOffset])
+		case schemapb.DataType_Geometry:
+			if rowOffset >= len(fs.GetScalars().GetGeometryData().GetData()) {
+				return 0, merr.WrapErrParameterInvalidMsg("offset out range of field datas")
+			}
+			res += len(fs.GetScalars().GetGeometryData().GetData()[rowOffset])
+		case schemapb.DataType_BinaryVector,
+			schemapb.DataType_FloatVector,
+			schemapb.DataType_Float16Vector,
+			schemapb.DataType_BFloat16Vector,
+			schemapb.DataType_Int8Vector,
+			schemapb.DataType_SparseFloatVector:
+			validData := fs.GetValidData()
+			isNullRow := len(validData) > 0 && rowOffset < len(validData) && !validData[rowOffset]
+			if isNullRow {
+				continue
+			}
+			switch fs.GetType() {
+			case schemapb.DataType_BinaryVector:
+				res += int(fs.GetVectors().GetDim() / 8)
+			case schemapb.DataType_FloatVector:
+				res += int(fs.GetVectors().GetDim() * 4)
+			case schemapb.DataType_Float16Vector:
+				res += int(fs.GetVectors().GetDim() * 2)
+			case schemapb.DataType_BFloat16Vector:
+				res += int(fs.GetVectors().GetDim() * 2)
+			case schemapb.DataType_SparseFloatVector:
+				vec := fs.GetVectors().GetSparseFloatVector()
+				if int(fieldIdx) < len(vec.Contents) {
+					res += len(vec.Contents[fieldIdx])
+				}
+			case schemapb.DataType_Int8Vector:
+				res += int(fs.GetVectors().GetDim())
+			}
+		case schemapb.DataType_ArrayOfVector:
+			arrayVector := fs.GetVectors().GetVectorArray()
+			if int(fieldIdx) >= len(arrayVector.GetData()) {
+				return 0, merr.WrapErrParameterInvalidMsg("offset out range of field datas")
+			}
+			res += calcVectorSize(arrayVector.GetData()[fieldIdx], arrayVector.GetElementType())
+		default:
+			panic("Unknown data type:" + fs.GetType().String())
+		}
+	}
+	return res, nil
+}
+
+// SchemaHelper provides methods to get the schema of fields
+type SchemaHelper struct {
+	schema              *schemapb.CollectionSchema
+	nameOffset          map[string]int
+	idOffset            map[int64]int
+	primaryKeyOffset    int
+	partitionKeyOffset  int
+	clusteringKeyOffset int
+	dynamicFieldOffset  int
+	// include sub-fields in StructArrayField
+	allFields []*schemapb.FieldSchema
+	timezone  string
+}
+
+// CreateSchemaHelper returns a new SchemaHelper object
+func CreateSchemaHelper(schema *schemapb.CollectionSchema) (*SchemaHelper, error) {
+	if schema == nil {
+		return nil, merr.WrapErrParameterInvalidMsg("schema is nil")
+	}
+
+	allFields := GetAllFieldSchemas(schema)
+
+	schemaHelper := SchemaHelper{
+		schema:              schema,
+		allFields:           allFields,
+		nameOffset:          make(map[string]int),
+		idOffset:            make(map[int64]int),
+		primaryKeyOffset:    -1,
+		partitionKeyOffset:  -1,
+		clusteringKeyOffset: -1,
+		dynamicFieldOffset:  -1,
+	}
+	for offset, field := range allFields {
+		if _, ok := schemaHelper.nameOffset[field.Name]; ok {
+			return nil, merr.WrapErrParameterInvalidMsg("duplicated fieldName: %s", field.Name)
+		}
+		if _, ok := schemaHelper.idOffset[field.FieldID]; ok {
+			return nil, merr.WrapErrParameterInvalidMsg("duplicated fieldID: %d", field.FieldID)
+		}
+		schemaHelper.nameOffset[field.Name] = offset
+		schemaHelper.idOffset[field.FieldID] = offset
+		if field.IsPrimaryKey {
+			if schemaHelper.primaryKeyOffset != -1 {
+				return nil, merr.WrapErrParameterInvalidMsg("primary key is not unique")
+			}
+			schemaHelper.primaryKeyOffset = offset
+		}
+
+		if field.IsPartitionKey {
+			if schemaHelper.partitionKeyOffset != -1 {
+				return nil, merr.WrapErrParameterInvalidMsg("partition key is not unique")
+			}
+			schemaHelper.partitionKeyOffset = offset
+		}
+
+		if field.IsClusteringKey {
+			if schemaHelper.clusteringKeyOffset != -1 {
+				return nil, merr.WrapErrParameterInvalidMsg("clustering key is not unique")
+			}
+			schemaHelper.clusteringKeyOffset = offset
+		}
+
+		if field.IsDynamic {
+			if schemaHelper.dynamicFieldOffset != -1 {
+				return nil, merr.WrapErrParameterInvalidMsg("dynamic field is not unique")
+			}
+			schemaHelper.dynamicFieldOffset = offset
+		}
+	}
+
+	found := false
+	for _, kv := range schema.GetProperties() {
+		if kv.Key == common.TimezoneKey {
+			schemaHelper.timezone = kv.Value
+			found = true
+			break
+		}
+	}
+	if !found {
+		schemaHelper.timezone = common.DefaultTimezone
+	}
+	return &schemaHelper, nil
+}
+
+// GetTimezone returns the timezone string associated with the schema.
+func (helper *SchemaHelper) GetTimezone() string {
+	return helper.timezone
+}
+
+// GetPrimaryKeyField returns the schema of the primary key
+func (helper *SchemaHelper) GetPrimaryKeyField() (*schemapb.FieldSchema, error) {
+	if helper.primaryKeyOffset == -1 {
+		return nil, merr.WrapErrParameterInvalidMsg("failed to get primary key field: no primary in schema")
+	}
+	return helper.allFields[helper.primaryKeyOffset], nil
+}
+
+// GetPartitionKeyField returns the schema of the partition key
+func (helper *SchemaHelper) GetPartitionKeyField() (*schemapb.FieldSchema, error) {
+	if helper.partitionKeyOffset == -1 {
+		return nil, merr.WrapErrParameterInvalidMsg("failed to get partition key field: no partition key in schema")
+	}
+	return helper.allFields[helper.partitionKeyOffset], nil
+}
+
+// GetClusteringKeyField returns the schema of the clustering key.
+// If not found, an error shall be returned.
+func (helper *SchemaHelper) GetClusteringKeyField() (*schemapb.FieldSchema, error) {
+	if helper.clusteringKeyOffset == -1 {
+		return nil, merr.WrapErrParameterInvalidMsg("failed to get clustering key field: not clustering key in schema")
+	}
+	return helper.allFields[helper.clusteringKeyOffset], nil
+}
+
+// GetDynamicField returns the field schema of dynamic field if exists.
+// if there is no dynamic field defined in schema, error will be returned.
+func (helper *SchemaHelper) GetDynamicField() (*schemapb.FieldSchema, error) {
+	if helper.dynamicFieldOffset == -1 {
+		return nil, merr.WrapErrParameterInvalidMsg("failed to get dynamic field: no dynamic field in schema")
+	}
+	return helper.allFields[helper.dynamicFieldOffset], nil
+}
+
+// GetFieldFromName is used to find the schema by field name
+func (helper *SchemaHelper) GetFieldFromName(fieldName string) (*schemapb.FieldSchema, error) {
+	offset, ok := helper.nameOffset[fieldName]
+	if !ok {
+		return nil, merr.WrapErrParameterInvalidMsg("failed to get field schema by name: fieldName(%s) not found", fieldName)
+	}
+	return helper.allFields[offset], nil
+}
+
+// GetFieldFromNameDefaultJSON is used to find the schema by field name, if not exist, use json field
+func (helper *SchemaHelper) GetFieldFromNameDefaultJSON(fieldName string) (*schemapb.FieldSchema, error) {
+	offset, ok := helper.nameOffset[fieldName]
+	if !ok {
+		return helper.getDefaultJSONField(fieldName)
+	}
+	fieldSchema := helper.allFields[offset]
+	return fieldSchema, nil
+}
+
+func (helper *SchemaHelper) GetStructArrayFieldFromName(fieldName string) *schemapb.StructArrayFieldSchema {
+	for _, field := range helper.schema.StructArrayFields {
+		if field.Name == fieldName {
+			return field
+		}
+	}
+	return nil
+}
+
+func (helper *SchemaHelper) IsFieldTextMatchEnabled(fieldId int64) bool {
+	sche, err := helper.GetFieldFromID(fieldId)
+	if err != nil {
+		return false
+	}
+	return CreateFieldSchemaHelper(sche).EnableMatch()
+}
+
+func (helper *SchemaHelper) getDefaultJSONField(fieldName string) (*schemapb.FieldSchema, error) {
+	for _, f := range helper.schema.GetFields() {
+		if f.DataType == schemapb.DataType_JSON && f.IsDynamic {
+			return f, nil
+		}
+	}
+	return nil, merr.WrapErrParameterInvalidMsg("field %s not exist", fieldName)
+}
+
+// GetFieldFromID returns the schema of specified field
+func (helper *SchemaHelper) GetFieldFromID(fieldID int64) (*schemapb.FieldSchema, error) {
+	offset, ok := helper.idOffset[fieldID]
+	if !ok {
+		return nil, merr.WrapErrParameterInvalidMsg("fieldID(%d) not found", fieldID)
+	}
+	return helper.allFields[offset], nil
+}
+
+// GetVectorDimFromID returns the dimension of specified field
+func (helper *SchemaHelper) GetVectorDimFromID(fieldID int64) (int, error) {
+	sch, err := helper.GetFieldFromID(fieldID)
+	if err != nil {
+		return 0, err
+	}
+	if !IsVectorType(sch.DataType) {
+		return 0, merr.WrapErrParameterInvalidMsg("field type = %s not has dim", schemapb.DataType_name[int32(sch.DataType)])
+	}
+	for _, kv := range sch.TypeParams {
+		if kv.Key == common.DimKey {
+			dim, err := strconv.Atoi(kv.Value)
+			if err != nil {
+				return 0, err
+			}
+			return dim, nil
+		}
+	}
+	return 0, merr.WrapErrParameterInvalidMsg("fieldID(%d) not has dim", fieldID)
+}
+
+func (helper *SchemaHelper) GetFunctionByOutputField(field *schemapb.FieldSchema) (*schemapb.FunctionSchema, error) {
+	for _, function := range helper.schema.GetFunctions() {
+		for _, id := range function.GetOutputFieldIds() {
+			if field.GetFieldID() == id {
+				return function, nil
+			}
+		}
+	}
+	return nil, merr.WrapErrParameterInvalidMsg("function not exist")
+}
+
+// As of now, only BM25 function output field is not supported to retrieve raw field data
+func (helper *SchemaHelper) CanRetrieveRawFieldData(field *schemapb.FieldSchema) bool {
+	if !field.IsFunctionOutput {
+		return true
+	}
+
+	f, err := helper.GetFunctionByOutputField(field)
+	if err != nil {
+		return false
+	}
+
+	return f.GetType() != schemapb.FunctionType_BM25
+}
+
+func (helper *SchemaHelper) GetCollectionName() string {
+	return helper.schema.Name
+}
+
+func IsBinaryVectorType(dataType schemapb.DataType) bool {
+	return dataType == schemapb.DataType_BinaryVector
+}
+
+func IsIntVectorType(dataType schemapb.DataType) bool {
+	return dataType == schemapb.DataType_Int8Vector
+}
+
+func IsDenseFloatVectorType(dataType schemapb.DataType) bool {
+	switch dataType {
+	case schemapb.DataType_FloatVector, schemapb.DataType_Float16Vector, schemapb.DataType_BFloat16Vector:
+		return true
+	default:
+		return false
+	}
+}
+
+func IsArrayOfVectorType(dataType schemapb.DataType) bool {
+	return dataType == schemapb.DataType_ArrayOfVector
+}
+
+// return VectorTypeSize for each dim (byte)
+func VectorTypeSize(dataType schemapb.DataType) float64 {
+	switch dataType {
+	case schemapb.DataType_FloatVector, schemapb.DataType_SparseFloatVector:
+		return 4.0
+	case schemapb.DataType_BinaryVector:
+		return 0.125
+	case schemapb.DataType_Float16Vector, schemapb.DataType_BFloat16Vector:
+		return 2.0
+	case schemapb.DataType_Int8Vector:
+		return 1.0
+	default:
+		return 0.0
+	}
+}
+
+func IsSparseFloatVectorType(dataType schemapb.DataType) bool {
+	return dataType == schemapb.DataType_SparseFloatVector
+}
+
+func IsFloatVectorType(dataType schemapb.DataType) bool {
+	return IsDenseFloatVectorType(dataType) || IsSparseFloatVectorType(dataType)
+}
+
+func IsFixDimVectorType(dataType schemapb.DataType) bool {
+	return IsBinaryVectorType(dataType) || IsDenseFloatVectorType(dataType) || IsIntVectorType(dataType)
+}
+
+// IsVectorType returns true if input is a vector type, otherwise false
+func IsVectorType(dataType schemapb.DataType) bool {
+	return IsBinaryVectorType(dataType) || IsFloatVectorType(dataType) || IsIntVectorType(dataType) || IsVectorArrayType(dataType)
+}
+
+func IsVectorArrayType(dataType schemapb.DataType) bool {
+	return dataType == schemapb.DataType_ArrayOfVector
+}
+
+// NewEmptyArrayOfVectorRow builds a row-dense ArrayOfVector placeholder for a null row.
+func NewEmptyArrayOfVectorRow(dim int64, elementType schemapb.DataType) (*schemapb.VectorField, error) {
+	vf := &schemapb.VectorField{Dim: dim}
+	switch elementType {
+	case schemapb.DataType_FloatVector:
+		vf.Data = &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{}}
+	case schemapb.DataType_BinaryVector:
+		vf.Data = &schemapb.VectorField_BinaryVector{BinaryVector: []byte{}}
+	case schemapb.DataType_Float16Vector:
+		vf.Data = &schemapb.VectorField_Float16Vector{Float16Vector: []byte{}}
+	case schemapb.DataType_BFloat16Vector:
+		vf.Data = &schemapb.VectorField_Bfloat16Vector{Bfloat16Vector: []byte{}}
+	case schemapb.DataType_Int8Vector:
+		vf.Data = &schemapb.VectorField_Int8Vector{Int8Vector: []byte{}}
+	default:
+		return nil, merr.WrapErrParameterInvalidMsg("unsupported ArrayOfVector element type %s", elementType)
+	}
+	return vf, nil
+}
+
+// IsClusteringKeyType returns true if the data type is supported as a clustering key.
+// Supported scalar types: Int8, Int16, Int32, Int64, Float, Double, VarChar, String, FloatVector.
+func IsClusteringKeyType(dataType schemapb.DataType) bool {
+	switch dataType {
+	case schemapb.DataType_Int8, schemapb.DataType_Int16,
+		schemapb.DataType_Int32, schemapb.DataType_Int64,
+		schemapb.DataType_Float, schemapb.DataType_Double,
+		schemapb.DataType_VarChar, schemapb.DataType_String:
+		return true
+	default:
+		return dataType == schemapb.DataType_FloatVector
+	}
+}
+
+// IsIntegerType returns true if input is an integer type, otherwise false
+func IsIntegerType(dataType schemapb.DataType) bool {
+	switch dataType {
+	case schemapb.DataType_Int8, schemapb.DataType_Int16,
+		schemapb.DataType_Int32, schemapb.DataType_Int64:
+		return true
+	default:
+		return false
+	}
+}
+
+func IsJSONType(dataType schemapb.DataType) bool {
+	return dataType == schemapb.DataType_JSON
+}
+
+func IsGeometryType(dataType schemapb.DataType) bool {
+	return dataType == schemapb.DataType_Geometry
+}
+
+func IsTimestamptzType(dataType schemapb.DataType) bool {
+	return dataType == schemapb.DataType_Timestamptz
+}
+
+func IsArrayType(dataType schemapb.DataType) bool {
+	return dataType == schemapb.DataType_Array
+}
+
+// IsFloatingType returns true if input is a floating type, otherwise false
+func IsFloatingType(dataType schemapb.DataType) bool {
+	switch dataType {
+	case schemapb.DataType_Float, schemapb.DataType_Double:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsArithmetic returns true if input is of arithmetic type, otherwise false.
+func IsArithmetic(dataType schemapb.DataType) bool {
+	return IsIntegerType(dataType) || IsFloatingType(dataType)
+}
+
+// IsBoolType returns true if input is a bool type, otherwise false
+func IsBoolType(dataType schemapb.DataType) bool {
+	switch dataType {
+	case schemapb.DataType_Bool:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsStringType returns true if input is a varChar type, otherwise false
+func IsStringType(dataType schemapb.DataType) bool {
+	switch dataType {
+	case schemapb.DataType_String, schemapb.DataType_VarChar, schemapb.DataType_Text:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsTextType returns true if input is a TEXT type, otherwise false
+// TEXT type is stored as LOB (Large Object) references in sealed segments,
+// requiring special handling during search (requery pattern)
+func IsTextType(dataType schemapb.DataType) bool {
+	return dataType == schemapb.DataType_Text
+}
+
+func IsArrayContainStringElementType(dataType schemapb.DataType, elementType schemapb.DataType) bool {
+	if IsArrayType(dataType) {
+		if elementType == schemapb.DataType_String || elementType == schemapb.DataType_VarChar {
+			return true
+		}
+	}
+	return false
+}
+
+func IsVariableDataType(dataType schemapb.DataType) bool {
+	return IsStringType(dataType) || IsArrayType(dataType) || IsJSONType(dataType) || IsVectorArrayType(dataType) || IsGeometryType(dataType)
+}
+
+func IsPrimitiveType(dataType schemapb.DataType) bool {
+	return IsArithmetic(dataType) || IsStringType(dataType) || IsBoolType(dataType) || IsTimestamptzType(dataType)
+}
+
+// PrepareResultFieldData construct this slice fo FieldData for final result reduce
+// this shall preallocate the space for field data internal slice prevent slice growing cost.
+func PrepareResultFieldData(sample []*schemapb.FieldData, topK int64) []*schemapb.FieldData {
+	result := make([]*schemapb.FieldData, 0, len(sample))
+	for _, fieldData := range sample {
+		fd := &schemapb.FieldData{
+			Type:      fieldData.Type,
+			FieldName: fieldData.FieldName,
+			FieldId:   fieldData.FieldId,
+			IsDynamic: fieldData.IsDynamic,
+		}
+		switch fieldType := fieldData.Field.(type) {
+		case *schemapb.FieldData_Scalars:
+			scalarField := fieldData.GetScalars()
+			scalar := &schemapb.FieldData_Scalars{
+				Scalars: &schemapb.ScalarField{},
+			}
+			switch fieldType.Scalars.Data.(type) {
+			case *schemapb.ScalarField_BoolData:
+				scalar.Scalars.Data = &schemapb.ScalarField_BoolData{
+					BoolData: &schemapb.BoolArray{
+						Data: make([]bool, 0, topK),
+					},
+				}
+			case *schemapb.ScalarField_IntData:
+				scalar.Scalars.Data = &schemapb.ScalarField_IntData{
+					IntData: &schemapb.IntArray{
+						Data: make([]int32, 0, topK),
+					},
+				}
+			case *schemapb.ScalarField_LongData:
+				scalar.Scalars.Data = &schemapb.ScalarField_LongData{
+					LongData: &schemapb.LongArray{
+						Data: make([]int64, 0, topK),
+					},
+				}
+			case *schemapb.ScalarField_TimestamptzData:
+				scalar.Scalars.Data = &schemapb.ScalarField_TimestamptzData{
+					TimestamptzData: &schemapb.TimestamptzArray{
+						Data: make([]int64, 0, topK),
+					},
+				}
+			case *schemapb.ScalarField_FloatData:
+				scalar.Scalars.Data = &schemapb.ScalarField_FloatData{
+					FloatData: &schemapb.FloatArray{
+						Data: make([]float32, 0, topK),
+					},
+				}
+			case *schemapb.ScalarField_DoubleData:
+				scalar.Scalars.Data = &schemapb.ScalarField_DoubleData{
+					DoubleData: &schemapb.DoubleArray{
+						Data: make([]float64, 0, topK),
+					},
+				}
+			case *schemapb.ScalarField_StringData:
+				scalar.Scalars.Data = &schemapb.ScalarField_StringData{
+					StringData: &schemapb.StringArray{
+						Data: make([]string, 0, topK),
+					},
+				}
+			case *schemapb.ScalarField_JsonData:
+				scalar.Scalars.Data = &schemapb.ScalarField_JsonData{
+					JsonData: &schemapb.JSONArray{
+						Data: make([][]byte, 0, topK),
+					},
+				}
+			case *schemapb.ScalarField_GeometryData:
+				scalar.Scalars.Data = &schemapb.ScalarField_GeometryData{
+					GeometryData: &schemapb.GeometryArray{
+						Data: make([][]byte, 0, topK),
+					},
+				}
+			case *schemapb.ScalarField_GeometryWktData:
+				scalar.Scalars.Data = &schemapb.ScalarField_GeometryWktData{
+					GeometryWktData: &schemapb.GeometryWktArray{
+						Data: make([]string, 0, topK),
+					},
+				}
+			case *schemapb.ScalarField_ArrayData:
+				scalar.Scalars.Data = &schemapb.ScalarField_ArrayData{
+					ArrayData: &schemapb.ArrayArray{
+						Data:        make([]*schemapb.ScalarField, 0, topK),
+						ElementType: scalarField.GetArrayData().GetElementType(),
+					},
+				}
+			}
+			fd.Field = scalar
+		case *schemapb.FieldData_Vectors:
+			vectorField := fieldData.GetVectors()
+			dim := vectorField.GetDim()
+			vectors := &schemapb.FieldData_Vectors{
+				Vectors: &schemapb.VectorField{
+					Dim: dim,
+				},
+			}
+			switch fieldType.Vectors.Data.(type) {
+			case *schemapb.VectorField_FloatVector:
+				vectors.Vectors.Data = &schemapb.VectorField_FloatVector{
+					FloatVector: &schemapb.FloatArray{
+						Data: make([]float32, 0, dim*topK),
+					},
+				}
+			case *schemapb.VectorField_Float16Vector:
+				vectors.Vectors.Data = &schemapb.VectorField_Float16Vector{
+					Float16Vector: make([]byte, 0, topK*dim*2),
+				}
+			case *schemapb.VectorField_Bfloat16Vector:
+				vectors.Vectors.Data = &schemapb.VectorField_Bfloat16Vector{
+					Bfloat16Vector: make([]byte, 0, topK*dim*2),
+				}
+			case *schemapb.VectorField_BinaryVector:
+				vectors.Vectors.Data = &schemapb.VectorField_BinaryVector{
+					BinaryVector: make([]byte, 0, topK*dim/8),
+				}
+			case *schemapb.VectorField_SparseFloatVector:
+				vectors.Vectors.Data = &schemapb.VectorField_SparseFloatVector{
+					SparseFloatVector: &schemapb.SparseFloatArray{
+						// dim to be updated when appending data.
+						Dim:      0,
+						Contents: make([][]byte, 0, topK),
+					},
+				}
+				vectors.Vectors.Dim = 0
+			case *schemapb.VectorField_Int8Vector:
+				vectors.Vectors.Data = &schemapb.VectorField_Int8Vector{
+					Int8Vector: make([]byte, 0, topK*dim),
+				}
+			}
+			fd.Field = vectors
+		}
+		result = append(result, fd)
+	}
+	return result
+}
+
+type FieldDataIdxComputer struct {
+	fieldsData                     []*schemapb.FieldData
+	lastRowIdx                     int64
+	dataIndices                    []int64
+	isVector                       []bool
+	nullableVectorWithoutValidData []bool
+	resultBuffer                   []int64
+}
+
+func NewFieldDataIdxComputer(fieldsData []*schemapb.FieldData) *FieldDataIdxComputer {
+	return NewFieldDataIdxComputerWithSchema(fieldsData, nil)
+}
+
+func NewFieldDataIdxComputerWithSchema(fieldsData []*schemapb.FieldData, schema *schemapb.CollectionSchema) *FieldDataIdxComputer {
+	c := &FieldDataIdxComputer{
+		fieldsData:                     fieldsData,
+		lastRowIdx:                     0,
+		dataIndices:                    make([]int64, len(fieldsData)),
+		isVector:                       make([]bool, len(fieldsData)),
+		nullableVectorWithoutValidData: make([]bool, len(fieldsData)),
+		resultBuffer:                   make([]int64, len(fieldsData)),
+	}
+
+	fieldSchemas := make(map[int64]*schemapb.FieldSchema)
+	if schema != nil {
+		for _, field := range schema.GetFields() {
+			fieldSchemas[field.GetFieldID()] = field
+		}
+	}
+
+	for i, fieldData := range fieldsData {
+		validData := fieldData.GetValidData()
+		fieldSchema := fieldSchemas[fieldData.GetFieldId()]
+		isVector := IsSupportedNullableVectorType(fieldData.GetType())
+		isNullableVector := false
+		if fieldSchema != nil {
+			isVector = IsSupportedNullableVectorType(fieldSchema.GetDataType())
+			isNullableVector = fieldSchema.GetNullable() && isVector
+		}
+		c.isVector[i] = isVector && (len(validData) > 0 || isNullableVector)
+		c.nullableVectorWithoutValidData[i] = isNullableVector && len(validData) == 0
+	}
+	return c
+}
+
+func (c *FieldDataIdxComputer) Compute(rowIdx int64) []int64 {
+	if rowIdx < c.lastRowIdx {
+		c.lastRowIdx = 0
+		for i := range c.dataIndices {
+			c.dataIndices[i] = 0
+		}
+	}
+
+	for i, fieldData := range c.fieldsData {
+		if c.isVector[i] {
+			if c.nullableVectorWithoutValidData[i] {
+				c.resultBuffer[i] = -1
+				continue
+			}
+			validData := fieldData.GetValidData()
+			for j := c.lastRowIdx; j < rowIdx && j < int64(len(validData)); j++ {
+				if validData[j] {
+					c.dataIndices[i]++
+				}
+			}
+			c.resultBuffer[i] = c.dataIndices[i]
+		} else {
+			c.resultBuffer[i] = rowIdx
+		}
+	}
+
+	c.lastRowIdx = rowIdx
+	return c.resultBuffer
+}
+
+func AppendFieldData(dst, src []*schemapb.FieldData, idx int64, fieldIdxs ...int64) (appendSize int64) {
+	dstMap := make(map[int64]*schemapb.FieldData)
+	for _, fieldData := range dst {
+		if fieldData != nil {
+			dstMap[fieldData.FieldId] = fieldData
+		}
+	}
+	for i, fieldData := range src {
+		fieldIdx := idx
+		if i < len(fieldIdxs) {
+			fieldIdx = fieldIdxs[i]
+		}
+		dstFieldData, ok := dstMap[fieldData.FieldId]
+		if !ok {
+			dstFieldData = &schemapb.FieldData{
+				Type:      fieldData.Type,
+				FieldName: fieldData.FieldName,
+				FieldId:   fieldData.FieldId,
+				IsDynamic: fieldData.IsDynamic,
+			}
+			dst[i] = dstFieldData
+		}
+		// assign null data
+		if len(fieldData.GetValidData()) != 0 {
+			if dstFieldData.ValidData == nil {
+				dstFieldData.ValidData = make([]bool, 0)
+			}
+			valid := fieldData.ValidData[idx]
+			dstFieldData.ValidData = append(dstFieldData.ValidData, valid)
+		} else if fieldIdx < 0 {
+			if dstFieldData.ValidData == nil {
+				dstFieldData.ValidData = make([]bool, 0)
+			}
+			dstFieldData.ValidData = append(dstFieldData.ValidData, false)
+		}
+		switch fieldType := fieldData.Field.(type) {
+		case *schemapb.FieldData_Scalars:
+			if dstFieldData.GetScalars() == nil {
+				dstFieldData.Field = &schemapb.FieldData_Scalars{
+					Scalars: &schemapb.ScalarField{},
+				}
+			}
+			dstScalar := dstFieldData.GetScalars()
+			switch srcScalar := fieldType.Scalars.Data.(type) {
+			case *schemapb.ScalarField_BoolData:
+				if dstScalar.GetBoolData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_BoolData{
+						BoolData: &schemapb.BoolArray{
+							Data: []bool{srcScalar.BoolData.Data[idx]},
+						},
+					}
+				} else {
+					dstScalar.GetBoolData().Data = append(dstScalar.GetBoolData().Data, srcScalar.BoolData.Data[idx])
+				}
+				/* #nosec G103 */
+				appendSize += int64(unsafe.Sizeof(srcScalar.BoolData.Data[idx]))
+			case *schemapb.ScalarField_IntData:
+				if dstScalar.GetIntData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_IntData{
+						IntData: &schemapb.IntArray{
+							Data: []int32{srcScalar.IntData.Data[idx]},
+						},
+					}
+				} else {
+					dstScalar.GetIntData().Data = append(dstScalar.GetIntData().Data, srcScalar.IntData.Data[idx])
+				}
+				/* #nosec G103 */
+				appendSize += int64(unsafe.Sizeof(srcScalar.IntData.Data[idx]))
+			case *schemapb.ScalarField_LongData:
+				if dstScalar.GetLongData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_LongData{
+						LongData: &schemapb.LongArray{
+							Data: []int64{srcScalar.LongData.Data[idx]},
+						},
+					}
+				} else {
+					dstScalar.GetLongData().Data = append(dstScalar.GetLongData().Data, srcScalar.LongData.Data[idx])
+				}
+				/* #nosec G103 */
+				appendSize += int64(unsafe.Sizeof(srcScalar.LongData.Data[idx]))
+			case *schemapb.ScalarField_FloatData:
+				if dstScalar.GetFloatData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_FloatData{
+						FloatData: &schemapb.FloatArray{
+							Data: []float32{srcScalar.FloatData.Data[idx]},
+						},
+					}
+				} else {
+					dstScalar.GetFloatData().Data = append(dstScalar.GetFloatData().Data, srcScalar.FloatData.Data[idx])
+				}
+				/* #nosec G103 */
+				appendSize += int64(unsafe.Sizeof(srcScalar.FloatData.Data[idx]))
+			case *schemapb.ScalarField_DoubleData:
+				if dstScalar.GetDoubleData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_DoubleData{
+						DoubleData: &schemapb.DoubleArray{
+							Data: []float64{srcScalar.DoubleData.Data[idx]},
+						},
+					}
+				} else {
+					dstScalar.GetDoubleData().Data = append(dstScalar.GetDoubleData().Data, srcScalar.DoubleData.Data[idx])
+				}
+				/* #nosec G103 */
+				appendSize += int64(unsafe.Sizeof(srcScalar.DoubleData.Data[idx]))
+			case *schemapb.ScalarField_StringData:
+				if dstScalar.GetStringData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_StringData{
+						StringData: &schemapb.StringArray{
+							Data: []string{srcScalar.StringData.Data[idx]},
+						},
+					}
+				} else {
+					dstScalar.GetStringData().Data = append(dstScalar.GetStringData().Data, srcScalar.StringData.Data[idx])
+				}
+				/* #nosec G103 */
+				appendSize += int64(unsafe.Sizeof(srcScalar.StringData.Data[idx]))
+			case *schemapb.ScalarField_ArrayData:
+				if dstScalar.GetArrayData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_ArrayData{
+						ArrayData: &schemapb.ArrayArray{
+							Data:        []*schemapb.ScalarField{srcScalar.ArrayData.Data[idx]},
+							ElementType: srcScalar.ArrayData.ElementType,
+						},
+					}
+				} else {
+					dstScalar.GetArrayData().Data = append(dstScalar.GetArrayData().Data, srcScalar.ArrayData.Data[idx])
+				}
+				/* #nosec G103 */
+				appendSize += int64(unsafe.Sizeof(srcScalar.ArrayData.Data[idx]))
+			case *schemapb.ScalarField_JsonData:
+				if dstScalar.GetJsonData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_JsonData{
+						JsonData: &schemapb.JSONArray{
+							Data: [][]byte{srcScalar.JsonData.Data[idx]},
+						},
+					}
+				} else {
+					dstScalar.GetJsonData().Data = append(dstScalar.GetJsonData().Data, srcScalar.JsonData.Data[idx])
+				}
+				/* #nosec G103 */
+				appendSize += int64(unsafe.Sizeof(srcScalar.JsonData.Data[idx]))
+			case *schemapb.ScalarField_TimestamptzData:
+				if dstScalar.GetTimestamptzData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_TimestamptzData{
+						TimestamptzData: &schemapb.TimestamptzArray{
+							Data: []int64{srcScalar.TimestamptzData.Data[idx]},
+						},
+					}
+				} else {
+					dstScalar.GetTimestamptzData().Data = append(dstScalar.GetTimestamptzData().Data, srcScalar.TimestamptzData.Data[idx])
+				}
+				/* #nosec G103 */
+				appendSize += int64(unsafe.Sizeof(srcScalar.TimestamptzData.Data[idx]))
+			case *schemapb.ScalarField_GeometryData:
+				if dstScalar.GetGeometryData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_GeometryData{
+						GeometryData: &schemapb.GeometryArray{
+							Data: [][]byte{srcScalar.GeometryData.Data[idx]},
+						},
+					}
+				} else {
+					dstScalar.GetGeometryData().Data = append(dstScalar.GetGeometryData().Data, srcScalar.GeometryData.Data[idx])
+				}
+				appendSize += int64(unsafe.Sizeof(srcScalar.GeometryData.Data[idx]))
+			// just for result
+			case *schemapb.ScalarField_GeometryWktData:
+				if dstScalar.GetGeometryWktData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_GeometryWktData{
+						GeometryWktData: &schemapb.GeometryWktArray{
+							Data: []string{srcScalar.GeometryWktData.Data[idx]},
+						},
+					}
+				} else {
+					dstScalar.GetGeometryWktData().Data = append(dstScalar.GetGeometryWktData().Data, srcScalar.GeometryWktData.Data[idx])
+				}
+			}
+		case *schemapb.FieldData_Vectors:
+			dim := fieldType.Vectors.Dim
+			if dstFieldData.GetVectors() == nil {
+				dstFieldData.Field = &schemapb.FieldData_Vectors{
+					Vectors: &schemapb.VectorField{
+						Dim: dim,
+					},
+				}
+			}
+			dstVector := dstFieldData.GetVectors()
+			isNullRow := fieldIdx < 0 || (len(fieldData.GetValidData()) > 0 && !fieldData.GetValidData()[idx])
+
+			switch srcVector := fieldType.Vectors.Data.(type) {
+			case *schemapb.VectorField_BinaryVector:
+				if !isNullRow {
+					if dstVector.GetBinaryVector() == nil {
+						srcToCopy := srcVector.BinaryVector[fieldIdx*(dim/8) : (fieldIdx+1)*(dim/8)]
+						dstVector.Data = &schemapb.VectorField_BinaryVector{
+							BinaryVector: make([]byte, len(srcToCopy)),
+						}
+						copy(dstVector.Data.(*schemapb.VectorField_BinaryVector).BinaryVector, srcToCopy)
+					} else {
+						dstBinaryVector := dstVector.Data.(*schemapb.VectorField_BinaryVector)
+						dstBinaryVector.BinaryVector = append(dstBinaryVector.BinaryVector, srcVector.BinaryVector[fieldIdx*(dim/8):(fieldIdx+1)*(dim/8)]...)
+					}
+					/* #nosec G103 */
+					appendSize += int64(unsafe.Sizeof(srcVector.BinaryVector[fieldIdx*(dim/8) : (fieldIdx+1)*(dim/8)]))
+				}
+			case *schemapb.VectorField_FloatVector:
+				if !isNullRow {
+					if dstVector.GetFloatVector() == nil {
+						srcToCopy := srcVector.FloatVector.Data[fieldIdx*dim : (fieldIdx+1)*dim]
+						dstVector.Data = &schemapb.VectorField_FloatVector{
+							FloatVector: &schemapb.FloatArray{
+								Data: make([]float32, len(srcToCopy)),
+							},
+						}
+						copy(dstVector.Data.(*schemapb.VectorField_FloatVector).FloatVector.Data, srcToCopy)
+					} else {
+						dstVector.GetFloatVector().Data = append(dstVector.GetFloatVector().Data, srcVector.FloatVector.Data[fieldIdx*dim:(fieldIdx+1)*dim]...)
+					}
+					/* #nosec G103 */
+					appendSize += int64(unsafe.Sizeof(srcVector.FloatVector.Data[fieldIdx*dim : (fieldIdx+1)*dim]))
+				}
+			case *schemapb.VectorField_Float16Vector:
+				if !isNullRow {
+					if dstVector.GetFloat16Vector() == nil {
+						srcToCopy := srcVector.Float16Vector[fieldIdx*(dim*2) : (fieldIdx+1)*(dim*2)]
+						dstVector.Data = &schemapb.VectorField_Float16Vector{
+							Float16Vector: make([]byte, len(srcToCopy)),
+						}
+						copy(dstVector.Data.(*schemapb.VectorField_Float16Vector).Float16Vector, srcToCopy)
+					} else {
+						dstFloat16Vector := dstVector.Data.(*schemapb.VectorField_Float16Vector)
+						dstFloat16Vector.Float16Vector = append(dstFloat16Vector.Float16Vector, srcVector.Float16Vector[fieldIdx*(dim*2):(fieldIdx+1)*(dim*2)]...)
+					}
+					/* #nosec G103 */
+					appendSize += int64(unsafe.Sizeof(srcVector.Float16Vector[fieldIdx*(dim*2) : (fieldIdx+1)*(dim*2)]))
+				}
+			case *schemapb.VectorField_Bfloat16Vector:
+				if !isNullRow {
+					if dstVector.GetBfloat16Vector() == nil {
+						srcToCopy := srcVector.Bfloat16Vector[fieldIdx*(dim*2) : (fieldIdx+1)*(dim*2)]
+						dstVector.Data = &schemapb.VectorField_Bfloat16Vector{
+							Bfloat16Vector: make([]byte, len(srcToCopy)),
+						}
+						copy(dstVector.Data.(*schemapb.VectorField_Bfloat16Vector).Bfloat16Vector, srcToCopy)
+					} else {
+						dstBfloat16Vector := dstVector.Data.(*schemapb.VectorField_Bfloat16Vector)
+						dstBfloat16Vector.Bfloat16Vector = append(dstBfloat16Vector.Bfloat16Vector, srcVector.Bfloat16Vector[fieldIdx*(dim*2):(fieldIdx+1)*(dim*2)]...)
+					}
+					/* #nosec G103 */
+					appendSize += int64(unsafe.Sizeof(srcVector.Bfloat16Vector[fieldIdx*(dim*2) : (fieldIdx+1)*(dim*2)]))
+				}
+			case *schemapb.VectorField_SparseFloatVector:
+				if !isNullRow {
+					if dstVector.GetSparseFloatVector() == nil {
+						dstVector.Data = &schemapb.VectorField_SparseFloatVector{
+							SparseFloatVector: &schemapb.SparseFloatArray{
+								Dim:      0,
+								Contents: make([][]byte, 0),
+							},
+						}
+						dstVector.Dim = srcVector.SparseFloatVector.Dim
+					}
+					vec := dstVector.Data.(*schemapb.VectorField_SparseFloatVector).SparseFloatVector
+					appendSize += appendSparseFloatArraySingleRow(vec, srcVector.SparseFloatVector, fieldIdx)
+				}
+			case *schemapb.VectorField_Int8Vector:
+				if !isNullRow {
+					if dstVector.GetInt8Vector() == nil {
+						srcToCopy := srcVector.Int8Vector[fieldIdx*dim : (fieldIdx+1)*dim]
+						dstVector.Data = &schemapb.VectorField_Int8Vector{
+							Int8Vector: make([]byte, len(srcToCopy)),
+						}
+						copy(dstVector.Data.(*schemapb.VectorField_Int8Vector).Int8Vector, srcToCopy)
+					} else {
+						dstInt8Vector := dstVector.Data.(*schemapb.VectorField_Int8Vector)
+						dstInt8Vector.Int8Vector = append(dstInt8Vector.Int8Vector, srcVector.Int8Vector[fieldIdx*dim:(fieldIdx+1)*dim]...)
+					}
+					/* #nosec G103 */
+					appendSize += int64(unsafe.Sizeof(srcVector.Int8Vector[fieldIdx*dim : (fieldIdx+1)*dim]))
+				}
+			case *schemapb.VectorField_VectorArray:
+				if dstVector.GetVectorArray() == nil {
+					dstVector.Data = &schemapb.VectorField_VectorArray{
+						VectorArray: &schemapb.VectorArray{
+							Data:        []*schemapb.VectorField{srcVector.VectorArray.Data[fieldIdx]},
+							Dim:         srcVector.VectorArray.Dim,
+							ElementType: srcVector.VectorArray.ElementType,
+						},
+					}
+				} else {
+					dstVector.GetVectorArray().Data = append(dstVector.GetVectorArray().Data, srcVector.VectorArray.Data[fieldIdx])
+				}
+			}
+		}
+	}
+
+	return
+}
+
+func AppendFieldDataByColumn(dst, src *schemapb.FieldData, dataIndices []int64, rowIndices ...[]int64) {
+	if dst == nil || src == nil {
+		return
+	}
+
+	// Handle ValidData: use rowIndices if provided, otherwise use dataIndices
+	if len(src.GetValidData()) > 0 {
+		validIndices := dataIndices
+		if len(rowIndices) > 0 {
+			validIndices = rowIndices[0]
+		}
+		if dst.ValidData == nil {
+			dst.ValidData = make([]bool, 0, len(validIndices))
+		}
+		for _, idx := range validIndices {
+			dst.ValidData = append(dst.ValidData, src.ValidData[int(idx)])
+		}
+	}
+
+	// Return early if no data to copy
+	if len(dataIndices) == 0 {
+		return
+	}
+
+	switch srcField := src.Field.(type) {
+	case *schemapb.FieldData_Scalars:
+		if dst.GetScalars() == nil {
+			dst.Field = &schemapb.FieldData_Scalars{
+				Scalars: &schemapb.ScalarField{},
+			}
+		}
+		dstScalar := dst.GetScalars()
+		switch srcScalar := srcField.Scalars.Data.(type) {
+		case *schemapb.ScalarField_BoolData:
+			if dstScalar.GetBoolData() == nil {
+				dstScalar.Data = &schemapb.ScalarField_BoolData{
+					BoolData: &schemapb.BoolArray{Data: make([]bool, 0, len(dataIndices))},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstScalar.GetBoolData().Data = append(dstScalar.GetBoolData().Data, srcScalar.BoolData.Data[idx])
+			}
+		case *schemapb.ScalarField_IntData:
+			if dstScalar.GetIntData() == nil {
+				dstScalar.Data = &schemapb.ScalarField_IntData{
+					IntData: &schemapb.IntArray{Data: make([]int32, 0, len(dataIndices))},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstScalar.GetIntData().Data = append(dstScalar.GetIntData().Data, srcScalar.IntData.Data[idx])
+			}
+		case *schemapb.ScalarField_LongData:
+			if dstScalar.GetLongData() == nil {
+				dstScalar.Data = &schemapb.ScalarField_LongData{
+					LongData: &schemapb.LongArray{Data: make([]int64, 0, len(dataIndices))},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstScalar.GetLongData().Data = append(dstScalar.GetLongData().Data, srcScalar.LongData.Data[idx])
+			}
+		case *schemapb.ScalarField_FloatData:
+			if dstScalar.GetFloatData() == nil {
+				dstScalar.Data = &schemapb.ScalarField_FloatData{
+					FloatData: &schemapb.FloatArray{Data: make([]float32, 0, len(dataIndices))},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstScalar.GetFloatData().Data = append(dstScalar.GetFloatData().Data, srcScalar.FloatData.Data[idx])
+			}
+		case *schemapb.ScalarField_DoubleData:
+			if dstScalar.GetDoubleData() == nil {
+				dstScalar.Data = &schemapb.ScalarField_DoubleData{
+					DoubleData: &schemapb.DoubleArray{Data: make([]float64, 0, len(dataIndices))},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstScalar.GetDoubleData().Data = append(dstScalar.GetDoubleData().Data, srcScalar.DoubleData.Data[idx])
+			}
+		case *schemapb.ScalarField_StringData:
+			if dstScalar.GetStringData() == nil {
+				dstScalar.Data = &schemapb.ScalarField_StringData{
+					StringData: &schemapb.StringArray{Data: make([]string, 0, len(dataIndices))},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstScalar.GetStringData().Data = append(dstScalar.GetStringData().Data, srcScalar.StringData.Data[idx])
+			}
+		case *schemapb.ScalarField_ArrayData:
+			if dstScalar.GetArrayData() == nil {
+				dstScalar.Data = &schemapb.ScalarField_ArrayData{
+					ArrayData: &schemapb.ArrayArray{
+						Data:        make([]*schemapb.ScalarField, 0, len(dataIndices)),
+						ElementType: srcScalar.ArrayData.ElementType,
+					},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstScalar.GetArrayData().Data = append(dstScalar.GetArrayData().Data, srcScalar.ArrayData.Data[idx])
+			}
+		case *schemapb.ScalarField_JsonData:
+			if dstScalar.GetJsonData() == nil {
+				dstScalar.Data = &schemapb.ScalarField_JsonData{
+					JsonData: &schemapb.JSONArray{Data: make([][]byte, 0, len(dataIndices))},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstScalar.GetJsonData().Data = append(dstScalar.GetJsonData().Data, srcScalar.JsonData.Data[idx])
+			}
+		case *schemapb.ScalarField_GeometryData:
+			if dstScalar.GetGeometryData() == nil {
+				dstScalar.Data = &schemapb.ScalarField_GeometryData{
+					GeometryData: &schemapb.GeometryArray{Data: make([][]byte, 0, len(dataIndices))},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstScalar.GetGeometryData().Data = append(dstScalar.GetGeometryData().Data, srcScalar.GeometryData.Data[idx])
+			}
+		case *schemapb.ScalarField_GeometryWktData:
+			if dstScalar.GetGeometryWktData() == nil {
+				dstScalar.Data = &schemapb.ScalarField_GeometryWktData{
+					GeometryWktData: &schemapb.GeometryWktArray{Data: make([]string, 0, len(dataIndices))},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstScalar.GetGeometryWktData().Data = append(dstScalar.GetGeometryWktData().Data, srcScalar.GeometryWktData.Data[idx])
+			}
+		case *schemapb.ScalarField_TimestamptzData:
+			if dstScalar.GetTimestamptzData() == nil {
+				dstScalar.Data = &schemapb.ScalarField_TimestamptzData{
+					TimestamptzData: &schemapb.TimestamptzArray{Data: make([]int64, 0, len(dataIndices))},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstScalar.GetTimestamptzData().Data = append(dstScalar.GetTimestamptzData().Data, srcScalar.TimestamptzData.Data[idx])
+			}
+		}
+	case *schemapb.FieldData_Vectors:
+		dim := srcField.Vectors.Dim
+		if dst.GetVectors() == nil {
+			dst.Field = &schemapb.FieldData_Vectors{
+				Vectors: &schemapb.VectorField{Dim: dim},
+			}
+		}
+		dstVector := dst.GetVectors()
+		switch srcVector := srcField.Vectors.Data.(type) {
+		case *schemapb.VectorField_BinaryVector:
+			if dstVector.GetBinaryVector() == nil {
+				dstVector.Data = &schemapb.VectorField_BinaryVector{
+					BinaryVector: make([]byte, 0, len(dataIndices)*int(dim/8)),
+				}
+			}
+			for _, idx := range dataIndices {
+				start := idx * (dim / 8)
+				end := (idx + 1) * (dim / 8)
+				dstVector.Data.(*schemapb.VectorField_BinaryVector).BinaryVector = append(
+					dstVector.Data.(*schemapb.VectorField_BinaryVector).BinaryVector,
+					srcVector.BinaryVector[start:end]...)
+			}
+		case *schemapb.VectorField_FloatVector:
+			if dstVector.GetFloatVector() == nil {
+				dstVector.Data = &schemapb.VectorField_FloatVector{
+					FloatVector: &schemapb.FloatArray{Data: make([]float32, 0, len(dataIndices)*int(dim))},
+				}
+			}
+			for _, idx := range dataIndices {
+				start := idx * dim
+				end := (idx + 1) * dim
+				dstVector.GetFloatVector().Data = append(dstVector.GetFloatVector().Data, srcVector.FloatVector.Data[start:end]...)
+			}
+		case *schemapb.VectorField_Float16Vector:
+			if dstVector.GetFloat16Vector() == nil {
+				dstVector.Data = &schemapb.VectorField_Float16Vector{
+					Float16Vector: make([]byte, 0, len(dataIndices)*int(dim*2)),
+				}
+			}
+			for _, idx := range dataIndices {
+				start := idx * (dim * 2)
+				end := (idx + 1) * (dim * 2)
+				dstVector.Data.(*schemapb.VectorField_Float16Vector).Float16Vector = append(
+					dstVector.Data.(*schemapb.VectorField_Float16Vector).Float16Vector,
+					srcVector.Float16Vector[start:end]...)
+			}
+		case *schemapb.VectorField_Bfloat16Vector:
+			if dstVector.GetBfloat16Vector() == nil {
+				dstVector.Data = &schemapb.VectorField_Bfloat16Vector{
+					Bfloat16Vector: make([]byte, 0, len(dataIndices)*int(dim*2)),
+				}
+			}
+			for _, idx := range dataIndices {
+				start := idx * (dim * 2)
+				end := (idx + 1) * (dim * 2)
+				dstVector.Data.(*schemapb.VectorField_Bfloat16Vector).Bfloat16Vector = append(
+					dstVector.Data.(*schemapb.VectorField_Bfloat16Vector).Bfloat16Vector,
+					srcVector.Bfloat16Vector[start:end]...)
+			}
+		case *schemapb.VectorField_SparseFloatVector:
+			if dstVector.GetSparseFloatVector() == nil {
+				dstVector.Data = &schemapb.VectorField_SparseFloatVector{
+					SparseFloatVector: &schemapb.SparseFloatArray{
+						Dim:      srcVector.SparseFloatVector.Dim,
+						Contents: make([][]byte, 0, len(dataIndices)),
+					},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstVector.GetSparseFloatVector().Contents = append(
+					dstVector.GetSparseFloatVector().Contents,
+					srcVector.SparseFloatVector.Contents[idx])
+			}
+		case *schemapb.VectorField_Int8Vector:
+			if dstVector.GetInt8Vector() == nil {
+				dstVector.Data = &schemapb.VectorField_Int8Vector{
+					Int8Vector: make([]byte, 0, len(dataIndices)*int(dim)),
+				}
+			}
+			for _, idx := range dataIndices {
+				start := idx * dim
+				end := (idx + 1) * dim
+				dstVector.Data.(*schemapb.VectorField_Int8Vector).Int8Vector = append(
+					dstVector.Data.(*schemapb.VectorField_Int8Vector).Int8Vector,
+					srcVector.Int8Vector[start:end]...)
+			}
+		case *schemapb.VectorField_VectorArray:
+			if srcVector.VectorArray == nil {
+				return
+			}
+			if dstVector.GetVectorArray() == nil {
+				dstVector.Data = &schemapb.VectorField_VectorArray{
+					VectorArray: &schemapb.VectorArray{
+						Data:        make([]*schemapb.VectorField, 0, len(dataIndices)),
+						Dim:         srcVector.VectorArray.Dim,
+						ElementType: srcVector.VectorArray.ElementType,
+					},
+				}
+			}
+			for _, idx := range dataIndices {
+				dstVector.GetVectorArray().Data = append(dstVector.GetVectorArray().Data, srcVector.VectorArray.Data[idx])
+			}
+		}
+	}
+}
+
+// DeleteFieldData delete fields data appended last time
+func DeleteFieldData(dst []*schemapb.FieldData) {
+	for i, fieldData := range dst {
+		switch fieldType := fieldData.Field.(type) {
+		case *schemapb.FieldData_Scalars:
+			if dst[i] == nil || dst[i].GetScalars() == nil {
+				return
+			}
+			dstScalar := dst[i].GetScalars()
+			switch fieldType.Scalars.Data.(type) {
+			case *schemapb.ScalarField_BoolData:
+				dstScalar.GetBoolData().Data = dstScalar.GetBoolData().Data[:len(dstScalar.GetBoolData().Data)-1]
+			case *schemapb.ScalarField_IntData:
+				dstScalar.GetIntData().Data = dstScalar.GetIntData().Data[:len(dstScalar.GetIntData().Data)-1]
+			case *schemapb.ScalarField_LongData:
+				dstScalar.GetLongData().Data = dstScalar.GetLongData().Data[:len(dstScalar.GetLongData().Data)-1]
+			case *schemapb.ScalarField_TimestamptzData:
+				dstScalar.GetTimestamptzData().Data = dstScalar.GetTimestamptzData().Data[:len(dstScalar.GetTimestamptzData().Data)-1]
+			case *schemapb.ScalarField_FloatData:
+				dstScalar.GetFloatData().Data = dstScalar.GetFloatData().Data[:len(dstScalar.GetFloatData().Data)-1]
+			case *schemapb.ScalarField_DoubleData:
+				dstScalar.GetDoubleData().Data = dstScalar.GetDoubleData().Data[:len(dstScalar.GetDoubleData().Data)-1]
+			case *schemapb.ScalarField_StringData:
+				dstScalar.GetStringData().Data = dstScalar.GetStringData().Data[:len(dstScalar.GetStringData().Data)-1]
+			case *schemapb.ScalarField_JsonData:
+				dstScalar.GetJsonData().Data = dstScalar.GetJsonData().Data[:len(dstScalar.GetJsonData().Data)-1]
+			case *schemapb.ScalarField_GeometryData:
+				dstScalar.GetGeometryData().Data = dstScalar.GetGeometryData().Data[:len(dstScalar.GetGeometryData().Data)-1]
+			}
+		case *schemapb.FieldData_Vectors:
+			if dst[i] == nil || dst[i].GetVectors() == nil {
+				return
+			}
+			dim := fieldType.Vectors.Dim
+			dstVector := dst[i].GetVectors()
+			switch fieldType.Vectors.Data.(type) {
+			case *schemapb.VectorField_BinaryVector:
+				dstBinaryVector := dstVector.Data.(*schemapb.VectorField_BinaryVector)
+				dstBinaryVector.BinaryVector = dstBinaryVector.BinaryVector[:len(dstBinaryVector.BinaryVector)-int(dim/8)]
+			case *schemapb.VectorField_FloatVector:
+				dstVector.GetFloatVector().Data = dstVector.GetFloatVector().Data[:len(dstVector.GetFloatVector().Data)-int(dim)]
+			case *schemapb.VectorField_Float16Vector:
+				dstFloat16Vector := dstVector.Data.(*schemapb.VectorField_Float16Vector)
+				dstFloat16Vector.Float16Vector = dstFloat16Vector.Float16Vector[:len(dstFloat16Vector.Float16Vector)-int(dim*2)]
+			case *schemapb.VectorField_Bfloat16Vector:
+				dstBfloat16Vector := dstVector.Data.(*schemapb.VectorField_Bfloat16Vector)
+				dstBfloat16Vector.Bfloat16Vector = dstBfloat16Vector.Bfloat16Vector[:len(dstBfloat16Vector.Bfloat16Vector)-int(dim*2)]
+			case *schemapb.VectorField_SparseFloatVector:
+				trimSparseFloatArray(dstVector.GetSparseFloatVector())
+			case *schemapb.VectorField_Int8Vector:
+				dstInt8Vector := dstVector.Data.(*schemapb.VectorField_Int8Vector)
+				dstInt8Vector.Int8Vector = dstInt8Vector.Int8Vector[:len(dstInt8Vector.Int8Vector)-int(dim)]
+			}
+		}
+	}
+}
+
+func UpdateFieldData(base, update []*schemapb.FieldData, baseIdx, updateIdx int64) error {
+	// Create a map for quick lookup of update fields by field ID
+	updateFieldMap := make(map[string]*schemapb.FieldData)
+	for _, fieldData := range update {
+		updateFieldMap[fieldData.FieldName] = fieldData
+	}
+	// Iterate through base fields and update if corresponding field exists in update
+	for _, baseFieldData := range base {
+		updateFieldData, exists := updateFieldMap[baseFieldData.FieldName]
+		if !exists {
+			// No update for this field, keep original value
+			continue
+		}
+
+		// Update ValidData if present
+		if len(updateFieldData.GetValidData()) != 0 {
+			if len(baseFieldData.GetValidData()) != 0 {
+				baseFieldData.ValidData[baseIdx] = updateFieldData.ValidData[updateIdx]
+			}
+		}
+
+		// Update field data based on type
+		switch baseFieldType := baseFieldData.Field.(type) {
+		case *schemapb.FieldData_Scalars:
+			updateFieldType := updateFieldData.Field.(*schemapb.FieldData_Scalars)
+			baseScalar := baseFieldType.Scalars
+			updateScalar := updateFieldType.Scalars
+
+			switch baseScalar.Data.(type) {
+			case *schemapb.ScalarField_BoolData:
+				updateData := updateScalar.GetBoolData()
+				baseData := baseScalar.GetBoolData()
+				if updateData != nil && baseData != nil &&
+					int(updateIdx) < len(updateData.Data) && int(baseIdx) < len(baseData.Data) {
+					baseData.Data[baseIdx] = updateData.Data[updateIdx]
+				}
+			case *schemapb.ScalarField_IntData:
+				updateData := updateScalar.GetIntData()
+				baseData := baseScalar.GetIntData()
+				if updateData != nil && baseData != nil &&
+					int(updateIdx) < len(updateData.Data) && int(baseIdx) < len(baseData.Data) {
+					baseData.Data[baseIdx] = updateData.Data[updateIdx]
+				}
+			case *schemapb.ScalarField_LongData:
+				updateData := updateScalar.GetLongData()
+				baseData := baseScalar.GetLongData()
+				if updateData != nil && baseData != nil &&
+					int(updateIdx) < len(updateData.Data) && int(baseIdx) < len(baseData.Data) {
+					baseData.Data[baseIdx] = updateData.Data[updateIdx]
+				}
+			case *schemapb.ScalarField_FloatData:
+				updateData := updateScalar.GetFloatData()
+				baseData := baseScalar.GetFloatData()
+				if updateData != nil && baseData != nil &&
+					int(updateIdx) < len(updateData.Data) && int(baseIdx) < len(baseData.Data) {
+					baseData.Data[baseIdx] = updateData.Data[updateIdx]
+				}
+			case *schemapb.ScalarField_DoubleData:
+				updateData := updateScalar.GetDoubleData()
+				baseData := baseScalar.GetDoubleData()
+				if updateData != nil && baseData != nil &&
+					int(updateIdx) < len(updateData.Data) && int(baseIdx) < len(baseData.Data) {
+					baseData.Data[baseIdx] = updateData.Data[updateIdx]
+				}
+			case *schemapb.ScalarField_StringData:
+				updateData := updateScalar.GetStringData()
+				baseData := baseScalar.GetStringData()
+				if updateData != nil && baseData != nil &&
+					int(updateIdx) < len(updateData.Data) && int(baseIdx) < len(baseData.Data) {
+					baseData.Data[baseIdx] = updateData.Data[updateIdx]
+				}
+			case *schemapb.ScalarField_ArrayData:
+				updateData := updateScalar.GetArrayData()
+				baseData := baseScalar.GetArrayData()
+				if updateData != nil && baseData != nil &&
+					int(updateIdx) < len(updateData.Data) && int(baseIdx) < len(baseData.Data) {
+					baseData.Data[baseIdx] = updateData.Data[updateIdx]
+				}
+			case *schemapb.ScalarField_JsonData:
+				updateData := updateScalar.GetJsonData()
+				baseData := baseScalar.GetJsonData()
+				if updateData != nil && baseData != nil &&
+					int(updateIdx) < len(updateData.Data) && int(baseIdx) < len(baseData.Data) {
+					if baseFieldData.GetIsDynamic() {
+						// dynamic field is a json with only 1 level nested struct,
+						// so we need to unmarshal and iterate updateData's key value, and update the baseData's key value
+						var baseMap map[string]interface{}
+						var updateMap map[string]interface{}
+						// unmarshal base and update
+						if err := json.Unmarshal(baseData.Data[baseIdx], &baseMap); err != nil {
+							return merr.Wrap(err, "failed to unmarshal base json")
+						}
+						if err := json.Unmarshal(updateData.Data[updateIdx], &updateMap); err != nil {
+							return merr.Wrap(err, "failed to unmarshal update json")
+						}
+						// merge
+						for k, v := range updateMap {
+							baseMap[k] = v
+						}
+						// marshal back
+						newJSON, err := json.Marshal(baseMap)
+						if err != nil {
+							return merr.Wrap(err, "failed to marshal merged json")
+						}
+						baseScalar.GetJsonData().Data[baseIdx] = newJSON
+					} else {
+						baseScalar.GetJsonData().Data[baseIdx] = updateData.Data[updateIdx]
+					}
+				}
+			case *schemapb.ScalarField_TimestamptzData:
+				updateData := updateScalar.GetTimestamptzData()
+				baseData := baseScalar.GetTimestamptzData()
+				if updateData != nil && baseData != nil &&
+					int(updateIdx) < len(updateData.Data) && int(baseIdx) < len(baseData.Data) {
+					baseData.Data[baseIdx] = updateData.Data[updateIdx]
+				}
+			case *schemapb.ScalarField_GeometryData:
+				updateData := updateScalar.GetGeometryData()
+				baseData := baseScalar.GetGeometryData()
+				if updateData != nil && baseData != nil &&
+					int(updateIdx) < len(updateData.Data) && int(baseIdx) < len(baseData.Data) {
+					baseData.Data[baseIdx] = updateData.Data[updateIdx]
+				}
+			case *schemapb.ScalarField_GeometryWktData:
+				updateData := updateScalar.GetGeometryWktData()
+				baseData := baseScalar.GetGeometryWktData()
+				if updateData != nil && baseData != nil &&
+					int(updateIdx) < len(updateData.Data) && int(baseIdx) < len(baseData.Data) {
+					baseData.Data[baseIdx] = updateData.Data[updateIdx]
+				}
+			default:
+				return merr.WrapErrParameterInvalidMsg("unsupported scalar field type: %s", baseFieldData.Type.String())
+			}
+
+		case *schemapb.FieldData_Vectors:
+			updateFieldType := updateFieldData.Field.(*schemapb.FieldData_Vectors)
+			baseVector := baseFieldType.Vectors
+			updateVector := updateFieldType.Vectors
+			dim := baseVector.Dim
+
+			switch baseVector.Data.(type) {
+			case *schemapb.VectorField_BinaryVector:
+				baseData := baseVector.GetBinaryVector()
+				updateData := updateVector.GetBinaryVector()
+				if baseData != nil && updateData != nil {
+					baseStartIdx := baseIdx * (dim / 8)
+					baseEndIdx := (baseIdx + 1) * (dim / 8)
+					updateStartIdx := updateIdx * (dim / 8)
+					updateEndIdx := (updateIdx + 1) * (dim / 8)
+					if int(updateEndIdx) <= len(updateData) && int(baseEndIdx) <= len(baseData) {
+						copy(baseData[baseStartIdx:baseEndIdx], updateData[updateStartIdx:updateEndIdx])
+					}
+				}
+			case *schemapb.VectorField_FloatVector:
+				baseData := baseVector.GetFloatVector()
+				updateData := updateVector.GetFloatVector()
+				if baseData != nil && updateData != nil {
+					baseStartIdx := baseIdx * dim
+					baseEndIdx := (baseIdx + 1) * dim
+					updateStartIdx := updateIdx * dim
+					updateEndIdx := (updateIdx + 1) * dim
+					if int(updateEndIdx) <= len(updateData.Data) && int(baseEndIdx) <= len(baseData.Data) {
+						copy(baseData.Data[baseStartIdx:baseEndIdx], updateData.Data[updateStartIdx:updateEndIdx])
+					}
+				}
+			case *schemapb.VectorField_Float16Vector:
+				baseData := baseVector.GetFloat16Vector()
+				updateData := updateVector.GetFloat16Vector()
+				if baseData != nil && updateData != nil {
+					baseStartIdx := baseIdx * (dim * 2)
+					baseEndIdx := (baseIdx + 1) * (dim * 2)
+					updateStartIdx := updateIdx * (dim * 2)
+					updateEndIdx := (updateIdx + 1) * (dim * 2)
+					if int(updateEndIdx) <= len(updateData) && int(baseEndIdx) <= len(baseData) {
+						copy(baseData[baseStartIdx:baseEndIdx], updateData[updateStartIdx:updateEndIdx])
+					}
+				}
+			case *schemapb.VectorField_Bfloat16Vector:
+				baseData := baseVector.GetBfloat16Vector()
+				updateData := updateVector.GetBfloat16Vector()
+				if baseData != nil && updateData != nil {
+					baseStartIdx := baseIdx * (dim * 2)
+					baseEndIdx := (baseIdx + 1) * (dim * 2)
+					updateStartIdx := updateIdx * (dim * 2)
+					updateEndIdx := (updateIdx + 1) * (dim * 2)
+					if int(updateEndIdx) <= len(updateData) && int(baseEndIdx) <= len(baseData) {
+						copy(baseData[baseStartIdx:baseEndIdx], updateData[updateStartIdx:updateEndIdx])
+					}
+				}
+			case *schemapb.VectorField_SparseFloatVector:
+				baseData := baseVector.GetSparseFloatVector()
+				updateData := updateVector.GetSparseFloatVector()
+				if baseData != nil && updateData != nil && int(baseIdx) < len(baseData.Contents) && int(updateIdx) < len(updateData.Contents) {
+					baseData.Contents[baseIdx] = updateData.Contents[updateIdx]
+					// Update dimension if necessary
+					if updateData.Dim > baseData.Dim {
+						baseData.Dim = updateData.Dim
+					}
+				}
+			case *schemapb.VectorField_Int8Vector:
+				baseData := baseVector.GetInt8Vector()
+				updateData := updateVector.GetInt8Vector()
+				if baseData != nil && updateData != nil {
+					baseStartIdx := baseIdx * dim
+					baseEndIdx := (baseIdx + 1) * dim
+					updateStartIdx := updateIdx * dim
+					updateEndIdx := (updateIdx + 1) * dim
+					if int(updateEndIdx) <= len(updateData) && int(baseEndIdx) <= len(baseData) {
+						copy(baseData[baseStartIdx:baseEndIdx], updateData[updateStartIdx:updateEndIdx])
+					}
+				}
+			default:
+				return merr.WrapErrParameterInvalidMsg("unsupported vector field type: %s", baseFieldData.Type.String())
+			}
+		default:
+			return merr.WrapErrParameterInvalidMsg("unsupported field type: %s", baseFieldData.Type.String())
+		}
+	}
+
+	return nil
+}
+
+// UpdateArrayFieldByColumnWithOp merges an Array field's update rows into
+// the base rows while applying a FieldPartialUpdateOp. Non-Array field
+// types or a REPLACE op fall back to UpdateFieldDataByColumn's behavior.
+//
+// maxCapacity caps ARRAY_APPEND's post-merge length; pass -1 to skip the
+// check (proxy should pass the schema-declared max_capacity).
+func UpdateArrayFieldByColumnWithOp(
+	base, update *schemapb.FieldData,
+	baseIndices, updateIndices []int64,
+	op schemapb.FieldPartialUpdateOp_OpType,
+	maxCapacity int,
+) error {
+	if op == schemapb.FieldPartialUpdateOp_REPLACE {
+		return UpdateFieldDataByColumn(base, update, baseIndices, updateIndices)
+	}
+	if base == nil || update == nil || len(baseIndices) == 0 {
+		return nil
+	}
+	if len(baseIndices) != len(updateIndices) {
+		return merr.WrapErrParameterInvalidMsg("baseIndices and updateIndices length mismatch: %d vs %d", len(baseIndices), len(updateIndices))
+	}
+	if base.GetType() != schemapb.DataType_Array {
+		return merr.WrapErrParameterInvalidMsg("op %s requires Array field, got %s", op.String(), base.GetType().String())
+	}
+	baseScalar := base.GetScalars()
+	updateScalar := update.GetScalars()
+	if baseScalar.GetArrayData() == nil || updateScalar.GetArrayData() == nil {
+		return merr.WrapErrParameterInvalidMsg("op %s requires non-nil ArrayData on both base and update", op.String())
+	}
+	baseData := baseScalar.GetArrayData().Data
+	updateData := updateScalar.GetArrayData().Data
+	elementType := baseScalar.GetArrayData().GetElementType()
+	for i, baseIdx := range baseIndices {
+		updateIdx := updateIndices[i]
+		// If the upsert payload row is explicitly null, there is nothing to
+		// append/remove; leave the existing base row untouched.
+		if len(update.ValidData) > 0 && !update.ValidData[updateIdx] {
+			continue
+		}
+		merged, err := ApplyArrayRowOp(baseData[baseIdx], updateData[updateIdx], op, elementType, maxCapacity)
+		if err != nil {
+			return err
+		}
+		baseData[baseIdx] = merged
+		// After a successful merge the base row carries concrete data and
+		// must be marked valid, otherwise downstream readers keep treating
+		// it as null and drop the merged payload silently.
+		if len(base.ValidData) > 0 {
+			base.ValidData[baseIdx] = true
+		}
+	}
+	return nil
+}
+
+func UpdateFieldDataByColumn(base, update *schemapb.FieldData, baseIndices, updateIndices []int64) error {
+	if base == nil || update == nil || len(baseIndices) == 0 {
+		return nil
+	}
+	if len(baseIndices) != len(updateIndices) {
+		return merr.WrapErrParameterInvalidMsg("baseIndices and updateIndices length mismatch: %d vs %d", len(baseIndices), len(updateIndices))
+	}
+	if IsCompactNullableVectorFieldData(base) {
+		return updateCompactNullableVectorFieldDataByColumn(base, update, baseIndices, updateIndices)
+	}
+
+	// Handle ValidData
+	if len(update.GetValidData()) > 0 && len(base.GetValidData()) > 0 {
+		for i, baseIdx := range baseIndices {
+			updateIdx := updateIndices[i]
+			base.ValidData[baseIdx] = update.ValidData[updateIdx]
+		}
+	}
+
+	switch baseField := base.Field.(type) {
+	case *schemapb.FieldData_Scalars:
+		updateField := update.Field.(*schemapb.FieldData_Scalars)
+		baseScalar := baseField.Scalars
+		updateScalar := updateField.Scalars
+
+		switch baseScalar.Data.(type) {
+		case *schemapb.ScalarField_BoolData:
+			baseData := baseScalar.GetBoolData().Data
+			updateData := updateScalar.GetBoolData().Data
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		case *schemapb.ScalarField_IntData:
+			baseData := baseScalar.GetIntData().Data
+			updateData := updateScalar.GetIntData().Data
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		case *schemapb.ScalarField_LongData:
+			baseData := baseScalar.GetLongData().Data
+			updateData := updateScalar.GetLongData().Data
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		case *schemapb.ScalarField_FloatData:
+			baseData := baseScalar.GetFloatData().Data
+			updateData := updateScalar.GetFloatData().Data
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		case *schemapb.ScalarField_DoubleData:
+			baseData := baseScalar.GetDoubleData().Data
+			updateData := updateScalar.GetDoubleData().Data
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		case *schemapb.ScalarField_StringData:
+			baseData := baseScalar.GetStringData().Data
+			updateData := updateScalar.GetStringData().Data
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		case *schemapb.ScalarField_ArrayData:
+			baseData := baseScalar.GetArrayData().Data
+			updateData := updateScalar.GetArrayData().Data
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		case *schemapb.ScalarField_JsonData:
+			baseData := baseScalar.GetJsonData().Data
+			updateData := updateScalar.GetJsonData().Data
+			if base.GetIsDynamic() {
+				// dynamic field is a json with only 1 level nested struct,
+				// so we need to unmarshal and iterate updateData's key value, and update the baseData's key value
+				for i, baseIdx := range baseIndices {
+					updateIdx := updateIndices[i]
+					var baseMap map[string]interface{}
+					var updateMap map[string]interface{}
+					// unmarshal base and update
+					if err := json.Unmarshal(baseData[baseIdx], &baseMap); err != nil {
+						return merr.Wrap(err, "failed to unmarshal base json")
+					}
+					if err := json.Unmarshal(updateData[updateIdx], &updateMap); err != nil {
+						return merr.Wrap(err, "failed to unmarshal update json")
+					}
+					// merge
+					for k, v := range updateMap {
+						baseMap[k] = v
+					}
+					// marshal back
+					newJSON, err := json.Marshal(baseMap)
+					if err != nil {
+						return merr.Wrap(err, "failed to marshal merged json")
+					}
+					baseData[baseIdx] = newJSON
+				}
+			} else {
+				for i, baseIdx := range baseIndices {
+					baseData[baseIdx] = updateData[updateIndices[i]]
+				}
+			}
+		case *schemapb.ScalarField_GeometryData:
+			baseData := baseScalar.GetGeometryData().Data
+			updateData := updateScalar.GetGeometryData().Data
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		case *schemapb.ScalarField_GeometryWktData:
+			baseData := baseScalar.GetGeometryWktData().Data
+			updateData := updateScalar.GetGeometryWktData().Data
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		case *schemapb.ScalarField_TimestamptzData:
+			baseData := baseScalar.GetTimestamptzData().Data
+			updateData := updateScalar.GetTimestamptzData().Data
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		}
+	case *schemapb.FieldData_Vectors:
+		updateField := update.Field.(*schemapb.FieldData_Vectors)
+		baseVector := baseField.Vectors
+		updateVector := updateField.Vectors
+		dim := baseVector.Dim
+
+		switch baseVector.Data.(type) {
+		case *schemapb.VectorField_BinaryVector:
+			baseData := baseVector.GetBinaryVector()
+			updateData := updateVector.GetBinaryVector()
+			elemSize := dim / 8
+			for i, baseIdx := range baseIndices {
+				updateIdx := updateIndices[i]
+				copy(baseData[baseIdx*elemSize:(baseIdx+1)*elemSize], updateData[updateIdx*elemSize:(updateIdx+1)*elemSize])
+			}
+		case *schemapb.VectorField_FloatVector:
+			baseData := baseVector.GetFloatVector().Data
+			updateData := updateVector.GetFloatVector().Data
+			for i, baseIdx := range baseIndices {
+				updateIdx := updateIndices[i]
+				copy(baseData[baseIdx*dim:(baseIdx+1)*dim], updateData[updateIdx*dim:(updateIdx+1)*dim])
+			}
+		case *schemapb.VectorField_Float16Vector:
+			baseData := baseVector.GetFloat16Vector()
+			updateData := updateVector.GetFloat16Vector()
+			elemSize := dim * 2
+			for i, baseIdx := range baseIndices {
+				updateIdx := updateIndices[i]
+				copy(baseData[baseIdx*elemSize:(baseIdx+1)*elemSize], updateData[updateIdx*elemSize:(updateIdx+1)*elemSize])
+			}
+		case *schemapb.VectorField_Bfloat16Vector:
+			baseData := baseVector.GetBfloat16Vector()
+			updateData := updateVector.GetBfloat16Vector()
+			elemSize := dim * 2
+			for i, baseIdx := range baseIndices {
+				updateIdx := updateIndices[i]
+				copy(baseData[baseIdx*elemSize:(baseIdx+1)*elemSize], updateData[updateIdx*elemSize:(updateIdx+1)*elemSize])
+			}
+		case *schemapb.VectorField_SparseFloatVector:
+			baseData := baseVector.GetSparseFloatVector().Contents
+			updateData := updateVector.GetSparseFloatVector().Contents
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		case *schemapb.VectorField_Int8Vector:
+			baseData := baseVector.GetInt8Vector()
+			updateData := updateVector.GetInt8Vector()
+			for i, baseIdx := range baseIndices {
+				updateIdx := updateIndices[i]
+				copy(baseData[baseIdx*dim:(baseIdx+1)*dim], updateData[updateIdx*dim:(updateIdx+1)*dim])
+			}
+		case *schemapb.VectorField_VectorArray:
+			baseData := baseVector.GetVectorArray().Data
+			updateData := updateVector.GetVectorArray().Data
+			for i, baseIdx := range baseIndices {
+				baseData[baseIdx] = updateData[updateIndices[i]]
+			}
+		}
+	}
+
+	return nil
+}
+
+// IsCompactNullableVectorFieldData reports whether field uses compact nullable vector payload.
+func IsCompactNullableVectorFieldData(field *schemapb.FieldData) bool {
+	return len(field.GetValidData()) > 0 && IsSupportedNullableVectorType(field.GetType())
+}
+
+func updateCompactNullableVectorFieldDataByColumn(base, update *schemapb.FieldData, baseIndices, updateIndices []int64) error {
+	if !IsSupportedNullableVectorType(update.GetType()) {
+		return merr.WrapErrParameterInvalidMsg("cannot update nullable vector field %s with %s", base.GetType().String(), update.GetType().String())
+	}
+	if update.GetType() != base.GetType() {
+		return merr.WrapErrParameterInvalidMsg("cannot update nullable vector field %s with %s", base.GetType().String(), update.GetType().String())
+	}
+
+	baseValidData := base.GetValidData()
+	updateValidData := update.GetValidData()
+	if len(updateValidData) == 0 {
+		return merr.WrapErrParameterInvalidMsg("nullable vector field %s missing ValidData", update.GetFieldName())
+	}
+
+	updateByBaseIdx := make(map[int]int, len(baseIndices))
+	for i, baseIdx := range baseIndices {
+		updateIdx := updateIndices[i]
+		if baseIdx < 0 || int(baseIdx) >= len(baseValidData) {
+			return merr.WrapErrParameterInvalidMsg("base index %d out of range for nullable vector field %s", baseIdx, base.GetFieldName())
+		}
+		if updateIdx < 0 || int(updateIdx) >= len(updateValidData) {
+			return merr.WrapErrParameterInvalidMsg("update index %d out of range for nullable vector field %s", updateIdx, update.GetFieldName())
+		}
+		updateByBaseIdx[int(baseIdx)] = int(updateIdx)
+	}
+
+	basePhysicalIndices, _ := BuildNullableVectorDataIndices(baseValidData)
+	updatePhysicalIndices, _ := BuildNullableVectorDataIndices(updateValidData)
+	newValidData := append([]bool(nil), baseValidData...)
+	for baseIdx, updateIdx := range updateByBaseIdx {
+		newValidData[baseIdx] = updateValidData[updateIdx]
+	}
+
+	baseVector := base.GetVectors()
+	updateVector := update.GetVectors()
+	if baseVector == nil || updateVector == nil {
+		return merr.WrapErrParameterInvalidMsg("nullable vector field data is nil")
+	}
+	dim := baseVector.GetDim()
+	if dim == 0 {
+		dim = updateVector.GetDim()
+	}
+	if dim != 0 {
+		baseVector.Dim = dim
+	}
+
+	switch base.GetType() {
+	case schemapb.DataType_BinaryVector:
+		elemSize := dim / 8
+		newData := make([]byte, 0, int64(countValid(newValidData))*elemSize)
+		appendRow := func(vector *schemapb.VectorField, physicalIdx int) error {
+			data := vector.GetBinaryVector()
+			start := int64(physicalIdx) * elemSize
+			end := start + elemSize
+			if start < 0 || end > int64(len(data)) {
+				return merr.WrapErrParameterInvalidMsg("binary vector physical index %d out of range", physicalIdx)
+			}
+			newData = append(newData, data[start:end]...)
+			return nil
+		}
+		if err := rebuildCompactNullableVectorData(newValidData, updateByBaseIdx, basePhysicalIndices, updatePhysicalIndices, appendRow, baseVector, updateVector); err != nil {
+			return err
+		}
+		baseVector.Data = &schemapb.VectorField_BinaryVector{BinaryVector: newData}
+	case schemapb.DataType_FloatVector:
+		newData := make([]float32, 0, int64(countValid(newValidData))*dim)
+		appendRow := func(vector *schemapb.VectorField, physicalIdx int) error {
+			data := vector.GetFloatVector().GetData()
+			start := int64(physicalIdx) * dim
+			end := start + dim
+			if start < 0 || end > int64(len(data)) {
+				return merr.WrapErrParameterInvalidMsg("float vector physical index %d out of range", physicalIdx)
+			}
+			newData = append(newData, data[start:end]...)
+			return nil
+		}
+		if err := rebuildCompactNullableVectorData(newValidData, updateByBaseIdx, basePhysicalIndices, updatePhysicalIndices, appendRow, baseVector, updateVector); err != nil {
+			return err
+		}
+		baseVector.Data = &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: newData}}
+	case schemapb.DataType_Float16Vector:
+		elemSize := dim * 2
+		newData := make([]byte, 0, int64(countValid(newValidData))*elemSize)
+		appendRow := func(vector *schemapb.VectorField, physicalIdx int) error {
+			data := vector.GetFloat16Vector()
+			start := int64(physicalIdx) * elemSize
+			end := start + elemSize
+			if start < 0 || end > int64(len(data)) {
+				return merr.WrapErrParameterInvalidMsg("float16 vector physical index %d out of range", physicalIdx)
+			}
+			newData = append(newData, data[start:end]...)
+			return nil
+		}
+		if err := rebuildCompactNullableVectorData(newValidData, updateByBaseIdx, basePhysicalIndices, updatePhysicalIndices, appendRow, baseVector, updateVector); err != nil {
+			return err
+		}
+		baseVector.Data = &schemapb.VectorField_Float16Vector{Float16Vector: newData}
+	case schemapb.DataType_BFloat16Vector:
+		elemSize := dim * 2
+		newData := make([]byte, 0, int64(countValid(newValidData))*elemSize)
+		appendRow := func(vector *schemapb.VectorField, physicalIdx int) error {
+			data := vector.GetBfloat16Vector()
+			start := int64(physicalIdx) * elemSize
+			end := start + elemSize
+			if start < 0 || end > int64(len(data)) {
+				return merr.WrapErrParameterInvalidMsg("bfloat16 vector physical index %d out of range", physicalIdx)
+			}
+			newData = append(newData, data[start:end]...)
+			return nil
+		}
+		if err := rebuildCompactNullableVectorData(newValidData, updateByBaseIdx, basePhysicalIndices, updatePhysicalIndices, appendRow, baseVector, updateVector); err != nil {
+			return err
+		}
+		baseVector.Data = &schemapb.VectorField_Bfloat16Vector{Bfloat16Vector: newData}
+	case schemapb.DataType_SparseFloatVector:
+		baseSparse := baseVector.GetSparseFloatVector()
+		updateSparse := updateVector.GetSparseFloatVector()
+		if updateSparse == nil {
+			return merr.WrapErrParameterInvalidMsg("sparse float vector update data is nil")
+		}
+		baseDim := int64(0)
+		if baseSparse != nil {
+			baseDim = baseSparse.GetDim()
+		}
+		newSparse := &schemapb.SparseFloatArray{
+			Dim:      maxInt64(baseDim, updateSparse.GetDim()),
+			Contents: make([][]byte, 0, countValid(newValidData)),
+		}
+		appendRow := func(vector *schemapb.VectorField, physicalIdx int) error {
+			data := vector.GetSparseFloatVector()
+			if data == nil || physicalIdx < 0 || physicalIdx >= len(data.GetContents()) {
+				return merr.WrapErrParameterInvalidMsg("sparse vector physical index %d out of range", physicalIdx)
+			}
+			row := data.GetContents()[physicalIdx]
+			newSparse.Contents = append(newSparse.Contents, row)
+			if rowDim := SparseFloatRowDim(row); rowDim > newSparse.Dim {
+				newSparse.Dim = rowDim
+			}
+			return nil
+		}
+		if err := rebuildCompactNullableVectorData(newValidData, updateByBaseIdx, basePhysicalIndices, updatePhysicalIndices, appendRow, baseVector, updateVector); err != nil {
+			return err
+		}
+		baseVector.Data = &schemapb.VectorField_SparseFloatVector{SparseFloatVector: newSparse}
+		baseVector.Dim = newSparse.GetDim()
+	case schemapb.DataType_Int8Vector:
+		elemSize := dim
+		newData := make([]byte, 0, int64(countValid(newValidData))*elemSize)
+		appendRow := func(vector *schemapb.VectorField, physicalIdx int) error {
+			data := vector.GetInt8Vector()
+			start := int64(physicalIdx) * elemSize
+			end := start + elemSize
+			if start < 0 || end > int64(len(data)) {
+				return merr.WrapErrParameterInvalidMsg("int8 vector physical index %d out of range", physicalIdx)
+			}
+			newData = append(newData, data[start:end]...)
+			return nil
+		}
+		if err := rebuildCompactNullableVectorData(newValidData, updateByBaseIdx, basePhysicalIndices, updatePhysicalIndices, appendRow, baseVector, updateVector); err != nil {
+			return err
+		}
+		baseVector.Data = &schemapb.VectorField_Int8Vector{Int8Vector: newData}
+	default:
+		return merr.WrapErrParameterInvalidMsg("unsupported nullable vector field type %s", base.GetType().String())
+	}
+
+	base.ValidData = newValidData
+	return nil
+}
+
+func rebuildCompactNullableVectorData(
+	validData []bool,
+	updateByBaseIdx map[int]int,
+	basePhysicalIndices []int,
+	updatePhysicalIndices []int,
+	appendRow func(vector *schemapb.VectorField, physicalIdx int) error,
+	baseVector *schemapb.VectorField,
+	updateVector *schemapb.VectorField,
+) error {
+	for logicalIdx, valid := range validData {
+		if !valid {
+			continue
+		}
+		if updateIdx, ok := updateByBaseIdx[logicalIdx]; ok {
+			if err := appendRow(updateVector, updatePhysicalIndices[updateIdx]); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := appendRow(baseVector, basePhysicalIndices[logicalIdx]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func maxInt64(lhs, rhs int64) int64 {
+	if lhs > rhs {
+		return lhs
+	}
+	return rhs
+}
+
+func countValid(validData []bool) int {
+	validCount := 0
+	for _, valid := range validData {
+		if valid {
+			validCount++
+		}
+	}
+	return validCount
+}
+
+// MergeFieldData appends fields data to dst
+func MergeFieldData(dst []*schemapb.FieldData, src []*schemapb.FieldData) error {
+	fieldID2Data := make(map[int64]*schemapb.FieldData)
+	for _, data := range dst {
+		if _, ok := data.Field.(*schemapb.FieldData_StructArrays); ok {
+			panic("struct is not flattened")
+		}
+
+		fieldID2Data[data.FieldId] = data
+	}
+	for _, srcFieldData := range src {
+		switch fieldType := srcFieldData.Field.(type) {
+		case *schemapb.FieldData_Scalars:
+			if _, ok := fieldID2Data[srcFieldData.FieldId]; !ok {
+				return merr.WrapErrParameterInvalidMsg("fields in src but not in dst: " + srcFieldData.Type.String())
+			}
+			fieldData := fieldID2Data[srcFieldData.FieldId]
+			fieldData.ValidData = append(fieldData.ValidData, srcFieldData.GetValidData()...)
+			dstScalar := fieldData.GetScalars()
+			switch srcScalar := fieldType.Scalars.Data.(type) {
+			case *schemapb.ScalarField_BoolData:
+				if dstScalar.GetBoolData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_BoolData{
+						BoolData: &schemapb.BoolArray{
+							Data: srcScalar.BoolData.Data,
+						},
+					}
+				} else {
+					dstScalar.GetBoolData().Data = append(dstScalar.GetBoolData().Data, srcScalar.BoolData.Data...)
+				}
+			case *schemapb.ScalarField_IntData:
+				if dstScalar.GetIntData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_IntData{
+						IntData: &schemapb.IntArray{
+							Data: srcScalar.IntData.Data,
+						},
+					}
+				} else {
+					dstScalar.GetIntData().Data = append(dstScalar.GetIntData().Data, srcScalar.IntData.Data...)
+				}
+			case *schemapb.ScalarField_LongData:
+				if dstScalar.GetLongData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_LongData{
+						LongData: &schemapb.LongArray{
+							Data: srcScalar.LongData.Data,
+						},
+					}
+				} else {
+					dstScalar.GetLongData().Data = append(dstScalar.GetLongData().Data, srcScalar.LongData.Data...)
+				}
+			case *schemapb.ScalarField_TimestamptzData:
+				if dstScalar.GetTimestamptzData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_TimestamptzData{
+						TimestamptzData: &schemapb.TimestamptzArray{
+							Data: srcScalar.TimestamptzData.Data,
+						},
+					}
+				} else {
+					dstScalar.GetTimestamptzData().Data = append(dstScalar.GetTimestamptzData().Data, srcScalar.TimestamptzData.Data...)
+				}
+			case *schemapb.ScalarField_FloatData:
+				if dstScalar.GetFloatData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_FloatData{
+						FloatData: &schemapb.FloatArray{
+							Data: srcScalar.FloatData.Data,
+						},
+					}
+				} else {
+					dstScalar.GetFloatData().Data = append(dstScalar.GetFloatData().Data, srcScalar.FloatData.Data...)
+				}
+			case *schemapb.ScalarField_DoubleData:
+				if dstScalar.GetDoubleData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_DoubleData{
+						DoubleData: &schemapb.DoubleArray{
+							Data: srcScalar.DoubleData.Data,
+						},
+					}
+				} else {
+					dstScalar.GetDoubleData().Data = append(dstScalar.GetDoubleData().Data, srcScalar.DoubleData.Data...)
+				}
+			case *schemapb.ScalarField_StringData:
+				if dstScalar.GetStringData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_StringData{
+						StringData: &schemapb.StringArray{
+							Data: srcScalar.StringData.Data,
+						},
+					}
+				} else {
+					dstScalar.GetStringData().Data = append(dstScalar.GetStringData().Data, srcScalar.StringData.Data...)
+				}
+			case *schemapb.ScalarField_ArrayData:
+				if dstScalar.GetArrayData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_ArrayData{
+						ArrayData: &schemapb.ArrayArray{
+							Data:        srcScalar.ArrayData.Data,
+							ElementType: srcScalar.ArrayData.ElementType,
+						},
+					}
+				} else {
+					dstScalar.GetArrayData().Data = append(dstScalar.GetArrayData().Data, srcScalar.ArrayData.Data...)
+				}
+			case *schemapb.ScalarField_JsonData:
+				if dstScalar.GetJsonData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_JsonData{
+						JsonData: &schemapb.JSONArray{
+							Data: srcScalar.JsonData.Data,
+						},
+					}
+				} else {
+					dstScalar.GetJsonData().Data = append(dstScalar.GetJsonData().Data, srcScalar.JsonData.Data...)
+				}
+			case *schemapb.ScalarField_GeometryData:
+				if dstScalar.GetGeometryData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_GeometryData{
+						GeometryData: &schemapb.GeometryArray{
+							Data: srcScalar.GeometryData.Data,
+						},
+					}
+				} else {
+					dstScalar.GetGeometryData().Data = append(dstScalar.GetGeometryData().Data, srcScalar.GeometryData.Data...)
+				}
+			case *schemapb.ScalarField_BytesData:
+				if dstScalar.GetBytesData() == nil {
+					dstScalar.Data = &schemapb.ScalarField_BytesData{
+						BytesData: &schemapb.BytesArray{
+							Data: srcScalar.BytesData.Data,
+						},
+					}
+				} else {
+					dstScalar.GetBytesData().Data = append(dstScalar.GetBytesData().Data, srcScalar.BytesData.Data...)
+				}
+			default:
+				return merr.WrapErrParameterInvalidMsg("unsupported data type: " + srcFieldData.Type.String())
+			}
+		case *schemapb.FieldData_Vectors:
+			if _, ok := fieldID2Data[srcFieldData.FieldId]; !ok {
+				return merr.WrapErrParameterInvalidMsg("fields in src but not in dst: " + srcFieldData.Type.String())
+			}
+			fieldData := fieldID2Data[srcFieldData.FieldId]
+			// Merge ValidData for nullable vectors
+			fieldData.ValidData = append(fieldData.ValidData, srcFieldData.GetValidData()...)
+			dstVector := fieldData.GetVectors()
+			switch srcVector := fieldType.Vectors.Data.(type) {
+			case *schemapb.VectorField_BinaryVector:
+				if dstVector.GetBinaryVector() == nil {
+					dstVector.Data = &schemapb.VectorField_BinaryVector{
+						BinaryVector: srcVector.BinaryVector,
+					}
+				} else {
+					dstBinaryVector := dstVector.Data.(*schemapb.VectorField_BinaryVector)
+					dstBinaryVector.BinaryVector = append(dstBinaryVector.BinaryVector, srcVector.BinaryVector...)
+				}
+			case *schemapb.VectorField_Float16Vector:
+				if dstVector.GetFloat16Vector() == nil {
+					dstVector.Data = &schemapb.VectorField_Float16Vector{
+						Float16Vector: srcVector.Float16Vector,
+					}
+				} else {
+					dstFloat16Vector := dstVector.Data.(*schemapb.VectorField_Float16Vector)
+					dstFloat16Vector.Float16Vector = append(dstFloat16Vector.Float16Vector, srcVector.Float16Vector...)
+				}
+			case *schemapb.VectorField_Bfloat16Vector:
+				if dstVector.GetBfloat16Vector() == nil {
+					dstVector.Data = &schemapb.VectorField_Bfloat16Vector{
+						Bfloat16Vector: srcVector.Bfloat16Vector,
+					}
+				} else {
+					dstBfloat16Vector := dstVector.Data.(*schemapb.VectorField_Bfloat16Vector)
+					dstBfloat16Vector.Bfloat16Vector = append(dstBfloat16Vector.Bfloat16Vector, srcVector.Bfloat16Vector...)
+				}
+			case *schemapb.VectorField_FloatVector:
+				if dstVector.GetFloatVector() == nil {
+					dstVector.Data = &schemapb.VectorField_FloatVector{
+						FloatVector: &schemapb.FloatArray{
+							Data: srcVector.FloatVector.Data,
+						},
+					}
+				} else {
+					dstVector.GetFloatVector().Data = append(dstVector.GetFloatVector().Data, srcVector.FloatVector.Data...)
+				}
+			case *schemapb.VectorField_SparseFloatVector:
+				if dstVector.GetSparseFloatVector() == nil {
+					dstVector.Data = &schemapb.VectorField_SparseFloatVector{
+						SparseFloatVector: srcVector.SparseFloatVector,
+					}
+				} else {
+					appendSparseFloatArray(dstVector.GetSparseFloatVector(), srcVector.SparseFloatVector)
+				}
+			case *schemapb.VectorField_Int8Vector:
+				if dstVector.GetInt8Vector() == nil {
+					dstVector.Data = &schemapb.VectorField_Int8Vector{
+						Int8Vector: srcVector.Int8Vector,
+					}
+				} else {
+					dstInt8Vector := dstVector.Data.(*schemapb.VectorField_Int8Vector)
+					dstInt8Vector.Int8Vector = append(dstInt8Vector.Int8Vector, srcVector.Int8Vector...)
+				}
+			case *schemapb.VectorField_VectorArray:
+				if dstVector.GetVectorArray() == nil {
+					dstVector.Data = &schemapb.VectorField_VectorArray{
+						VectorArray: &schemapb.VectorArray{
+							Dim:         srcVector.VectorArray.Dim,
+							ElementType: srcVector.VectorArray.ElementType,
+							Data:        srcVector.VectorArray.Data,
+						},
+					}
+				} else {
+					dstVector.GetVectorArray().Data = append(dstVector.GetVectorArray().Data, srcVector.VectorArray.Data...)
+				}
+			case nil:
+				// nullable vector field where all rows are null — no vector data to merge
+			default:
+				return merr.WrapErrParameterInvalidMsg("unsupported data type: " + srcFieldData.Type.String())
+			}
+		}
+	}
+
+	return nil
+}
+
+// GetTotalFieldsNum get total fields number, including StructArrayField itself.
+func GetTotalFieldsNum(schema *schemapb.CollectionSchema) int {
+	num := len(schema.GetFields())
+	for _, structArrayField := range schema.GetStructArrayFields() {
+		// +1 for the StructArrayField itself
+		num += len(structArrayField.GetFields()) + 1
+	}
+	return num
+}
+
+// GetAllFieldSchemas returns every FieldSchema contained
+// in CollectionSchema, including those under StructArrayField.
+func GetAllFieldSchemas(schema *schemapb.CollectionSchema) []*schemapb.FieldSchema {
+	all := make([]*schemapb.FieldSchema, 0, len(schema.Fields)+5)
+	all = append(all, schema.Fields...)
+	for _, structField := range schema.GetStructArrayFields() {
+		all = append(all, structField.Fields...)
+	}
+	return all
+}
+
+// IsExternalCollection returns true when schema has external field mappings.
+func IsExternalCollection(schema *schemapb.CollectionSchema) bool {
+	if schema == nil {
+		return false
+	}
+	for _, field := range schema.GetFields() {
+		if field.GetExternalField() != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// GetVectorFieldSchemas get vector fields schema from collection schema.
+func GetVectorFieldSchemas(schema *schemapb.CollectionSchema) []*schemapb.FieldSchema {
+	ret := make([]*schemapb.FieldSchema, 0)
+	for _, fieldSchema := range schema.GetFields() {
+		if IsVectorType(fieldSchema.DataType) {
+			ret = append(ret, fieldSchema)
+		}
+	}
+	for _, structArrayField := range schema.GetStructArrayFields() {
+		for _, fieldSchema := range structArrayField.GetFields() {
+			if IsVectorType(fieldSchema.DataType) {
+				ret = append(ret, fieldSchema)
+			}
+		}
+	}
+
+	return ret
+}
+
+func GetDenseVectorFieldSchemas(schema *schemapb.CollectionSchema) []*schemapb.FieldSchema {
+	ret := make([]*schemapb.FieldSchema, 0)
+	for _, fieldSchema := range schema.GetFields() {
+		if IsDenseFloatVectorType(fieldSchema.DataType) || IsBinaryVectorType(fieldSchema.DataType) || IsIntVectorType(fieldSchema.DataType) {
+			ret = append(ret, fieldSchema)
+		}
+	}
+	return ret
+}
+
+// GetPrimaryFieldSchema get primary field schema from collection schema
+func GetPrimaryFieldSchema(schema *schemapb.CollectionSchema) (*schemapb.FieldSchema, error) {
+	for _, fieldSchema := range schema.GetFields() {
+		if fieldSchema.IsPrimaryKey {
+			return fieldSchema, nil
+		}
+	}
+
+	return nil, merr.WrapErrParameterInvalidMsg("primary field is not found")
+}
+
+// NormalizeAndValidateExternalCollectionSchema ensures unsupported features are
+// disabled for external collections. For non-milvus-table formats, it also
+// mutates each user field to set nullable=true. The mutation is intentional:
+// external Parquet sources may contain nulls, and non-nullable fields would
+// silently produce incorrect results when reading those nulls. Milvus-table
+// keeps the mapped source snapshot nullability because the target field
+// definition must match the source field.
+//
+// Validation runs in two passes: pass 1 checks every field; pass 2 mutates
+// only after all checks succeed. Without this split, a failing check on a
+// later field would leave earlier fields with their Nullable bit silently
+// flipped — the caller receives an error but the schema pointer it owns is
+// already partially mutated.
+func NormalizeAndValidateExternalCollectionSchema(schema *schemapb.CollectionSchema) error {
+	// External source and spec form an atomic tuple. They must be both
+	// empty (deferred to a later refresh) or both non-empty (ready to
+	// load). One-without-the-other leaves the collection in a half-
+	// initialized state that no refresh path can recover from cleanly.
+	srcSet := schema.GetExternalSource() != ""
+	specSet := schema.GetExternalSpec() != ""
+	if srcSet != specSet {
+		return merr.WrapErrParameterInvalidMsg("external collection %s requires external_source and external_spec to be both set or both empty (got source=%q, spec=%q)",
+			schema.GetName(), schema.GetExternalSource(), schema.GetExternalSpec())
+	}
+
+	if !IsExternalCollection(schema) {
+		return nil
+	}
+
+	if schema.GetEnableDynamicField() {
+		return merr.WrapErrParameterInvalidMsg("external collection %s does not support dynamic field", schema.GetName())
+	}
+
+	if len(schema.GetStructArrayFields()) > 0 {
+		return merr.WrapErrParameterInvalidMsg("external collection %s does not support struct fields", schema.GetName())
+	}
+
+	generatedColumns := externalGeneratedColumnOwners(schema)
+
+	isMilvusTable := false
+	if schema.GetExternalSpec() != "" {
+		var err error
+		isMilvusTable, err = isMilvusTableExternalSpec(schema.GetExternalSpec())
+		if err != nil {
+			return err
+		}
+	}
+	allowRealPrimaryKey := hasUserPrimaryKey(schema) && isMilvusTable
+
+	// Pass 1: validate all user fields. No mutation here so a failure at any
+	// field leaves the input schema untouched.
+	externalFieldOwners := make(map[string][]*schemapb.FieldSchema)
+	for _, field := range schema.GetFields() {
+		if IsExternalSystemOrVirtualField(field.GetName()) {
+			continue
+		}
+
+		// Function output fields are computed internally, skip all external-data checks.
+		if isExternalGeneratedField(schema, field) {
+			if field.GetExternalField() != "" {
+				return merr.WrapErrParameterInvalidMsg("function output field '%s' in external collection %s must not have external_field mapping", field.GetName(), schema.GetName())
+			}
+			continue
+		}
+
+		if field.GetIsPrimaryKey() && !allowRealPrimaryKey {
+			return merr.WrapErrParameterInvalidMsg("external collection %s does not support user-defined primary key field %s", schema.GetName(), field.GetName())
+		}
+		if field.GetIsPartitionKey() {
+			return merr.WrapErrParameterInvalidMsg("external collection %s does not support partition key field %s", schema.GetName(), field.GetName())
+		}
+		if field.GetIsClusteringKey() {
+			return merr.WrapErrParameterInvalidMsg("external collection %s does not support clustering key field %s", schema.GetName(), field.GetName())
+		}
+		if field.GetAutoID() {
+			return merr.WrapErrParameterInvalidMsg("external collection %s does not support auto id on field %s", schema.GetName(), field.GetName())
+		}
+
+		if field.GetExternalField() == "" {
+			return merr.WrapErrParameterInvalidMsg("field '%s' in external collection %s must have external_field mapping", field.GetName(), schema.GetName())
+		}
+		ext := field.GetExternalField()
+		externalFieldOwners[ext] = append(externalFieldOwners[ext], field)
+
+		if !isExternalFieldTypeSupported(field.GetDataType()) {
+			return merr.WrapErrParameterInvalidMsg("external collection %s does not support field type %s on field %s",
+				schema.GetName(), field.GetDataType().String(), field.GetName())
+		}
+
+		if outputField, ok := generatedColumns[ext]; ok {
+			return merr.WrapErrParameterInvalidMsg("external_field %q on field '%s' in external collection %s conflicts with generated function output field '%s' (field id %d)",
+				ext, field.GetName(), schema.GetName(), outputField.GetName(), outputField.GetFieldID())
+		}
+	}
+
+	// Each external_field mapping must back at most one user field. A single
+	// source field cannot satisfy two distinct type bindings, and even same-type
+	// aliasing has no semantic value here.
+	if err := validateUniqueExternalFieldOwners(externalFieldOwners); err != nil {
+		return err
+	}
+
+	if isMilvusTable {
+		return nil
+	}
+
+	// Pass 2: normalize. All fields passed validation; safe to mutate.
+	// Force nullable for external user fields: Parquet columns can contain
+	// nulls, and non-nullable fields would silently produce incorrect results.
+	for _, field := range schema.GetFields() {
+		if IsExternalSystemOrVirtualField(field.GetName()) {
+			continue
+		}
+		// Function output fields are computed internally.
+		if isExternalGeneratedField(schema, field) {
+			continue
+		}
+		if !field.GetNullable() {
+			field.Nullable = true
+		}
+	}
+
+	return nil
+}
+
+func validateUniqueExternalFieldOwners(externalFieldOwners map[string][]*schemapb.FieldSchema) error {
+	for ext, owners := range externalFieldOwners {
+		if len(owners) <= 1 {
+			continue
+		}
+		parts := make([]string, 0, len(owners))
+		for _, f := range owners {
+			parts = append(parts, fmt.Sprintf("%s (%s)", f.GetName(), f.GetDataType().String()))
+		}
+		return merr.WrapErrParameterInvalidMsg("external_field %q is mapped by multiple fields: %s; each external_field must be referenced by at most one user field",
+			ext, strings.Join(parts, ", "))
+	}
+	return nil
+}
+
+func externalGeneratedColumnOwners(schema *schemapb.CollectionSchema) map[string]*schemapb.FieldSchema {
+	generatedColumns := make(map[string]*schemapb.FieldSchema)
+	for _, field := range schema.GetFields() {
+		if field.GetFieldID() == 0 {
+			continue
+		}
+		if IsFunctionOutputField(schema, field) {
+			generatedColumns[strconv.FormatInt(field.GetFieldID(), 10)] = field
+		}
+	}
+	return generatedColumns
+}
+
+func isExternalGeneratedField(schema *schemapb.CollectionSchema, field *schemapb.FieldSchema) bool {
+	return IsFunctionOutputField(schema, field)
+}
+
+// ValidateExternalCollectionResolvedSchema checks external-collection
+// constraints after RootCoord has resolved field IDs and function output IDs.
+// At this point generated function outputs can be matched by their field-ID
+// based external column names, so this is the shared post-resolution validation
+// boundary for create, add-field, and alter-schema flows. Keep external user
+// field checks here as well so those flows consistently reject unsupported
+// source field types, duplicate external_field owners, and mappings that
+// collide with generated output columns.
+func ValidateExternalCollectionResolvedSchema(schema *schemapb.CollectionSchema) error {
+	if !IsExternalCollection(schema) {
+		return nil
+	}
+	generatedColumns := externalGeneratedColumnOwners(schema)
+	externalFieldOwners := make(map[string][]*schemapb.FieldSchema)
+	for _, field := range schema.GetFields() {
+		if IsExternalSystemOrVirtualField(field.GetName()) {
+			continue
+		}
+		if isExternalGeneratedField(schema, field) {
+			if field.GetExternalField() != "" {
+				return merr.WrapErrParameterInvalidMsg("function output field '%s' in external collection %s must not have external_field mapping", field.GetName(), schema.GetName())
+			}
+			continue
+		}
+		if !isExternalFieldTypeSupported(field.GetDataType()) {
+			return merr.WrapErrParameterInvalidMsg("external collection %s does not support field type %s on field %s",
+				schema.GetName(), field.GetDataType().String(), field.GetName())
+		}
+		ext := field.GetExternalField()
+		if ext == "" {
+			continue
+		}
+		outputField, ok := generatedColumns[ext]
+		if !ok {
+			externalFieldOwners[ext] = append(externalFieldOwners[ext], field)
+			continue
+		}
+		return merr.WrapErrParameterInvalidMsg("external_field %q on field '%s' in external collection %s conflicts with generated function output field '%s' (field id %d)",
+			ext, field.GetName(), schema.GetName(), outputField.GetName(), outputField.GetFieldID())
+	}
+	return validateUniqueExternalFieldOwners(externalFieldOwners)
+}
+
+func hasUserPrimaryKey(schema *schemapb.CollectionSchema) bool {
+	for _, field := range schema.GetFields() {
+		if field.GetIsPrimaryKey() && !IsExternalSystemOrVirtualField(field.GetName()) {
+			return true
+		}
+	}
+	return false
+}
+
+func isMilvusTableExternalSpec(externalSpec string) (bool, error) {
+	spec, err := specutil.ParseExternalSpec(externalSpec)
+	if err != nil {
+		return false, err
+	}
+	return spec.Format == specutil.FormatMilvusTable, nil
+}
+
+// IsExternalSystemOrVirtualField returns true for names reserved by the
+// external-table pipeline (RowID, Timestamp, VirtualPK) and never present in
+// user-provided external source data.
+func IsExternalSystemOrVirtualField(name string) bool {
+	return name == common.RowIDFieldName ||
+		name == common.TimeStampFieldName ||
+		name == common.VirtualPKFieldName
+}
+
+func isExternalSystemOrVirtualField(name string) bool {
+	return IsExternalSystemOrVirtualField(name)
+}
+
+// ValidateMilvusTableSchemaIdentity checks that every target milvus-table data
+// field maps to exactly one source snapshot data field through ExternalField.
+// Source function outputs are optional source columns: a target ordinary field
+// may map to them, but a target function output remains target-local and is
+// regenerated during refresh. Create-time validation may ignore field IDs so
+// RootCoord can copy them from the snapshot; refresh-time validation must
+// require field IDs to prevent reading source manifests through a mismatched
+// target schema.
+func ValidateMilvusTableSchemaIdentity(target, source *schemapb.CollectionSchema, requireFieldID bool) error {
+	if target == nil {
+		return merr.WrapErrParameterInvalidMsg("target schema is nil")
+	}
+	if source == nil {
+		return merr.WrapErrParameterInvalidMsg("source snapshot schema is nil")
+	}
+	if target.GetEnableDynamicField() != source.GetEnableDynamicField() {
+		return merr.WrapErrParameterInvalidMsg("dynamic field setting mismatch: target=%v source=%v",
+			target.GetEnableDynamicField(), source.GetEnableDynamicField())
+	}
+
+	targetFields := milvusTableMappableUserFieldMap(target)
+	requiredSourceFields := milvusTableMappableUserFieldMap(source)
+	allSourceFields := milvusTableUserFieldMap(source)
+	targetFieldCount := milvusTableMappableUserFieldCount(target)
+	requiredSourceFieldCount := milvusTableMappableUserFieldCount(source)
+	if targetFieldCount < requiredSourceFieldCount || targetFieldCount > len(allSourceFields) {
+		return merr.WrapErrParameterInvalidMsg("user field count mismatch: target=%d source=%d", targetFieldCount, requiredSourceFieldCount)
+	}
+	targetUsesVirtualPK := milvusTableUsesVirtualPrimaryKey(target)
+	mappedSourceFields := make(map[string]string, len(targetFields))
+	for targetName, targetField := range targetFields {
+		sourceName := targetField.GetExternalField()
+		if sourceName == "" {
+			return merr.WrapErrParameterInvalidMsg("target field %q must set external_field mapping to a source snapshot field", targetName)
+		}
+		sourceField, ok := allSourceFields[sourceName]
+		if !ok {
+			return merr.WrapErrParameterInvalidMsg("target field %q maps to source field %q, but source snapshot schema has no such field",
+				targetName, sourceName)
+		}
+		if owner, ok := mappedSourceFields[sourceName]; ok {
+			return merr.WrapErrParameterInvalidMsg("source snapshot field %q is mapped by multiple target fields: %q and %q",
+				sourceName, owner, targetName)
+		}
+		mappedSourceFields[sourceName] = targetName
+		if err := validateMilvusTableFieldIdentity(targetField, sourceField, requireFieldID, targetUsesVirtualPK, IsFunctionOutputField(source, sourceField)); err != nil {
+			return merr.Wrapf(err, "field %q mapped to source field %q", targetName, sourceName)
+		}
+	}
+	for sourceName := range requiredSourceFields {
+		if _, ok := mappedSourceFields[sourceName]; !ok {
+			return merr.WrapErrParameterInvalidMsg("source snapshot field %q is not mapped by target schema", sourceName)
+		}
+	}
+	return nil
+}
+
+// IsFunctionOutputField reports whether field is marked as a collection
+// function output. Create/alter paths are expected to normalize this marker
+// before schema validation and storage column resolution.
+func IsFunctionOutputField(_ *schemapb.CollectionSchema, field *schemapb.FieldSchema) bool {
+	return field != nil && field.GetIsFunctionOutput()
+}
+
+type storageColumnResolverConfig struct {
+	externalSpec string
+}
+
+// StorageColumnResolverOption configures StorageColumnResolver.
+type StorageColumnResolverOption func(*storageColumnResolverConfig)
+
+// WithStorageColumnExternalSpec lets callers provide the external spec carried
+// by the source manifest context. It is only an override hint; if it does not
+// resolve to milvus-table, the resolver still falls back to schema.ExternalSpec.
+func WithStorageColumnExternalSpec(externalSpec string) StorageColumnResolverOption {
+	return func(config *storageColumnResolverConfig) {
+		config.externalSpec = externalSpec
+	}
+}
+
+// StorageColumnResolver centralizes the mapping from Milvus fields to physical
+// storage columns. Source columns are columns read from the user's external
+// source; manifest-stored columns are columns read from Milvus segment
+// manifests after refresh or function execution.
+type StorageColumnResolver struct {
+	schema        *schemapb.CollectionSchema
+	hasSource     bool
+	isMilvusTable bool
+}
+
+// NewStorageColumnResolver builds a resolver from schema.ExternalSpec. Callers
+// should prefer schema as the source of truth; use WithStorageColumnExternalSpec
+// only for legacy paths where an external filesystem context carries the spec.
+func NewStorageColumnResolver(schema *schemapb.CollectionSchema, opts ...StorageColumnResolverOption) *StorageColumnResolver {
+	config := &storageColumnResolverConfig{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(config)
+		}
+	}
+
+	hasSource := false
+	isMilvusTable := false
+	if config.externalSpec != "" {
+		isMilvusTable = isMilvusTableStorageSpec(config.externalSpec)
+	}
+	if schema != nil {
+		hasSource = schema.GetExternalSource() != ""
+		if !isMilvusTable {
+			isMilvusTable = isMilvusTableStorageSpec(schema.GetExternalSpec())
+		}
+	}
+
+	return &StorageColumnResolver{
+		schema:        schema,
+		hasSource:     hasSource,
+		isMilvusTable: isMilvusTable,
+	}
+}
+
+func isMilvusTableStorageSpec(externalSpec string) bool {
+	spec, err := specutil.ParseExternalSpec(externalSpec)
+	return err == nil && spec.Format == specutil.FormatMilvusTable
+}
+
+// IsMilvusTable reports whether the resolver is using milvus-table physical
+// column rules.
+func (r *StorageColumnResolver) IsMilvusTable() bool {
+	return r != nil && r.isMilvusTable
+}
+
+// SourceDataColumnName returns the physical column name in the external source.
+// Function outputs are target-local generated columns and are never source data.
+func (r *StorageColumnResolver) SourceDataColumnName(field *schemapb.FieldSchema) (string, bool) {
+	if field == nil {
+		return "", false
+	}
+	var schema *schemapb.CollectionSchema
+	if r != nil {
+		schema = r.schema
+	}
+	if IsFunctionOutputField(schema, field) {
+		return "", false
+	}
+	if IsExternalSystemOrVirtualField(field.GetName()) {
+		return "", false
+	}
+	if r != nil && r.isMilvusTable {
+		return strconv.FormatInt(field.GetFieldID(), 10), true
+	}
+	if extField := field.GetExternalField(); extField != "" {
+		return extField, true
+	}
+	return "", false
+}
+
+// SourceDataColumnNames returns all top-level source columns required by the
+// external refresh path.
+func (r *StorageColumnResolver) SourceDataColumnNames() []string {
+	if r == nil || r.schema == nil {
+		return nil
+	}
+	columns := make([]string, 0, len(r.schema.GetFields()))
+	for _, field := range r.schema.GetFields() {
+		columnName, ok := r.SourceDataColumnName(field)
+		if ok {
+			columns = append(columns, columnName)
+		} else if !r.hasSource && !r.isMilvusTable && !IsFunctionOutputField(r.schema, field) && !IsExternalSystemOrVirtualField(field.GetName()) {
+			// Preserve the historical helper behavior for non-external schemas:
+			// callers that use this on ordinary schemas get field names.
+			columns = append(columns, field.GetName())
+		}
+	}
+	if r.isMilvusTable && hasUserPrimaryKey(r.schema) {
+		// Real-PK milvus-table segments import source deltalogs. Keep the
+		// source insert timestamp column so segcore can preserve Milvus
+		// delete/reinsert ordering when loading those deltas.
+		columns = append(columns, strconv.FormatInt(common.TimeStampField, 10))
+	}
+	if len(columns) == 0 {
+		return nil
+	}
+	return columns
+}
+
+// IsSourceDataField reports whether the field is backed by user external source
+// data. It intentionally excludes ordinary non-external fields.
+func (r *StorageColumnResolver) IsSourceDataField(field *schemapb.FieldSchema) bool {
+	_, ok := r.SourceDataColumnName(field)
+	return ok
+}
+
+// ManifestStoredColumnName returns the physical column name used when reading a
+// Milvus segment manifest. For milvus-table, refreshed source fields and
+// target-local function outputs are addressed by numeric field IDs; virtual PK
+// is not stored as a source column.
+func (r *StorageColumnResolver) ManifestStoredColumnName(field *schemapb.FieldSchema) (string, bool) {
+	if field == nil {
+		return "", false
+	}
+	if r != nil && r.isMilvusTable {
+		if field.GetName() == common.VirtualPKFieldName {
+			return "", false
+		}
+		return strconv.FormatInt(field.GetFieldID(), 10), true
+	}
+	if extField := field.GetExternalField(); extField != "" {
+		return extField, true
+	}
+	return strconv.FormatInt(field.GetFieldID(), 10), true
+}
+
+// ManifestStoredFields returns all fields that can be read from a segment
+// manifest with ManifestStoredColumnName.
+func (r *StorageColumnResolver) ManifestStoredFields() []*schemapb.FieldSchema {
+	if r == nil || r.schema == nil {
+		return nil
+	}
+	allFields := GetAllFieldSchemas(r.schema)
+	fields := make([]*schemapb.FieldSchema, 0, len(allFields))
+	for _, field := range allFields {
+		if _, ok := r.ManifestStoredColumnName(field); ok {
+			fields = append(fields, field)
+		}
+	}
+	return fields
+}
+
+func milvusTableUserFieldMap(schema *schemapb.CollectionSchema) map[string]*schemapb.FieldSchema {
+	fields := make(map[string]*schemapb.FieldSchema, len(schema.GetFields()))
+	for _, field := range schema.GetFields() {
+		if isExternalSystemOrVirtualField(field.GetName()) {
+			continue
+		}
+		fields[field.GetName()] = field
+	}
+	return fields
+}
+
+func milvusTableMappableUserFieldMap(schema *schemapb.CollectionSchema) map[string]*schemapb.FieldSchema {
+	fields := make(map[string]*schemapb.FieldSchema, len(schema.GetFields()))
+	for _, field := range schema.GetFields() {
+		if isExternalSystemOrVirtualField(field.GetName()) || IsFunctionOutputField(schema, field) {
+			continue
+		}
+		fields[field.GetName()] = field
+	}
+	return fields
+}
+
+func milvusTableMappableUserFieldCount(schema *schemapb.CollectionSchema) int {
+	count := 0
+	for _, field := range schema.GetFields() {
+		if isExternalSystemOrVirtualField(field.GetName()) || IsFunctionOutputField(schema, field) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func milvusTableUsesVirtualPrimaryKey(schema *schemapb.CollectionSchema) bool {
+	for _, field := range schema.GetFields() {
+		if field.GetIsPrimaryKey() {
+			return field.GetName() == common.VirtualPKFieldName
+		}
+	}
+	return false
+}
+
+func validateMilvusTableFieldIdentity(target, source *schemapb.FieldSchema, requireFieldID bool, targetUsesVirtualPK bool, sourceFunctionOutputAsDataField bool) error {
+	if requireFieldID && target.GetFieldID() != source.GetFieldID() {
+		return merr.WrapErrParameterInvalidMsg("field_id mismatch: target=%d source=%d", target.GetFieldID(), source.GetFieldID())
+	}
+	sourcePKAsDataField := targetUsesVirtualPK && source.GetIsPrimaryKey() && !target.GetIsPrimaryKey()
+	targetComparable := comparableMilvusTableField(target, requireFieldID, sourcePKAsDataField, false)
+	sourceComparable := comparableMilvusTableField(source, requireFieldID, sourcePKAsDataField, sourceFunctionOutputAsDataField)
+	if !proto.Equal(targetComparable, sourceComparable) {
+		return merr.WrapErrParameterInvalidMsg("definition mismatch between target and source snapshot schema")
+	}
+	return nil
+}
+
+func comparableMilvusTableField(field *schemapb.FieldSchema, keepFieldID bool, sourcePKAsDataField bool, sourceFunctionOutputAsDataField bool) *schemapb.FieldSchema {
+	clone := proto.Clone(field).(*schemapb.FieldSchema)
+	if !keepFieldID {
+		clone.FieldID = 0
+	}
+	if sourcePKAsDataField {
+		clone.IsPrimaryKey = false
+		clone.AutoID = false
+	}
+	if sourceFunctionOutputAsDataField {
+		clone.IsFunctionOutput = false
+	}
+	clone.Name = ""
+	clone.ExternalField = ""
+	clone.Description = ""
+	clone.TypeParams = normalizeMilvusTableKVPairs(clone.GetTypeParams())
+	clone.IndexParams = normalizeMilvusTableKVPairs(clone.GetIndexParams())
+	return clone
+}
+
+func normalizeMilvusTableKVPairs(kvs []*commonpb.KeyValuePair) []*commonpb.KeyValuePair {
+	if len(kvs) == 0 {
+		return nil
+	}
+	out := make([]*commonpb.KeyValuePair, 0, len(kvs))
+	for _, kv := range kvs {
+		out = append(out, &commonpb.KeyValuePair{Key: kv.GetKey(), Value: kv.GetValue()})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].GetKey() == out[j].GetKey() {
+			return out[i].GetValue() < out[j].GetValue()
+		}
+		return out[i].GetKey() < out[j].GetKey()
+	})
+	return out
+}
+
+// isExternalFieldTypeSupported returns true if the given data type can be
+// reliably used in external collections (both load and take modes).
+//
+// Blocked types and reasons:
+//   - SparseFloatVector: Custom binary encoding incompatible with external files
+func isExternalFieldTypeSupported(dt schemapb.DataType) bool {
+	switch dt {
+	case schemapb.DataType_Bool,
+		schemapb.DataType_Int8,
+		schemapb.DataType_Int16,
+		schemapb.DataType_Int32,
+		schemapb.DataType_Int64,
+		schemapb.DataType_Float,
+		schemapb.DataType_Double,
+		schemapb.DataType_VarChar,
+		schemapb.DataType_Text,
+		schemapb.DataType_JSON,
+		schemapb.DataType_Array,
+		schemapb.DataType_Timestamptz,
+		schemapb.DataType_Geometry,
+		schemapb.DataType_FloatVector,
+		schemapb.DataType_Float16Vector,
+		schemapb.DataType_BFloat16Vector,
+		schemapb.DataType_BinaryVector,
+		schemapb.DataType_Int8Vector,
+		schemapb.DataType_ArrayOfVector:
+		return true
+	default:
+		return false
+	}
+}
+
+func IsFieldSparseFloatVector(schema *schemapb.CollectionSchema, fieldID int64) bool {
+	fieldSchema := GetField(schema, fieldID)
+	return fieldSchema != nil && IsSparseFloatVectorType(fieldSchema.DataType)
+}
+
+// GetPartitionKeyFieldSchema get partition field schema from collection schema
+func GetPartitionKeyFieldSchema(schema *schemapb.CollectionSchema) (*schemapb.FieldSchema, error) {
+	for _, fieldSchema := range schema.GetFields() {
+		if fieldSchema.IsPartitionKey {
+			return fieldSchema, nil
+		}
+	}
+
+	return nil, merr.WrapErrParameterInvalidMsg("partition key field is not found")
+}
+
+// GetDynamicField returns the dynamic field if it exists.
+func GetDynamicField(schema *schemapb.CollectionSchema) *schemapb.FieldSchema {
+	for _, fieldSchema := range schema.GetFields() {
+		if fieldSchema.GetIsDynamic() {
+			return fieldSchema
+		}
+	}
+	return nil
+}
+
+// HasPartitionKey check if a collection schema has PartitionKey field
+func HasPartitionKey(schema *schemapb.CollectionSchema) bool {
+	for _, fieldSchema := range schema.Fields {
+		if fieldSchema.IsPartitionKey {
+			return true
+		}
+	}
+	return false
+}
+
+func IsFieldDataTypeSupportMaterializedView(fieldSchema *schemapb.FieldSchema) bool {
+	return IsIntegerType(fieldSchema.DataType) || IsStringType(fieldSchema.DataType)
+}
+
+// HasClusterKey check if a collection schema has ClusterKey field
+func HasClusterKey(schema *schemapb.CollectionSchema) bool {
+	for _, fieldSchema := range schema.Fields {
+		if fieldSchema.IsClusteringKey {
+			return true
+		}
+	}
+	return false
+}
+
+// GetPrimaryFieldData get primary field data from all field data inserted from sdk
+func GetPrimaryFieldData(datas []*schemapb.FieldData, primaryFieldSchema *schemapb.FieldSchema) (*schemapb.FieldData, error) {
+	primaryFieldID := primaryFieldSchema.FieldID
+	primaryFieldName := primaryFieldSchema.Name
+
+	var primaryFieldData *schemapb.FieldData
+	for _, field := range datas {
+		if field.FieldId == primaryFieldID || field.FieldName == primaryFieldName {
+			primaryFieldData = field
+			break
+		}
+	}
+
+	if primaryFieldData == nil {
+		return nil, merr.WrapErrParameterInvalidMsg("can't find data for primary field: %v", primaryFieldName)
+	}
+
+	return primaryFieldData, nil
+}
+
+func GetField(schema *schemapb.CollectionSchema, fieldID int64) *schemapb.FieldSchema {
+	preficate := func(field *schemapb.FieldSchema) bool {
+		return field.GetFieldID() == fieldID
+	}
+
+	if field := lo.FindOrElse(schema.GetFields(), nil, preficate); field != nil {
+		return field
+	}
+
+	for _, structField := range schema.GetStructArrayFields() {
+		if field := lo.FindOrElse(structField.Fields, nil, preficate); field != nil {
+			return field
+		}
+	}
+
+	return nil
+}
+
+func GetFieldByName(schema *schemapb.CollectionSchema, fieldName string) *schemapb.FieldSchema {
+	preficate := func(field *schemapb.FieldSchema) bool {
+		return field.GetName() == fieldName
+	}
+
+	if field := lo.FindOrElse(schema.GetFields(), nil, preficate); field != nil {
+		return field
+	}
+
+	for _, structField := range schema.GetStructArrayFields() {
+		if field := lo.FindOrElse(structField.Fields, nil, preficate); field != nil {
+			return field
+		}
+	}
+
+	return nil
+}
+
+func GetFunctionOutputField(schema *schemapb.CollectionSchema, fn *schemapb.FunctionSchema) *schemapb.FieldSchema {
+	if outputIDs := fn.GetOutputFieldIds(); len(outputIDs) > 0 {
+		return GetField(schema, outputIDs[0])
+	}
+	if outputNames := fn.GetOutputFieldNames(); len(outputNames) > 0 {
+		return GetFieldByName(schema, outputNames[0])
+	}
+	return nil
+}
+
+// GetFieldByID returns the field schema with the given field ID, or nil if not found.
+func GetFieldByID(schema *schemapb.CollectionSchema, fieldID int64) *schemapb.FieldSchema {
+	predicate := func(field *schemapb.FieldSchema) bool {
+		return field.GetFieldID() == fieldID
+	}
+	if field := lo.FindOrElse(schema.GetFields(), nil, predicate); field != nil {
+		return field
+	}
+	for _, structField := range schema.GetStructArrayFields() {
+		if field := lo.FindOrElse(structField.Fields, nil, predicate); field != nil {
+			return field
+		}
+	}
+	return nil
+}
+
+func IsPrimaryFieldDataExist(datas []*schemapb.FieldData, primaryFieldSchema *schemapb.FieldSchema) bool {
+	primaryFieldID := primaryFieldSchema.FieldID
+	primaryFieldName := primaryFieldSchema.Name
+
+	var primaryFieldData *schemapb.FieldData
+	for _, field := range datas {
+		if field.FieldId == primaryFieldID || field.FieldName == primaryFieldName {
+			primaryFieldData = field
+			break
+		}
+	}
+
+	return primaryFieldData != nil
+}
+
+func IsAutoPKField(field *schemapb.FieldSchema) bool {
+	return field.GetIsPrimaryKey() && field.GetAutoID()
+}
+
+func AppendSystemFields(schema *schemapb.CollectionSchema) *schemapb.CollectionSchema {
+	newSchema := proto.Clone(schema).(*schemapb.CollectionSchema)
+	newSchema.Fields = append(newSchema.Fields, &schemapb.FieldSchema{
+		FieldID:      int64(common.RowIDField),
+		Name:         common.RowIDFieldName,
+		IsPrimaryKey: false,
+		DataType:     schemapb.DataType_Int64,
+	})
+	newSchema.Fields = append(newSchema.Fields, &schemapb.FieldSchema{
+		FieldID:      int64(common.TimeStampField),
+		Name:         common.TimeStampFieldName,
+		IsPrimaryKey: false,
+		DataType:     schemapb.DataType_Int64,
+	})
+	return newSchema
+}
+
+func GetId(src *schemapb.IDs, idx int) (int, any) {
+	switch src.IdField.(type) {
+	case *schemapb.IDs_IntId:
+		return 8, src.GetIntId().Data[idx]
+	case *schemapb.IDs_StrId:
+		return len(src.GetStrId().Data[idx]), src.GetStrId().Data[idx]
+	default:
+		panic("unknown pk type")
+	}
+}
+
+func AppendID(dst *schemapb.IDs, src any) {
+	switch value := src.(type) {
+	case int64:
+		if dst.GetIdField() == nil {
+			dst.IdField = &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{
+					Data: []int64{value},
+				},
+			}
+		} else {
+			dst.GetIntId().Data = append(dst.GetIntId().Data, value)
+		}
+	case string:
+		if dst.GetIdField() == nil {
+			dst.IdField = &schemapb.IDs_StrId{
+				StrId: &schemapb.StringArray{
+					Data: []string{value},
+				},
+			}
+		} else {
+			dst.GetStrId().Data = append(dst.GetStrId().Data, value)
+		}
+	default:
+		// TODO
+	}
+}
+
+func AppendIDs(dst *schemapb.IDs, src *schemapb.IDs, idx int) {
+	switch src.IdField.(type) {
+	case *schemapb.IDs_IntId:
+		if dst.GetIdField() == nil {
+			dst.IdField = &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{
+					Data: []int64{src.GetIntId().Data[idx]},
+				},
+			}
+		} else {
+			dst.GetIntId().Data = append(dst.GetIntId().Data, src.GetIntId().Data[idx])
+		}
+	case *schemapb.IDs_StrId:
+		if dst.GetIdField() == nil {
+			dst.IdField = &schemapb.IDs_StrId{
+				StrId: &schemapb.StringArray{
+					Data: []string{src.GetStrId().Data[idx]},
+				},
+			}
+		} else {
+			dst.GetStrId().Data = append(dst.GetStrId().Data, src.GetStrId().Data[idx])
+		}
+	default:
+		// TODO
+	}
+}
+
+func GetSizeOfIDs(data *schemapb.IDs) int {
+	result := 0
+	if data.GetIdField() == nil {
+		return result
+	}
+
+	switch data.GetIdField().(type) {
+	case *schemapb.IDs_IntId:
+		result = len(data.GetIntId().GetData())
+	case *schemapb.IDs_StrId:
+		result = len(data.GetStrId().GetData())
+	default:
+		// TODO::
+	}
+
+	return result
+}
+
+func GetPKSize(fieldData *schemapb.FieldData) int {
+	switch fieldData.GetType() {
+	case schemapb.DataType_Int64:
+		return len(fieldData.GetScalars().GetLongData().GetData())
+	case schemapb.DataType_VarChar:
+		return len(fieldData.GetScalars().GetStringData().GetData())
+	}
+	return 0
+}
+
+func IsPrimaryFieldType(dataType schemapb.DataType) bool {
+	if dataType == schemapb.DataType_Int64 || dataType == schemapb.DataType_VarChar {
+		return true
+	}
+
+	return false
+}
+
+func GetPK(data *schemapb.IDs, idx int64) interface{} {
+	if int64(GetSizeOfIDs(data)) <= idx {
+		return nil
+	}
+	switch data.GetIdField().(type) {
+	case *schemapb.IDs_IntId:
+		return data.GetIntId().GetData()[idx]
+	case *schemapb.IDs_StrId:
+		return data.GetStrId().GetData()[idx]
+	}
+	return nil
+}
+
+func GetDataIterator(field *schemapb.FieldData) func(int) any {
+	if field.GetValidData() != nil {
+		validData := field.GetValidData()
+		if IsCompactNullableVectorFieldData(field) {
+			idxs, _ := BuildNullableVectorDataIndices(validData)
+			return func(idx int) any {
+				if idxs[idx] == -1 {
+					return nil
+				}
+				return getData(field, idxs[idx])
+			}
+		}
+		dataLen := getScalarDataLen(field)
+		if dataLen == len(validData) {
+			// Full-size format: data array has the same length as ValidData,
+			// values at invalid positions are zero-filled. Use direct indexing.
+			return func(idx int) any {
+				if !validData[idx] {
+					return nil
+				}
+				return getData(field, idx)
+			}
+		}
+
+		idxs := make([]int, len(validData))
+		cnt := 0
+		for i, valid := range validData {
+			if valid {
+				idxs[i] = cnt
+				cnt++
+			} else {
+				idxs[i] = -1
+			}
+		}
+		return func(idx int) any {
+			if idxs[idx] == -1 {
+				return nil
+			}
+			return getData(field, idxs[idx])
+		}
+	}
+	return func(idx int) any {
+		return getData(field, idx)
+	}
+}
+
+// getScalarDataLen returns the length of the scalar data array in a FieldData.
+// For vector types or unrecognized types, returns -1.
+func getScalarDataLen(field *schemapb.FieldData) int {
+	switch field.GetType() {
+	case schemapb.DataType_Bool:
+		return len(field.GetScalars().GetBoolData().GetData())
+	case schemapb.DataType_Int8, schemapb.DataType_Int16, schemapb.DataType_Int32:
+		return len(field.GetScalars().GetIntData().GetData())
+	case schemapb.DataType_Int64:
+		return len(field.GetScalars().GetLongData().GetData())
+	case schemapb.DataType_Float:
+		return len(field.GetScalars().GetFloatData().GetData())
+	case schemapb.DataType_Double:
+		return len(field.GetScalars().GetDoubleData().GetData())
+	case schemapb.DataType_Timestamptz:
+		return len(field.GetScalars().GetTimestamptzData().GetData())
+	case schemapb.DataType_VarChar, schemapb.DataType_Text:
+		return len(field.GetScalars().GetStringData().GetData())
+	}
+	return -1
+}
+
+func getData(field *schemapb.FieldData, idx int) any {
+	switch field.GetType() {
+	case schemapb.DataType_Bool:
+		return field.GetScalars().GetBoolData().GetData()[idx]
+	case schemapb.DataType_Int8, schemapb.DataType_Int16, schemapb.DataType_Int32:
+		return field.GetScalars().GetIntData().GetData()[idx]
+	case schemapb.DataType_Int64:
+		return field.GetScalars().GetLongData().GetData()[idx]
+	case schemapb.DataType_Float:
+		return field.GetScalars().GetFloatData().GetData()[idx]
+	case schemapb.DataType_Double:
+		return field.GetScalars().GetDoubleData().GetData()[idx]
+	case schemapb.DataType_Timestamptz:
+		return field.GetScalars().GetTimestamptzData().GetData()[idx]
+	case schemapb.DataType_VarChar, schemapb.DataType_Text:
+		return field.GetScalars().GetStringData().GetData()[idx]
+	case schemapb.DataType_FloatVector:
+		dim := int(field.GetVectors().GetDim())
+		return field.GetVectors().GetFloatVector().GetData()[idx*dim : (idx+1)*dim]
+	case schemapb.DataType_BinaryVector:
+		dim := int(field.GetVectors().GetDim())
+		dataBytes := dim / 8
+		return field.GetVectors().GetBinaryVector()[idx*dataBytes : (idx+1)*dataBytes]
+	case schemapb.DataType_Float16Vector:
+		dim := int(field.GetVectors().GetDim())
+		dataBytes := dim * 2
+		return field.GetVectors().GetFloat16Vector()[idx*dataBytes : (idx+1)*dataBytes]
+	case schemapb.DataType_BFloat16Vector:
+		dim := int(field.GetVectors().GetDim())
+		dataBytes := dim * 2
+		return field.GetVectors().GetBfloat16Vector()[idx*dataBytes : (idx+1)*dataBytes]
+	case schemapb.DataType_SparseFloatVector:
+		return field.GetVectors().GetSparseFloatVector().Contents[idx]
+	case schemapb.DataType_Int8Vector:
+		dim := int(field.GetVectors().GetDim())
+		dataBytes := dim
+		return field.GetVectors().GetInt8Vector()[idx*dataBytes : (idx+1)*dataBytes]
+	}
+	return nil
+}
+
+func AppendPKs(pks *schemapb.IDs, pk interface{}) {
+	switch realPK := pk.(type) {
+	case int64:
+		if pks.GetIntId() == nil {
+			pks.IdField = &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{
+					Data: make([]int64, 0),
+				},
+			}
+		}
+		pks.GetIntId().Data = append(pks.GetIntId().GetData(), realPK)
+	case string:
+		if pks.GetStrId() == nil {
+			pks.IdField = &schemapb.IDs_StrId{
+				StrId: &schemapb.StringArray{
+					Data: make([]string, 0),
+				},
+			}
+		}
+		pks.GetStrId().Data = append(pks.GetStrId().GetData(), realPK)
+	}
+}
+
+// SwapPK swaps i-th PK with j-th PK
+func SwapPK(data *schemapb.IDs, i, j int) {
+	switch f := data.GetIdField().(type) {
+	case *schemapb.IDs_IntId:
+		f.IntId.Data[i], f.IntId.Data[j] = f.IntId.Data[j], f.IntId.Data[i]
+	case *schemapb.IDs_StrId:
+		f.StrId.Data[i], f.StrId.Data[j] = f.StrId.Data[j], f.StrId.Data[i]
+	}
+}
+
+// ComparePKInSlice returns if i-th PK < j-th PK
+func ComparePKInSlice(data *schemapb.IDs, i, j int) bool {
+	switch f := data.GetIdField().(type) {
+	case *schemapb.IDs_IntId:
+		return f.IntId.Data[i] < f.IntId.Data[j]
+	case *schemapb.IDs_StrId:
+		return f.StrId.Data[i] < f.StrId.Data[j]
+	}
+	return false
+}
+
+// ComparePK returns if i-th PK of dataA > j-th PK of dataB
+func ComparePK(pkA, pkB interface{}) bool {
+	switch v := pkA.(type) {
+	case int64:
+		return v < pkB.(int64)
+	case string:
+		return v < pkB.(string)
+	}
+	return false
+}
+
+type ResultWithID interface {
+	GetIds() *schemapb.IDs
+	GetHasMoreResult() bool
+}
+
+type ResultWithTimestamp interface {
+	GetTimestamps() []int64
+}
+
+// SelectMinPK select the index of the minPK in results T of the cursors.
+func SelectMinPK[T ResultWithID](results []T, cursors []int64) (int, bool) {
+	var (
+		sel               = -1
+		drainResult       = false
+		minIntPK    int64 = math.MaxInt64
+
+		firstStr = true
+		firstInt = true
+		minStrPK string
+	)
+	for i, cursor := range cursors {
+		// if cursor has run out of all results from one result and this result has more matched results
+		// in this case we have tell reduce to stop because better results may be retrieved in the following iteration
+		if int(cursor) >= GetSizeOfIDs(results[i].GetIds()) && (results[i].GetHasMoreResult()) {
+			drainResult = true
+			continue
+		}
+
+		pkInterface := GetPK(results[i].GetIds(), cursor)
+		switch pk := pkInterface.(type) {
+		case string:
+			if firstStr || pk < minStrPK {
+				firstStr = false
+				minStrPK = pk
+				sel = i
+			}
+		case int64:
+			if firstInt || pk < minIntPK {
+				firstInt = false
+				minIntPK = pk
+				sel = i
+			}
+		default:
+			continue
+		}
+	}
+
+	return sel, drainResult
+}
+
+func SelectMinPKWithTimestamp[T interface {
+	ResultWithID
+	ResultWithTimestamp
+}](results []T, cursors []int64) (int, bool) {
+	var (
+		sel                = -1
+		drainResult        = false
+		maxTimestamp int64 = 0
+		minIntPK     int64 = math.MaxInt64
+
+		firstStr = true
+		minStrPK string
+	)
+	for i, cursor := range cursors {
+		timestamps := results[i].GetTimestamps()
+		// if cursor has run out of all results from one result and this result has more matched results
+		// in this case we have tell reduce to stop because better results may be retrieved in the following iteration
+		if int(cursor) >= GetSizeOfIDs(results[i].GetIds()) && (results[i].GetHasMoreResult()) {
+			drainResult = true
+			continue
+		}
+
+		pkInterface := GetPK(results[i].GetIds(), cursor)
+
+		switch pk := pkInterface.(type) {
+		case string:
+			ts := timestamps[cursor]
+			if firstStr || pk < minStrPK || (pk == minStrPK && ts > maxTimestamp) {
+				firstStr = false
+				minStrPK = pk
+				sel = i
+				maxTimestamp = ts
+			}
+		case int64:
+			ts := timestamps[cursor]
+			if pk < minIntPK || (pk == minIntPK && ts > maxTimestamp) {
+				minIntPK = pk
+				sel = i
+				maxTimestamp = ts
+			}
+		default:
+			continue
+		}
+	}
+
+	return sel, drainResult
+}
+
+func appendSparseFloatArray(dst, src *schemapb.SparseFloatArray) {
+	if len(src.Contents) == 0 {
+		return
+	}
+	if dst.Dim < src.Dim {
+		dst.Dim = src.Dim
+	}
+	dst.Contents = append(dst.Contents, src.Contents...)
+}
+
+// return the size of indices and values of the appended row
+func appendSparseFloatArraySingleRow(dst, src *schemapb.SparseFloatArray, idx int64) int64 {
+	row := src.Contents[idx]
+	dst.Contents = append(dst.Contents, row)
+	rowDim := SparseFloatRowDim(row)
+	if rowDim == 0 {
+		return 0
+	}
+	if dst.Dim < rowDim {
+		dst.Dim = rowDim
+	}
+	return int64(len(row))
+}
+
+func trimSparseFloatArray(vec *schemapb.SparseFloatArray) {
+	if len(vec.Contents) == 0 {
+		return
+	}
+	// not decreasing dim of the entire SparseFloatArray, as we don't want to
+	// iterate through the entire array to find the new max dim. Correctness
+	// will not be affected.
+	vec.Contents = vec.Contents[:len(vec.Contents)-1]
+}
+
+func ValidateSparseFloatRows(rows ...[]byte) error {
+	for _, row := range rows {
+		if row == nil {
+			return merr.WrapErrParameterInvalidMsg("nil sparse float vector")
+		}
+		if len(row)%8 != 0 {
+			return merr.WrapErrParameterInvalidMsg("invalid data length in sparse float vector: %d", len(row))
+		}
+		for i := 0; i < SparseFloatRowElementCount(row); i++ {
+			idx := SparseFloatRowIndexAt(row, i)
+			if idx == math.MaxUint32 {
+				return merr.WrapErrParameterInvalidMsg("invalid index in sparse float vector: must be less than 2^32-1")
+			}
+			if i > 0 && idx <= SparseFloatRowIndexAt(row, i-1) {
+				return merr.WrapErrParameterInvalidMsg("unsorted or same indices in sparse float vector")
+			}
+			val := SparseFloatRowValueAt(row, i)
+			if err := VerifyFloat(float64(val)); err != nil {
+				return err
+			}
+			if val < 0 {
+				return merr.WrapErrParameterInvalidMsg("negative value in sparse float vector")
+			}
+		}
+	}
+	return nil
+}
+
+// SparseFloatRowUtils
+func SparseFloatRowElementCount(row []byte) int {
+	if row == nil {
+		return 0
+	}
+	return len(row) / 8
+}
+
+// does not check for out-of-range access
+func SparseFloatRowIndexAt(row []byte, idx int) uint32 {
+	return common.Endian.Uint32(row[idx*8:])
+}
+
+// does not check for out-of-range access
+func SparseFloatRowValueAt(row []byte, idx int) float32 {
+	return math.Float32frombits(common.Endian.Uint32(row[idx*8+4:]))
+}
+
+func SparseFloatRowSetAt(row []byte, pos int, idx uint32, value float32) {
+	binary.LittleEndian.PutUint32(row[pos*8:], idx)
+	binary.LittleEndian.PutUint32(row[pos*8+4:], math.Float32bits(value))
+}
+
+func SortSparseFloatRow(indices []uint32, values []float32) ([]uint32, []float32) {
+	elemCount := len(indices)
+
+	indexOrder := make([]int, elemCount)
+	for i := range indexOrder {
+		indexOrder[i] = i
+	}
+
+	sort.Slice(indexOrder, func(i, j int) bool {
+		return indices[indexOrder[i]] < indices[indexOrder[j]]
+	})
+
+	sortedIndices := make([]uint32, elemCount)
+	sortedValues := make([]float32, elemCount)
+	for i, index := range indexOrder {
+		sortedIndices[i] = indices[index]
+		sortedValues[i] = values[index]
+	}
+
+	return sortedIndices, sortedValues
+}
+
+func CreateAndSortSparseFloatRow(sparse map[uint32]float32) []byte {
+	row := make([]byte, len(sparse)*8)
+	data := lo.MapToSlice(sparse, func(indices uint32, value float32) Pair[uint32, float32] {
+		return Pair[uint32, float32]{indices, value}
+	})
+	sort.Slice(data, func(i, j int) bool { return data[i].A < data[j].A })
+	for i := 0; i < len(data); i++ {
+		SparseFloatRowSetAt(row, i, data[i].A, data[i].B)
+	}
+	return row
+}
+
+func CreateSparseFloatRow(indices []uint32, values []float32) []byte {
+	row := make([]byte, len(indices)*8)
+	for i := 0; i < len(indices); i++ {
+		SparseFloatRowSetAt(row, i, indices[i], values[i])
+	}
+	return row
+}
+
+// accepted format:
+//   - {"indices": [1, 2, 3], "values": [0.1, 0.2, 0.3]}    # format1
+//   - {"1": 0.1, "2": 0.2, "3": 0.3}                       # format2
+//
+// we don't require the indices to be sorted from user input, but the returned
+// byte representation must have indices sorted
+func CreateSparseFloatRowFromMap(input map[string]interface{}) ([]byte, error) {
+	var indices []uint32
+	var values []float32
+
+	if len(input) == 0 {
+		// for empty json input, return empty sparse row
+		return CreateSparseFloatRow(indices, values), nil
+	}
+
+	getValue := func(key interface{}) (float32, error) {
+		var val float64
+		switch v := key.(type) {
+		case int:
+			val = float64(v)
+		case float64:
+			val = v
+		case json.Number:
+			if num, err := strconv.ParseFloat(v.String(), 64); err == nil {
+				val = num
+			} else {
+				return 0, merr.WrapErrParameterInvalidMsg("invalid value type in JSON: %s", reflect.TypeOf(v))
+			}
+		default:
+			return 0, merr.WrapErrParameterInvalidMsg("invalid value type in JSON: %s", reflect.TypeOf(key))
+		}
+		if VerifyFloat(val) != nil {
+			return 0, merr.WrapErrParameterInvalidMsg("invalid value in JSON: %v", val)
+		}
+		if val > math.MaxFloat32 {
+			return 0, merr.WrapErrParameterInvalidMsg("value too large in JSON: %v", val)
+		}
+		return float32(val), nil
+	}
+
+	getIndex := func(key interface{}) (uint32, error) {
+		var idx int64
+		switch v := key.(type) {
+		case int:
+			idx = int64(v)
+		case float64:
+			// check if the float64 is actually an integer
+			if v != float64(int64(v)) {
+				return 0, merr.WrapErrParameterInvalidMsg("invalid index in JSON: %v", v)
+			}
+			idx = int64(v)
+		case json.Number:
+			if num, err := strconv.ParseInt(v.String(), 0, 64); err == nil {
+				idx = num
+			} else {
+				return 0, err
+			}
+		default:
+			return 0, merr.WrapErrParameterInvalidMsg("invalid index type in JSON: %s", reflect.TypeOf(key))
+		}
+		if idx >= math.MaxUint32 {
+			return 0, merr.WrapErrParameterInvalidMsg("index too large in JSON: %v", idx)
+		}
+		return uint32(idx), nil
+	}
+
+	jsonIndices, ok1 := input["indices"].([]interface{})
+	jsonValues, ok2 := input["values"].([]interface{})
+
+	if ok1 && ok2 {
+		// try format1
+		for _, idx := range jsonIndices {
+			index, err := getIndex(idx)
+			if err != nil {
+				return nil, err
+			}
+			indices = append(indices, index)
+		}
+		for _, val := range jsonValues {
+			value, err := getValue(val)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, value)
+		}
+	} else if !ok1 && !ok2 {
+		// try format2
+		for k, v := range input {
+			idx, err := strconv.ParseUint(k, 0, 32)
+			if err != nil {
+				return nil, err
+			}
+
+			val, err := getValue(v)
+			if err != nil {
+				return nil, err
+			}
+
+			indices = append(indices, uint32(idx))
+			values = append(values, val)
+		}
+	} else {
+		return nil, merr.WrapErrParameterInvalidMsg("invalid JSON input")
+	}
+
+	if len(indices) != len(values) {
+		return nil, merr.WrapErrParameterInvalidMsg("indices and values length mismatch")
+	}
+
+	sortedIndices, sortedValues := SortSparseFloatRow(indices, values)
+	row := CreateSparseFloatRow(sortedIndices, sortedValues)
+	if err := ValidateSparseFloatRows(row); err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+func CreateSparseFloatRowFromJSON(input []byte) ([]byte, error) {
+	var vec map[string]interface{}
+	decoder := json.NewDecoder(bytes.NewReader(input))
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(&vec)
+	if err != nil {
+		return nil, err
+	}
+	return CreateSparseFloatRowFromMap(vec)
+}
+
+// dim of a sparse float vector is the maximum/last index + 1.
+// for an empty row, dim is 0.
+func SparseFloatRowDim(row []byte) int64 {
+	if len(row) == 0 {
+		return 0
+	}
+	return int64(SparseFloatRowIndexAt(row, SparseFloatRowElementCount(row)-1)) + 1
+}
+
+// placeholderGroup is a serialized PlaceholderGroup, return estimated total
+// number of non-zero elements of all the sparse vectors in the placeholderGroup
+// This is a rough estimate, and should be used only for statistics.
+func EstimateSparseVectorNNZFromPlaceholderGroup(placeholderGroup []byte, nq int) int {
+	overheadBytes := math.Max(10, float64(nq*3))
+	return (len(placeholderGroup) - int(overheadBytes)) / 8
+}
+
+func GetNeedProcessFunctions(fieldIDs []int64, functions []*schemapb.FunctionSchema, allowNonBM25Outputs bool, partialUpdate bool) ([]*schemapb.FunctionSchema, error) {
+	if len(functions) == 0 {
+		return functions, nil
+	}
+
+	fieldIDFuncMapping := map[int64]*schemapb.FunctionSchema{}
+	funCandidate := map[string]*schemapb.FunctionSchema{}
+
+	for _, functionSchema := range functions {
+		funCandidate[functionSchema.Name] = functionSchema
+		for _, fieldID := range functionSchema.OutputFieldIds {
+			fieldIDFuncMapping[fieldID] = functionSchema
+		}
+	}
+
+	for _, fieldID := range fieldIDs {
+		if f, exists := fieldIDFuncMapping[fieldID]; exists {
+			if f.Type == schemapb.FunctionType_BM25 {
+				return nil, merr.WrapErrParameterInvalidMsg("attempt to insert bm25 function output field")
+			}
+			if !allowNonBM25Outputs {
+				return nil, merr.WrapErrParameterInvalidMsg("Insert data has function output field, but collection's property `collection.function.allowInsertNonBM25FunctionOutputs` is not enable")
+			}
+			delete(funCandidate, f.Name)
+		}
+	}
+
+	needProcessFunctions := []*schemapb.FunctionSchema{}
+	for _, functionSchema := range funCandidate {
+		if partialUpdate {
+			// If some input exists, push it down to the function for processing
+			allInputNotExist := true
+			for _, inputID := range functionSchema.InputFieldIds {
+				if slices.Contains(fieldIDs, inputID) {
+					allInputNotExist = false
+					break
+				}
+			}
+			if !allInputNotExist {
+				needProcessFunctions = append(needProcessFunctions, functionSchema)
+			}
+		} else {
+			needProcessFunctions = append(needProcessFunctions, functionSchema)
+		}
+	}
+	return needProcessFunctions, nil
+}
+
+func IsBM25FunctionOutputField(field *schemapb.FieldSchema, collSchema *schemapb.CollectionSchema) bool {
+	if !IsFunctionOutputField(collSchema, field) || field.GetDataType() != schemapb.DataType_SparseFloatVector {
+		return false
+	}
+
+	for _, fSchema := range collSchema.GetFunctions() {
+		if fSchema.GetType() == schemapb.FunctionType_BM25 {
+			if len(fSchema.GetOutputFieldNames()) != 0 && field.GetName() == fSchema.GetOutputFieldNames()[0] {
+				return true
+			}
+			if len(fSchema.GetOutputFieldIds()) != 0 && field.GetFieldID() == fSchema.GetOutputFieldIds()[0] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func IsBm25FunctionInputField(coll *schemapb.CollectionSchema, field *schemapb.FieldSchema) bool {
+	for _, fn := range coll.GetFunctions() {
+		if fn.GetType() == schemapb.FunctionType_BM25 && field.GetName() == fn.GetInputFieldNames()[0] {
+			return true
+		}
+	}
+	return false
+}
+
+func IsMinHashFunctionOutputField(field *schemapb.FieldSchema, collSchema *schemapb.CollectionSchema) bool {
+	if !IsFunctionOutputField(collSchema, field) || field.GetDataType() != schemapb.DataType_BinaryVector {
+		return false
+	}
+
+	for _, fSchema := range collSchema.GetFunctions() {
+		if fSchema.GetType() == schemapb.FunctionType_MinHash {
+			if len(fSchema.GetOutputFieldNames()) != 0 && field.GetName() == fSchema.GetOutputFieldNames()[0] {
+				return true
+			}
+			if len(fSchema.GetOutputFieldIds()) != 0 && field.GetFieldID() == fSchema.GetOutputFieldIds()[0] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ConcatStructFieldName transforms struct field names to structName[fieldName] format
+// This ensures global uniqueness while allowing same field names across different structs
+func ConcatStructFieldName(structName string, fieldName string) string {
+	return fmt.Sprintf("%s[%s]", structName, fieldName)
+}
+
+// IsStructSubField checks if a field name follows the "structName[fieldName]" convention,
+// indicating it is a sub-field within a StructArrayField.
+func IsStructSubField(fieldName string) bool {
+	return strings.Contains(fieldName, "[")
+}
+
+func ExtractStructFieldName(fieldName string) (string, error) {
+	parts := strings.Split(fieldName, "[")
+	if len(parts) == 1 {
+		return fieldName, nil
+	} else if len(parts) == 2 {
+		return parts[1][:len(parts[1])-1], nil
+	} else {
+		return "", merr.WrapErrParameterInvalidMsg("invalid struct field name: %s, more than one [ found", fieldName)
+	}
+}
+
+// ApplyArrayRowOp applies a FieldPartialUpdateOp to a single Array-field row.
+//
+// base and update are per-row ScalarField values (as stored in
+// ArrayArray.Data[i]). elementType is the Array field's declared element type,
+// used to dispatch the concrete typed-array handling. maxCapacity caps the
+// resulting array length for ARRAY_APPEND; pass -1 to skip the check (the
+// proxy is expected to enforce the schema-declared max_capacity).
+//
+// Returned ScalarField is a newly constructed value; base/update are not
+// mutated. Nil base or update is treated as an empty row for that side.
+func ApplyArrayRowOp(
+	base, update *schemapb.ScalarField,
+	op schemapb.FieldPartialUpdateOp_OpType,
+	elementType schemapb.DataType,
+	maxCapacity int,
+) (*schemapb.ScalarField, error) {
+	switch op {
+	case schemapb.FieldPartialUpdateOp_REPLACE:
+		return update, nil
+	case schemapb.FieldPartialUpdateOp_ARRAY_APPEND:
+		return appendArrayRow(base, update, elementType, maxCapacity)
+	case schemapb.FieldPartialUpdateOp_ARRAY_REMOVE:
+		return removeArrayRow(base, update, elementType)
+	default:
+		return nil, merr.WrapErrParameterInvalidMsg("unsupported FieldPartialUpdateOp: %s", op.String())
+	}
+}
+
+func appendArrayRow(
+	base, update *schemapb.ScalarField,
+	elementType schemapb.DataType,
+	maxCapacity int,
+) (*schemapb.ScalarField, error) {
+	switch elementType {
+	case schemapb.DataType_Bool:
+		b := base.GetBoolData().GetData()
+		u := update.GetBoolData().GetData()
+		merged := make([]bool, 0, len(b)+len(u))
+		merged = append(merged, b...)
+		merged = append(merged, u...)
+		if maxCapacity >= 0 && len(merged) > maxCapacity {
+			return nil, newArrayCapacityError(len(merged), maxCapacity)
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_BoolData{BoolData: &schemapb.BoolArray{Data: merged}}}, nil
+	case schemapb.DataType_Int8, schemapb.DataType_Int16, schemapb.DataType_Int32:
+		b := base.GetIntData().GetData()
+		u := update.GetIntData().GetData()
+		merged := make([]int32, 0, len(b)+len(u))
+		merged = append(merged, b...)
+		merged = append(merged, u...)
+		if maxCapacity >= 0 && len(merged) > maxCapacity {
+			return nil, newArrayCapacityError(len(merged), maxCapacity)
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: merged}}}, nil
+	case schemapb.DataType_Int64:
+		b := base.GetLongData().GetData()
+		u := update.GetLongData().GetData()
+		merged := make([]int64, 0, len(b)+len(u))
+		merged = append(merged, b...)
+		merged = append(merged, u...)
+		if maxCapacity >= 0 && len(merged) > maxCapacity {
+			return nil, newArrayCapacityError(len(merged), maxCapacity)
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: merged}}}, nil
+	case schemapb.DataType_Float:
+		b := base.GetFloatData().GetData()
+		u := update.GetFloatData().GetData()
+		merged := make([]float32, 0, len(b)+len(u))
+		merged = append(merged, b...)
+		merged = append(merged, u...)
+		if maxCapacity >= 0 && len(merged) > maxCapacity {
+			return nil, newArrayCapacityError(len(merged), maxCapacity)
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_FloatData{FloatData: &schemapb.FloatArray{Data: merged}}}, nil
+	case schemapb.DataType_Double:
+		b := base.GetDoubleData().GetData()
+		u := update.GetDoubleData().GetData()
+		merged := make([]float64, 0, len(b)+len(u))
+		merged = append(merged, b...)
+		merged = append(merged, u...)
+		if maxCapacity >= 0 && len(merged) > maxCapacity {
+			return nil, newArrayCapacityError(len(merged), maxCapacity)
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_DoubleData{DoubleData: &schemapb.DoubleArray{Data: merged}}}, nil
+	case schemapb.DataType_VarChar, schemapb.DataType_String:
+		b := base.GetStringData().GetData()
+		u := update.GetStringData().GetData()
+		merged := make([]string, 0, len(b)+len(u))
+		merged = append(merged, b...)
+		merged = append(merged, u...)
+		if maxCapacity >= 0 && len(merged) > maxCapacity {
+			return nil, newArrayCapacityError(len(merged), maxCapacity)
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_StringData{StringData: &schemapb.StringArray{Data: merged}}}, nil
+	default:
+		return nil, merr.WrapErrParameterInvalidMsg("ARRAY_APPEND does not support element type: %s", elementType.String())
+	}
+}
+
+func removeArrayRow(
+	base, update *schemapb.ScalarField,
+	elementType schemapb.DataType,
+) (*schemapb.ScalarField, error) {
+	switch elementType {
+	case schemapb.DataType_Bool:
+		b := base.GetBoolData().GetData()
+		u := update.GetBoolData().GetData()
+		if len(b) == 0 || len(u) == 0 {
+			return base, nil
+		}
+		remove := make(map[bool]struct{}, len(u))
+		for _, v := range u {
+			remove[v] = struct{}{}
+		}
+		out := make([]bool, 0, len(b))
+		for _, v := range b {
+			if _, skip := remove[v]; !skip {
+				out = append(out, v)
+			}
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_BoolData{BoolData: &schemapb.BoolArray{Data: out}}}, nil
+	case schemapb.DataType_Int8, schemapb.DataType_Int16, schemapb.DataType_Int32:
+		b := base.GetIntData().GetData()
+		u := update.GetIntData().GetData()
+		if len(b) == 0 || len(u) == 0 {
+			return base, nil
+		}
+		remove := make(map[int32]struct{}, len(u))
+		for _, v := range u {
+			remove[v] = struct{}{}
+		}
+		out := make([]int32, 0, len(b))
+		for _, v := range b {
+			if _, skip := remove[v]; !skip {
+				out = append(out, v)
+			}
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: out}}}, nil
+	case schemapb.DataType_Int64:
+		b := base.GetLongData().GetData()
+		u := update.GetLongData().GetData()
+		if len(b) == 0 || len(u) == 0 {
+			return base, nil
+		}
+		remove := make(map[int64]struct{}, len(u))
+		for _, v := range u {
+			remove[v] = struct{}{}
+		}
+		out := make([]int64, 0, len(b))
+		for _, v := range b {
+			if _, skip := remove[v]; !skip {
+				out = append(out, v)
+			}
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: out}}}, nil
+	case schemapb.DataType_Float:
+		// Linear scan: float32 equality is position-wise exact; hashing is
+		// valid but yields no speedup in typical cardinalities.
+		b := base.GetFloatData().GetData()
+		u := update.GetFloatData().GetData()
+		if len(b) == 0 || len(u) == 0 {
+			return base, nil
+		}
+		out := make([]float32, 0, len(b))
+		for _, v := range b {
+			if !containsFloat32(u, v) {
+				out = append(out, v)
+			}
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_FloatData{FloatData: &schemapb.FloatArray{Data: out}}}, nil
+	case schemapb.DataType_Double:
+		b := base.GetDoubleData().GetData()
+		u := update.GetDoubleData().GetData()
+		if len(b) == 0 || len(u) == 0 {
+			return base, nil
+		}
+		out := make([]float64, 0, len(b))
+		for _, v := range b {
+			if !containsFloat64(u, v) {
+				out = append(out, v)
+			}
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_DoubleData{DoubleData: &schemapb.DoubleArray{Data: out}}}, nil
+	case schemapb.DataType_VarChar, schemapb.DataType_String:
+		b := base.GetStringData().GetData()
+		u := update.GetStringData().GetData()
+		if len(b) == 0 || len(u) == 0 {
+			return base, nil
+		}
+		remove := make(map[string]struct{}, len(u))
+		for _, v := range u {
+			remove[v] = struct{}{}
+		}
+		out := make([]string, 0, len(b))
+		for _, v := range b {
+			if _, skip := remove[v]; !skip {
+				out = append(out, v)
+			}
+		}
+		return &schemapb.ScalarField{Data: &schemapb.ScalarField_StringData{StringData: &schemapb.StringArray{Data: out}}}, nil
+	default:
+		return nil, merr.WrapErrParameterInvalidMsg("ARRAY_REMOVE does not support element type: %s", elementType.String())
+	}
+}
+
+func containsFloat32(haystack []float32, needle float32) bool {
+	// NaN is intentionally treated as never equal to any value, matching
+	// IEEE-754 semantics — an ARRAY_REMOVE request targeting NaN cannot
+	// delete NaN elements from the base.
+	for _, v := range haystack {
+		if v == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func containsFloat64(haystack []float64, needle float64) bool {
+	for _, v := range haystack {
+		if v == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func newArrayCapacityError(got, max int) error {
+	return merr.WrapErrParameterInvalidMsg("array length %d exceeds max_capacity %d", got, max)
+}
