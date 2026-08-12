@@ -25,16 +25,16 @@ public class SymbolResolverClassTests extends ProcessorTestCase {
     public void testValidResolverCompiles() throws Exception {
         String source = """
             package test;
-            import java.lang.foreign.MemorySegment;
             import java.lang.foreign.SymbolLookup;
             import org.elasticsearch.foreign.LibrarySpecification;
             import org.elasticsearch.foreign.Function;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.SymbolResolver;
             class MyResolver implements SymbolResolver {
                 public MyResolver() {}
                 @Override
-                public MemorySegment resolve(String symbolName, SymbolLookup lookup) {
-                    return lookup.find(symbolName).orElseThrow();
+                public ResolvedSymbol resolve(String symbolName, SymbolLookup lookup) {
+                    return new ResolvedSymbol(symbolName, lookup.find(symbolName).orElseThrow());
                 }
             }
             @LibrarySpecification(name = "testlib", symbolResolver = MyResolver.class)
@@ -88,16 +88,16 @@ public class SymbolResolverClassTests extends ProcessorTestCase {
     public void testResolverMissingNoArgConstructorEmitsError() {
         String source = """
             package test;
-            import java.lang.foreign.MemorySegment;
             import java.lang.foreign.SymbolLookup;
             import org.elasticsearch.foreign.LibrarySpecification;
             import org.elasticsearch.foreign.Function;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.SymbolResolver;
             class BadResolver implements SymbolResolver {
                 public BadResolver(String config) {}
                 @Override
-                public MemorySegment resolve(String symbolName, SymbolLookup lookup) {
-                    return lookup.find(symbolName).orElseThrow();
+                public ResolvedSymbol resolve(String symbolName, SymbolLookup lookup) {
+                    return new ResolvedSymbol(symbolName, lookup.find(symbolName).orElseThrow());
                 }
             }
             @LibrarySpecification(name = "testlib", symbolResolver = BadResolver.class)
@@ -141,17 +141,18 @@ public class SymbolResolverClassTests extends ProcessorTestCase {
     public void testPrefixResolverCompiles() throws Exception {
         String source = """
             package test;
-            import java.lang.foreign.MemorySegment;
             import java.lang.foreign.SymbolLookup;
             import org.elasticsearch.foreign.LibrarySpecification;
             import org.elasticsearch.foreign.Function;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.SymbolResolver;
             class PrefixResolver implements SymbolResolver {
                 public PrefixResolver() {}
                 @Override
-                public MemorySegment resolve(String symbolName, SymbolLookup lookup) {
-                    return lookup.find("mylib_" + symbolName).orElseThrow(
-                        () -> new UnsatisfiedLinkError(symbolName));
+                public ResolvedSymbol resolve(String symbolName, SymbolLookup lookup) {
+                    String resolvedName = "mylib_" + symbolName;
+                    return new ResolvedSymbol(resolvedName, lookup.find(resolvedName).orElseThrow(
+                        () -> new UnsatisfiedLinkError(symbolName)));
                 }
             }
             @LibrarySpecification(name = "testlib", symbolResolver = PrefixResolver.class)
@@ -171,5 +172,115 @@ public class SymbolResolverClassTests extends ProcessorTestCase {
         assertNotNull(implClass);
         assertNotNull(implClass.getDeclaredField("compress$mh"));
         assertNotNull(implClass.getDeclaredField("decompress$mh"));
+    }
+
+    /**
+     * A valid method handle resolver with a public no-arg constructor compiles cleanly and is
+     * invoked when the generated implementation initializes.
+     */
+    public void testMethodHandleResolverIsInvoked() throws Exception {
+        String source = """
+            package test;
+            import java.lang.foreign.FunctionDescriptor;
+            import java.lang.foreign.Linker;
+            import java.lang.foreign.MemorySegment;
+            import java.lang.foreign.SymbolLookup;
+            import java.lang.invoke.MethodHandle;
+            import org.elasticsearch.foreign.Function;
+            import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.MethodHandleResolver;
+            import org.elasticsearch.foreign.ResolvedSymbol;
+            import org.elasticsearch.foreign.SymbolResolver;
+            @LibrarySpecification(
+                symbolResolver = ResolverLib.FakeSymbolResolver.class,
+                methodHandleResolver = ResolverLib.RecordingMethodHandleResolver.class
+            )
+            public interface ResolverLib {
+                @Function("native_add")
+                int add(int a, int b);
+
+                class FakeSymbolResolver implements SymbolResolver {
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
+                        return new ResolvedSymbol("native_add_v2", MemorySegment.ofAddress(1L));
+                    }
+                }
+
+                class RecordingMethodHandleResolver implements MethodHandleResolver {
+                    public static boolean invoked;
+
+                    public MethodHandle resolve(ResolvedSymbol symbol, FunctionDescriptor descriptor, Linker linker, Linker.Option... options) {
+                        invoked = symbol.name().equals("native_add_v2");
+                        return linker.downcallHandle(symbol.address(), descriptor, options);
+                    }
+                }
+            }
+            """;
+
+        CompilationResult result = compile("test.ResolverLib", source);
+        assertTrue("Expected compilation to succeed but got errors: " + result.errors(), result.success());
+
+        assertNotNull(result.loadClass("test.ResolverLib$Impl"));
+        Class<?> resolverClass = result.loadClass("test.ResolverLib$RecordingMethodHandleResolver");
+        assertTrue(resolverClass.getField("invoked").getBoolean(null));
+    }
+
+    /**
+     * The method handle resolver class must implement MethodHandleResolver. The type bound on
+     * the annotation parameter causes javac to reject a non-implementing class.
+     */
+    public void testMethodHandleResolverNotImplementingInterfaceEmitsError() {
+        String source = """
+            package test;
+            import org.elasticsearch.foreign.Function;
+            import org.elasticsearch.foreign.LibrarySpecification;
+            class BadResolver {
+                public BadResolver() {}
+            }
+            @LibrarySpecification(name = "testlib", methodHandleResolver = BadResolver.class)
+            public interface MyLib {
+                @Function("native_add")
+                int add(int a, int b);
+            }
+            """;
+
+        CompilationResult result = compile("test.MyLib", source);
+
+        assertFalse("Expected compilation to fail when resolver doesn't implement MethodHandleResolver", result.success());
+        boolean hasError = result.errors().stream().anyMatch(msg -> msg.contains("cannot be converted to"));
+        assertTrue("Expected type mismatch error but got: " + result.errors(), hasError);
+    }
+
+    /**
+     * The method handle resolver class must have a public no-arg constructor.
+     */
+    public void testMethodHandleResolverMissingNoArgConstructorEmitsError() {
+        String source = """
+            package test;
+            import java.lang.foreign.FunctionDescriptor;
+            import java.lang.foreign.Linker;
+            import java.lang.invoke.MethodHandle;
+            import org.elasticsearch.foreign.Function;
+            import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.MethodHandleResolver;
+            import org.elasticsearch.foreign.ResolvedSymbol;
+            class BadResolver implements MethodHandleResolver {
+                public BadResolver(String config) {}
+                @Override
+                public MethodHandle resolve(ResolvedSymbol symbol, FunctionDescriptor descriptor, Linker linker, Linker.Option... options) {
+                    return linker.downcallHandle(symbol.address(), descriptor, options);
+                }
+            }
+            @LibrarySpecification(name = "testlib", methodHandleResolver = BadResolver.class)
+            public interface MyLib {
+                @Function("native_add")
+                int add(int a, int b);
+            }
+            """;
+
+        CompilationResult result = compile("test.MyLib", source);
+
+        assertFalse("Expected compilation to fail when resolver has no no-arg constructor", result.success());
+        boolean hasError = result.errors().stream().anyMatch(msg -> msg.contains("must have a public no-arg constructor"));
+        assertTrue("Expected error about no-arg constructor but got: " + result.errors(), hasError);
     }
 }

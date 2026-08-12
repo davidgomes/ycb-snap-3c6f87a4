@@ -62,9 +62,10 @@ import java.lang.annotation.Target;
  *
  * <pre>{@code
  * public class PrefixResolver implements SymbolResolver {
- *     public MemorySegment resolve(String symbolName, SymbolLookup lookup) {
- *         return lookup.find("mylib_" + symbolName).orElseThrow(
- *             () -> new UnsatisfiedLinkError(symbolName));
+ *     public ResolvedSymbol resolve(String symbolName, SymbolLookup lookup) {
+ *         String resolvedName = "mylib_" + symbolName;
+ *         return new ResolvedSymbol(resolvedName, lookup.find(resolvedName).orElseThrow(
+ *             () -> new UnsatisfiedLinkError(symbolName)));
  *     }
  * }
  *
@@ -95,4 +96,11 @@ public @interface LibrarySpecification {
      * Defaults to {@link DefaultSymbolResolver}, which looks up symbols by their exact name.
      */
     Class<? extends SymbolResolver> symbolResolver() default DefaultSymbolResolver.class;
+
+    /**
+     * Custom method handle resolver for this library. The resolver creates a method handle after
+     * the selected native symbol and generated function descriptor are known. Defaults to
+     * {@link DefaultMethodHandleResolver}, which creates an unmodified downcall handle.
+     */
+    Class<? extends MethodHandleResolver> methodHandleResolver() default DefaultMethodHandleResolver.class;
 }
