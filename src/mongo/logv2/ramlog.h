@@ -1,0 +1,211 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/observable_mutex.h"
+
+#include <array>
+#include <cstddef>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace mongo::logv2 {
+
+/**
+ * Variable-capacity circular log of line-oriented messages.
+ *
+ * Holds up to RamLog::kMaxLines lines and caps total space to RamLog::kMaxSizeBytes [1]. There is
+ * no limit on the length of the line. RamLog expects the caller to truncate lines to a reasonable
+ * length.
+ *
+ * RamLogs are stored in a global registry, accessed via RamLog::get() and
+ * RamLog::getIfExists().
+ *
+ * RamLogs and their registry are self-synchronizing.  See documentary comments.
+ * To read a RamLog, instantiate a RamLog::LineIterator, documented below.
+ *
+ * Note:
+ * 1. In the degenerate case of a single log line being above RamLog::kMaxSizeBytes, it may
+ *    keep up to two log lines and exceed the size cap.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] RamLog {
+    RamLog(const RamLog&) = delete;
+    RamLog& operator=(const RamLog&) = delete;
+
+public:
+    class LineIterator;
+    friend class RamLog::LineIterator;
+
+    /**
+     * Returns a pointer to the ramlog named "name", creating one if it did not already exist.
+     *
+     * "name" is the ramlog's public identity (e.g., "global" is looked up by the getLog command),
+     * For its ObservableMutex tag we derive a valid camelCase metric name segment from it by
+     * capitalizing its first letter. "name" should otherwise be camelCase.
+     *
+     * Synchronizes on the RamLog catalog lock, _namedLock.
+     */
+    static RamLog* get(const std::string& name);
+
+    /**
+     * Returns a pointer to the ramlog named "name", creating one if it did not already exist.
+     * Allows setting custom maxLines and maxSizeBytes.
+     *
+     * Synchronizes on the RamLog catalog lock, _namedLock.
+     */
+    static RamLog* get(const std::string& name, size_t maxLines, size_t maxSizeBytes);
+
+    /**
+     * Returns a pointer to the ramlog named "name", or NULL if no such ramlog exists.
+     *
+     * Synchronizes on the RamLog catalog lock, _namedLock.
+     */
+    static RamLog* getIfExists(const std::string& name);
+
+    /**
+     * Writes the names of all existing ramlogs into "names".
+     *
+     * Synchronizes on the RamLog catalog lock, _namedLock.
+     */
+    static void getNames(std::vector<std::string>& names);
+
+    /**
+     * Sets the global maximum number of lines for newly created RamLogs.
+     */
+    static void setGlobalMaxLines(size_t maxLines);
+
+    /**
+     * Gets the global maximum number of lines for newly created RamLogs.
+     */
+    static size_t getGlobalMaxLines();
+
+    /**
+     * Sets the global maximum size in bytes for newly created RamLogs.
+     */
+    static void setGlobalMaxSizeBytes(size_t maxSizeBytes);
+
+    /**
+     * Gets the global maximum size in bytes for newly created RamLogs.
+     */
+    static size_t getGlobalMaxSizeBytes();
+
+    /**
+     * Writes "str" as a line into the RamLog.  If "str" is longer than the maximum
+     * line size of the log, it keeps two lines.
+     *
+     * Synchronized on the instance's own mutex, _mutex.
+     */
+    void write(const std::string& str);
+
+    /**
+     * Empties out the RamLog.
+     */
+    void clear();
+
+    /**
+     * Inspect maxLines setting.
+     */
+    size_t getMaxLines() const {
+        return _maxLines;
+    }
+
+    /**
+     * Inspect maxSizeBytes setting.
+     */
+    size_t getMaxSizeBytes() const {
+        return _maxSizeBytes;
+    }
+
+private:
+    explicit RamLog(std::string_view name, size_t maxLines, size_t maxSizeBytes);
+    ~RamLog();  // want this private as we want to leak so we can use them till the very end
+
+    std::string_view getLine(size_t lineNumber) const;
+
+    size_t getLineCount() const;
+
+    void trimIfNeeded(size_t newStr);
+
+    static RamLog* getImpl(const std::string& name,
+                           size_t maxLines = getGlobalMaxLines(),
+                           size_t maxSizeBytes = getGlobalMaxSizeBytes());
+
+private:
+    // Maximum number of lines.
+    size_t _maxLines;
+
+    // Maximum capacity of RamLog of string data.
+    size_t _maxSizeBytes;
+
+    // Guards all non-static data.
+    // std::recursive_mutex // NOLINT is intentional, std::mutex can not be used here
+    mutable ObservableMutex<std::recursive_mutex> _mutex;  // NOLINT
+
+    // Array of lines
+    std::vector<std::string> _lines;
+
+    // First line of ram log
+    size_t _firstLinePosition;
+
+    // Last line of ram log
+    size_t _lastLinePosition;
+
+    // Total size of bytes written
+    size_t _totalSizeBytes;
+
+    // Name of Ram Log
+    std::string _name;
+
+    // Total lines written since last clear, can be > kMaxLines
+    size_t _totalLinesWritten;
+};
+
+/**
+ * Iterator over the lines of a RamLog.
+ *
+ * Also acts as a means of inspecting other properites of a ramlog consistently.
+ *
+ * Instances of LineIterator hold the lock for the underlying RamLog for their whole lifetime,
+ * and so should not be kept around.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] RamLog::LineIterator {
+    LineIterator(const LineIterator&) = delete;
+    LineIterator& operator=(const LineIterator&) = delete;
+
+public:
+    explicit LineIterator(RamLog* ramlog);
+
+    /**
+     * Returns true if there are more lines available to return by calls to next().
+     */
+    bool more() const {
+        return _nextLineIndex < _ramlog->getLineCount();
+    }
+
+    /**
+     * Returns the next line and advances the iterator.
+     */
+    std::string_view next() {
+        return _ramlog->getLine(_nextLineIndex++);  // Postfix increment.
+    }
+
+    /**
+     * Returns the total number of lines ever written to the ramlog.
+     */
+    size_t getTotalLinesWritten();
+
+private:
+    const RamLog* _ramlog;
+
+    // Holds RamLog's mutex
+    std::lock_guard<ObservableMutex<std::recursive_mutex>> _lock;
+
+    size_t _nextLineIndex;
+};
+
+}  // namespace mongo::logv2

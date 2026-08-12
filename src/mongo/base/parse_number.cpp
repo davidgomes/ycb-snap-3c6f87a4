@@ -1,0 +1,308 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/parse_number.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/static_assert.h"
+#include "mongo/base/status_with.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/platform/overflow_arithmetic.h"
+#include "mongo/util/ctype.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <iterator>
+#include <limits>
+#include <string>
+#include <string_view>
+
+#include <absl/strings/charconv.h>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+/**
+ * Returns the value of the digit "c", with the same conversion behavior as strtol.
+ *
+ * Assumes "c" is an ASCII character or UTF-8 octet.
+ */
+uint8_t _digitValue(char c) {
+    if (c >= '0' && c <= '9')
+        return uint8_t(c - '0');
+    if (c >= 'a' && c <= 'z')
+        return uint8_t(c - 'a' + 10);
+    if (c >= 'A' && c <= 'Z')
+        return uint8_t(c - 'A' + 10);
+    return 36;  // Illegal digit value for all supported bases.
+}
+
+/**
+ * Assuming "stringValue" represents a parseable number, extracts the sign and returns a
+ * substring with any sign characters stripped away.  "*isNegative" is set to true if the
+ * number is negative, and false otherwise.
+ */
+inline std::string_view _extractSign(std::string_view stringValue, bool* isNegative) {
+    if (stringValue.empty()) {
+        *isNegative = false;
+        return stringValue;
+    }
+
+    bool foundSignMarker;
+    switch (stringValue[0]) {
+        case '-':
+            foundSignMarker = true;
+            *isNegative = true;
+            break;
+        case '+':
+            foundSignMarker = true;
+            *isNegative = false;
+            break;
+        default:
+            foundSignMarker = false;
+            *isNegative = false;
+            break;
+    }
+
+    if (foundSignMarker)
+        return stringValue.substr(1);
+    return stringValue;
+}
+
+/**
+ * Assuming "stringValue" represents a parseable number, determines what base to use given
+ * "inputBase".  Stores the correct base into "*outputBase".  Follows strtol rules.  If
+ * "inputBase" is not 0, *outputBase is set to "inputBase".  Otherwise, if "stringValue" starts
+ * with "0x" or "0X", sets outputBase to 16, or if it starts with 0, sets outputBase to 8.
+ *
+ * Returns stringValue, unless it sets *outputBase to 16, in which case it will strip off the
+ * "0x" or "0X" prefix, if present.
+ */
+inline std::string_view _extractBase(std::string_view stringValue, int inputBase, int* outputBase) {
+    const auto hexPrefixLower = "0x"sv;
+    const auto hexPrefixUpper = "0X"sv;
+    if (inputBase == 0) {
+        if (stringValue.size() > 2 &&
+            (stringValue.starts_with(hexPrefixLower) || stringValue.starts_with(hexPrefixUpper))) {
+            *outputBase = 16;
+            return stringValue.substr(2);
+        }
+        if (stringValue.size() > 1 && stringValue[0] == '0') {
+            *outputBase = 8;
+            return stringValue;
+        }
+        *outputBase = 10;
+        return stringValue;
+    } else {
+        *outputBase = inputBase;
+        if (inputBase == 16 &&
+            (stringValue.starts_with(hexPrefixLower) || stringValue.starts_with(hexPrefixUpper))) {
+            return stringValue.substr(2);
+        }
+        return stringValue;
+    }
+}
+
+StatusWith<uint64_t> _parseMagnitude(std::string_view magnitudeStr,
+                                     uint64_t base,
+                                     const char** end,
+                                     bool allowTrailingText) {
+    uint64_t n = 0;
+    size_t charsConsumed = 0;
+    for (char digitChar : magnitudeStr) {
+        const uint64_t digitValue = _digitValue(digitChar);
+        if (digitValue >= base) {
+            break;
+        }
+
+        // This block is (n = (n * base) + digitValue) with overflow checking at each step.
+        uint64_t multiplied;
+        if (overflow::mul(n, base, &multiplied))
+            return Status(ErrorCodes::Overflow, "Overflow");
+        if (overflow::add(multiplied, digitValue, &n))
+            return Status(ErrorCodes::Overflow, "Overflow");
+        ++charsConsumed;
+    }
+    if (end)
+        *end = magnitudeStr.data() + charsConsumed;
+    if (!allowTrailingText && charsConsumed != magnitudeStr.size())
+        return Status(ErrorCodes::FailedToParse, "Did not consume whole string.");
+    if (charsConsumed == 0)
+        return Status(ErrorCodes::FailedToParse, "Did not consume any digits");
+    return n;
+}
+
+std::string_view removeLeadingWhitespace(std::string_view s) {
+    return s.substr(std::distance(
+        s.begin(), std::find_if_not(s.begin(), s.end(), [](char c) { return ctype::isSpace(c); })));
+}
+
+template <std::integral NumberType>
+Status _parseNumber(std::string_view s,
+                    NumberType* result,
+                    const char** endptr,
+                    const NumberParser& parser) {
+    MONGO_STATIC_ASSERT(sizeof(NumberType) <= sizeof(uint64_t));
+    using Limits = std::numeric_limits<NumberType>;
+
+    if (endptr)
+        *endptr = s.data();
+
+    if (parser._base == 1 || parser._base < 0 || parser._base > 36)
+        return Status(ErrorCodes::BadValue, "Invalid parser._base");
+
+    if (parser._skipLeadingWhitespace)
+        s = removeLeadingWhitespace(s);
+
+    bool isNegative = false;
+    s = _extractSign(s, &isNegative);
+    if constexpr (!Limits::is_signed)
+        if (isNegative)
+            return Status(ErrorCodes::FailedToParse, "Negative value");
+
+    int base = 0;
+    s = _extractBase(s, parser._base, &base);
+
+    if (s.empty())
+        return Status(ErrorCodes::FailedToParse, "No digits");
+    auto status = _parseMagnitude(s, base, endptr, parser._allowTrailingText);
+    if (!status.isOK())
+        return status.getStatus();
+    uint64_t magnitude = status.getValue();
+
+    if constexpr (Limits::is_signed || Limits::digits < 64) {
+        uint64_t max = Limits::max();
+        if constexpr (Limits::is_signed)
+            if (isNegative)
+                max += 1;  // accept range [-(max+1), max]
+        if (magnitude > max)
+            return Status(ErrorCodes::Overflow, "Overflow");
+    }
+
+    if constexpr (Limits::is_signed)
+        if (isNegative)
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4146)  // unary minus operator applied to unsigned type
+#endif
+            magnitude = -magnitude;
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    *result = NumberType(magnitude);
+    return Status::OK();
+}
+
+Status _parseNumber(std::string_view stringValue,
+                    double* result,
+                    const char** endptr,
+                    const NumberParser& parser) {
+    if (endptr)
+        *endptr = stringValue.data();
+    if (parser._base != 0) {
+        return {ErrorCodes::BadValue, "NumberParser::base must be 0 for a double."};
+    }
+    if (stringValue.empty())
+        return {ErrorCodes::FailedToParse, "Empty string"};
+
+    // `std::from_chars` will not ignore leading whitespace and `+`.
+    // `absl::from_chars` implements the same behavior.
+    if (ctype::isSpace(stringValue[0])) {
+        if (!parser._skipLeadingWhitespace)
+            return {ErrorCodes::FailedToParse, "Leading whitespace"};
+        stringValue = removeLeadingWhitespace(stringValue);
+    }
+    if (stringValue.empty())
+        return {ErrorCodes::FailedToParse, "Whitespace-only string"};
+    if (stringValue.front() == '+')
+        stringValue.remove_prefix(1);
+
+    auto stringStart = stringValue.data();
+    auto stringEnd = stringStart + stringValue.size();
+    double d;
+    auto r = absl::from_chars(stringStart, stringEnd, d);
+    if (r.ec != std::errc{}) {
+        if (r.ec == std::errc::result_out_of_range)
+            return {ErrorCodes::Overflow, "Out of range"};
+        if (r.ec == std::errc::invalid_argument)
+            return {ErrorCodes::FailedToParse, "Invalid number"};
+        return {ErrorCodes::FailedToParse, "Failed to parse number"};
+    }
+    if (r.ptr == stringStart)
+        return {ErrorCodes::FailedToParse, "Did not consume any digits"};
+    if (endptr)
+        *endptr = r.ptr;
+    if (r.ptr != stringEnd && !parser._allowTrailingText)
+        return {ErrorCodes::FailedToParse, "Did not consume whole string"};
+
+    *result = d;
+    return Status::OK();
+}
+
+Status _parseNumber(std::string_view stringValue,
+                    Decimal128* result,
+                    const char** endptr,
+                    const NumberParser& parser) {
+    if (endptr)
+        *endptr = stringValue.data();  // same behavior as strtod: if unable to parse, set end to
+                                       // be the beginning of input str
+
+    if (parser._base != 0) {
+        return Status(ErrorCodes::BadValue,
+                      "NumberParser::parser._base must be 0 for a Decimal128.");
+    }
+
+    if (parser._skipLeadingWhitespace) {
+        stringValue = removeLeadingWhitespace(stringValue);
+    }
+
+    if (stringValue.empty()) {
+        return Status(ErrorCodes::FailedToParse, "Empty string");
+    }
+
+    std::uint32_t signalingFlags = 0;
+    size_t charsConsumed;
+    auto parsedDecimal =
+        Decimal128(std::string{stringValue}, &signalingFlags, parser._roundingMode, &charsConsumed);
+
+    if (Decimal128::hasFlag(signalingFlags, Decimal128::SignalingFlag::kOverflow)) {
+        return Status(ErrorCodes::Overflow, "Conversion from string to decimal would overflow");
+    } else if (Decimal128::hasFlag(signalingFlags, Decimal128::SignalingFlag::kUnderflow)) {
+        return Status(ErrorCodes::Overflow, "Conversion from string to decimal would underflow");
+    } else if (signalingFlags != Decimal128::SignalingFlag::kNoFlag &&
+               signalingFlags != Decimal128::SignalingFlag::kInexact) {  // Ignore precision loss.
+        return Status(ErrorCodes::FailedToParse, "Failed to parse string to decimal");
+    }
+    if (endptr)
+        *endptr += charsConsumed;
+    if (!parser._allowTrailingText && charsConsumed != stringValue.size())
+        return Status(ErrorCodes::FailedToParse, "Did not consume whole string.");
+
+    *result = parsedDecimal;
+    return Status::OK();
+}
+}  // namespace
+
+#define DEFINE_NUMBER_PARSER_OPERATOR(type)                                                  \
+    Status NumberParser::operator()(std::string_view s, type* out, const char** end) const { \
+        return _parseNumber(s, out, end, *this);                                             \
+    }
+
+DEFINE_NUMBER_PARSER_OPERATOR(long)
+DEFINE_NUMBER_PARSER_OPERATOR(long long)
+DEFINE_NUMBER_PARSER_OPERATOR(unsigned long)
+DEFINE_NUMBER_PARSER_OPERATOR(unsigned long long)
+DEFINE_NUMBER_PARSER_OPERATOR(short)
+DEFINE_NUMBER_PARSER_OPERATOR(unsigned short)
+DEFINE_NUMBER_PARSER_OPERATOR(int)
+DEFINE_NUMBER_PARSER_OPERATOR(unsigned int)
+DEFINE_NUMBER_PARSER_OPERATOR(int8_t)
+DEFINE_NUMBER_PARSER_OPERATOR(uint8_t)
+DEFINE_NUMBER_PARSER_OPERATOR(double)
+DEFINE_NUMBER_PARSER_OPERATOR(Decimal128)
+}  // namespace mongo

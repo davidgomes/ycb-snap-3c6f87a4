@@ -1,0 +1,44 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/s/mongos_options.h"
+    configs:
+        section: "Sharding options"
+        source: [yaml, cli, ini]
+
+configs:
+    "sharding.configDB":
+        description: >-
+            Connection string for communicating with config servers:
+            <config replset name>/<host1:port>,<host2:port>,[...]
+        short_name: configdb
+        arg_vartype: String
+    "sharding.configOnly":
+        description: >-
+            Run mongos in config-only mode for standby clusters. This mode only provides the ability
+            to connect to the standby cluster's config server for non-data-accessing commands.
+        short_name: configOnly
+        cpp_varname: "serverGlobalParams.configOnly"
+        arg_vartype: Bool
+        implicit: true
+    "replication.localPingThresholdMs":
+        description: "ping time (in ms) for a node to be considered local (default 15ms)"
+        short_name: "localThreshold"
+        cpp_varname: "serverGlobalParams.defaultLocalThresholdMillis"
+        arg_vartype: Int
+    "test":
+        description: "just run unit tests"
+        short_name: "test"
+        arg_vartype: Switch
+        source: [cli, ini]
+    "noscripting":
+        description: "Disable scripting engine"
+        arg_vartype: Switch
+        source: [cli, ini]
+    "security.javascriptEnabled":
+        description: "Enable javascript execution"
+        arg_vartype: Bool
+        source: [yaml]

@@ -1,0 +1,295 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/client.h"
+#include "mongo/db/exec/matcher/matcher.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/matcher/matcher.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
+#include "mongo/db/service_context.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/demangle.h"
+#include "mongo/util/timer.h"
+
+#include <iostream>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+namespace MatcherTests {
+
+class CollectionBase {
+public:
+    CollectionBase() {}
+
+    virtual ~CollectionBase() {}
+};
+
+const NamespaceString kTestNss = NamespaceString::createNamespaceString_forTest("db.dummy");
+
+using M = Matcher;
+
+class Basic {
+public:
+    void run() {
+        BSONObj query = fromjson("{\"a\":\"b\"}");
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M m(query, expCtx);
+        ASSERT(exec::matcher::matches(&m, fromjson("{\"a\":\"b\"}")));
+    }
+};
+
+class DoubleEqual {
+public:
+    void run() {
+        BSONObj query = fromjson("{\"a\":5}");
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M m(query, expCtx);
+        ASSERT(exec::matcher::matches(&m, fromjson("{\"a\":5}")));
+    }
+};
+
+class MixedNumericEqual {
+public:
+    void run() {
+        BSONObjBuilder query;
+        query.append("a", 5);
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M m(query.done(), expCtx);
+        ASSERT(exec::matcher::matches(&m, fromjson("{\"a\":5}")));
+    }
+};
+
+class MixedNumericGt {
+public:
+    void run() {
+        BSONObj query = fromjson("{\"a\":{\"$gt\":4}}");
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M m(query, expCtx);
+        BSONObjBuilder b;
+        b.append("a", 5);
+        ASSERT(exec::matcher::matches(&m, b.done()));
+    }
+};
+
+class MixedNumericIN {
+public:
+    void run() {
+        BSONObj query = fromjson("{ a : { $in : [4,6] } }");
+        ASSERT_EQUALS(4, query["a"].embeddedObject()["$in"].embeddedObject()["0"].number());
+        ASSERT_EQUALS(BSONType::numberInt,
+                      query["a"].embeddedObject()["$in"].embeddedObject()["0"].type());
+
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M m(query, expCtx);
+
+        {
+            BSONObjBuilder b;
+            b.append("a", 4.0);
+            ASSERT(exec::matcher::matches(&m, b.done()));
+        }
+
+        {
+            BSONObjBuilder b;
+            b.append("a", 5);
+            ASSERT(!exec::matcher::matches(&m, b.done()));
+        }
+
+
+        {
+            BSONObjBuilder b;
+            b.append("a", 4);
+            ASSERT(exec::matcher::matches(&m, b.done()));
+        }
+    }
+};
+
+class MixedNumericEmbedded {
+public:
+    void run() {
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M m(BSON("a" << BSON("x" << 1)), expCtx);
+        ASSERT(exec::matcher::matches(&m, BSON("a" << BSON("x" << 1))));
+        ASSERT(exec::matcher::matches(&m, BSON("a" << BSON("x" << 1.0))));
+    }
+};
+
+class Size {
+public:
+    void run() {
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M m(fromjson("{a:{$size:4}}"), expCtx);
+        ASSERT(exec::matcher::matches(&m, fromjson("{a:[1,2,3,4]}")));
+        ASSERT(!exec::matcher::matches(&m, fromjson("{a:[1,2,3]}")));
+        ASSERT(!exec::matcher::matches(&m, fromjson("{a:[1,2,3,'a','b']}")));
+        ASSERT(!exec::matcher::matches(&m, fromjson("{a:[[1,2,3,4]]}")));
+    }
+};
+
+class WithinBox {
+public:
+    void run() {
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M m(fromjson("{loc:{$within:{$box:[{x: 4, y:4},[6,6]]}}}"), expCtx);
+        ASSERT(!exec::matcher::matches(&m, fromjson("{loc: [3,4]}")));
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: [4,4]}")));
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: [5,5]}")));
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: [5,5.1]}")));
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: {x: 5, y:5.1}}")));
+    }
+};
+
+class WithinPolygon {
+public:
+    void run() {
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M m(fromjson("{loc:{$within:{$polygon:[{x:0,y:0},[0,5],[5,5],[5,0]]}}}"), expCtx);
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: [3,4]}")));
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: [4,4]}")));
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: {x:5,y:5}}")));
+        ASSERT(!exec::matcher::matches(&m, fromjson("{loc: [5,5.1]}")));
+        ASSERT(!exec::matcher::matches(&m, fromjson("{loc: {}}")));
+    }
+};
+
+class WithinCenter {
+public:
+    void run() {
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M m(fromjson("{loc:{$within:{$center:[{x:30,y:30},10]}}}"), expCtx);
+        ASSERT(!exec::matcher::matches(&m, fromjson("{loc: [3,4]}")));
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: {x:30,y:30}}")));
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: [20,30]}")));
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: [30,20]}")));
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: [40,30]}")));
+        ASSERT(exec::matcher::matches(&m, fromjson("{loc: [30,40]}")));
+        ASSERT(!exec::matcher::matches(&m, fromjson("{loc: [31,40]}")));
+    }
+};
+
+/** Test that MatchDetails::elemMatchKey() is set correctly after a match. */
+class ElemMatchKey {
+public:
+    void run() {
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M matcher(BSON("a.b" << 1), expCtx);
+        MatchDetails details;
+        details.requestElemMatchKey();
+        ASSERT(!details.hasElemMatchKey());
+        ASSERT(exec::matcher::matches(&matcher, fromjson("{ a:[ { b:1 } ] }"), &details));
+        // The '0' entry of the 'a' array is matched.
+        ASSERT(details.hasElemMatchKey());
+        ASSERT_EQUALS(std::string("0"), details.elemMatchKey());
+    }
+};
+
+class WhereSimple1 {
+public:
+    void run() {
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        const NamespaceString nss =
+            NamespaceString::createNamespaceString_forTest("unittests.matchertests");
+        const auto expCtx = ExpressionContextBuilder{}.opCtx(opCtxPtr.get()).ns(kTestNss).build();
+        M m(BSON("$where" << "function(){ return this.a == 1; }"),
+            expCtx,
+            ExtensionsCallbackReal(&opCtx, &nss),
+            MatchExpressionParser::AllowedFeatures::kJavascript);
+        ASSERT(exec::matcher::matches(&m, BSON("a" << 1)));
+        ASSERT(!exec::matcher::matches(&m, BSON("a" << 2)));
+    }
+};
+
+class TimingBase {
+public:
+    long dotime(const BSONObj& patt, const BSONObj& obj) {
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M m(patt, expCtx);
+        Timer t;
+        for (int i = 0; i < 900000; i++) {
+            if (!exec::matcher::matches(&m, obj)) {
+                ASSERT(0);
+            }
+        }
+        return t.millis();
+    }
+};
+
+class AllTiming : public TimingBase {
+public:
+    void run() {
+        long normal = TimingBase::dotime(BSON("x" << 5), BSON("x" << 5));
+
+        long all = TimingBase::dotime(BSON("x" << BSON("$all" << BSON_ARRAY(5))), BSON("x" << 5));
+
+        std::cout << "AllTiming " << demangleName(typeid(M)) << " normal: " << normal
+                  << " all: " << all << std::endl;
+    }
+};
+
+/** Test that 'collator' is passed to MatchExpressionParser::parse(). */
+class NullCollator {
+public:
+    void run() {
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        M matcher(BSON("a" << "string"), expCtx);
+        ASSERT(!exec::matcher::matches(&matcher, BSON("a" << "string2")));
+    }
+};
+
+/** Test that 'collator' is passed to MatchExpressionParser::parse(). */
+class Collator {
+public:
+    void run() {
+        auto collator =
+            std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        expCtx->setCollator(std::move(collator));
+        M matcher(BSON("a" << "string"), expCtx);
+        ASSERT(exec::matcher::matches(&matcher, BSON("a" << "string2")));
+    }
+};
+
+class All : public unittest::OldStyleSuiteSpecification {
+public:
+    All() : OldStyleSuiteSpecification("matcher") {}
+
+    void setupTests() override {
+        add<Basic>();
+        add<DoubleEqual>();
+        add<MixedNumericEqual>();
+        add<MixedNumericGt>();
+        add<MixedNumericIN>();
+        add<Size>();
+        add<MixedNumericEmbedded>();
+        add<ElemMatchKey>();
+        add<WhereSimple1>();
+        add<AllTiming>();
+        add<WithinBox>();
+        add<WithinCenter>();
+        add<WithinPolygon>();
+        add<NullCollator>();
+        add<Collator>();
+    }
+};
+
+unittest::OldStyleSuiteInitializer<All> dball;
+
+}  // namespace MatcherTests
+}  // namespace mongo

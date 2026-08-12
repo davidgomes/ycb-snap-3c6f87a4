@@ -1,0 +1,545 @@
+# Apple cc toolchain needs to be loaded before regular cc toolchain or else Apple will just use regular cc toolchain
+bazel_dep(name = "apple_support", version = "1.24.1", repo_name = "build_bazel_apple_support")
+bazel_dep(name = "bazel_features", version = "1.37.0")
+
+bazel_features_deps = use_extension("//bazel:bzlmod.bzl", "bazel_features_deps")
+use_repo(bazel_features_deps, "bazel_features_globals", "bazel_features_version")
+
+multiversion_compat = use_extension("//bazel/resmoke/multiversion:version_compat.bzl", "multiversion_compat")
+use_repo(multiversion_compat, "multiversion_compat_settings")
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+mongo_tcmalloc_repository = use_repo_rule(
+    "//src/third_party/tcmalloc:repositories.bzl",
+    "mongo_tcmalloc_repository",
+)
+
+http_archive(
+    name = "bazel_clang_tidy",
+    integrity = "sha256-PLwbo3dS1ZgeuSiaUctGRIU/O3ScB64+U2mEsN7fgtA=",
+    strip_prefix = "bazel_clang_tidy-1.7",
+    urls = [
+        # Implements retry by relisting each url multiple times to be used as a failover.
+        # TODO(SERVER-86719): Re-implement http_archive to allow sleeping between retries
+        "https://github.com/mongodb-forks/bazel_clang_tidy/archive/refs/tags/v1.7.tar.gz",
+    ] * 5,
+)
+
+# Downloads the llvm-bolt toolchain (arm64 or amd64) matching the host architecture.
+setup_bolt_binaries = use_repo_rule("//bazel/repository_rules:bolt_binaries.bzl", "setup_bolt_binaries")
+
+setup_bolt_binaries(name = "bolt_binaries")
+
+# Downloads the perf tool (arm64 or amd64) matching the host architecture. perf is
+# shipped separately from the llvm-bolt toolchain and is used by the bolt training pipeline.
+setup_perf_binaries = use_repo_rule("//bazel/repository_rules:perf_binaries.bzl", "setup_perf_binaries")
+
+setup_perf_binaries(name = "perf_binaries")
+
+spidermonkey_wasi_repo = use_repo_rule(
+    "//src/mongo/scripting/mozjs/wasm:spidermonkey_wasi_repo.bzl",
+    "spidermonkey_wasi",
+)
+
+spidermonkey_wasi_repo(
+    name = "spidermonkey_wasi",
+    sha256 = "c4dac530b125bf9d09664a8d611db7e1775ab3b9f1b939b62a65c32a0362b289",
+    urls = [
+        "https://mdb-build-public.s3.amazonaws.com/spidermonkey-wasm/FIREFOX_140_12_0esr_RELEASE/spidermonkey-wasip2-release.tar.gz",
+    ] * 5,
+)
+
+bazel_dep(name = "rules_cc", version = "0.2.10")
+bazel_dep(name = "rules_fuzzing", version = "0.6.0")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "platforms", version = "0.0.11")
+single_version_override(
+    module_name = "platforms",
+    version = "0.0.11",
+)
+
+# TODO SERVER-122884: move over from WORKSPACE
+# buf does not support s390x
+#bazel_dep(name = "aspect_rules_lint", version = "1.1.0")
+#single_version_override(
+#    module_name = "aspect_rules_lint",
+#    version = "1.1.0",
+#)
+
+bazel_dep(name = "rules_multirun", version = "0.9.0")
+bazel_dep(name = "aspect_bazel_lib", version = "2.13.0")
+single_version_override(
+    module_name = "aspect_bazel_lib",
+    version = "2.13.0",
+)
+
+bazel_dep(name = "aspect_rules_js", version = "2.1.3")
+single_version_override(
+    module_name = "aspect_rules_js",
+    version = "2.1.3",
+)
+
+bazel_dep(name = "rules_nodejs", version = "6.3.0")
+single_version_override(
+    module_name = "rules_nodejs",
+    version = "6.3.0",
+)
+
+bazel_dep(name = "rules_poetry", version = "")
+git_override(
+    module_name = "rules_poetry",
+    commit = "092d43107d13e711ac4ac92050d8b570bcc8ef43",
+    patches = ["//bazel/rules_poetry:rules_poetry.patch"],
+    remote = "https://github.com/mongodb-forks/rules_poetry",
+)
+
+#
+## We need skylib to be able to use config_setting_group in rule_poetry below
+## https://github.com/bazelbuild/bazel-skylib/blob/main/docs/selects_doc.md#selectsconfig_setting_group
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "rules_pkg", version = "1.2.0")
+bazel_dep(name = "abseil-cpp", version = "20250512.1", repo_name = "com_google_absl")
+local_path_override(
+    module_name = "abseil-cpp",
+    path = "src/third_party/abseil-cpp/dist",
+)
+
+bazel_dep(name = "protobuf", version = "31.1", repo_name = "com_google_protobuf")
+local_path_override(
+    module_name = "protobuf",
+    path = "src/third_party/protobuf/dist",
+)
+
+bazel_dep(name = "googletest", version = "1.17.0", repo_name = "com_google_googletest")
+local_path_override(
+    module_name = "googletest",
+    path = "src/third_party/googletest",
+)
+
+mongo_tcmalloc_repository(name = "com_google_tcmalloc")
+
+bazel_dep(
+    name = "google_benchmark",
+    version = "1.9.4",
+    dev_dependency = True,
+    repo_name = "com_github_google_benchmark",
+)
+
+bazel_dep(name = "grpc", version = "1.74.1", repo_name = "com_github_grpc_grpc")
+local_path_override(
+    module_name = "grpc",
+    path = "src/third_party/grpc/dist",
+)
+
+# googleapis still requests older grpc-java releases that import repos from
+# grpc_repo_deps_ext. Keep grpc-java on a newer module that declares those
+# dependencies directly so Bazel's module graph stays consistent with grpc@1.74.
+single_version_override(
+    module_name = "grpc-java",
+    version = "1.74.0",
+)
+
+bazel_dep(name = "boringssl", version = "")
+local_path_override(
+    module_name = "boringssl",
+    path = "src/third_party/boringssl_replacement",
+)
+
+bazel_dep(name = "c-ares", version = "1.27.0")
+local_path_override(
+    module_name = "c-ares",
+    path = "src/third_party/cares",
+)
+
+bazel_dep(name = "re2", version = "2025-08-12")
+local_path_override(
+    module_name = "re2",
+    path = "src/third_party/re2/dist",
+)
+
+bazel_dep(name = "zlib", version = "1.3.1")
+local_path_override(
+    module_name = "zlib",
+    path = "src/third_party/zlib",
+)
+
+# When updating fuzztest run the following command
+# bazel run @fuzztest//bazel:setup_configs > bazelrc.fuzztest
+bazel_dep(name = "fuzztest", version = "20250805.0")
+local_path_override(
+    module_name = "fuzztest",
+    path = "src/third_party/fuzztest/dist",
+)
+
+bazel_dep(name = "rules_python", version = "1.8.5")
+
+bazel_dep(name = "buildifier_prebuilt", version = "6.4.0", dev_dependency = True)
+single_version_override(
+    module_name = "buildifier_prebuilt",
+    version = "6.4.0",
+)
+
+bazel_dep(name = "prometheus-cpp", version = "1.3.0", repo_name = "com_github_jupp0r_prometheus_cpp")
+local_path_override(
+    module_name = "prometheus-cpp",
+    path = "src/third_party/prometheus-cpp/dist",
+)
+
+bazel_dep(name = "rules_multitool", version = "0.4.0")
+
+multitool = use_extension("@rules_multitool//multitool:extension.bzl", "multitool")
+multitool.hub(lockfile = "//tools/lint:multitool.lock.json")
+use_repo(multitool, "multitool")
+
+# TODO SERVER-122885: port over from WORKSPACE
+# currently breaks pyright
+##node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node", dev_dependency = True)
+##node.toolchain(node_version = "18.20.4")
+
+##
+##npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm", dev_dependency = True)
+##npm.npm_translate_lock(
+##    name = "npm",
+##    npmrc = "//:.npmrc",
+##    pnpm_lock = "//:pnpm-lock.yaml",
+##    verify_node_modules_ignored = "//:.bazelignore",
+##)
+##use_repo(npm, "npm")
+##
+##pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
+##use_repo(pnpm, "pnpm")
+#
+setup_local_config_platform = use_repo_rule("//bazel/platforms:local_config_platform.bzl", "setup_local_config_platform")
+
+setup_local_config_platform(name = "internal_platforms_do_not_use")
+
+register_execution_platforms("@internal_platforms_do_not_use//host:host")
+
+# TODO SERVER-122886: port over from WORKSPACE
+# cannot be moved without changing the path or creating a symlink
+# to _main~setup_mongo_toolchains~mongo_toolchain_v4 and _main~setup_mongo_toolchains~mongo_toolchain_v5
+##setup_mongo_toolchains_extension = use_extension("//bazel/toolchains:mongo_toolchain.bzl", "setup_mongo_toolchains_extension")
+##use_repo(
+##    setup_mongo_toolchains_extension,
+##    "mongo_toolchain_v4",
+##    "mongo_toolchain_v5",
+##)
+#
+# Native/third-party system-compiler toolchain. Only matches the host platform
+# when it is generated with USE_NATIVE_TOOLCHAIN=1 (which adds the
+# use_native_toolchain constraint), so it never competes with the hermetic
+# mongo toolchain on a normal build.
+setup_mongo_native_toolchain = use_repo_rule("//bazel/toolchains/cc/mongo_native:native_toolchain.bzl", "setup_mongo_native_toolchain")
+
+setup_mongo_native_toolchain(name = "mongo_native_toolchain")
+
+register_toolchains("@mongo_native_toolchain//:mongo_native_toolchain")
+
+setup_mongo_apple_toolchains_extension = use_extension("//bazel/toolchains/cc/mongo_apple:mongo_apple_toolchain.bzl", "setup_mongo_apple_toolchain_extension")
+use_repo(setup_mongo_apple_toolchains_extension, "mongo_apple_toolchain")
+
+register_toolchains(
+    "@mongo_apple_toolchain//...",
+)
+
+# Cross-compilation toolchain for building macOS binaries on Linux
+setup_mongo_apple_cross_toolchains_extension = use_extension("//bazel/toolchains/cc/mongo_apple_cross:mongo_apple_cross_toolchain.bzl", "setup_mongo_apple_cross_toolchain_extension")
+use_repo(setup_mongo_apple_cross_toolchains_extension, "mongo_apple_cross_toolchain", "mongo_apple_cross_toolchain_files")
+
+register_toolchains(
+    "@mongo_apple_cross_toolchain//...",
+)
+
+setup_mongo_python_toolchains = use_extension("//bazel:bzlmod.bzl", "setup_mongo_python_toolchains")
+use_repo(
+    setup_mongo_python_toolchains,
+    "py_host",
+    "py_linux_arm64",
+    "py_linux_ppc64le",
+    "py_linux_s390x",
+    "py_linux_x86_64",
+    "py_macos_arm64",
+    "py_macos_x86_64",
+    "py_windows_x86_64",
+)
+
+register_toolchains(
+    "@py_linux_arm64//:python_toolchain",
+    "@py_linux_ppc64le//:python_toolchain",
+    "@py_linux_s390x//:python_toolchain",
+    "@py_linux_x86_64//:python_toolchain",
+    "@py_macos_arm64//:python_toolchain",
+    "@py_macos_x86_64//:python_toolchain",
+    "@py_windows_x86_64//:python_toolchain",
+)
+
+# broken on windows currently
+setup_local_host_values = use_repo_rule("//bazel/platforms:local_host_values.bzl", "setup_local_host_values")
+
+setup_local_host_values(name = "local_host_values")
+
+setup_evergreen_variables = use_repo_rule("//bazel/repository_rules:evergreen_variables.bzl", "setup_evergreen_variables")
+
+setup_evergreen_variables(name = "evergreen_variables")
+
+setup_pgo_data = use_repo_rule("//bazel/repository_rules:pgo_data.bzl", "setup_pgo_data")
+
+setup_pgo_data(name = "pgo_data")
+
+setup_cspgo_data = use_repo_rule("//bazel/repository_rules:cspgo_data.bzl", "setup_cspgo_data")
+
+setup_cspgo_data(name = "cspgo_data")
+
+setup_bolt_data = use_repo_rule("//bazel/repository_rules:bolt_data.bzl", "setup_bolt_data")
+
+setup_bolt_data(name = "bolt_data")
+
+mothra_repository = use_repo_rule("//bazel/repository_rules:mothra.bzl", "mothra_repository")
+
+# This repository is created in CI setup or by manually cloning the 10gen/mothra repo to ./mothra.
+# If the directory doesn't exist, a stub with empty teams will be created.
+mothra_repository(name = "mothra")
+
+jstestfuzz_repository = use_extension(
+    "//bazel/repository_rules:jstestfuzz_repository.bzl",
+    "jstestfuzz_repository",
+)
+use_repo(jstestfuzz_repository, "jstestfuzz")
+
+setup_mongo_windows_toolchains_extension = use_extension("//bazel/toolchains/cc/mongo_windows:mongo_toolchain.bzl", "setup_mongo_windows_toolchain_extension")
+use_repo(setup_mongo_windows_toolchains_extension, "mongo_windows_toolchain")
+
+register_toolchains("@mongo_windows_toolchain//...")
+
+###################### RUST DEPS ######################
+# Rules rust uses a custom cargo-bazel binary that doesnt exist for ppc so
+# we have to build it ourselves. It needs to be in sync with the rules_rust
+# version. Use the script buildscripts/build_cargo_bazel_ppc64le.sh on a ppc
+# machine to regenerate the file, upload it to the public build s3 bucket
+# and then fix the url in ppc64le_cargo_bazel_url.patch
+bazel_dep(name = "rules_rust", version = "0.69.0")
+
+# Right now we dont build rust on ppc, when we do unsupported_host_skip_crates.patch
+# should be removed
+single_version_override(
+    module_name = "rules_rust",
+    patches = [
+        "//bazel/rules_rust:windows_long_path.patch",
+        "//bazel/rules_rust:ppc64le_platform.patch",
+        "//bazel/rules_rust:ppc64le_crates.patch",
+        "//bazel/rules_rust:ppc64le_cargo_bazel_url.patch",
+        "//bazel/rules_rust:cargo_build_script_pwd_flags.patch",
+    ],
+    version = "0.69.0",
+)
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+
+# The known_shas.bzl in rules_rust has a list of hashes for nightly tools
+# Make sure this version is set to one of those, or specify the hashes yourself
+rust.toolchain(
+    edition = "2024",
+    versions = ["nightly/2026-02-12"],
+)
+
+rust_host = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
+rust_host.host_tools(
+    name = "rust_host_tools_nightly",
+    edition = "2024",
+    version = "nightly/2026-02-12",
+)
+use_repo(rust_host, "rust_host_tools_nightly")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.spec(
+    package = "wasmtime",
+    version = "=44.0.1",
+)
+crate.spec(
+    features = [
+        "cranelift",
+        "component-model",
+        "async",
+        "wasi",
+    ],
+    package = "wasmtime-c-api-impl",
+    version = "=44.0.1",
+)
+
+# We partially custom build wasmtime_c because otherwise it tries to use cmake
+# to create generate conf.h
+crate.annotation(
+    additive_build_file = "//src/third_party/wasmtime:BUILD.bazel.wasmtime",
+    crate = "wasmtime-c-api-impl",
+    extra_aliased_targets = {"wasmtime_c": "wasmtime_c"},
+    gen_build_script = "off",
+    patch_args = ["-p1"],
+    patches = [
+        "//bazel/wasmtime:store_rs.patch",
+        "//bazel/wasmtime:store_rs_resource_limiter.patch",
+        "//bazel/wasmtime:store_h.patch",
+        "//bazel/wasmtime:store_h_resource_limiter.patch",
+        "//bazel/wasmtime:store_hh.patch",
+        "//bazel/wasmtime:store_hh_resource_limiter.patch",
+        "//bazel/wasmtime:val_raw_u8_list_h.patch",
+        "//bazel/wasmtime:val_raw_u8_list_rs.patch",
+    ],
+)
+
+# The val_bytes_* patches add a Val::Bytes variant to the wasmtime component
+# model, enabling a bulk-copy fast path when passing large BSON byte arrays
+# (e.g. mapReduce documents) from C++ into WASM linear memory. Without this,
+# each byte is boxed individually as a Val::U8, producing O(N) allocations for
+# a single document. The patches must be applied to wasmtime, wasmtime-wast
+# (the test harness), and wasmtime-wave (the value serialisation layer) so
+# that all three agree on the Val enum layout.
+# TODO (SERVER-127394): Contribute these patches upstream to the wasmtime repo
+crate.annotation(
+    crate = "wasmtime",
+    patch_args = ["-p1"],
+    patches = [
+        "//bazel/wasmtime:val_bytes_fast_path.patch",
+        "//bazel/wasmtime:val_bytes_lift_fast_path.patch",
+        "//bazel/wasmtime:val_bytes_wave_fast_path.patch",
+    ],
+)
+crate.annotation(
+    crate = "wasmtime-wast",
+    patch_args = ["-p1"],
+    patches = [
+        "//bazel/wasmtime:val_bytes_wast_fast_path.patch",
+    ],
+)
+
+# Disable default features and re-enable everything except "objdump/explore" so we don't pull in capstone/capstone-sys.
+# Can be renabled when it uses a version of capstone containing this commit - https://github.com/capstone-rust/capstone-rs/commit/28a6eb15fdc6fb988d13c663e8b4af4d7870d263
+crate.spec(
+    default_features = False,
+    features = [
+        "run",
+        "compile",
+        "serve",
+        "wast",
+        "config",
+        "completion",
+        "wizer",
+        "wasi-nn",
+        "wasi-threads",
+        "wasi-http",
+        "wasi-config",
+        "wasi-keyvalue",
+        "wasi-tls",
+        "wat",
+        "parallel-compilation",
+        "pooling-allocator",
+        "cache",
+        "logging",
+        "demangle",
+        "cranelift",
+        "profiling",
+        "coredump",
+        "addr2line",
+        "debug-builtins",
+        "component-model",
+        "component-model-async",
+        "threads",
+        "stack-switching",
+        "winch",
+        "pulley",
+        "gc",
+    ],
+    package = "wasmtime-cli",
+    version = "=44.0.1",
+)
+
+# This causes us to build the actual binary and not just the rlib
+crate.annotation(
+    crate = "wasmtime-cli",
+    gen_binaries = ["wasmtime"],
+)
+crate.spec(
+    package = "zstd-sys",
+    version = "=2.0.9+zstd.1.5.5",
+)
+
+# Disable zstd-sys's build script to prevent it from compiling its own copy of zstd.
+# With LTO we can only have one set of zstd symbols, so we link against our vendored copy.
+# The crate falls back to pre-generated bindings when the build script is disabled.
+crate.annotation(
+    crate = "zstd-sys",
+    gen_build_script = "off",
+    deps = ["@@//src/third_party/zstandard:zstd"],
+)
+
+# Update the lock file using "CARGO_BAZEL_REPIN=1 bazel sync --only=crates"
+# You may need to delete the contents of crates.lock first
+crate.from_specs(
+    cargo_lockfile = "//bazel:crates.toml",
+    host_tools = "@rust_host_tools_nightly",
+    lockfile = "//bazel:crates.lock",
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "powerpc64le-unknown-linux-gnu",
+        "s390x-unknown-linux-gnu",
+    ],
+)
+use_repo(crate, "crates")
+
+# wit-bindgen-cli must live in a separate crate extension because
+# artifact="bin" changes how crate_universe configures exec-platform
+# toolchain resolution for the entire extension, which breaks Windows
+# exec builds of other binary targets (e.g. wasmtime-cli). Any other artifact="bin"
+# should live here.
+cargo_bindeps = use_extension("@rules_rust//crate_universe:extension.bzl", "crate")
+cargo_bindeps.spec(
+    artifact = "bin",
+    package = "wit-bindgen-cli",
+    version = "=0.51.0",
+)
+cargo_bindeps.annotation(
+    crate = "wit-bindgen-cli",
+    gen_all_binaries = True,
+)
+cargo_bindeps.from_specs(
+    name = "cargo_bindeps",
+    cargo_lockfile = "//bazel:cargo_bindeps.toml",
+    host_tools = "@rust_host_tools_nightly",
+    lockfile = "//bazel:cargo_bindeps.lock",
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "powerpc64le-unknown-linux-gnu",
+        "s390x-unknown-linux-gnu",
+    ],
+)
+use_repo(cargo_bindeps, "cargo_bindeps")
+#################### END RUST DEPS ####################
+
+wasi_deps = use_repo_rule(
+    "//bazel/toolchains/cc/mongo_wasm/toolchain:wasi_repo.bzl",
+    "setup_wasi_deps",
+)
+
+wasi_deps(name = "wasi_sdk")
+
+spidermonkey_repo = use_repo_rule(
+    "//src/mongo/scripting/mozjs/wasm:spidermonkey_repo.bzl",
+    "spidermonkey_repository",
+)
+
+spidermonkey_repo(
+    name = "spidermonkey",
+    repository_file = "//src/mongo/scripting/mozjs/wasm/spider-monkey:spider-monkey-repository",
+    sha256_file = "//src/mongo/scripting/mozjs/wasm/spider-monkey:spider-monkey-sha256sum",
+    version_file = "//src/mongo/scripting/mozjs/wasm/spider-monkey:spider-monkey-version",
+)

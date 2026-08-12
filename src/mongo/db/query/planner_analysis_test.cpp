@@ -1,0 +1,551 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/planner_analysis.h"
+
+#include "mongo/bson/json.h"
+#include "mongo/db/index/wildcard_key_generator.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/compiler/metadata/index_entry.h"
+#include "mongo/db/query/compiler/optimizer/index_bounds_builder/index_bounds_builder.h"
+#include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
+#include "mongo/db/query/compiler/physical_model/interval/interval.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/query_planner_test_fixture.h"
+#include "mongo/unittest/unittest.h"
+
+#include <set>
+#include <string_view>
+#include <vector>
+
+#include <s2cellid.h>
+
+
+using namespace mongo;
+
+namespace {
+using namespace std::literals::string_view_literals;
+
+/**
+ * Make a minimal IndexEntry from just a key pattern. A dummy name will be added.
+ */
+IndexEntry buildSimpleIndexEntry(const BSONObj& kp,
+                                 WildcardProjection* wcProjection = nullptr,
+                                 bool sparse = false) {
+    return {kp,
+            IndexNames::nameToType(IndexNames::findPluginName(kp)),
+            IndexConfig::kLatestIndexVersion,
+            false,
+            {},
+            {},
+            sparse,
+            false,
+            CoreIndexInfo::Identifier("test_foo"),
+            {},
+            wcProjection};
+}
+
+TEST(QueryPlannerAnalysis, CanUseIndexForRightSideOfLookupOnlyInClassic) {
+    QueryTestServiceContext testServiceContext;
+    auto opCtx = testServiceContext.makeOperationContext();
+    const auto kNss = NamespaceString::createNamespaceString_forTest("test.test");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx =
+        new ExpressionContextForTest(opCtx.get(), kNss);
+
+    std::string foreignField = "b";
+    std::vector<IndexEntry> indexList;
+    BSONObj keyPattern = BSON("$**" << 1);
+
+    auto wcProjection = WildcardKeyGenerator::createProjectionExecutor(keyPattern, BSONObj());
+    auto compatibleWcIndex = buildSimpleIndexEntry(keyPattern, &wcProjection);
+
+    auto wcProjectionExclude =
+        WildcardKeyGenerator::createProjectionExecutor(keyPattern, BSON("b" << 0));
+    auto incompatibleWcIndex = buildSimpleIndexEntry(keyPattern, &wcProjectionExclude);
+
+    auto sbeIndex = buildSimpleIndexEntry(BSON("b" << 1));
+
+    // There are no indexes.
+    ASSERT_FALSE(QueryPlannerAnalysis::canUseIndexForRightSideOfLookupOnlyInClassic(
+        expCtx, foreignField, indexList));
+    // A single index that is wildcard index that can be used only in classic.
+    indexList.push_back(compatibleWcIndex);
+    ASSERT_TRUE(QueryPlannerAnalysis::canUseIndexForRightSideOfLookupOnlyInClassic(
+        expCtx, foreignField, indexList));
+
+    // A single index that is a  wildcard index that excludes the foreignField, thus it is not
+    // eligible for the query.
+    indexList.clear();
+    indexList.push_back(incompatibleWcIndex);
+    ASSERT_FALSE(QueryPlannerAnalysis::canUseIndexForRightSideOfLookupOnlyInClassic(
+        expCtx, foreignField, indexList));
+
+    // A second index that can be used in SBE.
+    indexList.push_back(sbeIndex);
+    ASSERT_FALSE(QueryPlannerAnalysis::canUseIndexForRightSideOfLookupOnlyInClassic(
+        expCtx, foreignField, indexList));
+
+    // A wildcard index that can be used in classic and a second index that can be used in SBE.
+    indexList.clear();
+    indexList.push_back(compatibleWcIndex);
+    indexList.push_back(sbeIndex);
+    ASSERT_FALSE(QueryPlannerAnalysis::canUseIndexForRightSideOfLookupOnlyInClassic(
+        expCtx, foreignField, indexList));
+
+    // A single index that can be used in SBE.
+    indexList.clear();
+    indexList.push_back(sbeIndex);
+    ASSERT_FALSE(QueryPlannerAnalysis::canUseIndexForRightSideOfLookupOnlyInClassic(
+        expCtx, foreignField, indexList));
+
+    // A sparse (non-partial) index on the foreign field can now be used in SBE via the dynamic
+    // indexed loop join, so it must NOT force the $lookup into the classic engine.
+    auto sparseIndex = buildSimpleIndexEntry(BSON("b" << 1), nullptr, true /* sparse */);
+    indexList.clear();
+    indexList.push_back(sparseIndex);
+    ASSERT_FALSE(QueryPlannerAnalysis::canUseIndexForRightSideOfLookupOnlyInClassic(
+        expCtx, foreignField, indexList));
+}
+
+TEST(QueryPlannerAnalysis, GetSortPatternBasic) {
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"), QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: -1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: -1}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1, b: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: 1}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1, b: -1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: -1}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: -1, b: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: -1, b: 1}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: -1, b: -1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: -1, b: -1}")));
+}
+
+TEST(QueryPlannerAnalysis, GetSortPatternOtherElements) {
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"), QueryPlannerAnalysis::getSortPattern(fromjson("{a: 0}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: 100}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: Infinity}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: true}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: false}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: []}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: {}}")));
+
+    ASSERT_BSONOBJ_EQ(fromjson("{a: -1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: -100}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: -1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: -Infinity}")));
+
+    ASSERT_BSONOBJ_EQ(fromjson("{}"), QueryPlannerAnalysis::getSortPattern(fromjson("{}")));
+}
+
+TEST(QueryPlannerAnalysis, GetSortPatternSpecialIndexTypes) {
+    ASSERT_BSONOBJ_EQ(fromjson("{}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: 'hashed'}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: 'text'}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: '2dsphere'}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{}"), QueryPlannerAnalysis::getSortPattern(fromjson("{a: ''}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{}"), QueryPlannerAnalysis::getSortPattern(fromjson("{a: 'foo'}")));
+
+    ASSERT_BSONOBJ_EQ(fromjson("{a: -1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: -1, b: 'text'}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: -1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: -1, b: '2dsphere'}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: 'text'}")));
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: '2dsphere'}")));
+
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: 'text', c: 1}")));
+    ASSERT_BSONOBJ_EQ(
+        fromjson("{a: 1}"),
+        QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: '2dsphere', c: 1}")));
+
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 1, b: 1}"),
+                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: 1, c: 'text'}")));
+    ASSERT_BSONOBJ_EQ(
+        fromjson("{a: 1, b: 1}"),
+        QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: 1, c: 'text', d: 1}")));
+}
+
+// Test the generation of sort orders provided by an index scan done by
+// IndexScanNode::computeProperties().
+TEST(QueryPlannerAnalysis, IxscanSortOrdersBasic) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    IndexScanNode ixscan(testNss,
+                         buildSimpleIndexEntry(fromjson("{a: 1, b: 1, c: 1, d: 1, e: 1}")));
+
+    // Bounds are {a: [[1,1]], b: [[2,2]], c: [[3,3]], d: [[1,5]], e:[[1,1],[2,2]]},
+    // all inclusive.
+    OrderedIntervalList oil1("a");
+    oil1.intervals.push_back(Interval(fromjson("{'': 1, '': 1}"), true, true));
+    ixscan.bounds.fields.push_back(oil1);
+
+    OrderedIntervalList oil2("b");
+    oil2.intervals.push_back(Interval(fromjson("{'': 2, '': 2}"), true, true));
+    ixscan.bounds.fields.push_back(oil2);
+
+    OrderedIntervalList oil3("c");
+    oil3.intervals.push_back(Interval(fromjson("{'': 3, '': 3}"), true, true));
+    ixscan.bounds.fields.push_back(oil3);
+
+    OrderedIntervalList oil4("d");
+    oil4.intervals.push_back(Interval(fromjson("{'': 1, '': 5}"), true, true));
+    ixscan.bounds.fields.push_back(oil4);
+
+    OrderedIntervalList oil5("e");
+    oil5.intervals.push_back(Interval(fromjson("{'': 1, '': 1}"), true, true));
+    oil5.intervals.push_back(Interval(fromjson("{'': 2, '': 2}"), true, true));
+    ixscan.bounds.fields.push_back(oil5);
+
+    // Compute and retrieve the set of sorts.
+    ixscan.computeProperties();
+    auto sorts = ixscan.providedSorts();
+
+    // One possible sort is the index key pattern.
+    ASSERT(sorts.contains(fromjson("{a: 1, b: 1, c: 1, d: 1, e: 1}")));
+
+    // All prefixes of the key pattern.
+    ASSERT(sorts.contains(fromjson("{a: 1}")));
+    ASSERT(sorts.contains(fromjson("{a: -1, b: 1}")));
+    ASSERT(sorts.contains(fromjson("{a: 1, b: -1, c: 1}")));
+    ASSERT(sorts.contains(fromjson("{a: 1, b: 1, c: -1, d: 1}")));
+
+    // Additional sorts considered due to point intervals on 'a', 'b', and 'c'.
+    ASSERT(sorts.contains(fromjson("{b: -1, d: 1, e: 1}")));
+    ASSERT(sorts.contains(fromjson("{d: 1, c: 1, e: 1}")));
+    ASSERT(sorts.contains(fromjson("{d: 1, c: -1}")));
+
+    // Sorts that are not considered.
+    ASSERT_FALSE(sorts.contains(fromjson("{d: -1, e: -1}")));
+    ASSERT_FALSE(sorts.contains(fromjson("{e: 1, a: 1}")));
+    ASSERT_FALSE(sorts.contains(fromjson("{d: 1, e: -1}")));
+    ASSERT_FALSE(sorts.contains(fromjson("{a: 1, d: 1, e: -1}")));
+
+    // Verify that the 'sorts' object has expected internal fields.
+    ASSERT(sorts.getIgnoredFields() == std::set<std::string>({"a", "b", "c"}));
+    ASSERT_BSONOBJ_EQ(fromjson("{d: 1, e: 1}"), sorts.getBaseSortPattern());
+}
+
+TEST(QueryPlannerAnalysis, GeoSkipValidation) {
+    BSONObj unsupportedVersion = fromjson("{'2dsphereIndexVersion': 2}");
+    BSONObj supportedVersion = fromjson("{'2dsphereIndexVersion': 3}");
+
+    auto relevantIndex = buildSimpleIndexEntry(fromjson("{'geometry.field': '2dsphere'}"));
+    auto irrelevantIndex = buildSimpleIndexEntry(fromjson("{'geometry.field': 1}"));
+    auto differentFieldIndex = buildSimpleIndexEntry(fromjson("{'geometry.blah': '2dsphere'}"));
+    auto compoundIndex = buildSimpleIndexEntry(fromjson("{'geometry.field': '2dsphere', 'a': -1}"));
+    auto unsupportedIndex = buildSimpleIndexEntry(fromjson("{'geometry.field': '2dsphere'}"));
+
+    relevantIndex.infoObj = irrelevantIndex.infoObj = differentFieldIndex.infoObj =
+        compoundIndex.infoObj = supportedVersion;
+    unsupportedIndex.infoObj = unsupportedVersion;
+
+    QueryPlannerParams params{QueryPlannerParams::ArgsForTest{}};
+
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::unique_ptr<FetchNode> fetchNodePtr = std::make_unique<FetchNode>(testNss);
+    std::unique_ptr<GeoMatchExpression> exprPtr =
+        std::make_unique<GeoMatchExpression>("geometry.field"sv, nullptr, BSONObj());
+
+    GeoMatchExpression* expr = exprPtr.get();
+
+    FetchNode* fetchNode = fetchNodePtr.get();
+    // Takes ownership.
+    fetchNode->filter = std::move(exprPtr);
+
+    OrNode orNode;
+    // Takes ownership.
+    orNode.children.push_back(std::move(fetchNodePtr));
+
+    // We should not skip validation if there are no indices.
+    QueryPlannerAnalysis::analyzeGeo(params, fetchNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), false);
+
+    QueryPlannerAnalysis::analyzeGeo(params, &orNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), false);
+
+    // We should not skip validation if there is a non 2dsphere index.
+    params.mainCollectionInfo.indexes.push_back(irrelevantIndex);
+
+    QueryPlannerAnalysis::analyzeGeo(params, fetchNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), false);
+
+    QueryPlannerAnalysis::analyzeGeo(params, &orNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), false);
+
+    // We should not skip validation if the 2dsphere index isn't on relevant field.
+    params.mainCollectionInfo.indexes.push_back(differentFieldIndex);
+
+    QueryPlannerAnalysis::analyzeGeo(params, fetchNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), false);
+
+    QueryPlannerAnalysis::analyzeGeo(params, &orNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), false);
+
+    // We should not skip validation if the 2dsphere index version does not support it.
+
+    params.mainCollectionInfo.indexes.push_back(unsupportedIndex);
+
+    QueryPlannerAnalysis::analyzeGeo(params, fetchNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), false);
+
+    QueryPlannerAnalysis::analyzeGeo(params, &orNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), false);
+
+    // We should skip validation if there is a relevant 2dsphere index.
+    params.mainCollectionInfo.indexes.push_back(relevantIndex);
+
+    QueryPlannerAnalysis::analyzeGeo(params, fetchNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), true);
+
+    // Reset the test.
+    expr->setCanSkipValidation(false);
+
+    QueryPlannerAnalysis::analyzeGeo(params, &orNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), true);
+
+    // We should skip validation if there is a relevant 2dsphere compound index.
+
+    // Reset the test.
+    params.mainCollectionInfo.indexes.clear();
+    expr->setCanSkipValidation(false);
+
+    params.mainCollectionInfo.indexes.push_back(compoundIndex);
+
+    QueryPlannerAnalysis::analyzeGeo(params, fetchNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), true);
+
+    // Reset the test.
+    expr->setCanSkipValidation(false);
+
+    QueryPlannerAnalysis::analyzeGeo(params, &orNode);
+    ASSERT_EQ(expr->getCanSkipValidation(), true);
+}
+
+TEST_F(QueryPlannerTest, ExprQueryHasImprecisePredicatesRemoved) {
+    // Ensure that all of the $_internalExpr predicates which get added when optimizing are later
+    // removed for an $expr on a collection scan.
+
+    runQuery(fromjson("{$expr: {$eq: ['$a', 123]}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{cscan: {filter: {$and: [{$expr: {$eq: ['$a', {$const: 123}]}}]}, dir: 1}}");
+
+    // Does not remove an InternalExpr* within an OR.
+    runQuery(fromjson("{$or: [{$expr: {$eq: ['$a', 123]}}, {$expr: {$eq: ['$b', 456]}}]}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{cscan: {filter: {$or: [{$and: [{$expr: {$eq: ['$a', {$const: 123}]}}]},"
+        "                        {$and: [{$expr: {$eq: ['$b', {$const: 456}]}}]}]},"
+        "dir: 1}}");
+
+    // Does not remove an InternalExpr* within an OR, even when an adjacent $expr is present.
+    runQuery(
+        fromjson("{or: [{a: {$_internalExprEq: 123}},"
+                 "{$expr: {$eq: ['$a', 123]}}, {$expr: {$eq: ['$b', 456]}}]}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{cscan: {filter: {or: [{a: {$_internalExprEq: 123}},"
+        " {$expr: {$eq: ['$a', 123]}}, {$expr: {$eq: ['$b', 456]}}]}, dir: 1}}");
+
+    // Removes an InternalExpr* within an AND when adjacent to precise $expr predicates.
+    runQuery(fromjson("{$and: [{$expr: {$eq: ['$a', 123]}}, {$expr: {$eq: ['$b', 456]}}]}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{cscan: {filter: "
+        "{$and: [{$expr: {$eq: ['$a', 123]}}, {$expr: {$eq: ['$b', 456]}}]}, dir:1}}");
+}
+
+TEST_F(QueryPlannerTest, ExprQueryHasImprecisePredicatesRemovedMix) {
+    // Ensure that the query plan generated does not include redundant $_internalExpr expressions.
+    const auto filter =
+        "{$or: [{$and: [{$expr: {$eq: ['$a', 123]}}, {$expr: {$eq: ['$a1', 123]}}]},"
+        "       {$and: [{$expr: {$eq: ['$b', 123]}}, {$expr: {$eq: ['$b1', 123]}}]},"
+        "       {$and: [{$or: [{$and: [{$expr: {$eq: ['$c', 123]}}]},"
+        "                      {$and: [{$expr: {$eq: ['$c1', 123]}}]}]},"
+        "               {$or: [{$and: [{$expr: {$eq: ['$d', 123]}},"
+        "                              {$expr: {$eq: ['$d1', 123]}}]},"
+        "                      {$and: [{$expr: {$eq: ['$e1', 123]}},"
+        "                              {$expr: {$eq: ['$e2', 123]}}]}]}]}]}";
+
+    runQuery(fromjson(filter));
+
+    assertNumSolutions(1U);
+
+    auto filterWithConstant = std::string(filter);
+    boost::replace_all(filterWithConstant, "123", "{$const: 123}");
+    std::string soln = str::stream() << "{cscan: {filter:" << filterWithConstant << ", dir: 1}}";
+    assertSolutionExists(soln);
+}
+
+TEST_F(QueryPlannerTest, ExprOnFetchDoesNotIncludeImpreciseFilter) {
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(BSON("a" << 1));
+
+    // The residual predicate on b has to be applied after the fetch. Ensure that there is no
+    // additional imprecise predicate on the fetch.
+    runQuery(fromjson("{$and: [{a: 1}, {$expr: {$eq: ['$b', 99]}}]}"));
+    ASSERT_EQUALS(getNumSolutions(), 1U);
+    assertSolutionExists(
+        "{fetch: {filter: {$and: [{$expr: {$eq: ['$b', {$const: 99}]}}]}, node: "
+        "     {ixscan: {pattern: {a: 1}, "
+        "      bounds: {a: [[1,1,true,true]]}}}}}");
+}
+
+TEST(QueryPlannerAnalysis, TurnIndexScanIntoCount) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    auto node = std::make_unique<IndexScanNode>(testNss, buildSimpleIndexEntry(BSON("a" << 1)));
+
+    OrderedIntervalList a{"a"};
+    a.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+        BSON("" << 1 << "" << 10), BoundInclusion::kIncludeBothStartAndEndKeys));
+    node->bounds.fields.push_back(a);
+
+    QuerySolution qs;
+    qs.setRoot(std::move(node));
+    ASSERT_TRUE(QueryPlannerAnalysis::turnIxscanIntoCount(&qs));
+}
+
+TEST(QueryPlannerAnalysis, TurnIndexScanAndFetchIntoCount) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    auto node = std::make_unique<IndexScanNode>(testNss, buildSimpleIndexEntry(BSON("a" << 1)));
+    OrderedIntervalList a{"a"};
+    a.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+        BSON("" << 1 << "" << 10), BoundInclusion::kIncludeBothStartAndEndKeys));
+    node->bounds.fields.push_back(a);
+
+    QuerySolution qs;
+    qs.setRoot(std::make_unique<FetchNode>(std::move(node), testNss));
+    ASSERT_TRUE(QueryPlannerAnalysis::turnIxscanIntoCount(&qs));
+}
+
+TEST(QueryPlannerAnalysis, CannotTurnIndexScanAndFetchIntoCount) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    auto node = std::make_unique<IndexScanNode>(testNss, buildSimpleIndexEntry(BSON("a" << 1)));
+    OrderedIntervalList a{"a"};
+    a.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+        BSON("" << 1 << "" << 10), BoundInclusion::kIncludeBothStartAndEndKeys));
+    node->bounds.fields.push_back(a);
+
+    // Add fetch node with filter.
+    auto fetch = std::make_unique<FetchNode>(std::move(node), testNss);
+    auto operand = BSON("$lt" << 100);
+    std::unique_ptr<LTMatchExpression> expPtr =
+        std::make_unique<LTMatchExpression>("a"sv, operand["$lt"]);
+    fetch->filter = std::move(expPtr);
+
+    QuerySolution qs;
+    qs.setRoot(std::move(fetch));
+    ASSERT_FALSE(QueryPlannerAnalysis::turnIxscanIntoCount(&qs));
+}
+
+// ---------------------------------------------------------------------------
+// sortMatchesTraversalPreference
+// ---------------------------------------------------------------------------
+
+// Helper to build a TraversalPreference with just a sortPattern (direction and clusterField
+// are unused by sortMatchesTraversalPreference itself).
+TraversalPreference makeTraversalPreference(const BSONObj& sortPattern) {
+    return TraversalPreference{sortPattern, 1, ""};
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_ExactMatch) {
+    // Sort pattern exactly matches the index pattern → true.
+    ASSERT_TRUE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{a: 1, b: 1}")), fromjson("{a: 1, b: 1}"), {}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_SortIsProperPrefix) {
+    // Sort is a strict prefix of a longer index → true.
+    ASSERT_TRUE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{a: 1}")), fromjson("{a: 1, b: 1}"), {}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_SortLongerThanIndex) {
+    // Sort has more fields than the index can provide → false.
+    ASSERT_FALSE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{a: 1, b: 1}")), fromjson("{a: 1}"), {}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_SortEvenLongerThanIndex) {
+    // Sort has more fields than the index can provide → false.
+    ASSERT_FALSE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{a: 1, b: 1, c: 1}")), fromjson("{a: 1}"), {}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_SortFieldAfterIgnoreUnmatched) {
+    // The last field in the sort has no matching index field (index exhausted on it) → false.
+    ASSERT_FALSE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{a: 1, x: 1, b: 1}")), fromjson("{a: 1}"), {"x"}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_SortFieldAfterIgnoreDirectionMismatch) {
+    // The last field in the sort has no matching index field (index exhausted on it) → false.
+    ASSERT_FALSE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{a: 1, x: 1, b: -1}")), fromjson("{a: 1, b: 1}"), {"x"}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_TrailingIgnoredFields) {
+    // Sort has a trailing ignored field after all matched fields → true.
+    ASSERT_TRUE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{a: 1, x: 1}")), fromjson("{a: 1}"), {"x"}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_AllSortFieldsIgnored) {
+    // Every sort field is ignored → trivially true.
+    ASSERT_TRUE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{x: 1, y: 1}")), fromjson("{a: 1}"), {"x", "y"}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_IgnoredFieldInMiddle) {
+    // An ignored field sits between two non-ignored fields that both match → true.
+    ASSERT_TRUE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{a: 1, x: 1, b: 1}")), fromjson("{a: 1, b: 1}"), {"x"}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_DirectionMismatch) {
+    // Sort direction differs from index direction → false.
+    ASSERT_FALSE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{a: 1}")), fromjson("{a: -1}"), {}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_DirectionMismatchOnIgnoredField) {
+    // Direction mismatch only on an ignored field; the remaining fields match → true.
+    ASSERT_TRUE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{x: -1, a: 1}")), fromjson("{a: 1}"), {"x"}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_FieldNameMismatch) {
+    // Sort field name differs from the index field name → false.
+    ASSERT_FALSE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{a: 1}")), fromjson("{b: 1}"), {}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_EmptySort) {
+    // Empty sort is vacuously a prefix of any index → true.
+    ASSERT_TRUE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{}")), fromjson("{a: 1}"), {}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_BothEmpty) {
+    ASSERT_TRUE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{}")), fromjson("{}"), {}));
+}
+
+TEST(QueryPlannerAnalysis, SortMatchesTraversalPreference_InvalidData) {
+    // Non-number sort direction
+    ASSERT_FALSE(QueryPlannerAnalysis::sortMatchesTraversalPreference(
+        makeTraversalPreference(fromjson("{a: 'foo'}")), fromjson("{a: 'foo'}"), {}));
+}
+}  // namespace

@@ -1,0 +1,370 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/classic/distinct_scan.h"
+
+#include "mongo/db/exec/classic/orphan_chunk_skipper.h"
+
+#include <memory>
+#include <vector>
+
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/classic/requires_index_stage.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/classic/working_set_common.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/util/assert_util.h"
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+
+using std::unique_ptr;
+
+
+DistinctScan::DistinctScan(ExpressionContext* expCtx,
+                           CollectionAcquisition collection,
+                           DistinctParams params,
+                           WorkingSet* workingSet,
+                           std::unique_ptr<ShardFiltererImpl> shardFilterer,
+                           bool needsFetch)
+    : RequiresIndexStage(kStageType, expCtx, collection, params.indexEntry, workingSet),
+      _workingSet(workingSet),
+      _keyPattern(std::move(params.keyPattern)),
+      _scanDirection(params.scanDirection),
+      _bounds(std::move(params.bounds)),
+      _fieldNo(params.fieldNo),
+      _checker(&_bounds, _keyPattern, _scanDirection),
+      _shardFilterer(std::move(shardFilterer)),
+      _needsFetch(needsFetch) {
+    _specificStats.keyPattern = _keyPattern;
+    _specificStats.indexName = params.name;
+    _specificStats.indexVersion = static_cast<int>(indexDescriptor()->version());
+    _specificStats.isMultiKey = params.isMultiKey;
+    _specificStats.multiKeyPaths = params.multikeyPaths;
+    _specificStats.isUnique = indexDescriptor()->unique();
+    _specificStats.isSetSparseByUser = indexDescriptor()->isSetSparseByUser();
+    _specificStats.isPartial = indexDescriptor()->isPartial();
+    _specificStats.direction = _scanDirection;
+    _specificStats.collation = indexDescriptor()
+                                   ->infoObj()
+                                   .getObjectField(IndexDescriptor::kCollationFieldName)
+                                   .getOwned();
+    _specificStats.isShardFiltering = _shardFilterer != nullptr;
+    _specificStats.isFetching = _needsFetch;
+    _specificStats.isShardFilteringDistinctScanEnabled =
+        expCtx->isFeatureFlagShardFilteringDistinctScanEnabled();
+
+    // If we are shard-filtering and *not* fetching, that means our index includes the shard key. We
+    // may be able to use this information to skip orphan chunks & hence do less work.
+    if (_shardFilterer && !_needsFetch) {
+        auto chunkSkipper = OrphanChunkSkipper::tryMakeChunkSkipper(
+            *_shardFilterer,
+            _shardFilterer->getFilter().getShardKeyPattern(),
+            _keyPattern,
+            _scanDirection);
+        if (chunkSkipper) {
+            _chunkSkipper.emplace(std::move(*chunkSkipper));
+        }
+    }
+
+    // Set up our initial seek. If there is no valid data, just mark as EOF.
+    _commonStats.isEOF = !_checker.getStartSeekPoint(&_seekPoint);
+}
+
+PlanStage::StageState DistinctScan::doFetch(WorkingSetMember* member,
+                                            WorkingSetID id,
+                                            WorkingSetID* out) {
+    if (_idRetrying != WorkingSet::INVALID_ID) {
+        id = _idRetrying;
+        _idRetrying = WorkingSet::INVALID_ID;
+    }
+
+    return handlePlanStageYield(
+        expCtx(),
+        "DistinctScan",
+        [&] {
+            if (!_fetchCursor) {
+                _fetchCursor = collectionPtr()->getCursor(opCtx());
+            }
+
+            if (!WorkingSetCommon::fetch(opCtx(),
+                                         _workingSet,
+                                         id,
+                                         _fetchCursor.get(),
+                                         collectionPtr(),
+                                         collectionPtr()->ns())) {
+                _workingSet->free(id);
+                return NEED_TIME;
+            }
+
+            return ADVANCED;
+        },
+        [&] {
+            // Ensure that the BSONObj underlying the WorkingSetMember is owned because it may be
+            // freed when we yield.
+            member->makeObjOwnedIfNeeded();
+            _idRetrying = id;
+            *out = WorkingSet::INVALID_ID;
+        } /* yieldHandler */);
+}
+
+PlanStage::StageState DistinctScan::doWork(WorkingSetID* out) {
+    if (_commonStats.isEOF)
+        return PlanStage::IS_EOF;
+
+    boost::optional<IndexKeyEntry> kv;
+    const auto ret = handlePlanStageYield(
+        expCtx(),
+        "DistinctScan",
+        [&] {
+            auto& ru = *shard_role_details::getRecoveryUnit(opCtx());
+            if (!_cursor) {
+                _cursor = indexAccessMethod()->newCursor(opCtx(), ru, _scanDirection == 1);
+            }
+
+            if (_needsSequentialScan) {
+                kv = _cursor->next(ru);
+                _needsSequentialScan = false;
+                return PlanStage::ADVANCED;
+            }
+
+            key_string::Builder builder(
+                indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                indexAccessMethod()->getSortedDataInterface()->getOrdering());
+            kv = _cursor->seek(ru,
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   _seekPoint, _scanDirection == 1, builder));
+            return PlanStage::ADVANCED;
+        },
+        [&] {
+            *out = WorkingSet::INVALID_ID;
+        } /* yieldHandler */);
+
+    if (ret != PlanStage::ADVANCED) {
+        return ret;
+    }
+
+    if (!kv) {
+        _commonStats.isEOF = true;
+        return PlanStage::IS_EOF;
+    }
+
+    ++_specificStats.keysExamined;
+
+    switch (_checker.checkKey(kv->key, &_seekPoint)) {
+        case IndexBoundsChecker::MUST_ADVANCE: {
+            // Try again next time. The checker has adjusted the _seekPoint.
+            return PlanStage::NEED_TIME;
+        }
+        case IndexBoundsChecker::DONE: {
+            // There won't be a next time.
+            _commonStats.isEOF = true;
+            _cursor.reset();
+            return IS_EOF;
+        }
+        case IndexBoundsChecker::VALID: {
+            if (!kv->key.isOwned())
+                kv->key = kv->key.getOwned();
+
+            // If we are retrying a fetch that yielded, reuse the existing working set member;
+            // otherwise allocate a new one.
+            WorkingSetID id;
+            WorkingSetMember* member;
+            if (_needsFetch && _idRetrying != WorkingSet::INVALID_ID) {
+                id = _idRetrying;
+                member = _workingSet->get(id);
+            } else {
+                id = _workingSet->allocate();
+                member = _workingSet->get(id);
+                member->recordId = kv->loc;
+                member->keyData.push_back(
+                    IndexKeyDatum(_keyPattern,
+                                  kv->key,
+                                  workingSetIndexId(),
+                                  shard_role_details::getRecoveryUnit(opCtx())->getSnapshotId()));
+                _workingSet->transitionToRecordIdAndIdx(id);
+            }
+
+            if (_needsFetch) {
+                const auto fetchRet = doFetch(member, id, out);
+                // We increment distinct scan's docsExamined as we would in the fetch stage.
+                ++_specificStats.docsExamined;
+                if (fetchRet != PlanStage::ADVANCED) {
+                    return fetchRet;
+                }
+            }
+
+            // Start by assuming this belongs to the current shard.
+            auto belongs = ShardFilterer::DocumentBelongsResult::kBelongs;
+            if (_chunkSkipper) {
+                // If we have a chunk skipper, then we are potentially able to skip past orphan
+                // chunks.
+                auto info = _chunkSkipper->makeSeekPointIfOrphan(member->keyData, _seekPoint);
+                switch (info) {
+                    case OrphanChunkSkipper::NotOrphan: {
+                        // This is not an orphan, so we can continue skipping distinct values as
+                        // before. We handle that below.
+                        break;
+                    }
+                    case mongo::OrphanChunkSkipper::CanSkipOrphans: {
+                        // We have updated the seek point to skip past the current key (which is an
+                        // orphan) to the next owned value of the shard key. Need to seek again.
+                        _workingSet->free(id);
+                        // This is a chunk-skip past one or more orphan chunks; increment stats
+                        // counter.
+                        ++_specificStats.orphanChunkSkips;
+                        return PlanStage::NEED_TIME;
+                    }
+                    case mongo::OrphanChunkSkipper::NoMoreOwnedForThisPrefix: {
+                        // Fall back to a distinct scan: we've exhausted our owned chunks for
+                        // the prefix leading up to the shard key. Adjust the _seekPoint so that it
+                        // is exclusive on the field we are using, in case the next prefix matches
+                        // more owned chunks.
+                        _seekPoint.keyPrefix = kv->key;
+                        _seekPoint.prefixLen = _fieldNo + 1;
+                        _seekPoint.firstExclusive = _fieldNo;
+                        _workingSet->free(id);
+                        return PlanStage::NEED_TIME;
+                    }
+                    case mongo::OrphanChunkSkipper::NoMoreOwned: {
+                        // We're done! No more owned chunks remain, as the shard key is a contiguous
+                        // prefix of the current index.
+                        _workingSet->free(id);
+                        // We also count this as a chunk-skip, since there may have been additional
+                        // orphan values after the previous one (in any case, we end early).
+                        ++_specificStats.orphanChunkSkips;
+                        return PlanStage::IS_EOF;
+                    }
+                    default:
+                        MONGO_UNREACHABLE_TASSERT(9246503);
+                }
+            } else if (_shardFilterer) {
+                // We need one last check before we can return the key if we've been initialized
+                // with a shard filter. If this document is an orphan, we need to try the next one;
+                // otherwise, we can proceed with a regular distinct scan.
+                belongs = _shardFilterer->documentBelongsToMe(*member);
+            }
+
+            switch (belongs) {
+                case ShardFilterer::DocumentBelongsResult::kBelongs: {
+                    // Adjust the _seekPoint so that it is exclusive on the field we are using.
+                    _seekPoint.keyPrefix = kv->key;
+                    _seekPoint.prefixLen = _fieldNo + 1;
+                    _seekPoint.firstExclusive = _fieldNo;
+
+                    // Return the current entry.
+                    *out = id;
+                    return PlanStage::ADVANCED;
+                }
+                case ShardFilterer::DocumentBelongsResult::kNoShardKey: {
+                    tassert(9245300, "Covering index failed to provide shard key", _needsFetch);
+
+                    // Skip this working set member with a warning - no shard key should not be
+                    // possible unless manually inserting data into a shard.
+                    tassert(9245400, "Expected document to be fetched", member->hasObj());
+                    LOGV2_WARNING(
+                        9245401,
+                        "No shard key found in document, it may have been inserted manually "
+                        "into shard",
+                        "document"_attr = redact(member->doc.value().toBson()),
+                        "keyPattern"_attr = _shardFilterer->getKeyPattern());
+                    [[fallthrough]];
+                }
+                case ShardFilterer::DocumentBelongsResult::kDoesNotBelong: {
+                    // If we're here, we found an orphan and have no orphan chunk skipper; we need
+                    // to try the next entry in the index until we find the next non-orphan, and we
+                    // can resume seeking to the next distinct value.
+                    _needsSequentialScan = true;
+                    _workingSet->free(id);
+                    // Similar to shard-filtering, increment the counter for individual orphan docs
+                    // we've filtered out via the shard-filter.
+                    ++_specificStats.chunkSkips;
+                    return PlanStage::NEED_TIME;
+                }
+                default:
+                    MONGO_UNREACHABLE_TASSERT(9245301);
+            }
+        }
+    }
+    MONGO_UNREACHABLE_TASSERT(9245303);
+}
+
+bool DistinctScan::isEOF() const {
+    return _commonStats.isEOF;
+}
+
+void DistinctScan::doSaveStateRequiresIndex() {
+    if (_cursor && !_needsSequentialScan) {
+        // Unless we are 1) shard filtering, 2) not using an orphan chunk skipper, and 3) scanning
+        // past orphans, we always seek, so we don't care where the cursor is.
+        _cursor->saveUnpositioned();
+    } else if (_cursor) {
+        // We are scanning past orphans; save the cursor position.
+        _cursor->save();
+    }
+
+    if (_fetchCursor) {
+        _fetchCursor->saveUnpositioned();
+    }
+}
+
+void DistinctScan::doRestoreStateRequiresIndex() {
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx());
+    if (_cursor) {
+        _cursor->restore(ru);
+    }
+
+    if (_fetchCursor) {
+        uassert(9623400,
+                "Could not restore collection cursor for fetching DISTINCT_SCAN",
+                _fetchCursor->restore(ru));
+    }
+}
+
+void DistinctScan::doDetachFromOperationContext() {
+    if (_cursor) {
+        _cursor->detachFromOperationContext();
+    }
+    if (_fetchCursor) {
+        _fetchCursor->detachFromOperationContext();
+    }
+}
+
+void DistinctScan::doReattachToOperationContext() {
+    if (_cursor) {
+        _cursor->reattachToOperationContext(opCtx());
+    }
+    if (_fetchCursor) {
+        _fetchCursor->reattachToOperationContext(opCtx());
+    }
+}
+
+unique_ptr<PlanStageStats> DistinctScan::getStats() {
+    // Serialize the bounds to BSON if we have not done so already. This is done here rather than in
+    // the constructor in order to avoid the expensive serialization operation unless the distinct
+    // command is being explained.
+    if (_specificStats.indexBounds.isEmpty()) {
+        _specificStats.indexBounds = _bounds.toBSON(!_specificStats.collation.isEmpty());
+    }
+
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_DISTINCT_SCAN);
+    ret->specific = std::make_unique<DistinctScanStats>(_specificStats);
+    return ret;
+}
+
+const SpecificStats* DistinctScan::getSpecificStats() const {
+    return &_specificStats;
+}
+
+}  // namespace mongo

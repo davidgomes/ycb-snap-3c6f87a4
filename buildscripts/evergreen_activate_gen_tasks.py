@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Activate an evergreen task in the existing build."""
+
+import os
+import re
+import sys
+
+import click
+import requests
+import structlog
+from pydantic.main import BaseModel
+from retry.api import retry_call
+from urllib3.util import Retry
+
+from evergreen.api import (
+    DEFAULT_HTTP_RETRY_ATTEMPTS,
+    DEFAULT_HTTP_RETRY_BACKOFF_FACTOR,
+    DEFAULT_HTTP_RETRY_CODES,
+    EvergreenApi,
+    RetryingEvergreenApi,
+)
+
+# Get relative imports to work when the package is not installed on the PYTHONPATH.
+if __name__ == "__main__" and __package__ is None:
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from buildscripts.util.cmdutils import enable_logging
+from buildscripts.util.fileops import read_yaml_file
+from buildscripts.util.taskname import remove_gen_suffix
+
+LOGGER = structlog.getLogger(__name__)
+
+EVG_CONFIG_FILE = "./.evergreen.yml"
+BURN_IN_TAGS = "burn_in_tags"
+BURN_IN_TESTS = "burn_in_tests"
+BURN_IN_VARIANT_SUFFIX = "generated-by-burn-in-tags"
+
+
+class EvgExpansions(BaseModel):
+    """
+    Evergreen expansions file contents.
+
+    build_id: ID of build being run.
+    version_id: ID of version being run.
+    task_name: Name of task creating the generated configuration.
+    """
+
+    build_id: str
+    version_id: str
+    task_name: str
+
+    @classmethod
+    def from_yaml_file(cls, path: str) -> "EvgExpansions":
+        """Read the generation configuration from the given file."""
+        return cls(**read_yaml_file(path))
+
+    @property
+    def task(self) -> str:
+        """Get the task being generated."""
+        return remove_gen_suffix(self.task_name)
+
+
+def activate_task(expansions: EvgExpansions, evg_api: EvergreenApi) -> None:
+    """
+    Activate the given task in the specified build.
+
+    :param expansions: Evergreen expansions file contents.
+    :param evg_api: Evergreen API client.
+    """
+    tasks_not_activated = []
+    if expansions.task == BURN_IN_TAGS:
+        version = evg_api.version_by_id(expansions.version_id)
+        for build_variant in version.build_variants_map.keys():
+            build_id = version.build_variants_map[build_variant]
+            task_list = evg_api.tasks_by_build(build_id)
+            if build_variant.endswith(BURN_IN_VARIANT_SUFFIX):
+                for task in task_list:
+                    if task.display_name == BURN_IN_TESTS:
+                        LOGGER.info(
+                            "Activating task", task_id=task.task_id, task_name=task.display_name
+                        )
+                        try:
+                            retry_call(
+                                evg_api.configure_task,
+                                fargs=[task.task_id],
+                                fkwargs={"activated": True},
+                                tries=3,
+                                delay=5,
+                                backoff=2,
+                                exceptions=Exception,
+                            )
+                        except Exception:
+                            LOGGER.error(
+                                "Could not activate task",
+                                task_id=task.task_id,
+                                task_name=task.display_name,
+                                exc_info=True,
+                            )
+                            tasks_not_activated.append(task.task_id)
+            else:
+                for task in task_list:
+                    if re.match(BURN_IN_TESTS, task.display_name):
+                        LOGGER.info(
+                            "Activating task", task_id=task.task_id, task_name=task.display_name
+                        )
+                        try:
+                            retry_call(
+                                evg_api.configure_task,
+                                fargs=[task.task_id],
+                                fkwargs={"activated": True},
+                                tries=3,
+                                delay=5,
+                                backoff=2,
+                                exceptions=Exception,
+                            )
+                        except Exception:
+                            LOGGER.error(
+                                "Could not activate task",
+                                task_id=task.task_id,
+                                task_name=task.display_name,
+                                exc_info=True,
+                            )
+                            tasks_not_activated.append(task.task_id)
+
+    else:
+        task_list = retry_call(
+            evg_api.tasks_by_build,
+            fargs=[expansions.build_id],
+            tries=3,
+            exceptions=requests.exceptions.ChunkedEncodingError,
+        )
+        for task in task_list:
+            if task.display_name == expansions.task:
+                LOGGER.info("Activating task", task_id=task.task_id, task_name=task.display_name)
+                try:
+                    retry_call(
+                        evg_api.configure_task,
+                        fargs=[task.task_id],
+                        fkwargs={"activated": True},
+                        tries=3,
+                        delay=5,
+                        backoff=2,
+                        exceptions=Exception,
+                    )
+                except Exception:
+                    LOGGER.error(
+                        "Could not activate task",
+                        task_id=task.task_id,
+                        task_name=task.display_name,
+                        exc_info=True,
+                    )
+                    tasks_not_activated.append(task.task_id)
+    if len(tasks_not_activated) > 0:
+        LOGGER.error(
+            "Some tasks were unable to be activated", unactivated_tasks=len(tasks_not_activated)
+        )
+        raise ValueError(
+            "Some tasks were unable to be activated, failing the task to let the author know. "
+            "This should not be a blocking issue but may mean that some tasks are missing from your patch."
+        )
+
+
+@click.command()
+@click.option(
+    "--expansion-file",
+    type=str,
+    required=True,
+    help="Location of expansions file generated by evergreen.",
+)
+@click.option(
+    "--evergreen-config",
+    type=str,
+    default=EVG_CONFIG_FILE,
+    help="Location of evergreen configuration file.",
+)
+@click.option("--verbose", is_flag=True, default=False, help="Enable verbose logging.")
+def main(expansion_file: str, evergreen_config: str, verbose: bool) -> None:
+    """
+    Activate the associated generated executions based in the running build.
+
+    The `--expansion-file` should contain all the configuration needed to generate the tasks.
+    \f
+    :param expansion_file: Configuration file.
+    :param evergreen_config: Evergreen configuration file.
+    :param verbose: Use verbose logging.
+    """
+    enable_logging(verbose)
+    expansions = EvgExpansions.from_yaml_file(expansion_file)
+    evg_api = RetryingEvergreenApi.get_api(config_file=evergreen_config, log_on_error=True)
+    evg_api._http_retry = Retry(
+        # this is a way to reuse all of Evergreen's logic, but to bump up the number of attempts
+        total=DEFAULT_HTTP_RETRY_ATTEMPTS + 10,
+        backoff_factor=DEFAULT_HTTP_RETRY_BACKOFF_FACTOR,
+        status_forcelist=DEFAULT_HTTP_RETRY_CODES,
+        raise_on_status=False,
+        raise_on_redirect=False,
+    )
+
+    activate_task(expansions, evg_api)
+
+
+if __name__ == "__main__":
+    main()

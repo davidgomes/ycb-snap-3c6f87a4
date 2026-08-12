@@ -1,0 +1,157 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/oid.h"
+
+#include "mongo/base/parse_number.h"
+#include "mongo/platform/endian.h"
+#include "mongo/unittest/unittest.h"
+
+#include <cstring>
+
+#include <absl/hash/hash.h>
+
+
+namespace mongo {
+namespace {
+
+TEST(OIDTest, Equals) {
+    OID o1 = OID::gen();
+
+    ASSERT_EQ(o1, o1);
+    ASSERT_TRUE(o1 == o1);
+    ASSERT_EQ(o1.compare(o1), 0);
+}
+
+TEST(OIDTest, NotEquals) {
+    OID o1 = OID::gen();
+    OID o2 = OID::gen();
+
+    ASSERT_NE(o1, o2);
+    ASSERT_FALSE(o1 == o2);
+    ASSERT_TRUE(o1 != o2);
+    ASSERT_NE(o1.compare(o2), 0);
+}
+
+TEST(OIDTest, Increasing) {
+    OID o1 = OID::gen();
+    OID o2 = OID::gen();
+    ASSERT_LT(o1, o2);
+}
+
+TEST(OIDTest, IsSet) {
+    OID o;
+    ASSERT_FALSE(o.isSet());
+    o.init();
+    ASSERT_TRUE(o.isSet());
+}
+
+TEST(OIDTest, JustForked) {
+    OID o1 = OID::gen();
+    OID::justForked();
+    OID o2 = OID::gen();
+
+    ASSERT_NE(std::memcmp(o1.getInstanceUnique().bytes,
+                          o2.getInstanceUnique().bytes,
+                          OID::kInstanceUniqueSize),
+              0);
+}
+
+TEST(OIDTest, TimestampIsBigEndian) {
+    OID o1;  // zeroed
+    OID::Timestamp ts = 123;
+    o1.setTimestamp(ts);
+
+    int32_t ts_big = mongo::endian::nativeToBig<int32_t>(123);
+
+    const char* oidBytes = o1.view().view();
+    ASSERT(std::memcmp(&ts_big, oidBytes, sizeof(int32_t)) == 0);
+}
+
+TEST(OIDTest, IncrementIsBigEndian) {
+    OID o1;  // zeroed
+    OID::Increment incr;
+    // Increment is a 3 byte counter big endian
+    incr.bytes[0] = 0xBEu;
+    incr.bytes[1] = 0xADu;
+    incr.bytes[2] = 0xDEu;
+
+    o1.setIncrement(incr);
+
+    const char* oidBytes = o1.view().view();
+    oidBytes += OID::kTimestampSize + OID::kInstanceUniqueSize;
+
+    // now at start of increment
+    ASSERT_EQ(uint8_t(oidBytes[0]), 0xBEu);
+    ASSERT_EQ(uint8_t(oidBytes[1]), 0xADu);
+    ASSERT_EQ(uint8_t(oidBytes[2]), 0xDEu);
+}
+
+TEST(OIDTest, Deserialize) {
+    uint8_t OIDbytes[] = {
+        0xDEu,
+        0xADu,
+        0xBEu,
+        0xEFu,  // timestamp is -559038737 (signed)
+        0x00u,
+        0x00u,
+        0x00u,
+        0x00u,
+        0x00u,  // unique is 0
+        0x11u,
+        0x22u,
+        0x33u  // increment is 1122867
+    };
+
+    OID o1 = OID::from(OIDbytes);
+
+    ASSERT_EQ(o1.getTimestamp(), -559038737);
+    OID::InstanceUnique u = o1.getInstanceUnique();
+    for (std::size_t i = 0; i < OID::kInstanceUniqueSize; ++i) {
+        ASSERT_EQ(u.bytes[i], 0x00u);
+    }
+    OID::Increment i = o1.getIncrement();
+
+    // construct a uint32_t from increment
+    // recall that i is a big-endian 3 byte unsigned integer
+    uint32_t incr =
+        ((uint32_t(i.bytes[0]) << 16)) | ((uint32_t(i.bytes[1]) << 8)) | uint32_t(i.bytes[2]);
+
+    ASSERT_EQ(1122867u, incr);
+}
+
+TEST(OIDTest, FromString) {
+    std::string oidStr("541b1a00e8a23afa832b218e");
+    uint8_t oidBytes[] = {
+        0x54u, 0x1Bu, 0x1Au, 0x00u, 0xE8u, 0xA2u, 0x3Au, 0xFAu, 0x83u, 0x2Bu, 0x21u, 0x8Eu};
+
+    ASSERT_EQ(OID(oidStr), OID::from(oidBytes));
+}
+
+TEST(OIDTest, FromStringToString) {
+    std::string fromStr("541b1a00e8a23afa832b218e");
+    ASSERT_EQ(OID(fromStr).toString(), fromStr);
+}
+
+TEST(OIDTest, FromTerm) {
+    auto term = 7;
+    auto oid = OID::fromTerm(term);
+
+    auto oidStr = oid.toString();
+    auto oidHead = oidStr.substr(0, 8);
+    auto oidTail = oidStr.substr(oidStr.length() - 1);
+
+    ASSERT_EQ("7fffffff", oidHead);
+    int oidTailInt;
+    ASSERT_OK(mongo::NumberParser::strToAny()(oidTail, &oidTailInt));
+    ASSERT_EQ(term, oidTailInt);
+}
+
+TEST(OIDTest, AbslHash) {
+    OID o1 = OID::gen();
+    OID o2 = o1;
+    ASSERT_EQ(absl::Hash<OID>{}(o1), absl::Hash<OID>{}(o2));
+}
+
+}  // namespace
+}  // namespace mongo

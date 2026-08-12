@@ -1,0 +1,203 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <fstream>  // IWYU pragma: keep
+#include <memory>
+
+#ifdef _WIN32
+#include <bcrypt.h>
+#else
+#include <cerrno>
+
+#include <fcntl.h>
+#endif
+
+#define _CRT_RAND_S
+
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
+#include "mongo/platform/random.h"
+#include "mongo/util/assert_util.h"
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H) || defined(__wasi__)
+#include <unistd.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+
+#ifdef _WIN32
+#define SECURE_RANDOM_BCRYPT
+#elif defined(__wasi__)
+#define SECURE_RANDOM_GETENTROPY
+#elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__EMSCRIPTEN__)
+#define SECURE_RANDOM_URANDOM
+#elif defined(__OpenBSD__)
+#define SECURE_RANDOM_ARCFOUR
+#else
+#error "Must implement SecureRandom for platform"
+#endif
+
+namespace mongo {
+
+namespace {
+
+template <size_t Bytes>
+struct Buffer {
+    static constexpr size_t kArraySize = Bytes / sizeof(uint64_t);
+
+    uint64_t pop() {
+        return arr[--avail];
+    }
+    uint8_t* fillPtr() {
+        return reinterpret_cast<uint8_t*>(arr.data() + avail);
+    }
+    size_t fillSize() {
+        return sizeof(uint64_t) * (arr.size() - avail);
+    }
+    void setFilled() {
+        avail = arr.size();
+    }
+
+    std::array<uint64_t, kArraySize> arr;
+    size_t avail = 0;
+};
+
+#if defined(SECURE_RANDOM_BCRYPT)
+class Source {
+public:
+    size_t refill(uint8_t* buf, size_t n) {
+        // Use BCRYPT_USE_SYSTEM_PREFERRED_RNG to avoid calling BCryptOpenAlgorithmProvider.
+        // Opening a provider acquires BCrypt's internal critical section and may trigger a DLL
+        // load, which can deadlock against Windows' loader lock (LdrpDrainWorkQueue) when this
+        // runs during thread-local storage initialization on a newly created thread. Passing a
+        // NULL algorithm handle with this flag bypasses the provider machinery entirely.
+        auto ntstatus = ::BCryptGenRandom(
+            nullptr, reinterpret_cast<PUCHAR>(buf), n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (ntstatus != STATUS_SUCCESS) {
+            LOGV2_ERROR(
+                23823,
+                "Failed to generate random number from secure random object; NTSTATUS: {ntstatus}",
+                "ntstatus"_attr = ntstatus);
+            fassertFailed(28814);
+        }
+        return n;
+    }
+};
+#endif  // SECURE_RANDOM_BCRYPT
+
+#if defined(SECURE_RANDOM_URANDOM)
+class Source {
+public:
+    size_t refill(uint8_t* buf, size_t n) {
+        size_t i = 0;
+        while (i < n) {
+            ssize_t r;
+            while ((r = read(sharedFd(), buf + i, n - i)) == -1) {
+                if (errno == EINTR) {
+                    continue;
+                } else {
+                    auto errSave = errno;
+                    LOGV2_ERROR(23824,
+                                "SecureRandom: read `{kFn}`: {strerror_errSave}",
+                                "kFn"_attr = kFn,
+                                "strerror_errSave"_attr = strerror(errSave));
+                    fassertFailed(28840);
+                }
+            }
+            i += r;
+        }
+        return i;
+    }
+
+private:
+    static constexpr const char* kFn = "/dev/urandom";
+    static int sharedFd() {
+        // Retain the urandom fd forever.
+        // Kernel ensures that concurrent `read` calls don't mingle their data.
+        // http://lkml.iu.edu//hypermail/linux/kernel/0412.1/0181.html
+        static const int fd = [] {
+            int f;
+            while ((f = open(kFn, 0)) == -1) {
+                if (errno == EINTR) {
+                    continue;
+                } else {
+                    auto errSave = errno;
+                    LOGV2_ERROR(23825,
+                                "SecureRandom: open `{kFn}`: {strerror_errSave}",
+                                "kFn"_attr = kFn,
+                                "strerror_errSave"_attr = strerror(errSave));
+                    fassertFailed(28839);
+                }
+            }
+            return f;
+        }();
+        return fd;
+    }
+};
+#endif  // SECURE_RANDOM_URANDOM
+
+#if defined(SECURE_RANDOM_GETENTROPY)
+class Source {
+public:
+    size_t refill(uint8_t* buf, size_t n) {
+        // WASI maps getentropy() to wasi:random/random. It requires each call to
+        // request at most 256 bytes, so we loop for larger buffers.
+        constexpr size_t kMaxChunk = 256;
+        size_t i = 0;
+        while (i < n) {
+            size_t chunk = std::min(n - i, kMaxChunk);
+            if (getentropy(buf + i, chunk) != 0) {
+                // getentropy() under WASI calls wasi:random/random, which should never
+                // fail. If it does, fassertFailed terminates the process via abort(),
+                // which is the only option since there is no errno or log infrastructure
+                // available in the WASI environment.
+                fassertFailed(11605301);
+            }
+            i += chunk;
+        }
+        return n;
+    }
+};
+#endif  // SECURE_RANDOM_GETENTROPY
+
+#if defined(SECURE_RANDOM_ARCFOUR)
+class Source {
+public:
+    size_t refill(uint8_t* buf, size_t n) {
+        arc4random_buf(buf, n);
+        return n;
+    }
+};
+#endif  // SECURE_RANDOM_ARCFOUR
+
+}  // namespace
+
+class SecureUrbg::State {
+public:
+    uint64_t get() {
+        if (!_buffer.avail) {
+            size_t n = _source.refill(_buffer.fillPtr(), _buffer.fillSize());
+            _buffer.avail += n / sizeof(uint64_t);
+        }
+        return _buffer.pop();
+    }
+
+private:
+    Source _source;
+    Buffer<4096> _buffer;
+};
+
+SecureUrbg::SecureUrbg() : _state{std::make_unique<State>()} {}
+
+SecureUrbg::~SecureUrbg() = default;
+
+uint64_t SecureUrbg::operator()() {
+    return _state->get();
+}
+
+}  // namespace mongo

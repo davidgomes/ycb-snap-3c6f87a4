@@ -1,0 +1,319 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+/**
+ * This file tests near search functionality.
+ */
+
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/classic/near.h"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/classic/queued_data_stage.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/index_builds/index_build_test_helpers.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+namespace {
+
+const NamespaceString kTestNamespace = NamespaceString::createNamespaceString_forTest("test.coll");
+const BSONObj kTestKeyPattern = BSON("testIndex" << 1);
+
+class QueryStageNearTest : public unittest::Test {
+public:
+    void setUp() override {
+        _expCtx = ExpressionContextBuilder{}.opCtx(_opCtx).ns(kTestNamespace).build();
+
+        directClient.createCollection(kTestNamespace);
+        ASSERT_OK(createIndex(_opCtx, kTestNamespace.ns_forTest(), kTestKeyPattern));
+
+        _coll = acquireCollectionMaybeLockFree(
+            _opCtx,
+            CollectionAcquisitionRequest(kTestNamespace,
+                                         PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                         repl::ReadConcernArgs::get(_opCtx),
+                                         AcquisitionPrerequisites::kRead));
+        const auto& collPtr = _coll->getCollectionPtr();
+        ASSERT(collPtr);
+        _mockGeoIndex = collPtr->getIndexCatalog()->findIndexByKeyPatternAndOptions(
+            _opCtx, kTestKeyPattern, _makeMinimalIndexSpec(kTestKeyPattern));
+        ASSERT(_mockGeoIndex);
+    }
+
+    const CollectionPtr& getCollection() const {
+        return _coll->getCollectionPtr();
+    }
+
+protected:
+    BSONObj _makeMinimalIndexSpec(BSONObj keyPattern) {
+        return BSON(IndexDescriptor::kKeyPatternFieldName
+                    << keyPattern << IndexDescriptor::kIndexVersionFieldName
+                    << IndexDescriptor::getDefaultIndexVersion());
+    }
+
+    const ServiceContext::UniqueOperationContext _uniqOpCtx = cc().makeOperationContext();
+    OperationContext* const _opCtx = _uniqOpCtx.get();
+    DBDirectClient directClient{_opCtx};
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+
+    boost::optional<CollectionAcquisition> _coll;
+    const IndexCatalogEntry* _mockGeoIndex;
+};
+
+/**
+ * Stage which implements a basic distance search, and interprets the "distance" field of
+ * fetched documents as the distance.
+ */
+class MockNearStage final : public NearStage {
+public:
+    struct MockInterval {
+        MockInterval(const std::vector<BSONObj>& data, double min, double max)
+            : data(data), min(min), max(max) {}
+
+        std::vector<BSONObj> data;
+        double min;
+        double max;
+    };
+
+    MockNearStage(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                  WorkingSet* workingSet,
+                  const CollectionAcquisition& coll,
+                  const IndexCatalogEntry* entry)
+        : NearStage(
+              expCtx.get(), "MOCK_DISTANCE_SEARCH_STAGE", STAGE_UNKNOWN, workingSet, coll, entry),
+          _pos(0) {}
+
+    void addInterval(std::vector<BSONObj> data, double min, double max) {
+        _intervals.push_back(std::make_unique<MockInterval>(data, min, max));
+    }
+
+    std::unique_ptr<CoveredInterval> nextInterval(OperationContext* opCtx,
+                                                  WorkingSet* workingSet) final {
+        if (_pos == static_cast<int>(_intervals.size()))
+            return nullptr;
+
+        const MockInterval& interval = *_intervals[_pos++];
+
+        bool lastInterval = _pos == static_cast<int>(_intervals.size());
+
+        auto queuedStage = std::make_unique<QueuedDataStage>(expCtx(), workingSet);
+
+        for (unsigned int i = 0; i < interval.data.size(); i++) {
+            // Add all documents from the lastInterval into the QueuedDataStage.
+            const WorkingSetID id = workingSet->allocate();
+            WorkingSetMember* member = workingSet->get(id);
+            member->doc = {SnapshotId(), Document{interval.data[i]}};
+            member->recordId = RecordId{_pos, static_cast<int>(i)};
+            workingSet->transitionToOwnedObj(id);
+            queuedStage->pushBack(id);
+        }
+
+        _children.push_back(std::move(queuedStage));
+        return std::make_unique<CoveredInterval>(
+            _children.back().get(), interval.min, interval.max, lastInterval);
+    }
+
+    double computeDistance(WorkingSetMember* member) final {
+        ASSERT(member->hasObj());
+        return member->doc.value()["distance"].getDouble();
+    }
+
+    StageState initialize(OperationContext* opCtx,
+                          WorkingSet* workingSet,
+                          WorkingSetID* out) override {
+        return IS_EOF;
+    }
+
+private:
+    std::vector<std::unique_ptr<MockInterval>> _intervals;
+    int _pos;
+};
+
+static std::vector<BSONObj> advanceStage(PlanStage* stage, WorkingSet* workingSet) {
+    std::vector<BSONObj> results;
+
+    WorkingSetID nextMemberID;
+    PlanStage::StageState state = PlanStage::NEED_TIME;
+
+    while (PlanStage::NEED_TIME == state) {
+        while (PlanStage::ADVANCED == (state = stage->work(&nextMemberID))) {
+            results.push_back(workingSet->get(nextMemberID)->doc.value().toBson());
+        }
+    }
+
+    return results;
+}
+
+static void assertAscendingAndValid(const std::vector<BSONObj>& results) {
+    double lastDistance = -1.0;
+    for (std::vector<BSONObj>::const_iterator it = results.begin(); it != results.end(); ++it) {
+        double distance = (*it)["distance"].numberDouble();
+        bool shouldInclude = (*it)["$included"].eoo() || (*it)["$included"].trueValue();
+        ASSERT(shouldInclude);
+        ASSERT_GREATER_THAN_OR_EQUALS(distance, lastDistance);
+        lastDistance = distance;
+    }
+}
+
+TEST_F(QueryStageNearTest, Basic) {
+    std::vector<BSONObj> mockData;
+    WorkingSet workingSet;
+
+    MockNearStage nearStage(_expCtx.get(), &workingSet, *_coll, _mockGeoIndex);
+
+    // First set of results
+    mockData.clear();
+    mockData.push_back(BSON("distance" << 0.5));
+    // Not included in this interval, but will be buffered and included in the last interval
+    mockData.push_back(BSON("distance" << 2.0));
+    mockData.push_back(BSON("distance" << 0.0));
+    mockData.push_back(BSON("distance" << 3.5));  // Not included
+    nearStage.addInterval(mockData, 0.0, 1.0);
+
+    // Second set of results
+    mockData.clear();
+    mockData.push_back(BSON("distance" << 1.5));
+    mockData.push_back(BSON("distance" << 0.5));  // Not included
+    mockData.push_back(BSON("distance" << 1.0));
+    nearStage.addInterval(mockData, 1.0, 2.0);
+
+    // Last set of results
+    mockData.clear();
+    mockData.push_back(BSON("distance" << 2.5));
+    mockData.push_back(BSON("distance" << 3.0));  // Included
+    mockData.push_back(BSON("distance" << 2.0));
+    mockData.push_back(BSON("distance" << 3.5));  // Not included
+    nearStage.addInterval(mockData, 2.0, 3.0);
+
+    std::vector<BSONObj> results = advanceStage(&nearStage, &workingSet);
+    ASSERT_EQUALS(results.size(), 8u);
+    assertAscendingAndValid(results);
+}
+
+TEST_F(QueryStageNearTest, EmptyResults) {
+    std::vector<BSONObj> mockData;
+    WorkingSet workingSet;
+
+    auto coll = acquireCollectionMaybeLockFree(
+        _opCtx,
+        CollectionAcquisitionRequest(kTestNamespace,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(_opCtx),
+                                     AcquisitionPrerequisites::kRead));
+    ASSERT(coll.exists());
+
+    MockNearStage nearStage(_expCtx.get(), &workingSet, coll, _mockGeoIndex);
+
+    // Empty set of results
+    mockData.clear();
+    nearStage.addInterval(mockData, 0.0, 1.0);
+
+    // Non-empty set of results
+    mockData.clear();
+    mockData.push_back(BSON("distance" << 1.5));
+    mockData.push_back(BSON("distance" << 2.0));
+    mockData.push_back(BSON("distance" << 1.0));
+    nearStage.addInterval(mockData, 1.0, 2.0);
+
+    std::vector<BSONObj> results = advanceStage(&nearStage, &workingSet);
+    ASSERT_EQUALS(results.size(), 3u);
+    assertAscendingAndValid(results);
+}
+
+TEST_F(QueryStageNearTest, Spilling) {
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtendedAutoSpilling", true};
+    unittest::ServerParameterGuard maxMemoryBytes{"internalNearStageMaxMemoryBytes", 200 * 1024};
+
+    _expCtx->setTempDir(boost::filesystem::path(storageGlobalParams.dbpath) / "_tmp");
+    _expCtx->setAllowDiskUse(true);
+
+    WorkingSet workingSet;
+
+    MockNearStage nearStage(_expCtx.get(), &workingSet, *_coll, _mockGeoIndex);
+
+    static constexpr int kMaxDistance = 100;
+    size_t expectedResultCount = 0;
+    for (int minDistance = 0; minDistance < kMaxDistance; ++minDistance) {
+        std::vector<BSONObj> mockData;
+        mockData.reserve(kMaxDistance);
+        for (int distance = 0; distance <= kMaxDistance; ++distance) {
+            mockData.push_back(BSON("distance" << distance));
+            expectedResultCount += distance >= minDistance ? 1 : 0;
+        }
+        nearStage.addInterval(std::move(mockData), minDistance, minDistance + 1);
+    }
+
+    std::vector<BSONObj> results = advanceStage(&nearStage, &workingSet);
+    ASSERT_EQUALS(results.size(), expectedResultCount);
+    assertAscendingAndValid(results);
+
+    const auto fullStats = nearStage.getStats();
+    const auto* nearStats = static_cast<const NearStats*>(fullStats->specific.get());
+    ASSERT_GT(nearStats->spillingStats.getSpills(), 0);
+    ASSERT_GT(nearStats->spillingStats.getSpilledRecords(), results.size() / 2);
+
+    size_t approximateBytesPerSpilledRecord =
+        nearStats->spillingStats.getSpilledBytes() / nearStats->spillingStats.getSpilledRecords();
+    ASSERT_LTE(16, approximateBytesPerSpilledRecord);
+    ASSERT_GTE(64, approximateBytesPerSpilledRecord);
+}
+
+TEST_F(QueryStageNearTest, MemoryTracking) {
+    WorkingSet workingSet;
+    MockNearStage nearStage(_expCtx.get(), &workingSet, *_coll, _mockGeoIndex);
+
+    for (int distance = 0; distance < 10; ++distance) {
+        nearStage.addInterval({BSON("distance" << distance)}, distance, distance + 1);
+    }
+
+    advanceStage(&nearStage, &workingSet);
+
+    const auto fullStats = nearStage.getStats();
+    const auto* nearStats = static_cast<const NearStats*>(fullStats->specific.get());
+    ASSERT_GT(nearStats->peakTrackedMemBytes, 0);
+    ASSERT_EQ(nearStats->spillingStats.getSpills(), 0);
+}
+
+TEST_F(QueryStageNearTest, MemoryLimitExceeded) {
+    // Disable auto-spilling so the memory limit triggers the uassert rather than a spill attempt
+    // (which would fail because no temp dir is configured in this test).
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtendedAutoSpilling", false};
+    // Set an absurdly small limit so that buffering even one document exceeds it.
+    unittest::ServerParameterGuard maxMemoryBytes{"internalNearStageMaxMemoryBytes", 1};
+
+    WorkingSet workingSet;
+    MockNearStage nearStage(_expCtx.get(), &workingSet, *_coll, _mockGeoIndex);
+    nearStage.addInterval({BSON("distance" << 1.0)}, 0.0, 2.0);
+
+    ASSERT_THROWS_CODE(
+        advanceStage(&nearStage, &workingSet), DBException, ErrorCodes::ExceededMemoryLimit);
+}
+
+}  // namespace
+}  // namespace mongo

@@ -1,0 +1,683 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/classic/count_scan.h"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/index_builds/index_build_test_helpers.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/database.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+
+#include <string>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+namespace QueryStageCountScan {
+
+class CountBase {
+public:
+    CountBase() : _client(&_opCtx) {}
+
+    virtual ~CountBase() {
+        _client.dropCollection(ns());
+    }
+
+    void addIndex(const BSONObj& obj) {
+        ASSERT_OK(createIndex(&_opCtx, ns().ns_forTest(), obj));
+    }
+
+    void insert(const BSONObj& obj) {
+        _client.insert(ns(), obj);
+    }
+
+    void remove(const BSONObj& obj) {
+        _client.remove(ns(), obj);
+    }
+
+    /*
+     * Given a CountScan PlanStage object count, call work() on
+     * count until we reach IS_EOF.  Tally up how many objects
+     * we've counted and return the count.
+     */
+    int runCount(CountScan* count) {
+        int countWorks = 0;
+        WorkingSetID wsid;
+
+        PlanStage::StageState countState = count->work(&wsid);
+
+        while (PlanStage::IS_EOF != countState) {
+            if (PlanStage::ADVANCED == countState)
+                countWorks++;
+            countState = count->work(&wsid);
+        }
+        return countWorks;
+    }
+
+    CollectionPtr getCollection() {
+        return CollectionPtr(CollectionCatalog::get(&_opCtx)->establishConsistentCollection(
+            &_opCtx, ns(), boost::none));
+    }
+
+    const IndexCatalogEntry* getIndex(Database* db, const BSONObj& obj) {
+        std::vector<const IndexCatalogEntry*> indexes;
+        getCollection()->getIndexCatalog()->findIndexesByKeyPattern(
+            &_opCtx, obj, IndexCatalog::InclusionPolicy::kReady, &indexes);
+        return indexes.empty() ? nullptr : indexes[0];
+    }
+
+    CountScanParams makeCountScanParams(OperationContext* opCtx,
+                                        const CollectionAcquisition& collection,
+                                        const IndexCatalogEntry* entry) {
+        return {opCtx, collection.getCollectionPtr(), entry};
+    }
+
+    static NamespaceString ns() {
+        return NamespaceString::createNamespaceString_forTest("unittests",
+                                                              "QueryStageCountScanScan");
+    }
+
+protected:
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _opCtx = *_txnPtr;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        ExpressionContextBuilder{}.opCtx(&_opCtx).ns(ns()).build();
+
+private:
+    DBDirectClient _client;
+};
+
+
+//
+// Check that dups are properly identified
+//
+class QueryStageCountScanDups : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert some docs
+        insert(BSON("a" << BSON_ARRAY(5 << 7)));
+        insert(BSON("a" << BSON_ARRAY(6 << 8)));
+
+        // Add an index on a:1
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        // Set up the count stage
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("a" << 1);
+        params.startKeyInclusive = true;
+        params.endKey = BSON("a" << 10);
+        params.endKeyInclusive = true;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+
+        int numCounted = runCount(&count);
+        ASSERT_EQUALS(2, numCounted);
+    }
+};
+
+//
+// Check that expected results are returned with inclusive bounds
+//
+class QueryStageCountScanInclusiveBounds : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert some docs
+        for (int i = 0; i < 10; ++i) {
+            insert(BSON("a" << i));
+        }
+
+        // Add an index
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        // Set up the count stage
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 3);
+        params.startKeyInclusive = true;
+        params.endKey = BSON("" << 7);
+        params.endKeyInclusive = true;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+
+        int numCounted = runCount(&count);
+        ASSERT_EQUALS(5, numCounted);
+    }
+};
+
+//
+// Check that expected results are returned with exclusive bounds
+//
+class QueryStageCountScanExclusiveBounds : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert some docs
+        for (int i = 0; i < 10; ++i) {
+            insert(BSON("a" << i));
+        }
+
+        // Add an index
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        // Set up the count stage
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 3);
+        params.startKeyInclusive = false;
+        params.endKey = BSON("" << 7);
+        params.endKeyInclusive = false;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+
+        int numCounted = runCount(&count);
+        ASSERT_EQUALS(3, numCounted);
+    }
+};
+
+//
+// Check that cursor returns no results if all docs are below lower bound
+//
+class QueryStageCountScanLowerBound : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert doc, add index
+        insert(BSON("a" << 2));
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        // Set up count, and run
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 2);
+        params.startKeyInclusive = false;
+        params.endKey = BSON("" << 3);
+        params.endKeyInclusive = false;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+
+        int numCounted = runCount(&count);
+        ASSERT_EQUALS(0, numCounted);
+    }
+};
+
+//
+// Check that cursor returns no results if there are no docs within interval
+//
+class QueryStageCountScanNothingInInterval : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert documents, add index
+        insert(BSON("a" << 2));
+        insert(BSON("a" << 3));
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        // Set up count, and run
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 2);
+        params.startKeyInclusive = false;
+        params.endKey = BSON("" << 3);
+        params.endKeyInclusive = false;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+
+        int numCounted = runCount(&count);
+        ASSERT_EQUALS(0, numCounted);
+    }
+};
+
+//
+// Check that cursor returns no results if there are no docs within interval
+// and the first key located during initialization is above upper bound
+//
+class QueryStageCountScanNothingInIntervalFirstMatchTooHigh : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert some documents, add index
+        insert(BSON("a" << 2));
+        insert(BSON("a" << 4));
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        // Set up count, and run
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 2);
+        params.startKeyInclusive = false;
+        params.endKey = BSON("" << 3);
+        params.endKeyInclusive = true;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+
+        int numCounted = runCount(&count);
+        ASSERT_EQUALS(0, numCounted);
+    }
+};
+
+//
+// Check that cursor recovers its position properly if there is no change
+// during a yield
+//
+class QueryStageCountScanNoChangeDuringYield : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert documents, add index
+        for (int i = 0; i < 10; ++i) {
+            insert(BSON("a" << i));
+        }
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        // Set up count stage
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 2);
+        params.startKeyInclusive = false;
+        params.endKey = BSON("" << 6);
+        params.endKeyInclusive = true;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+        WorkingSetID wsid;
+
+        int numCounted = 0;
+        PlanStage::StageState countState;
+
+        // Begin running the count
+        while (numCounted < 2) {
+            countState = count.work(&wsid);
+            if (PlanStage::ADVANCED == countState)
+                numCounted++;
+        }
+
+        // Prepare the cursor to yield
+        static_cast<PlanStage*>(&count)->saveState();
+
+        // Recover from yield
+        RestoreContext restoreCtx(nullptr);
+        static_cast<PlanStage*>(&count)->restoreState(restoreCtx);
+
+        // finish counting
+        while (PlanStage::IS_EOF != countState) {
+            countState = count.work(&wsid);
+            if (PlanStage::ADVANCED == countState)
+                numCounted++;
+        }
+        ASSERT_EQUALS(4, numCounted);
+    }
+};
+
+//
+// Check that cursor recovers its position properly if its current location
+// is deleted during a yield
+//
+class QueryStageCountScanDeleteDuringYield : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert documents, add index
+        for (int i = 0; i < 10; ++i) {
+            insert(BSON("a" << i));
+        }
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        // Set up count stage
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 2);
+        params.startKeyInclusive = false;
+        params.endKey = BSON("" << 6);
+        params.endKeyInclusive = true;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+        WorkingSetID wsid;
+
+        int numCounted = 0;
+        PlanStage::StageState countState;
+
+        // Begin running the count
+        while (numCounted < 2) {
+            countState = count.work(&wsid);
+            if (PlanStage::ADVANCED == countState)
+                numCounted++;
+        }
+
+        // Prepare the cursor to yield
+        static_cast<PlanStage*>(&count)->saveState();
+
+        // Recover from yield
+        auto c = getCollection();
+
+        // Remove remaining objects
+        remove(BSON("a" << GTE << 5));
+
+        RestoreContext restoreCtx(nullptr);
+        static_cast<PlanStage*>(&count)->restoreState(restoreCtx);
+
+        // finish counting
+        while (PlanStage::IS_EOF != countState) {
+            countState = count.work(&wsid);
+            if (PlanStage::ADVANCED == countState)
+                numCounted++;
+        }
+        ASSERT_EQUALS(2, numCounted);
+    }
+};
+
+//
+// Check that cursor relocates its end location properly if end location
+// changes during a yield
+//
+class QueryStageCountScanInsertNewDocsDuringYield : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert documents, add index
+        for (int i = 0; i < 10; ++i) {
+            insert(BSON("a" << i));
+        }
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        // Set up count stage
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 2);
+        params.startKeyInclusive = false;
+        params.endKey = BSON("" << 6);
+        params.endKeyInclusive = true;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+        WorkingSetID wsid;
+
+        int numCounted = 0;
+        PlanStage::StageState countState;
+
+        // Begin running the count
+        while (numCounted < 2) {
+            countState = count.work(&wsid);
+            if (PlanStage::ADVANCED == countState)
+                numCounted++;
+        }
+
+        // Prepare the cursor to yield
+        static_cast<PlanStage*>(&count)->saveState();
+
+        // Insert one document before the end
+        insert(BSON("a" << 5.5));
+
+        // Insert one document after the end
+        insert(BSON("a" << 6.5));
+
+        // Recover from yield
+        RestoreContext restoreCtx(nullptr);
+        static_cast<PlanStage*>(&count)->restoreState(restoreCtx);
+
+        // finish counting
+        while (PlanStage::IS_EOF != countState) {
+            countState = count.work(&wsid);
+            if (PlanStage::ADVANCED == countState)
+                numCounted++;
+        }
+        ASSERT_EQUALS(5, numCounted);
+    }
+};
+
+//
+// Unused keys are not returned during iteration
+//
+class QueryStageCountScanUnusedKeys : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert docs, add index
+        for (int i = 0; i < 10; ++i) {
+            insert(BSON("a" << 1 << "b" << i));
+        }
+        addIndex(BSON("a" << 1));
+
+        // Mark several keys as 'unused'
+        remove(BSON("a" << 1 << "b" << 0));
+        remove(BSON("a" << 1 << "b" << 3));
+        remove(BSON("a" << 1 << "b" << 4));
+
+        const auto coll = ctx.getCollection();
+
+        // Ensure that count does not include unused keys
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 1);
+        params.startKeyInclusive = true;
+        params.endKey = BSON("" << 1);
+        params.endKeyInclusive = true;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+
+        int numCounted = runCount(&count);
+        ASSERT_EQUALS(7, numCounted);
+    }
+};
+
+//
+// Iteration is properly terminated when the end location is an unused key
+//
+class QueryStageCountScanUnusedEndKey : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert docs, add index
+        for (int i = 0; i < 10; ++i) {
+            insert(BSON("a" << 1 << "b" << i));
+        }
+        addIndex(BSON("a" << 1));
+
+        // Mark key at end position as 'unused' by deleting
+        remove(BSON("a" << 1 << "b" << 9));
+
+        const auto coll = ctx.getCollection();
+
+        // Run count and check
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 0);
+        params.startKeyInclusive = true;
+        params.endKey = BSON("" << 2);
+        params.endKeyInclusive = true;  // yes?
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+
+        int numCounted = runCount(&count);
+        ASSERT_EQUALS(9, numCounted);
+    }
+};
+
+//
+// Advances past a key that becomes unused during a yield
+//
+class QueryStageCountScanKeyBecomesUnusedDuringYield : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Insert documents, add index
+        for (int i = 0; i < 10; ++i) {
+            insert(BSON("a" << 1 << "b" << i));
+        }
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        // Set up count stage
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 1);
+        params.startKeyInclusive = true;
+        params.endKey = BSON("" << 1);
+        params.endKeyInclusive = true;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+        WorkingSetID wsid;
+
+        int numCounted = 0;
+        PlanStage::StageState countState;
+
+        // Begin running the count
+        while (numCounted < 2) {
+            countState = count.work(&wsid);
+            if (PlanStage::ADVANCED == countState)
+                numCounted++;
+        }
+
+        // Prepare the cursor to yield
+        static_cast<PlanStage*>(&count)->saveState();
+
+        // Mark the key at position 5 as 'unused'
+        remove(BSON("a" << 1 << "b" << 5));
+
+        // Recover from yield
+        RestoreContext restoreCtx(nullptr);
+        static_cast<PlanStage*>(&count)->restoreState(restoreCtx);
+
+        // finish counting
+        while (PlanStage::IS_EOF != countState) {
+            countState = count.work(&wsid);
+            if (PlanStage::ADVANCED == countState)
+                numCounted++;
+        }
+        ASSERT_EQUALS(8, numCounted);
+    }
+};
+
+/**
+ * Test that CountScan reports a positive peakTrackedMemBytes when deduplication is active
+ * (i.e. on a multikey index).
+ */
+class QueryStageCountScanMemoryTracking : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        // Array-valued field creates a multikey index, which enables deduplication.
+        insert(BSON("a" << BSON_ARRAY(1 << 2)));
+        insert(BSON("a" << BSON_ARRAY(3 << 4)));
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 1);
+        params.startKeyInclusive = true;
+        params.endKey = BSON("" << 4);
+        params.endKeyInclusive = true;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+
+        runCount(&count);
+
+        const auto* stats = static_cast<const CountScanStats*>(count.getSpecificStats());
+        ASSERT_GT(stats->peakTrackedMemBytes, 0);
+    }
+};
+
+/**
+ * Test that CountScan throws when the memory used by the deduplicator exceeds the configured
+ * limit.
+ */
+class QueryStageCountScanMemoryLimitExceeded : public CountBase {
+public:
+    void run() {
+        // Set an absurdly small limit so the deduplicator overhead alone exceeds it.
+        unittest::ServerParameterGuard maxMemoryBytes{"internalCountScanStageMaxMemoryBytes", 1};
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        insert(BSON("a" << BSON_ARRAY(1 << 2)));
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 1);
+        params.startKeyInclusive = true;
+        params.endKey = BSON("" << 2);
+        params.endKeyInclusive = true;
+
+        WorkingSet ws;
+        CountScan count(_expCtx.get(), coll, params, &ws);
+
+        ASSERT_THROWS_CODE(runCount(&count), DBException, 12227901);
+    }
+};
+
+class All : public unittest::OldStyleSuiteSpecification {
+public:
+    All() : OldStyleSuiteSpecification("query_stage_count_scan") {}
+
+    void setupTests() override {
+        add<QueryStageCountScanDups>();
+        add<QueryStageCountScanInclusiveBounds>();
+        add<QueryStageCountScanExclusiveBounds>();
+        add<QueryStageCountScanLowerBound>();
+        add<QueryStageCountScanNothingInInterval>();
+        add<QueryStageCountScanNothingInIntervalFirstMatchTooHigh>();
+        add<QueryStageCountScanNoChangeDuringYield>();
+        add<QueryStageCountScanDeleteDuringYield>();
+        add<QueryStageCountScanInsertNewDocsDuringYield>();
+        add<QueryStageCountScanUnusedKeys>();
+        add<QueryStageCountScanMemoryTracking>();
+        add<QueryStageCountScanMemoryLimitExceeded>();
+    }
+};
+
+unittest::OldStyleSuiteInitializer<All> queryStageCountScanAll;
+
+}  // namespace QueryStageCountScan
+}  // namespace mongo

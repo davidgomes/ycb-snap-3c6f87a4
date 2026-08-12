@@ -1,0 +1,268 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bson_depth.h"
+#include "mongo/db/exec/document_value/document_internal.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <compare>
+#include <cstddef>
+#include <limits>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+
+/**
+ * Utility class which represents a field path with nested paths separated by dots.
+ */
+class FieldPath {
+public:
+    /**
+     * Throws a AssertionException if a field name does not pass validation.
+     */
+    static Status validateFieldName(std::string_view fieldName);
+
+    /**
+     * Concatenates 'prefix' and 'suffix' using dotted path notation. 'prefix' is allowed to be
+     * empty.
+     */
+    static std::string getFullyQualifiedPath(std::string_view prefix, std::string_view suffix);
+
+    /**
+     * Returns the substring of 'path' until the first '.', or the entire string if there is no '.'.
+     */
+    static std::string_view extractFirstFieldFromDottedPath(std::string_view path) {
+        return path.substr(0, path.find('.'));
+    }
+
+    /**
+     * Throws a AssertionException if the string is empty or if any of the field names fail
+     * validation.
+     *
+     * Field names are validated using validateFieldName().
+     */
+    /* implicit */ FieldPath(std::string inputPath,
+                             bool precomputeHashes = false,
+                             bool validateFieldNames = true);
+    /* implicit */ FieldPath(std::string_view inputPath,
+                             bool precomputeHashes = false,
+                             bool validateFieldNames = true)
+        : FieldPath(std::string{inputPath}, precomputeHashes, validateFieldNames) {}
+    /* implicit */ FieldPath(const char* inputPath,
+                             bool precomputeHashes = false,
+                             bool validateFieldNames = true)
+        : FieldPath(std::string(inputPath), precomputeHashes, validateFieldNames) {}
+
+    /**
+     * Factory function to create a FieldPath with validation that returns a StatusWith instead of
+     * throwing exceptions. Returns an error Status if validation fails, or a StatusWith containing
+     * an optional FieldPath if validation succeeds.
+     */
+    friend StatusWith<FieldPath> fieldPathWithValidationStatus(std::string inputPath,
+                                                               bool precomputeHashes,
+                                                               bool validateFieldNames);
+
+    /**
+     * Returns the number of path elements in the field path.
+     */
+    size_t getPathLength() const {
+        return getPathLength(_fieldPathDotPosition);
+    }
+
+    /**
+     * Get the subpath including path elements [0, n].
+     */
+    std::string_view getSubpath(size_t n) const MONGO_COMPILER_LIFETIME_BOUND {
+        invariant(n + 1 < _fieldPathDotPosition.size());
+        return std::string_view(_fieldPath.c_str(), _fieldPathDotPosition[n + 1]);
+    }
+
+    /**
+     * Return the first path component.
+     */
+    std::string_view front() const MONGO_COMPILER_LIFETIME_BOUND {
+        return getFieldName(0);
+    }
+
+    /**
+     * Return the last path component.
+     */
+    std::string_view back() const MONGO_COMPILER_LIFETIME_BOUND {
+        return getFieldName(getPathLength() - 1);
+    }
+
+    /**
+     * Return the ith field name from this path using zero-based indexes.
+     */
+    std::string_view getFieldName(size_t i) const MONGO_COMPILER_LIFETIME_BOUND {
+        return getFieldName(i, _fieldPathDotPosition, _fieldPath);
+    }
+
+    /**
+     * Return the ith field name from this path using zero-based indexes, with pre-computed hash.
+     * Tasserts when trying to access a field name hash for a position for which no hashes were
+     * calculated.
+     */
+    HashedFieldName getFieldNameHashed(size_t i) const MONGO_COMPILER_LIFETIME_BOUND {
+        dassert(i < getPathLength());
+        tassert(
+            11212700, "cannot access a not-calculated field hash position", i < _fieldHash.size());
+        return HashedFieldName{getFieldName(i), _fieldHash[i]};
+    }
+
+    /**
+     * Returns the full path, not including the prefix 'FieldPath::prefix'.
+     */
+    const std::string& fullPath() const {
+        return _fieldPath;
+    }
+
+    /**
+     * Returns the full path, including the prefix 'FieldPath::prefix'.
+     */
+    std::string fullPathWithPrefix() const {
+        return prefix + _fieldPath;
+    }
+
+    /**
+     * Returns the path past the first element.
+     * Use instead of tail().fullPath() to avoid a copy.
+     * Precondition getPathLength() > 1.
+     */
+    std::string_view tailPath() const {
+        tassert(
+            12194301, "FieldPath::tailPath() called on single element path", getPathLength() > 1);
+        return std::string_view(_fieldPath).substr(_fieldPathDotPosition[1] + 1);
+    }
+
+    /**
+     * A FieldPath like this but missing the first element (useful for recursion).
+     * Precondition getPathLength() > 1.
+     */
+    FieldPath tail() const {
+        tassert(16409, "FieldPath::tail() called on single element path", getPathLength() > 1);
+        return {_fieldPath.substr(_fieldPathDotPosition[1] + 1)};
+    }
+
+    /**
+     * Returns a FieldPath like this, but missing the last element.
+     */
+    FieldPath withoutLastElement() const {
+        return FieldPath(getSubpath(getPathLength() - 2));
+    }
+
+    FieldPath concat(const FieldPath& tail) const;
+
+    bool isPrefixOf(const FieldPath& rhsPath) const {
+        const auto& lhsStr = fullPath();
+        const auto& rhsStr = rhsPath.fullPath();
+        return lhsStr.size() < rhsStr.size()
+            ? rhsStr.starts_with(lhsStr) && rhsStr[lhsStr.size()] == '.'
+            : lhsStr == rhsStr;
+    }
+
+    FieldPath subtractPrefix(size_t prefixLength) const {
+        tassert(10985000,
+                "Expected prefixLength < numPathElements",
+                prefixLength + 1 < _fieldPathDotPosition.size());
+        if (prefixLength == 0) {
+            return *this;
+        }
+        return FieldPath(_fieldPath.substr(_fieldPathDotPosition[prefixLength] + 1));
+    }
+
+    friend std::string toStringForLogging(const FieldPath& x) {
+        // There are at least two ways of serializing 'FieldPath' (with and without the prefix). For
+        // the logging purposes the distinction is likely not too important, so we simply pick one.
+        return x.fullPath();
+    }
+
+private:
+    FieldPath(std::string string, std::vector<size_t> dots, std::vector<uint32_t> hashes)
+        : _fieldPath(std::move(string)),
+          _fieldPathDotPosition(std::move(dots)),
+          _fieldHash(std::move(hashes)) {
+        uassert(ErrorCodes::Overflow,
+                "FieldPath is too long",
+                getPathLength() <= BSONDepth::getMaxAllowableDepth());
+    }
+
+    /**
+     * Given a vector of dot positions, returns the number of elements in the field path.
+     * ONLY FOR USE IN FACTORY FUNCTION. Otherwise use non-static member function of same name.
+     */
+    static size_t getPathLength(const std::vector<size_t>& dotPositions) {
+        tassert(11631400, "The vector 'dotPositions' cannot be empty", !dotPositions.empty());
+        return dotPositions.size() - 1;
+    }
+
+    /**
+     * Given a vector of dot positions and a field path, gets the ith field name using 0-based
+     * indexes.
+     * ONLY FOR USE IN FACTORY FUNCTION. Otherwise use non-static member function of same name.
+     */
+    static std::string_view getFieldName(size_t i,
+                                         const std::vector<size_t>& dotPositions,
+                                         const std::string& fieldPath) {
+        tassert(11631401,
+                "Index i must not be greater than the path length",
+                i < getPathLength(dotPositions));
+        const auto begin = dotPositions[i] + 1;
+        const auto end = dotPositions[i + 1];
+        tassert(11631402,
+                "std::string_view cannot be taken from range past end of string fieldPath",
+                begin < fieldPath.length() && end <= fieldPath.length());
+        return std::string_view(&fieldPath[begin], end - begin);
+    }
+
+    static constexpr char prefix = '$';
+
+    // Contains the full field path, with each field delimited by a '.' character.
+    std::string _fieldPath;
+
+    // Contains the position of field delimiter dots in '_fieldPath'. The first element contains
+    // string::npos (which evaluates to -1) and the last contains _fieldPath.size() to facilitate
+    // lookup.
+    std::vector<size_t> _fieldPathDotPosition;
+
+    // Contains the hash values for the field names, if it was requested when creating this path.
+    // The hashes can be accessed via 'getFieldNameHashed(i)'.
+    // Can be empty if precomputing hashes was not requested.
+    // Can also be partially empty, with slots at the end not being fully filled, after
+    // concatenating two field paths of which the second did not have precomputed hashes.
+    std::vector<uint32_t> _fieldHash;
+};
+
+StatusWith<FieldPath> fieldPathWithValidationStatus(std::string inputPath,
+                                                    bool precomputeHashes = false,
+                                                    bool validateFieldNames = true);
+
+inline bool operator<(const FieldPath& lhs, const FieldPath& rhs) {
+    return lhs.fullPath() < rhs.fullPath();
+}
+
+inline bool operator==(const FieldPath& lhs, const FieldPath& rhs) {
+    return lhs.fullPath() == rhs.fullPath();
+}
+
+template <typename H>
+H AbslHashValue(H h, const FieldPath& fieldPath) {
+    return H::combine(std::move(h), fieldPath.fullPath());
+}
+
+template <typename H>
+H AbslHashValue(H h, const boost::optional<FieldPath>& fieldPath) {
+    if (fieldPath)
+        h = H::combine(std::move(h), *fieldPath);
+    return H::combine(std::move(h), fieldPath.has_value());
+}
+}  // namespace mongo

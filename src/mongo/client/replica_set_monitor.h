@@ -1,0 +1,90 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/client/mongo_uri.h"
+#include "mongo/client/replica_set_change_notifier.h"
+#include "mongo/client/replica_set_monitor_interface.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
+
+#include <functional>
+#include <memory>
+#include <set>
+#include <span>
+#include <string>
+#include <string_view>
+
+namespace mongo {
+/**
+ * An abstract class, defines the external interface for static ReplicaSetMonitor methods and
+ * provides a means to refresh the local view.
+ * A ReplicaSetMonitor holds a state about the replica set and provides a means to refresh the local
+ * view. All methods perform the required synchronization to allow callers from multiple threads.
+ */
+class [[MONGO_MOD_PUBLIC]] ReplicaSetMonitor : public ReplicaSetMonitorInterface {
+public:
+    ~ReplicaSetMonitor() override;
+
+    /**
+     * Creates a new ReplicaSetMonitor, if it doesn't already exist.
+     */
+    static std::shared_ptr<ReplicaSetMonitor> createIfNeeded(const std::string& name,
+                                                             const std::set<HostAndPort>& servers);
+
+    static std::shared_ptr<ReplicaSetMonitor> createIfNeeded(const MongoURI& uri);
+
+    /**
+     * gets a cached Monitor per name. The getter method returns nullptr if there is no monitor
+     * registered for the particular replica set.
+     */
+    static std::shared_ptr<ReplicaSetMonitor> get(const std::string& name);
+
+    /**
+     * Removes the ReplicaSetMonitor for the given set name from ReplicaSetMonitorManager.
+     * Drop and remove the ReplicaSetMonitor for the given set name if it exists.
+     * Then all connections for this host are deleted from the connection pool DBConnectionPool.
+     * Those two steps are not performed atomically together, but the possible (unlikely) race:
+     *  1. RSM is dropped and removed
+     *  2. Another RSM is created for the same name
+     *  3. Pooled connections are cleared
+     * is not creating any incorrectness, it is only inefficient.
+     */
+    static void remove(const std::string& name);
+
+    /**
+     * Returns the change notifier for the underlying ReplicaMonitorManager
+     */
+    static ReplicaSetChangeNotifier& getNotifier();
+
+    /**
+     * Permanently stops all monitoring on replica sets and clears all cached information
+     * as well. As a consequence, NEVER call this if you have other threads that have a
+     * DBClientReplicaSet instance. This method should be used for unit test only.
+     */
+    static void cleanup();
+
+    /**
+     * Permanently stops all monitoring on replica sets.
+     */
+    static void shutdown();
+
+protected:
+    explicit ReplicaSetMonitor(std::function<void()> cleanupCallback);
+
+private:
+    /**
+     * @return callback helper to safely cleanup 'ReplicaSetMonitor' and 'globalConnPool' when the
+     * instance of ReplicaSetMonitor for the 'name' is being destroyed.
+     */
+    static std::function<void()> _getCleanupCallback(std::string_view name);
+
+    const std::function<void()> _cleanupCallback;
+};
+
+}  // namespace mongo

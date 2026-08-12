@@ -1,0 +1,176 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/util/builder.h"
+
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/str.h"
+
+#include <limits>
+#include <string_view>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+TEST(Builder, String1) {
+    const char* big = "eliot was here";
+    std::string_view small(big, 5);
+    ASSERT_EQUALS(small, "eliot");
+
+    BufBuilder bb;
+    bb.appendCStr(small);
+
+    ASSERT_EQUALS(bb.len(), small.size() + 1);
+    ASSERT_EQUALS(bb.buf()[small.size()], 0);
+
+    ASSERT_EQUALS(0, strcmp(bb.buf(), "eliot"));
+    ASSERT_EQUALS(0, strcmp("eliot", bb.buf()));
+}
+
+TEST(Builder, StringNulByteHandling) {
+    auto hasNulByte = "hello\0world"sv;
+
+    {
+        // appendCStr() throws without changing bb;
+        BufBuilder bb;
+        ASSERT_THROWS_CODE(bb.appendCStr(hasNulByte), DBException, 9527900);
+        ASSERT_EQ(bb.len(), 0);
+    }
+
+    {
+        // appendStrBytes appends embedded NUL without terminator.
+        BufBuilder bb;
+        bb.appendStrBytes(hasNulByte);
+        ASSERT_EQ(std::string_view(bb.buf(), bb.len()), hasNulByte);
+    }
+
+    {
+        // appendStrBytesAndNul appends embedded NUL and NUL terminator.
+        BufBuilder bb;
+        bb.appendStrBytesAndNul(hasNulByte);
+        // Since hasNulByte points to a string literal, we know that
+        // *(hasNulByte.data() + hasNulByte.size()) is valid and == '\0'
+        ASSERT_EQ(std::string_view(bb.buf(), bb.len()),
+                  std::string_view(hasNulByte.data(), hasNulByte.size() + 1));
+    }
+}
+
+TEST(Builder, GrowBeyondBufferMaxSize) {
+    BufBuilder bb;
+    bb.grow(BufferMaxSize);
+    ASSERT_THROWS_WITH_CHECK(bb.grow(1), AssertionException, [](const AssertionException& exception) {
+        ASSERT_EQ(exception.code(), 13548);
+        ASSERT_STRING_SEARCH_REGEX(
+            exception.reason(),
+            R"(BufBuilder attempted to grow.*to \d+ bytes, past the \d+MB limit. Current size: \d+ bytes.*Reserved: \d+ bytes.*Requested: \d+ bytes.)");
+    });
+}
+
+TEST(Builder, InitialSizeBeyondMaxSize) {
+    ASSERT_THROWS_WITH_CHECK(
+        BufBuilder(BufferMaxSize + 1), AssertionException, [](const AssertionException& exception) {
+            ASSERT_EQ(exception.code(), 13061200);
+            ASSERT_STRING_SEARCH_REGEX(
+                exception.reason(),
+                R"(BufBuilder initially requesting \d+ bytes, past the \d+MB limit.)");
+        });
+}
+
+TEST(Builder, StringBuilderAddress) {
+    const void* longPtr = reinterpret_cast<const void*>(-1);
+    const void* shortPtr = reinterpret_cast<const void*>(static_cast<uintptr_t>(0xDEADBEEF));
+
+    const void* nullPtr = nullptr;
+
+    StringBuilder sb;
+    sb << longPtr;
+
+    if (sizeof(longPtr) == 8) {
+        ASSERT_EQUALS("0xFFFFFFFFFFFFFFFF", sb.str());
+    } else {
+        ASSERT_EQUALS("0xFFFFFFFF", sb.str());
+    }
+
+    sb.reset();
+    sb << shortPtr;
+    ASSERT_EQUALS("0xDEADBEEF", sb.str());
+
+    sb.reset();
+    sb << nullPtr;
+    ASSERT_EQUALS("0x0", sb.str());
+}
+
+TEST(Builder, BooleanOstreamOperator) {
+    StringBuilder sb;
+    sb << true << false << true;
+    ASSERT_EQUALS("101", sb.str());
+
+    sb.reset();
+    sb << "{abc: " << true << ", def: " << false << "}";
+    ASSERT_EQUALS("{abc: 1, def: 0}", sb.str());
+}
+
+TEST(Builder, StackAllocatorShouldNotLeak) {
+    StackAllocator<StackSizeDefault> stackAlloc;
+    stackAlloc.malloc(StackSizeDefault + 1);  // Force heap allocation.
+    // Let the builder go out of scope. If this leaks, it will trip the ASAN leak detector.
+}
+
+TEST(Builder, StringBuilderFloatingPointExponentNotation) {
+    StringBuilder sb;
+    sb << 1000000.23456789;
+    ASSERT_EQUALS("1e+06", sb.str());
+
+    sb.reset();
+    sb << 1234567.89;
+    ASSERT_EQUALS("1.23457e+06", sb.str());
+}
+
+TEST(Builder, StringBuilderFloatingPointPrecision) {
+    StringBuilder sb;
+    sb << 1.23456789;
+    ASSERT_EQUALS("1.23457", sb.str());
+}
+
+template <typename T>
+void testStringBuilderIntegral() {
+    auto check = [](T num) {
+        ASSERT_EQ(std::string(str::stream() << num), std::to_string(num));
+    };
+
+    // Do some simple sanity checks.
+    check(0);
+    check(1);
+    check(-1);
+    check(std::numeric_limits<T>::min());
+    check(std::numeric_limits<T>::max());
+
+    // Check the full range of int16_t. Using int32_t as loop variable to detect when we are done.
+    for (int32_t num = std::numeric_limits<int16_t>::min();
+         num <= std::numeric_limits<int16_t>::max();
+         num++) {
+        check(num);
+    }
+}
+
+TEST(Builder, AppendInt) {
+    testStringBuilderIntegral<int>();
+}
+TEST(Builder, AppendUnsigned) {
+    testStringBuilderIntegral<unsigned>();
+}
+TEST(Builder, AppendLong) {
+    testStringBuilderIntegral<long>();
+}
+TEST(Builder, AppendUnsignedLong) {
+    testStringBuilderIntegral<unsigned long>();
+}
+TEST(Builder, AppendLongLong) {
+    testStringBuilderIntegral<long long>();
+}
+TEST(Builder, AppendUnsignedLongLong) {
+    testStringBuilderIntegral<unsigned long long>();
+}
+TEST(Builder, AppendShort) {
+    testStringBuilderIntegral<short>();
+}
+}  // namespace mongo

@@ -1,0 +1,30 @@
+test_kind: js_test
+selector:
+  roots:
+    - jstests/write_path/timeseries/pbt/**/*_pbt.js
+  # TODO (SERVER-122997) Re-enable when this fix is made
+  exclude_files:
+    - jstests/write_path/timeseries/pbt/large_measurements/timeseries_measurement_limit_pbt.js
+
+executor:
+  config:
+    shell_options:
+      global_vars:
+        TestData:
+          fastCheckParameters:
+            numRuns: 75
+            minCommands: 1
+            maxCommands: 250
+            # Set a timeout for tests, typically this limit should only be reached during
+            # Shrinking, however an interrupted test with only passing runs will succeed.
+            interruptAfterTimeLimit: 1_200_000
+
+  hooks:
+    - class: ValidateCollections
+    - class: CleanEveryN
+      n: 20
+  fixture:
+    class: MongoDFixture
+    mongod_options:
+      set_parameters:
+        enableTestCommands: 1

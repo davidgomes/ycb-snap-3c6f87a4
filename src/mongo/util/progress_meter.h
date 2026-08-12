@@ -1,0 +1,150 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/modules.h"
+
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <utility>
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+
+class ProgressMeter {
+    ProgressMeter(const ProgressMeter&) = delete;
+    ProgressMeter& operator=(const ProgressMeter&) = delete;
+
+public:
+    ProgressMeter(unsigned long long total,
+                  int secondsBetween = 3,
+                  int checkInterval = 100,
+                  std::string units = "",
+                  std::string name = "Progress")
+        : _showTotal(true), _units(units), _name(std::move(name)) {
+        reset(total, secondsBetween, checkInterval);
+    }
+
+    ProgressMeter() {
+        _name = "Progress";
+    }
+
+    // typically you do ProgressMeterHolder
+    void reset(unsigned long long total, int secondsBetween = 3, int checkInterval = 100);
+
+    void finished() {
+        _active = false;
+    }
+    bool isActive() const {
+        return _active;
+    }
+
+    /**
+     * @param n how far along we are relative to the total # we set in CurOp::setMessage
+     * @return if row was printed
+     */
+    bool hit(int n = 1);
+
+    void setUnits(const std::string& units) {
+        _units = units;
+    }
+    std::string getUnit() const {
+        return _units;
+    }
+
+    void setName(std::string_view name) {
+        std::lock_guard lk(_nameMutex);
+        _name = std::string{name};
+    }
+    std::string getName() const {
+        std::lock_guard lk(_nameMutex);
+        return _name;
+    }
+
+    void setTotalWhileRunning(unsigned long long total) {
+        _total = total;
+    }
+
+    unsigned long long done() const {
+        return _done;
+    }
+
+    unsigned long long hits() const {
+        return _hits;
+    }
+
+    unsigned long long total() const {
+        return _total;
+    }
+
+    void showTotal(bool doShow) {
+        _showTotal = doShow;
+    }
+
+    std::string toString() const;
+
+    bool operator==(const ProgressMeter& other) const {
+        return this == &other;
+    }
+
+private:
+    bool _active{false};
+
+    unsigned long long _total;
+    bool _showTotal{true};
+    int _secondsBetween{3};
+    int _checkInterval{100};
+
+    unsigned long long _done;
+    unsigned long long _hits;
+    int _lastTime;
+
+    std::string _units;
+
+    mutable std::mutex _nameMutex;
+    std::string _name;  // guarded by _nameMutex
+};
+
+/*
+ * Wraps a CurOp owned ProgressMeter and calls finished() when destructed. This may only exist as
+ * long as the underlying ProgressMeter.
+ *
+ * The underlying ProgressMeter will have the same locking requirements as CurOp (see CurOp class
+ * description). Accessors and modifiers on the underlying ProgressMeter may need to be performed
+ * while holding a client lock and specifying the WithLock argument. If accessing without a client
+ * lock, then the thread must be executing the associated OperationContext.
+ */
+class ProgressMeterHolder {
+    ProgressMeterHolder(const ProgressMeterHolder&) = delete;
+    ProgressMeterHolder& operator=(const ProgressMeterHolder&) = delete;
+
+public:
+    ProgressMeterHolder() : _pm(nullptr) {}
+
+    ~ProgressMeterHolder() {
+        if (_pm) {
+            {
+                std::unique_lock<Client> lk(*_opCtx->getClient());
+                _pm->finished();
+            }
+        }
+    }
+
+    void set(WithLock, ProgressMeter& pm, OperationContext* opCtx) {
+        _opCtx = opCtx;
+        _pm = &pm;
+    }
+
+    ProgressMeter* get(WithLock) {
+        return _pm;
+    }
+
+private:
+    ProgressMeter* _pm;
+    OperationContext* _opCtx;
+};
+}  // namespace mongo

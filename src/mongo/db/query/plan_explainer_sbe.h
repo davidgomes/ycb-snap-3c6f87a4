@@ -1,0 +1,168 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/compiler/optimizer/cost_based_ranker/estimates_storage.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/plan_cache/plan_cache_debug_info.h"
+#include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/sbe_plan_ranker.h"
+#include "mongo/db/query/stage_builder/sbe/builder_data.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+/**
+ * Helper class to structure information needed to display 'rejected' SBE plans for join
+ * optimization.
+ */
+struct JoinOptPlan {
+    // Note: these fields are are owned here.
+    std::unique_ptr<QuerySolution> soln;
+    std::unique_ptr<sbe::PlanStage> stage;
+    stage_builder::PlanStageData data;
+};
+
+class PlanExplainerSBEBase : public PlanExplainer {
+public:
+    PlanExplainerSBEBase(const sbe::PlanStage* root,
+                         const stage_builder::PlanStageData* data,
+                         const QuerySolution* solution,
+                         bool isMultiPlan,
+                         bool isCachedPlan,
+                         boost::optional<size_t> cachedPlanHash,
+                         std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> debugInfo,
+                         RemoteExplainVector* remoteExplains,
+                         bool usedJoinOpt = false,
+                         cost_based_ranker::EstimateMap estimates = {},
+                         std::vector<JoinOptPlan> rejectedPlans = {});
+
+    bool isSbeExplainer() const final {
+        return true;
+    }
+    bool areThereRejectedPlansToExplain() const final {
+        return _isMultiPlan;
+    }
+    bool isFromCache() const {
+        return _isFromPlanCache;
+    }
+    bool matchesCachedPlan() const;
+    std::string getPlanSummary() const final;
+    void getSummaryStats(PlanSummaryStats* statsOut) const final;
+    void getSecondarySummaryStats(const NamespaceString& secondaryColl,
+                                  PlanSummaryStats* statsOut) const override;
+    PlanStatsDetails getWinningPlanStats(ExplainOptions::Verbosity verbosity) const final;
+    PlanStatsDetails getWinningPlanStatsQueryPlanner(bool printBytecode) const final;
+
+    static BSONObj buildExecPlanDebugInfo(const sbe::PlanStage* root,
+                                          const stage_builder::PlanStageData* data,
+                                          size_t lengthCap,
+                                          bool printBytecode) {
+        tassert(10111200, "encountered unexpected missing sbe plan stage root", root);
+        tassert(10111201, "encountered unexpected missing sbe plan stage data", data);
+        BSONObjBuilder bob;
+        std::string slots = data->debugString(lengthCap);
+        if (static_cast<size_t>(bob.len()) + slots.size() > lengthCap) {
+            bob.append("warning", "exceeded explain BSON size cap");
+            return bob.obj();
+        }
+        bob.append("slots", slots);
+        if (static_cast<size_t>(bob.len()) >= lengthCap) {
+            bob.append("warning", "exceeded explain BSON size cap");
+            return bob.obj();
+        }
+        // TODO can put lengthCap on debugPrintInfo as well.
+        sbe::DebugPrintInfo debugPrintInfo = {.printBytecode = printBytecode};
+        std::string stages = sbe::DebugPrinter().print(*root, debugPrintInfo);
+        if (static_cast<size_t>(bob.len()) + stages.size() > lengthCap) {
+            bob.append("warning", "exceeded explain BSON size cap");
+            return bob.obj();
+        }
+        bob.append("stages", stages);
+        return bob.obj();
+    }
+
+protected:
+    boost::optional<BSONArray> buildRemotePlanInfo() const;
+
+    // These fields are are owned elsewhere (e.g. the PlanExecutor or CandidatePlan).
+    const sbe::PlanStage* _root{nullptr};
+    const stage_builder::PlanStageData* _rootData{nullptr};
+
+    // This field is owned here and has keys corresponding to nodes in PlanExplainer::_solution.
+    cost_based_ranker::EstimateMap _estimates;
+
+    const bool _isMultiPlan{false};
+    const bool _isFromPlanCache{false};
+    const bool _usedJoinOpt{false};
+    const boost::optional<size_t> _cachedPlanHash{boost::none};
+    // Pre-computed debugging info so we don't necessarily have to collect them from QuerySolution.
+    // All plans recovered from the same cached entry share the same debug info.
+    const std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> _debugInfo;
+    const RemoteExplainVector* _remoteExplains;
+
+    // Plans enumerated by join optimization that weren't chosen for execution.
+    std::vector<JoinOptPlan> _rejectedPlansForJoinOpt;
+};
+class PlanExplainerClassicRuntimePlannerForSBE final : public PlanExplainerSBEBase {
+public:
+    PlanExplainerClassicRuntimePlannerForSBE(
+        const sbe::PlanStage* root,
+        const stage_builder::PlanStageData* data,
+        const QuerySolution* solution,
+        bool isMultiPlan,
+        bool isCachedPlan,
+        boost::optional<size_t> cachedPlanHash,
+        std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> debugInfo,
+        std::unique_ptr<PlanStage> classicRuntimePlannerStage,
+        RemoteExplainVector* remoteExplains,
+        bool usedJoinOpt = false,
+        cost_based_ranker::EstimateMap estimates = {},
+        std::vector<JoinOptPlan> rejectedPlans = {},
+        boost::optional<PlanExplainerData> maybeExplainData = boost::none);
+
+    PlanStatsDetails getWinningPlanTrialStats() const final;
+    std::vector<PlanStatsDetails> getRejectedPlansStats(
+        ExplainOptions::Verbosity verbosity) const final;
+    boost::optional<StringMap<cost_based_ranker::SamplingMetadata>> getCeSamplingMetadata()
+        const override;
+    boost::optional<uint32_t> getJoinPlanCacheKeyHash() const override;
+
+private:
+    // Using a pointer to a MultiPlanStage, we can create a classic PlanExplainerImpl from which we
+    // can extract the necessary information regarding the classic multi-planner's trial period
+    // using the same format as we would for the classic engine.
+    const std::unique_ptr<PlanStage> _classicRuntimePlannerStage;
+    boost::optional<StringMap<cost_based_ranker::SamplingMetadata>> _ceSamplingMetadata;
+    boost::optional<uint32_t> _joinPlanCacheKeyHash;
+    // Do not call getCeSamplingMetadata() on this explainer; it returns boost::none because
+    // ceSamplingMetadata is copied into _ceSamplingMetadata above. Callers should use
+    // getCeSamplingMetadata() on PlanExplainerClassicRuntimePlannerForSBE instead.
+    const std::unique_ptr<PlanExplainer> _classicRuntimePlannerExplainer;
+};
+
+// Exposed only for testing purposes.
+void statsToBSON(const QuerySolutionNode* node,
+                 BSONObjBuilder* bob,
+                 const BSONObjBuilder* topLevelBob,
+                 const cost_based_ranker::EstimateMap& estimates = {});
+}  // namespace mongo

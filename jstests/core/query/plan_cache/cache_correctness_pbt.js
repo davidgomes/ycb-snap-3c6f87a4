@@ -1,0 +1,49 @@
+/**
+ * A property-based test that runs similar queries to potentially trigger cache usage, then asserts
+ * the queries return the same results when deoptimized.
+ * Auto-parameterization has had issues in the past. This test attempts to target that area.
+ *
+ * @tags: [
+ * query_intensive_pbt,
+ * # This test runs commands that are not allowed with security token: setParameter.
+ * not_allowed_with_signed_security_token,
+ * assumes_no_implicit_collection_creation_after_drop,
+ * # Incompatible with setParameter
+ * does_not_support_stepdowns,
+ * # Runs queries that may return many results, requiring getmores
+ * requires_getmore,
+ * ]
+ */
+import {isFCVgte} from "jstests/libs/feature_compatibility_version.js";
+import {createCacheCorrectnessProperty} from "jstests/libs/property_test_helpers/common_properties.js";
+import {getCollectionModel} from "jstests/libs/property_test_helpers/models/collection_models.js";
+import {getQueryAndOptionsModel} from "jstests/libs/property_test_helpers/models/query_models.js";
+import {makeWorkloadModel} from "jstests/libs/property_test_helpers/models/workload_models.js";
+import {testProperty} from "jstests/libs/property_test_helpers/property_testing_utils.js";
+import {isSlowBuild} from "jstests/libs/query/aggregation_pipeline_utils.js";
+
+if (isSlowBuild(db)) {
+    jsTest.log.info("Returning early because debug is on, opt is off, or a sanitizer is enabled.");
+    quit();
+}
+
+const is83orAbove = isFCVgte(db, "8.3");
+
+const numRuns = 50;
+const numQueriesPerRun = 15;
+
+const controlColl = db.cache_correctness_pbt_control;
+const experimentColl = db.cache_correctness_pbt_experiment;
+const correctnessProperty = createCacheCorrectnessProperty(controlColl, experimentColl);
+const aggModel = getQueryAndOptionsModel().filter(
+    // Older versions suffer from SERVER-101007
+    ({pipeline}) => is83orAbove || !JSON.stringify(pipeline).includes('"$elemMatch"'),
+);
+
+// Test with a regular collection.
+testProperty(
+    correctnessProperty,
+    {controlColl, experimentColl},
+    makeWorkloadModel({collModel: getCollectionModel(), aggModel, numQueriesPerRun}),
+    numRuns,
+);

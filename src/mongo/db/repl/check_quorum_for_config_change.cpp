@@ -1,0 +1,338 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/repl/check_quorum_for_config_change.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/repl/member_config.h"
+#include "mongo/db/repl/member_id.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
+#include "mongo/db/repl/repl_set_heartbeat_response.h"
+#include "mongo/db/repl/scatter_gather_runner.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <cstddef>
+#include <memory>
+#include <string>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
+
+namespace mongo {
+namespace repl {
+
+using executor::RemoteCommandRequest;
+
+QuorumChecker::QuorumChecker(const ReplSetConfig* rsConfig, int myIndex, long long term)
+    : _rsConfig(rsConfig),
+      _myIndex(myIndex),
+      _term(term),
+      _responses(_rsConfig->getNumMembers(), {false, false, false}),
+      _successfulVoterCount(0),
+      _numResponses(1),  // We "responded" to ourself already.
+      _numElectable(0),
+      _numResponsesRequired(_rsConfig->getNumMembers() +
+                            _rsConfig->getCountOfMembersWithPriorityPort()),
+      _vetoStatus(Status::OK()),
+      _finalStatus(ErrorCodes::CallbackCanceled, "Quorum check canceled") {
+    invariant(myIndex < _rsConfig->getNumMembers());
+    const MemberConfig& myConfig = _rsConfig->getMemberAt(_myIndex);
+
+    _responses.at(myIndex) = {true, myConfig.getPriorityPort().is_initialized(), true};
+    if (myConfig.isVoter()) {
+        _successfulVoterCount++;
+    }
+    if (myConfig.getPriorityPort()) {
+        _numResponses++;
+    }
+    if (myConfig.isElectable()) {
+        _numElectable = 1;
+    }
+
+    if (hasReceivedSufficientResponses()) {
+        _onQuorumCheckComplete();
+    }
+}
+
+QuorumChecker::~QuorumChecker() {}
+
+std::vector<RemoteCommandRequest> QuorumChecker::getRequests() const {
+    const bool isInitialConfig = _rsConfig->getConfigVersion() == 1;
+    const MemberConfig& myConfig = _rsConfig->getMemberAt(_myIndex);
+
+    std::vector<RemoteCommandRequest> requests;
+    if (hasReceivedSufficientResponses()) {
+        return requests;
+    }
+
+    BSONObj hbRequest;
+    invariant(_term != OpTime::kUninitializedTerm);
+    ReplSetHeartbeatArgsV1 hbArgs;
+    hbArgs.setSetName(_rsConfig->getReplSetName());
+    hbArgs.setConfigVersion(_rsConfig->getConfigVersion());
+    hbArgs.setConfigTerm(_rsConfig->getConfigTerm());
+    hbArgs.setHeartbeatVersion(1);
+    if (isInitialConfig) {
+        hbArgs.setCheckEmpty();
+    }
+    // hbArgs allows (but doesn't require) us to pass the current primary id as an optimization,
+    // but it is not readily available within QuorumChecker.
+    // Use the priority port because the recipient may send a heartbeat back to get a newer
+    // configuration and we want them to use the priority port if it is available.
+    hbArgs.setSenderHost(myConfig.getHostAndPortPriority());
+    hbArgs.setSenderId(myConfig.getId().getData());
+    hbArgs.setTerm(_term);
+    hbRequest = hbArgs.toBSON();
+
+    // Send a bunch of heartbeat requests.
+    // Schedule an operation when a "sufficient" number of them have completed, and use that
+    // to compute the quorum check results.
+    // Wait for the "completion" callback to finish, and then it's OK to return the results.
+    for (int i = 0; i < _rsConfig->getNumMembers(); ++i) {
+        if (_myIndex == i) {
+            // No need to check self for liveness or unreadiness.
+            continue;
+        }
+        const auto& member = _rsConfig->getMemberAt(i);
+        requests.push_back(RemoteCommandRequest(member.getHostAndPort(),
+                                                DatabaseName::kAdmin,
+                                                hbRequest,
+                                                BSON(rpc::kReplSetMetadataFieldName << 1),
+                                                nullptr,
+                                                _rsConfig->getHeartbeatTimeoutPeriodMillis()));
+
+        // If a member has a priority port specified then we need to check connectivity to both
+        // the main and the priority ports.
+        if (member.getPriorityPort()) {
+            requests.push_back(RemoteCommandRequest(member.getHostAndPortPriority(),
+                                                    DatabaseName::kAdmin,
+                                                    hbRequest,
+                                                    BSON(rpc::kReplSetMetadataFieldName << 1),
+                                                    nullptr,
+                                                    _rsConfig->getHeartbeatTimeoutPeriodMillis()));
+        }
+    }
+
+    return requests;
+}
+
+void QuorumChecker::processResponse(const RemoteCommandRequest& request,
+                                    const executor::RemoteCommandResponse& response) {
+    _tabulateHeartbeatResponse(request, response);
+    if (hasReceivedSufficientResponses()) {
+        _onQuorumCheckComplete();
+    }
+}
+
+void QuorumChecker::_appendFailedHeartbeatResponses(str::stream& stream) {
+    for (std::vector<std::pair<HostAndPort, Status>>::const_iterator it = _badResponses.begin();
+         it != _badResponses.end();
+         ++it) {
+        if (it != _badResponses.begin()) {
+            stream << ", ";
+        }
+        stream << it->first.toString() << " failed with " << it->second.reason();
+    }
+}
+
+void QuorumChecker::_appendFullySuccessfulVotingHostAndPorts(str::stream& stream,
+                                                             int expectedResponses) {
+    int count = 0;
+    for (int i = 0; i < _rsConfig->getNumMembers(); ++i) {
+        if (!_responses.at(i).fullySuccessful) {
+            continue;
+        }
+        const auto& member = _rsConfig->getMemberAt(i);
+        if (!member.isVoter()) {
+            continue;
+        }
+        if (count != 0) {
+            stream << ", ";
+        }
+        stream << member.getHostAndPort().toString();
+        if (++count == expectedResponses) {
+            break;
+        }
+    }
+}
+
+void QuorumChecker::_onQuorumCheckComplete() {
+    if (!_vetoStatus.isOK()) {
+        _finalStatus = _vetoStatus;
+        return;
+    }
+    if (_rsConfig->getConfigVersion() == 1 && !_badResponses.empty()) {
+        str::stream message;
+        message << "replSetInitiate quorum check failed because not all proposed set members "
+                   "responded affirmatively: ";
+        _appendFailedHeartbeatResponses(message);
+        _finalStatus = Status(ErrorCodes::NodeNotFound, message);
+        return;
+    }
+    if (_numElectable == 0) {
+        _finalStatus = Status(ErrorCodes::NodeNotFound,
+                              "Quorum check failed because no "
+                              "electable nodes responded; at least one required for config");
+        return;
+    }
+    if (_successfulVoterCount < _rsConfig->getMajorityVoteCount()) {
+        str::stream message;
+        message << "Quorum check failed because not enough voting nodes responded; required "
+                << _rsConfig->getMajorityVoteCount() << " but ";
+
+        if (_successfulVoterCount == 0) {
+            message << "none responded";
+        } else {
+            message << "only the following " << _successfulVoterCount
+                    << " voting nodes responded: ";
+            _appendFullySuccessfulVotingHostAndPorts(message, _successfulVoterCount);
+        }
+        if (!_badResponses.empty()) {
+            message << "; the following nodes did not respond affirmatively: ";
+            _appendFailedHeartbeatResponses(message);
+        }
+        _finalStatus = Status(ErrorCodes::NodeNotFound, message);
+        return;
+    }
+    _finalStatus = Status::OK();
+}
+
+void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& request,
+                                               const executor::RemoteCommandResponse& response) {
+    ++_numResponses;
+    if (!response.isOK()) {
+        LOGV2_WARNING(23722,
+                      "Failed to complete heartbeat request to target",
+                      "requestTarget"_attr = request.target,
+                      "responseStatus"_attr = response.status);
+        _badResponses.push_back(std::make_pair(request.target, response.status));
+        return;
+    }
+
+    BSONObj resBSON = response.data;
+    ReplSetHeartbeatResponse hbResp;
+    Status hbStatus = hbResp.initialize(resBSON, 0);
+
+    if (hbStatus.code() == ErrorCodes::InconsistentReplicaSetNames) {
+        static constexpr char message[] = "Our set name did not match that of the request target";
+        _vetoStatus =
+            Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                   str::stream() << message << ", requestTarget:" << request.target.toString());
+        LOGV2_WARNING(23723, message, "requestTarget"_attr = request.target.toString());
+        return;
+    }
+
+    if (!hbStatus.isOK() && hbStatus != ErrorCodes::InvalidReplicaSetConfig) {
+        LOGV2_WARNING(23724,
+                      "Got error response on heartbeat request",
+                      "hbStatus"_attr = hbStatus,
+                      "requestTarget"_attr = request.target,
+                      "hbResp"_attr = hbResp);
+        _badResponses.push_back(std::make_pair(request.target, hbStatus));
+        return;
+    }
+
+    if (_rsConfig->hasReplicaSetId()) {
+        StatusWith<rpc::ReplSetMetadata> replMetadata =
+            rpc::ReplSetMetadata::readFromMetadata(response.data);
+        if (replMetadata.isOK() && replMetadata.getValue().getReplicaSetId().isSet() &&
+            _rsConfig->getReplicaSetId() != replMetadata.getValue().getReplicaSetId()) {
+            static constexpr char message[] =
+                "Our replica set ID did not match that of our request target";
+            _vetoStatus =
+                Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                       str::stream() << message << ", replSetId: " << _rsConfig->getReplicaSetId()
+                                     << ", requestTarget: " << request.target.toString()
+                                     << ", requestTargetReplSetId: "
+                                     << replMetadata.getValue().getReplicaSetId());
+            LOGV2_WARNING(23726,
+                          message,
+                          "replSetId"_attr = _rsConfig->getReplicaSetId(),
+                          "requestTarget"_attr = request.target.toString(),
+                          "requestTargetReplSetId"_attr =
+                              replMetadata.getValue().getReplicaSetId());
+        }
+    }
+
+    for (int i = 0; i < _rsConfig->getNumMembers(); ++i) {
+        const MemberConfig& memberConfig = _rsConfig->getMemberAt(i);
+        if (memberConfig.getHostAndPort() != request.target &&
+            memberConfig.getHostAndPortPriority() != request.target) {
+            continue;
+        }
+        if (memberConfig.getPriorityPort() &&
+            memberConfig.getHostAndPortPriority() == request.target) {
+            _responses.at(i).priorityResponseReceived = true;
+        } else {
+            _responses.at(i).mainResponseReceived = true;
+        }
+        // Check if we have now received both responses for this node.
+        _responses.at(i).fullySuccessful = _responses.at(i).mainResponseReceived &&
+            (!memberConfig.getPriorityPort() || _responses.at(i).priorityResponseReceived);
+        // If we have received both responses for this node then update our global counters.
+        if (_responses.at(i).fullySuccessful) {
+            if (memberConfig.isVoter()) {
+                ++_successfulVoterCount;
+            }
+            if (memberConfig.isElectable()) {
+                ++_numElectable;
+            }
+        }
+        return;
+    }
+    MONGO_UNREACHABLE;
+}
+
+bool QuorumChecker::hasReceivedSufficientResponses() const {
+    if (!_vetoStatus.isOK() || _numResponses == _numResponsesRequired) {
+        // Vetoed or everybody has responded.  All done.
+        return true;
+    }
+
+    return false;
+}
+
+Status checkQuorumGeneral(executor::TaskExecutor* executor,
+                          const ReplSetConfig& rsConfig,
+                          const int myIndex,
+                          long long term,
+                          std::string logMessage) {
+    auto checker = std::make_shared<QuorumChecker>(&rsConfig, myIndex, term);
+    ScatterGatherRunner runner(checker, executor, std::move(logMessage));
+    Status status = runner.run();
+    if (!status.isOK()) {
+        return status;
+    }
+
+    return checker->getFinalStatus();
+}
+
+Status checkQuorumForInitiate(executor::TaskExecutor* executor,
+                              const ReplSetConfig& rsConfig,
+                              const int myIndex,
+                              long long term) {
+    invariant(rsConfig.getConfigVersion() == 1);
+    return checkQuorumGeneral(executor, rsConfig, myIndex, term, "initiate quorum check");
+}
+
+Status checkQuorumForReconfig(executor::TaskExecutor* executor,
+                              const ReplSetConfig& rsConfig,
+                              const int myIndex,
+                              long long term) {
+    invariant(rsConfig.getConfigVersion() > 1);
+    return checkQuorumGeneral(executor, rsConfig, myIndex, term, "reconfig quorum check");
+}
+
+}  // namespace repl
+}  // namespace mongo

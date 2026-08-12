@@ -1,0 +1,213 @@
+####################################################
+#                  YAML Conventions                 #
+#####################################################
+# Please see our conventions document at
+# https://wiki.corp.mongodb.com/pages/viewpage.action?pageId=133273894
+# for help navigating this document, or for help with our lint rules.
+
+#####################################################
+#               A note on expansions                #
+#####################################################
+
+# Expansions usually appear in the form ${key|default}
+# If 'key' is found in the executor's map of currently known
+# expansions, the corresponding value is used. If the key can
+# not be found, the default is used.
+#
+# Arbitrary expansions can be specified in the YAML configuration
+# files in the following places:
+# - The 'expansions' field for buildvariants (branch file)
+# - The 'expansions' field for distros (distros file)
+#
+# A number of 'built-in' expansions are also available for use; these include:
+# - environment variables available on the host machine
+# - 'workdir' (references the executor's work directory).
+# - 'task_id' (references the task id of the task the executor is working on).
+# - 'build_variant' (references the executing task's buildvariant).
+# - 'config_root' (references the root directory for the executor's configuration artifacts).
+
+#####################################################
+#          Setup environment in a new task          #
+#####################################################
+
+# There are several ways to setup the environment in your task.
+#
+# 1. If your task depends on 'archive_dist_test'/'archive_dist_test_debug' task you can call the function "do setup"
+# - func: "do setup"
+# Or alternatively call the functions in the sequence below, if you don't need everything else from "do setup"
+# - func: "fetch artifacts" (includes python, shell scripts, jstests etc. from the mongo and enterprise repos)
+# - func: "f_expansions_write"
+# - func: "kill processes"
+# - func: "cleanup environment"
+# - func: "set up venv"
+#
+# 2. If your task does not depend on 'archive_dist_test'/'archive_dist_test_debug' task use the following functions
+# call sequence
+# - command: manifest.load
+# - func: "git get shallow project" (clone the entire mongo and enterprise repos)
+# - func: "restore git history and tags"
+# - func: "f_expansions_write"
+# - func: "kill processes"
+# - func: "cleanup environment"
+# - func: "set up venv"
+
+include:
+  - filename: etc/evergreen_yml_components/configuration.yml
+  - filename: etc/evergreen_yml_components/definitions.yml
+
+  - filename: etc/evergreen_yml_components/tasks/resmoke/server_divisions/clusters_and_integrations/tasks.yml
+  - filename: etc/evergreen_yml_components/tasks/resmoke/server_divisions/durable_transactions_and_availability/tasks.yml
+  - filename: etc/evergreen_yml_components/tasks/resmoke/server_divisions/query/tasks.yml
+  - filename: etc/evergreen_yml_components/tasks/resmoke/non_server_teams/tasks.yml
+  - filename: etc/evergreen_yml_components/tasks/compile_tasks.yml
+  - filename: etc/evergreen_yml_components/tasks/compile_tasks_shared.yml
+  - filename: etc/evergreen_yml_components/tasks/misc_tasks.yml
+  - filename: etc/evergreen_yml_components/tasks/security_tasks.yml
+  - filename: etc/evergreen_yml_components/tasks/devcontainer_tasks.yml
+
+  - filename: etc/evergreen_yml_components/variants/misc/task_generation.yml
+  - filename: etc/evergreen_yml_components/variants/misc/misc.yml
+  - filename: etc/evergreen_yml_components/variants/misc/misc_master_branch_only.yml
+
+  - filename: etc/evergreen_yml_components/variants/amazon/test_dev.yml
+  - filename: etc/evergreen_yml_components/variants/amazon/test_dev_master_branch_only.yml
+  - filename: etc/evergreen_yml_components/variants/amazon/message_filter_plugin_master_branch_only.yml
+
+  - filename: etc/evergreen_yml_components/variants/macos/test_dev_master_branch_only.yml
+
+  - filename: etc/evergreen_yml_components/variants/mongot/test_dev.yml
+
+  - filename: etc/evergreen_yml_components/variants/rhel/test_dev.yml
+  - filename: etc/evergreen_yml_components/variants/rhel/test_dev_master_branch_only.yml
+
+  - filename: etc/evergreen_yml_components/variants/sanitizer/test_dev.yml
+  - filename: etc/evergreen_yml_components/variants/sanitizer/test_dev_master_branch_only.yml
+
+  - filename: etc/evergreen_yml_components/variants/ubuntu/test_dev.yml
+
+  - filename: etc/evergreen_yml_components/variants/windows/test_dev.yml
+  - filename: etc/evergreen_yml_components/variants/windows/test_dev_master_branch_only.yml
+
+  - filename: etc/evergreen_yml_components/variants/wiredtiger/test_dev_master_branch_only.yml
+
+  - filename: etc/evergreen_yml_components/variants/codecoverage/test_dev_master_branch_only.yml
+
+  - filename: etc/evergreen_yml_components/variants/amazon/streams/streams_dev.yml
+
+  - filename: src/mongo/db/modules/atlas/atlas_dev.yml
+  - filename: src/mongo/db/modules/atlas/atlas_sls_pin_bump.yml
+  - filename: etc/evergreen_yml_components/copybara/copybara.yml
+  - filename: etc/evergreen_yml_components/copybara/copybara_gen.yml
+
+  - filename: monguard/.evergreen/config_mongodb_master.yml
+  - filename: monguard/.evergreen/config_tasks.yml
+
+parameters:
+  - key: evergreen_config_file_path
+    value: "etc/evergreen.yml"
+    description: "path to this file"
+  - key: test_selection_strategies_array
+    description: "Array of test selection strategies"
+  - key: runtime_params_json
+    description: 'JSON of runtime params (e.g. {"enable_linux_perf":true}) to enable on-CPU profiling on benchmark tasks.'
+  - key: message_filter_plugin_release_version
+    description: "Dev release version string of the message filter plugin artifact to promote to GA. Used by promote_message_filter_plugin to locate the existing dev tarball in origin-message-filter-plugin-dev and re-import it via URP at the GA artifact name. No rebuild is performed."
+  # Note: the `urp_input_bucket_override` parameter is already declared by the merged
+  # monguard config (monguard/.evergreen/config_mongodb_master.yml) and is reused here.
+
+commit_queue_aliases:
+  # TODO(SERVER-124155): add check_for_todos to the commit queue variant's task list once the codebase is free of existing violations
+  - variant: "^(commit-queue)$"
+    task: "^(bazel_.*|run_.*|unit_test.*|compile_.*|lint_.*|resmoke_tests|check_for_noexcept|version_gen_validation|validate_commit_message|resmoke_validation_tests|buildscripts_test)$"
+    variant_tags: []
+    task_tags: []
+  - variant: "^(amazon-linux2023-arm64-static-compile)$"
+    variant_tags: []
+    task_tags: ["clang_tidy"]
+  - variant: "^(commit-queue-monorepo)$"
+    task: ".*"
+    variant_tags: []
+    task_tags: []
+  - variant: "^(commit-queue-atlas)$"
+    task: ".*"
+    variant_tags: []
+    task_tags: []
+  # Monguard
+  - variant: "^(amazon-linux2023-arm|Lint)$"
+    task: "^(.*)$"
+    variant_tags: []
+    task_tags: []
+
+github_pr_aliases:
+  # TODO(SERVER-124155): add check_for_todos to the commit queue variant's task list once the codebase is free of existing violations
+  - variant: "^(commit-queue)$"
+    task: "^(bazel_.*|run_.*|unit_test.*|compile_.*|lint_.*|resmoke_tests|check_for_noexcept|version_gen_validation|validate_commit_message|resmoke_validation_tests|buildscripts_test)$"
+    variant_tags: []
+    task_tags: []
+  - variant: "^(amazon-linux2023-arm64-static-compile)$"
+    variant_tags: []
+    task_tags: ["clang_tidy"]
+  - variant: "^(al2023-arm64-sep-benchmark)$"
+    variant_tags: []
+    task_tags: ["benchmarks_sep"]
+  - variant: "^(commit-queue-monorepo)$"
+    task: ".*"
+    variant_tags: []
+    task_tags: []
+  - variant: "^(commit-queue-atlas)$"
+    task: ".*"
+    variant_tags: []
+    task_tags: []
+  # Monguard
+  - variant: "^(amazon-linux2023-arm|Lint)$"
+    task: "^(.*)$"
+    variant_tags: []
+    task_tags: []
+
+patch_aliases:
+  - alias: required
+    variant_tags: ["required"]
+    task: ".*"
+  - alias: query
+    variant: "^(.*query-patch-only|amazon-linux2023-arm64-static-compile)$"
+    task: ".*"
+  - alias: query-quick
+    variant: "^(.*query-quick-patch-only|linux-x86-dynamic-compile)$"
+    task: ".*"
+  - alias: security
+    variant: "^(.*security-patch-only|linux-x86-dynamic-compile|windows-compile-required)$"
+    task: ".*"
+  - alias: bazel
+    description: "Runs bazel build system tests"
+    variant_tags: ["bazel_check"]
+    task_tags: ["bazel_check"]
+  - alias: bazel_variants
+    description: "Runs bazel build system tests"
+    variant_tags: ["bazel_check"]
+    task: ".*"
+  - alias: search
+    description: "Runs all $search, $vectorSearch tests"
+    variant: ".*"
+    task: "^.*search*"
+  - alias: required-and-mongot-e2e-tests
+    description: >
+      This alias selects all tasks in all required variants and all tasks in variants that use a real mongot.
+      Once more e2e tests have been contributed and thus our coverage is better, this alias can be refined
+      to only select tests that use a real mongot.
+    variant_tags: ["required", "mongot_e2e"]
+    task: ".*"
+  - alias: codecoverage
+    description: "Run tests and report code coverage"
+    variant: ".*-coverage"
+    task: ".*"
+  - alias: unittestcoverage
+    description: "Run unit tests and report code coverage"
+    variant: ".*-coverage"
+    task: "^(unit_test_group.*|bazel_coverage)$"
+  - alias: cluster_scalability
+    variant_tags: ["cluster_scalability_only"]
+    task_tags: ["cluster_scalability_only"]
+  - alias: streams
+    description: "Runs all streams variants"
+    variant: "^(enterprise-amazon2023-streams|enterprise-rhel8-streams-tsan|enterprise-rhel8-streams-aubsan)$"
+    task: ".*"

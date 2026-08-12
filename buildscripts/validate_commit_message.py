@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+"""Validate that the commit message is ok."""
+
+import pathlib
+import re
+import subprocess
+
+import pathspec
+import requests
+import structlog
+import typer
+from git import Commit, Repo
+from typing_extensions import Annotated
+
+from buildscripts.bazel_rules_mongo.utils.evergreen_git import get_changed_files
+
+LOGGER = structlog.get_logger(__name__)
+
+STATUS_OK = 0
+STATUS_ERROR = 1
+
+repo_root = pathlib.Path(
+    subprocess.run(
+        "git rev-parse --show-toplevel", shell=True, text=True, capture_output=True
+    ).stdout.strip()
+)
+
+pr_template = ""
+with open(repo_root / ".github" / "pull_request_template.md", "r") as r:
+    pr_template = r.read().strip()
+
+BANNED_STRINGS = ["https://spruce.mongodb.com", "https://evergreen.mongodb.com", pr_template]
+
+VALID_SUMMARY = re.compile(
+    r'(?:Revert ")?(?:([A-Z]+)-([A-Z0-9]+)|Import wiredtiger|Bump \S+ from \S+ to \S+)'
+)
+
+# The allowed jira projects and their corresponding allowed file paths.
+# allowed file paths are in gitignore format
+ALLOWED_JIRA_PROJECTS = {
+    "SERVER": ["**/*"],  # SERVER commits can modify any file
+    "GUARD": ["monguard/**/*"],  # GUARD commits can only modify files in the monguard directory
+}
+
+RETRY_INSTRUCTIONS = "If you are seeing this on a PR, after changing the required field, you will need to restart the failed validate_commit_message task in Evergreen before being able to submit your PR."
+
+
+def is_valid_commit(commit: Commit, changed_files: list[str] = [], requester: str = "") -> bool:
+    # Valid values look like:
+    # 1. SERVER-\d+
+    # 2. Revert "SERVER-\d+
+    # 3. Import wiredtiger
+    # 4. Revert "Import wiredtiger
+    match = VALID_SUMMARY.match(commit.summary)
+    if not match:
+        LOGGER.error(
+            f"""PR summary is not valid; it must match the regular expression: {VALID_SUMMARY}
+Current summary: {commit.summary}
+Please update the PR title and description to match the expected format.
+{RETRY_INSTRUCTIONS}
+The decision to add this check was made in SERVER-101443, please feel free to leave comments/feedback on that ticket.""",
+        )
+        return False
+
+    # get the jira project from the regex, this will be none for wiredtiger imports
+    jira_project = match.group(1)
+    ticket_suffix = match.group(2)
+    if jira_project:
+        if requester == "github_pr":
+            # For github_pr requests, the suffix can be alphanumeric (3-6 characters)
+            # This is to allow SERVER-XXXX tickets that will be auto-replaced after PR creation.
+            if not (3 <= len(ticket_suffix) <= 6):
+                LOGGER.error(
+                    f"""PR summary ticket suffix must be 3-6 characters, got {len(ticket_suffix)}: {ticket_suffix}
+{RETRY_INSTRUCTIONS}"""
+                )
+                return False
+        else:
+            # For non-github_pr requests, the suffix must be purely numeric.
+            if not ticket_suffix.isdigit():
+                LOGGER.error(
+                    f"""PR summary ticket suffix must be numeric, got: {ticket_suffix}
+{RETRY_INSTRUCTIONS}"""
+                )
+                return False
+
+        # Check that the jira project is in the allowed list
+        if jira_project not in ALLOWED_JIRA_PROJECTS:
+            LOGGER.error(
+                f"""PR summary contains an invalid Jira project {jira_project}; it must be one of: {list(ALLOWED_JIRA_PROJECTS.keys())}
+{RETRY_INSTRUCTIONS}"""
+            )
+            return False
+
+        allowed_file_paths = ALLOWED_JIRA_PROJECTS[jira_project]
+        spec = pathspec.PathSpec.from_lines("gitwildmatch", allowed_file_paths)
+
+        for file in changed_files:
+            if not spec.match_file(file):
+                LOGGER.error(
+                    f"""PR summary indicates Jira project {jira_project} but the PR modifies file {file} which is not allowed for that Jira project.
+{RETRY_INSTRUCTIONS}"""
+                )
+                return False
+
+    # Remove all whitespace from comparisons. GitHub line-wraps commit messages, which adds
+    # newline characters that otherwise would not match verbatim such banned strings.
+    stripped_message = "".join(commit.message.split())
+    for banned_string in BANNED_STRINGS:
+        if "".join(banned_string.split()) in stripped_message:
+            LOGGER.error(
+                f"""PR title/description contains a banned string (ignoring whitespace).
+Please update the PR title and description to not contain the following banned string:
+banned string: "{banned_string}"
+commit message: "{commit.message}"
+{RETRY_INSTRUCTIONS}
+The decision to add this check was made in SERVER-101443, please feel free to leave comments/feedback on that ticket."""
+            )
+            return False
+
+    return True
+
+
+def get_non_merge_queue_squashed_commits(
+    github_org: str,
+    github_repo: str,
+    pr_number: int,
+    github_token: str,
+) -> list[Commit]:
+    assert github_org
+    assert github_repo
+    assert pr_number >= 0
+    assert github_token
+
+    pr_merge_info_query = {
+        "query": f"""{{
+            repository(owner: "{github_org}", name: "{github_repo}") {{
+                pullRequest(number: {pr_number}) {{
+                    viewerMergeHeadlineText(mergeType: SQUASH)
+                    viewerMergeBodyText(mergeType: SQUASH)
+                }}
+            }}
+         }}"""
+    }
+    headers = {"Authorization": f"token {github_token}"}
+
+    LOGGER.info("Sending request", request=pr_merge_info_query)
+    req = requests.post(
+        url="https://api.github.com/graphql",
+        json=pr_merge_info_query,
+        headers=headers,
+        timeout=60,  # 60s
+    )
+    resp = req.json()
+    # Response will look like
+    # {'data': {'repository': {'pullRequest':
+    # {
+    #   'viewerMergeHeadlineText': 'SERVER-1234 Add a ton of great support (#32823)',
+    #   'viewerMergeBodyText': 'This PR adds back support for a lot of things\nMany great things!'
+    # }}}}
+    LOGGER.info("Squashed content", content=resp)
+    pr_info = resp["data"]["repository"]["pullRequest"]
+
+    fake_repo = Repo()
+    return [
+        Commit(
+            message="\n".join([pr_info["viewerMergeHeadlineText"], pr_info["viewerMergeBodyText"]]),
+            # required fields, but faked out - these aren't helpful in user-facing logs
+            repo=fake_repo,
+            binsha=b"00000000000000000000",
+        )
+    ]
+
+
+def get_merge_queue_commits(branch_name: str) -> list[Commit]:
+    assert branch_name
+
+    diff_commits = subprocess.run(
+        ["git", "log", '--pretty=format:"%H"', f"{branch_name}...HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # Comes back like "hash1"\n"hash2"\n...
+    commit_hashs: list[str] = diff_commits.stdout.replace('"', "").splitlines()
+    LOGGER.info("Diff commit hashes", commit_hashs=commit_hashs)
+    repo = Repo(repo_root)
+
+    return [repo.commit(commit_hash) for commit_hash in commit_hashs]
+
+
+def main(
+    github_org: Annotated[
+        str,
+        typer.Option(envvar="GITHUB_ORG", help="Name of the github organization (e.g. 10gen)"),
+    ] = "",
+    github_repo: Annotated[
+        str,
+        typer.Option(envvar="GITHUB_REPO", help="Name of the repo (e.g. mongo)"),
+    ] = "",
+    branch_name: Annotated[
+        str,
+        typer.Option(envvar="BRANCH_NAME", help="Name of the branch to compare against HEAD"),
+    ] = "",
+    pr_number: Annotated[
+        int,
+        typer.Option(envvar="PR_NUMBER", help="PR Number to compare with"),
+    ] = -1,
+    github_token: Annotated[
+        str,
+        typer.Option(envvar="GITHUB_TOKEN", help="Github token with pr read access"),
+    ] = "",
+    requester: Annotated[
+        str,
+        typer.Option(
+            envvar="REQUESTER",
+            help="What is requested this task. Defined https://docs.devprod.prod.corp.mongodb.com/evergreen/Project-Configuration/Project-Configuration-Files#expansions.",
+        ),
+    ] = "",
+):
+    """
+    Validate the commit message.
+
+    It validates the latest message when no arguments are provided.
+    """
+
+    commits: list[Commit] = []
+    if requester == "github_merge_queue":
+        commits = get_merge_queue_commits(branch_name)
+    elif requester == "github_pr":
+        commits = get_non_merge_queue_squashed_commits(
+            github_org, github_repo, pr_number, github_token
+        )
+    else:
+        LOGGER.error("Running with an invalid requester", requester=requester)
+        raise typer.Exit(code=STATUS_ERROR)
+
+    changed_files = get_changed_files("../expansions.yml", diff_filter=None)
+    for commit in commits:
+        if not is_valid_commit(commit, changed_files, requester):
+            LOGGER.error("Invalid commit, unable to merge")
+            raise typer.Exit(code=STATUS_ERROR)
+
+    return
+
+
+app = typer.Typer(pretty_exceptions_show_locals=False)
+app.command()(main)
+
+if __name__ == "__main__":
+    app()

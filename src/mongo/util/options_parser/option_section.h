@@ -1,0 +1,122 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+#include "mongo/base/status.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/options_parser/option_description.h"
+
+#include <list>
+
+#include <boost/program_options.hpp>
+
+[[MONGO_MOD_PUBLIC]];
+
+namespace mongo {
+namespace optionenvironment {
+
+namespace po = boost::program_options;
+
+/**
+ *  A container for OptionDescription instances as well as other OptionSection instances.
+ *  Provides a description of all options that are supported to be passed in to an
+ *  OptionsParser.  Has utility functions to support the various formats needed by the parsing
+ *  process.
+ *
+ *  The sections and section names only matter in the help string.  For sections in a JSON
+ *  config, look at the dots in the dottedName of the relevant OptionDescription
+ */
+
+class OptionSection {
+public:
+    OptionSection() = default;
+
+    /**
+     * This API is not meant to be called directly by hand-written code.
+     * See: docs/idl/configs.md
+     */
+    OptionSection(const std::string& name) : _name(name) {}
+
+    // Construction interface
+
+    /**
+     * Add a sub section to this section.  Used mainly to keep track of section headers for when
+     * we need generate the help std::string for the command line.
+     *
+     * Note that while the structure of this class allows for a nested hierarchy of sections,
+     * our actual use-case enforces a maximum depth of 2.
+     * The base node plus one level of subsections.
+     * This means that subsections being added must not contain subsections of their own.
+     */
+    Status addSection(const OptionSection& newSection);
+
+    /**
+     * Add an option to this section, and returns a reference to an OptionDescription to allow
+     * for chaining.
+     */
+    OptionDescription& addOptionChaining(const std::string& dottedName,
+                                         const std::string& singleName,
+                                         OptionType type,
+                                         const std::string& description,
+                                         const std::vector<std::string>& deprecatedDottedNames,
+                                         const std::vector<std::string>& deprecatedSingleNames);
+
+    // These functions are used by the OptionsParser to make calls into boost::program_options
+    Status getBoostOptions(po::options_description* boostOptions,
+                           bool visibleOnly = false,
+                           bool includeDefaults = false,
+                           OptionSources = SourceAll,
+                           bool getEmptySections = true) const;
+    Status getBoostPositionalOptions(
+        po::positional_options_description* boostPositionalOptions) const;
+
+    // This is needed so that the parser can iterate over all registered options to get the
+    // correct names when populating the Environment, as well as check that a parameter that was
+    // found has been registered and has the correct type
+    Status getAllOptions(std::vector<OptionDescription>* options) const;
+
+    // Count the number of options in this section and all subsections
+    Status countOptions(int* numOptions, bool visibleOnly, OptionSources sources) const;
+
+    /**
+     * Returns the number of subsections which have been added to this OptionSection.
+     */
+    size_t countSubSections() const;
+
+    /**
+     * Populates the given map with all the default values for any options in this option
+     * section and all sub sections.
+     */
+    Status getDefaults(std::map<Key, Value>* values) const;
+
+    /**
+     * Populates the given vector with all the constraints for all options in this section and
+     * sub sections.
+     */
+    Status getConstraints(std::vector<std::shared_ptr<Constraint>>* constraints) const;
+
+    std::string positionalHelpString(const std::string& execName) const;
+    std::string helpString() const;
+
+    // Debugging
+    void dump() const;
+
+private:
+    std::string _name;
+    std::list<OptionSection> _subSections;
+    std::list<OptionDescription> _options;
+
+    /**
+     * Internal accumulator of all dotted names (incl. deprecated) in _options and all _subSections.
+     * Used for ensuring duplicate entries don't find their way into different parts of the tree.
+     */
+    std::set<std::string> _allDottedNames;
+
+    /**
+     * Internal accumulator for all single names. See _allDottedNames for further info.
+     */
+    std::set<std::string> _allSingleNames;
+};
+
+}  // namespace optionenvironment
+}  // namespace mongo

@@ -1,0 +1,281 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#pragma once
+
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/geo/geometry_container.h"
+#include "mongo/db/geo/shapes.h"
+#include "mongo/db/index/geo/s2_common.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <ostream>
+#include <string>
+#include <string_view>
+
+#include <s2cellid.h>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+struct PointWithCRS;
+class GeometryContainer;
+
+// This represents either a $within or a $geoIntersects.
+class GeoExpression {
+    GeoExpression(const GeoExpression&) = delete;
+    GeoExpression& operator=(const GeoExpression&) = delete;
+
+public:
+    GeoExpression();
+    GeoExpression(const std::string& f);
+
+    enum Predicate { WITHIN, INTERSECT, INVALID };
+
+    std::string getField() const {
+        return _field;
+    }
+    Predicate getPred() const {
+        return _predicate;
+    }
+    const GeometryContainer& getGeometry() const {
+        return *_geoContainer;
+    }
+    std::shared_ptr<GeometryContainer> getGeometryPtr() const {
+        return _geoContainer;
+    }
+
+    void setPredicate(Predicate predicate) {
+        _predicate = predicate;
+    }
+
+    void setGeometry(std::shared_ptr<GeometryContainer> geoContainer) {
+        _geoContainer = geoContainer;
+    }
+
+private:
+    // Name of the field in the query.
+    std::string _field;
+    std::shared_ptr<GeometryContainer> _geoContainer;
+    Predicate _predicate;
+};
+
+class GeoMatchExpression : public LeafMatchExpression {
+
+public:
+    GeoMatchExpression(boost::optional<std::string_view> path,
+                       const GeoExpression* query,
+                       const BSONObj& rawObj,
+                       clonable_ptr<ErrorAnnotation> annotation = nullptr);
+    GeoMatchExpression(boost::optional<std::string_view> path,
+                       std::shared_ptr<const GeoExpression> query,
+                       const BSONObj& rawObj,
+                       clonable_ptr<ErrorAnnotation> annotation = nullptr);
+
+    ~GeoMatchExpression() override {}
+
+    void debugString(StringBuilder& debug, int indentationLevel = 0) const override;
+
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const query_shape::SerializationOptions& opts = {},
+                                       bool includePath = true) const final;
+
+    bool equivalent(const MatchExpression* other) const override;
+
+    std::unique_ptr<MatchExpression> clone() const override;
+
+    void setCanSkipValidation(bool val) {
+        _canSkipValidation = val;
+    }
+
+    bool getCanSkipValidation() const {
+        return _canSkipValidation;
+    }
+
+    const GeoExpression& getGeoExpression() const {
+        return *_query;
+    }
+
+    boost::optional<S2IndexVersion> get2dsphereIndexVersion() const {
+        return _2dsphereIndexVersion;
+    }
+    void set2dsphereIndexVersion(boost::optional<S2IndexVersion> v) {
+        _2dsphereIndexVersion = v;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    const BSONObj& rawObjForHashing() const {
+        return _rawObj;
+    }
+
+private:
+    // The original geo specification provided by the user.
+    BSONObj _rawObj;
+
+    // Share ownership of our query with all of our clones
+    std::shared_ptr<const GeoExpression> _query;
+    bool _canSkipValidation;
+    boost::optional<S2IndexVersion> _2dsphereIndexVersion;
+};
+
+
+// TODO SERVER-122401: Make a struct, turn parse stuff into something like
+// static Status parseNearQuery(const BSONObj& obj, NearQuery** out);
+class GeoNearExpression {
+    GeoNearExpression(const GeoNearExpression&) = delete;
+    GeoNearExpression& operator=(const GeoNearExpression&) = delete;
+
+public:
+    GeoNearExpression();
+    GeoNearExpression(const std::string& f);
+
+    // The name of the field that contains the geometry.
+    std::string field;
+
+    // The starting point of the near search. Use forward declaration of geometries.
+    std::unique_ptr<PointWithCRS> centroid;
+
+    // Min and max distance from centroid that we're willing to search.
+    // Distance is in units of the geometry's CRS, except SPHERE and isNearSphere => radians
+    double minDistance;
+    double maxDistance;
+
+    // Is this a $nearSphere query
+    bool isNearSphere;
+    // $nearSphere with a legacy point implies units are radians
+    bool unitsAreRadians;
+    // $near with a non-legacy point implies a wrapping query, otherwise the query doesn't wrap
+    bool isWrappingQuery;
+
+    std::string toString() const {
+        std::stringstream ss;
+        ss << " field=" << field;
+        ss << " maxdist=" << maxDistance;
+        ss << " isNearSphere=" << isNearSphere;
+        return ss.str();
+    }
+};
+
+class GeoNearMatchExpression : public LeafMatchExpression {
+public:
+    GeoNearMatchExpression(boost::optional<std::string_view> path,
+                           const GeoNearExpression* query,
+                           const BSONObj& rawObj);
+    GeoNearMatchExpression(boost::optional<std::string_view> path,
+                           std::shared_ptr<const GeoNearExpression> query,
+                           const BSONObj& rawObj);
+
+    ~GeoNearMatchExpression() override {}
+
+    void debugString(StringBuilder& debug, int indentationLevel = 0) const override;
+
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const query_shape::SerializationOptions& opts = {},
+                                       bool includePath = true) const final;
+
+    bool equivalent(const MatchExpression* other) const override;
+
+    std::unique_ptr<MatchExpression> clone() const override;
+
+    const GeoNearExpression& getData() const {
+        return *_query;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    const BSONObj& rawObjForHashing() const {
+        return _rawObj;
+    }
+
+private:
+    // The original geo specification provided by the user.
+    BSONObj _rawObj;
+
+    // Share ownership of our query with all of our clones
+    std::shared_ptr<const GeoNearExpression> _query;
+};
+
+/**
+ * Expression which checks whether a legacy 2D index point is contained within our near
+ * search annulus.  See nextInterval() below for more discussion.
+ * TODO SERVER-122399: Make this a standard type of GEO match expression
+ */
+class TwoDPtInAnnulusExpression : public LeafMatchExpression {
+public:
+    TwoDPtInAnnulusExpression(const R2Annulus& annulus, boost::optional<std::string_view> twoDPath)
+        : LeafMatchExpression(INTERNAL_2D_POINT_IN_ANNULUS, twoDPath), _annulus(annulus) {}
+
+    void serialize(BSONObjBuilder* out,
+                   const query_shape::SerializationOptions& opts = {},
+                   bool includePath = true) const final {
+        out->append("$TwoDPtInAnnulusExpression", true);
+    }
+
+    //
+    // These won't be called.
+    //
+
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const query_shape::SerializationOptions& opts = {},
+                                       bool includePath = true) const final {
+        MONGO_UNREACHABLE_TASSERT(9911958);
+    }
+
+    void debugString(StringBuilder& debug, int level = 0) const final {
+        MONGO_UNREACHABLE_TASSERT(9911959);
+    }
+
+    bool equivalent(const MatchExpression* other) const final {
+        MONGO_UNREACHABLE_TASSERT(9911960);
+        return false;
+    }
+
+    std::unique_ptr<MatchExpression> clone() const final {
+        MONGO_UNREACHABLE_TASSERT(9911961);
+        return nullptr;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    R2Annulus getAnnulus() const {
+        return _annulus;
+    }
+
+private:
+    R2Annulus _annulus;
+};
+}  // namespace mongo

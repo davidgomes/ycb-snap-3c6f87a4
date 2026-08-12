@@ -1,0 +1,194 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/compiler/ce/exact/exact_cardinality.h"
+#include "mongo/db/query/compiler/ce/sampling/sampling_estimator.h"
+#include "mongo/db/query/compiler/metadata/index_entry.h"
+#include "mongo/db/query/compiler/optimizer/cost_based_ranker/estimates_storage.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_ranking/plan_ranker.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <functional>
+#include <map>
+#include <memory>
+#include <vector>
+
+namespace mongo {
+
+class Collection;
+class CollectionPtr;
+
+/**
+ * QueryPlanner's job is to provide an entry point to the query planning and optimization
+ * process.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] QueryPlanner {
+public:
+    /**
+     * Holds the result of subqueries planning for rooted $or queries.
+     */
+    struct SubqueriesPlanningResult {
+        /**
+         * A class used internally in order to keep track of the results of planning
+         * a particular $or branch.
+         */
+        struct BranchPlanningResult {
+            // A parsed version of one branch of the $or.
+            std::unique_ptr<CanonicalQuery> canonicalQuery;
+
+            // If there is cache data available, then we store it here rather than generating
+            // a set of alternate plans for the branch. The index tags from the cache data
+            // can be applied directly to the parent $or MatchExpression when generating the
+            // composite solution.
+            std::unique_ptr<SolutionCacheData> cachedData;
+
+            // Query solutions resulting from planning the $or branch.
+            std::vector<std::unique_ptr<QuerySolution>> solutions;
+        };
+
+        // The copy of the query that we will annotate with tags and use to construct the composite
+        // solution. Must be a rooted $or query, or a contained $or that has been rewritten to a
+        // rooted $or.
+        std::unique_ptr<MatchExpression> orExpression;
+
+        // Holds a list of the results from planning each branch.
+        std::vector<std::unique_ptr<BranchPlanningResult>> branches;
+
+        // We need this to extract cache-friendly index data from the index assignments.
+        std::map<IndexEntry::Identifier, size_t> indexMap;
+    };
+
+    /**
+     * Given a CanonicalQuery and a QSN tree, creates QSN nodes for each pipeline stage in 'query'
+     * and grafts them on top of the existing QSN tree. If 'query' has an empty pipeline, this
+     * function is a noop.
+     * If `keepSentinel` is set, extends the QuerySolution but marks where the new stages added by
+     * inserting a SentinelNode into the tree. This node connects the pushed down stages to the
+     * original tree.
+     */
+    static std::unique_ptr<QuerySolution> extendWithAggPipeline(
+        const CanonicalQuery& query,
+        std::unique_ptr<QuerySolution>&& solution,
+        const std::map<NamespaceString, CollectionInfo>& secondaryCollInfos,
+        bool skipProjectGroupOptimization = false);
+
+    /**
+     * Returns the list of possible query solutions for the provided 'query' for multi-planning.
+     * Uses the indices and other data in 'params' to determine the set of available plans.
+     * If relevantIndexOutput is set, the referenced set is populated with the names of the
+     * top-level fields in the relevant indices.
+     * If hasRelevantMultikeyIndex is set, the referenced bool is set to true if there are
+     * relevant multikey indices.
+     */
+    static StatusWith<std::vector<std::unique_ptr<QuerySolution>>> plan(
+        const CanonicalQuery& query,
+        const QueryPlannerParams& params,
+        boost::optional<StringSet&> relevantIndexOutput = boost::none,
+        boost::optional<bool&> hasRelevantMultikeyIndex = boost::none);
+
+    /**
+     * Given a set of possible plans, estimate the cost of each plan using the cardinality
+     * estimation (CE) and costing modules. The return value contains a list of plans that were
+     * rejected on the basis of cost, as well as any non-rejected plans from which the caller can
+     * select a winner.
+     * If query.getExplain().has_value(), collect and return planExplainerData as part of the
+     * PlanRankingResult.
+     */
+    static StatusWith<PlanRankingResult> planWithCostBasedRanking(
+        const QueryPlannerParams& params,
+        ce::SamplingEstimator* samplingEstimator,
+        const ce::ExactCardinalityEstimator* exactCardinality,
+        std::vector<std::unique_ptr<QuerySolution>> allSoln,
+        const CanonicalQuery& query,
+        QueryCBRCEModeEnum ceMode);
+
+    /**
+     * Generates and returns a query solution, given data retrieved from the plan cache.
+     *
+     * @param query -- query for which we are generating a plan
+     * @param params -- planning parameters
+     * @param cachedSoln -- the CachedSolution retrieved from the plan cache.
+     */
+    static StatusWith<std::unique_ptr<QuerySolution>> planFromCache(
+        const CanonicalQuery& query,
+        const QueryPlannerParams& params,
+        const SolutionCacheData& solnCacheData);
+
+    /**
+     * Plan each branch of the rooted $or query independently, and return the resulting
+     * lists of query solutions in 'SubqueriesPlanningResult'.
+     *
+     * The 'createPlanCacheKey' callback is used to create a plan cache key of the specified
+     * 'KeyType' for each of the branches to look up the plan in the 'planCache'.
+     */
+    static StatusWith<SubqueriesPlanningResult> planSubqueries(
+        OperationContext* opCtx,
+        std::function<std::unique_ptr<SolutionCacheData>(
+            const CanonicalQuery& cq, const CollectionAcquisition& coll)> getSolutionCachedData,
+        const CollectionAcquisition& collection,
+        const CanonicalQuery& query,
+        const QueryPlannerParams& params,
+        ce::SamplingEstimator* samplingEstimator,
+        const ce::ExactCardinalityEstimator* exactCardinality,
+        boost::optional<StringSet&> topLevelSampleFieldNames = boost::none);
+
+    /**
+     * Generates and returns the index tag tree that will be inserted into the plan cache. This data
+     * gets stashed inside a QuerySolution until it can be inserted into the cache proper.
+     *
+     * @param taggedTree -- a MatchExpression with index tags that has been
+     *   produced by the enumerator.
+     * @param relevantIndices -- a list of the index entries used to tag
+     *   the tree (i.e. index numbers in the tags refer to entries in this vector)
+     */
+    static StatusWith<std::unique_ptr<PlanCacheIndexTree>> cacheDataFromTaggedTree(
+        const MatchExpression* taggedTree, const std::vector<IndexEntry>& relevantIndices);
+
+    /**
+     * @param filter -- an untagged MatchExpression
+     * @param indexTree -- a tree structure retrieved from the
+     *   cache with index tags that indicates how 'filter' should
+     *   be tagged.
+     * @param indexMap -- needed in order to put the proper index
+     *   numbers inside the index tags
+     *
+     * On success, 'filter' is mutated so that it has all the
+     * index tags needed in order for the access planner to recreate
+     * the cached plan.
+     *
+     * On failure, the tag state attached to the nodes of 'filter'
+     * is invalid. Planning from the cache should be aborted.
+     *
+     * Does not take ownership of either filter or indexTree.
+     */
+    static Status tagAccordingToCache(MatchExpression* filter,
+                                      const PlanCacheIndexTree* indexTree,
+                                      const std::map<IndexEntry::Identifier, size_t>& indexMap);
+
+    /**
+     * Uses the query planning results from QueryPlanner::planSubqueries() and the multi planner
+     * callback to select the best plan for each branch.
+     *
+     * On success, returns a composite solution obtained by planning each $or branch independently.
+     */
+    static StatusWith<std::unique_ptr<QuerySolution>> choosePlanForSubqueries(
+        const CanonicalQuery& query,
+        const QueryPlannerParams& params,
+        QueryPlanner::SubqueriesPlanningResult planningResult,
+        std::function<StatusWith<std::unique_ptr<QuerySolution>>(
+            CanonicalQuery* cq, std::vector<std::unique_ptr<QuerySolution>>)> multiplanCallback);
+};
+
+}  // namespace mongo

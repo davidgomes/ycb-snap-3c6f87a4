@@ -1,0 +1,391 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/query/plan_ranker.h"
+
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <queue>
+#include <vector>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
+namespace mongo::plan_ranker {
+
+namespace {
+
+/**
+ * Returns true if the value can serve as a type lower bound for the purposes of type bracketing.
+ * The function is designed to work with the 'interesting' for index prefix heuristic types only:
+ * Number, String, Date, Timestamp, Boolean, Object, Array, ObjectId. For other types it may return
+ * false positive results. The code of the function is based on index bounds build logic from
+ * 'index_bounds_builder.cpp'.
+ */
+bool isLowerBound(const BSONElement& value, bool isInclusive) {
+    switch (value.type()) {
+        case BSONType::numberInt:
+        case BSONType::numberDouble:
+        case BSONType::numberLong:
+        case BSONType::numberDecimal:
+            // Lower bound value for numbers.
+            return (std::isinf(value.numberDouble()) || std::isnan(value.numberDouble())) &&
+                isInclusive == true;
+        case BSONType::string:
+            // Lower bound value for strings.
+            return value.str().empty() && isInclusive == true;
+        case BSONType::date:
+            // Lower bound value for dates.
+            return value.date() == Date_t::min() && isInclusive == true;
+        case BSONType::timestamp:
+            // Lower bound value for timestamps.
+            return value.timestamp() == Timestamp::min() && isInclusive == true;
+        case BSONType::oid:
+            // Lower bound value for ObjectID.
+            return value.OID() == OID() && isInclusive == true;
+        case BSONType::object:
+        case BSONType::array:
+            // Lower bound value for Object and Array.
+            return value.Obj().isEmpty() && isInclusive == true;
+        case BSONType::binData:
+        case BSONType::eoo:
+        case BSONType::minKey:
+        case BSONType::maxKey:
+        case BSONType::boolean:  // Boolean bounds are considered always open since they are
+                                 // non-selective.
+        case BSONType::null:
+        case BSONType::undefined:
+        case BSONType::symbol:
+        case BSONType::regEx:
+        case BSONType::dbRef:
+        case BSONType::code:
+        case BSONType::codeWScope:
+            return true;
+    }
+
+    MONGO_UNREACHABLE_TASSERT(8102100);
+}
+
+/**
+ * Returns true if the value can serve as a type upper bound for the purposes of type bracketing.
+ * The function is designed to work with the 'interesting' for index prefix heuristic types only:
+ * Number, String, Date, Timestamp, Boolean, Object, Array, ObjectId. For other types it may return
+ * false positive results. The code of the function is based on index bounds build logic from
+ * 'index_bounds_builder.cpp'.
+ */
+bool isUpperBound(const BSONElement& value, bool isInclusive) {
+    switch (value.type()) {
+        case BSONType::numberInt:
+        case BSONType::numberDouble:
+        case BSONType::numberLong:
+        case BSONType::numberDecimal:
+            // Upper bound value for numbers.
+            return std::isinf(value.numberDouble()) && isInclusive == true;
+        case BSONType::string:
+            // A string value cannot be an upper bound value.
+            return false;
+        case BSONType::date:
+            // Upper bound value for Date.
+            return value.date() == Date_t::max() && isInclusive == true;
+        case BSONType::timestamp:
+            // Upper bound value for Timestamp.
+            return value.timestamp() == Timestamp::max() && isInclusive == true;
+        case BSONType::oid:
+            // Upper bound value for ObjectID.
+            return value.OID() == OID::max() && isInclusive == true;
+        case BSONType::object:
+            // Upper bound value for String.
+            return value.Obj().isEmpty() && isInclusive == false;
+        case BSONType::array:
+            // Upper bound value for Object.
+            return value.Obj().isEmpty() && isInclusive == false;
+        case BSONType::binData:
+            // Upper bound value for Array.
+            return value.valuesize() == 0 && isInclusive == false;
+        case BSONType::eoo:
+        case BSONType::minKey:
+        case BSONType::maxKey:
+        case BSONType::boolean:  // Boolean bounds are considered always open since they are
+                                 // non-selective.
+        case BSONType::null:
+        case BSONType::undefined:
+        case BSONType::symbol:
+        case BSONType::regEx:
+        case BSONType::dbRef:
+        case BSONType::code:
+        case BSONType::codeWScope:
+            return true;
+    }
+
+    MONGO_UNREACHABLE_TASSERT(8102101);
+}
+
+/**
+ * A plan scorer for the classic plan stage tree. Defines the plan productivity as a number
+ * of intermediate results returned, or advanced, by the root stage, divided by the "unit of works"
+ * which the plan performed. Each call to work(...) counts as one unit.
+ */
+class DefaultPlanScorer final : public PlanScorer<PlanStageStats> {
+protected:
+    double calculateProductivity(const PlanStageStats* stats) const final {
+        tassert(
+            11321201, "Expected plan stats works to be greater than 0", stats->common.works != 0);
+        return static_cast<double>(stats->common.advanced) /
+            static_cast<double>(stats->common.works);
+    }
+
+    std::string getProductivityFormula(const PlanStageStats* stats) const override {
+        StringBuilder sb;
+        sb << "(" << stats->common.advanced << " advanced)/(" << stats->common.works << " works)";
+        return sb.str();
+    }
+
+    double getNumberOfAdvances(const PlanStageStats* stats) const final {
+        return stats->common.advanced;
+    }
+
+    bool hasStage(StageType type, const PlanStageStats* root) const final {
+        return hasStage(root,
+                        [type](const PlanStageStats& stage) { return stage.stageType == type; });
+    }
+
+    bool hasFetch(const PlanStageStats* root) const final {
+        return hasStage(root, [](const PlanStageStats& stage) {
+            return stage.specific && stage.specific->doesFetch();
+        });
+    }
+
+    bool hasStage(const PlanStageStats* root,
+                  std::function<bool(const PlanStageStats&)> filter) const {
+        std::queue<const PlanStageStats*> remaining;
+        remaining.push(root);
+
+        while (!remaining.empty()) {
+            auto stats = remaining.front();
+            remaining.pop();
+
+            if (filter(*stats)) {
+                return true;
+            }
+
+            for (auto&& child : stats->children) {
+                remaining.push(child.get());
+            }
+        }
+        return false;
+    }
+};
+
+/**
+ * Return true if the nodes have the same type and the same number of children.
+ */
+bool areNodesCompatible(const std::vector<const QuerySolutionNode*>& nodes) {
+    for (size_t i = 1; i < nodes.size(); ++i) {
+        if (nodes[i - 1]->getType() != nodes[i]->getType()) {
+            return false;
+        }
+
+        if (nodes[i - 1]->children.size() != nodes[i]->children.size()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * The function tries to detect if the interval is closed on both ends. Can return false
+ * positive results for the types not mentioned in the comment to 'isMinMaxValue' function.
+ */
+bool isClosedInterval(const Interval& interval) {
+    // If the bound types are different the interval is considered to be open.
+    if (interval.start.type() != interval.end.type()) {
+        return false;
+    }
+
+    switch (interval.getDirection()) {
+        // Point intervals, empty intervals, and null intervals have no direction.
+        case Interval::Direction::kDirectionNone:
+            return true;
+        case Interval::Direction::kDirectionAscending:
+            return !isLowerBound(interval.start, interval.startInclusive) &&
+                !isUpperBound(interval.end, interval.endInclusive);
+        case Interval::Direction::kDirectionDescending:
+            return !isUpperBound(interval.start, interval.startInclusive) &&
+                !isLowerBound(interval.end, interval.endInclusive);
+    }
+
+    MONGO_UNREACHABLE_TASSERT(8102102);
+}
+
+/**
+ * Returns true if this OIL contains only closed intervals.
+ */
+bool containsOnlyClosedIntervals(const OrderedIntervalList& oil) {
+    for (const auto& interval : oil.intervals) {
+        if (!isClosedInterval(interval)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Calculates score for the given index bounds. The score reflects the following rules:
+ * - IndexBounds that has longest single point interval prefix wins,
+ * - if winner is not defined on the previous step then IndexBounds with the longest point
+ * interval prefix wins,
+ * - if winner is not defined on the previous step then IndexBounds with the longest closed
+ * interval prefix wins,
+ * - if winner is not defined, then IndexBounds with longest interval prefix wins
+ * - if winner is not defined, them IndexBounds with shortest index key pattern wins.
+ */
+uint64_t getIndexBoundsScore(const IndexBounds& bounds) {
+    const uint64_t indexKeyLength = static_cast<uint64_t>(bounds.fields.size());
+    uint64_t singlePointIntervalPrefix = 0;
+    uint64_t pointsIntervalPrefix = 0;
+    uint64_t closedIntervalPrefix = 0;
+    uint64_t intervalLength = 0;
+
+    for (const auto& field : bounds.fields) {
+        // Skip the $** index virtual field, as it's not part of the actual index key.
+        if (field.name == "$_path") {
+            continue;
+        }
+
+        // Stop scoring index bounds as soon as we see an all-values interval.
+        if (field.isMinToMax() || field.isMaxToMin()) {
+            break;
+        }
+
+        if (intervalLength == singlePointIntervalPrefix && field.isPoint()) {
+            ++singlePointIntervalPrefix;
+        }
+
+        if (intervalLength == pointsIntervalPrefix && field.containsOnlyPointIntervals()) {
+            ++pointsIntervalPrefix;
+        }
+
+        if (intervalLength == closedIntervalPrefix && containsOnlyClosedIntervals(field)) {
+            ++closedIntervalPrefix;
+        }
+
+        ++intervalLength;
+    }
+
+    // We pack calculated stats into one value to make their comparison simplier. For every
+    // prefix length we allocate 12 bits (4096 values) which is more then enough since an index
+    // can have no more than 32 fields (see "MongoDB Limits and Thresholds" reference).
+    // 'indexKeyLength' is treated differently because, unlike others, we prefer shorter index
+    // key prefix length (see the comment to the function for details).
+    uint64_t result = (singlePointIntervalPrefix << 52) | (pointsIntervalPrefix << 40) |
+        (closedIntervalPrefix << 28) | (intervalLength << 16) |
+        (std::numeric_limits<uint16_t>::max() - indexKeyLength);
+
+    return result;
+}
+
+/**
+ * Calculates scores for the given IndexBounds and add 1 to every winner's resultScores. i-th
+ * position in resultScores corresponds to i-th field in IndexBound.
+ */
+void scoreIndexBounds(const std::vector<const IndexBounds*>& bounds,
+                      std::vector<size_t>& resultScores) {
+    const size_t nfields = bounds.size();
+
+    std::vector<uint64_t> scores{};
+    scores.reserve(nfields);
+    for (size_t i = 0; i < bounds.size(); ++i) {
+        scores.emplace_back(getIndexBoundsScore(*bounds[i]));
+    }
+
+    auto topScore = max_element(scores.begin(), scores.end());
+    for (size_t i = 0; i < nfields; ++i) {
+        if (*topScore == scores[i]) {
+            resultScores[i] += 1;
+        }
+    }
+}
+}  // namespace
+
+std::unique_ptr<PlanScorer<PlanStageStats>> makePlanScorer() {
+    return std::make_unique<DefaultPlanScorer>();
+}
+
+std::vector<size_t> applyIndexPrefixHeuristic(const std::vector<const QuerySolution*>& solutions) {
+    std::vector<size_t> solutionScores(solutions.size(), 0);
+
+    std::vector<std::vector<const QuerySolutionNode*>> stack{};
+    stack.emplace_back();
+    stack.back().reserve(solutions.size());
+    for (auto solution : solutions) {
+        stack.back().emplace_back(solution->root());
+    }
+
+    while (!stack.empty()) {
+        auto top = std::move(stack.back());
+        stack.pop_back();
+
+        if (!areNodesCompatible(top)) {
+            return {};
+        }
+
+        // Compatible nodes have the same number of children, see comment to 'areNodesCompatible'
+        // function.
+        for (size_t childIndex = 0; childIndex < top.front()->children.size(); ++childIndex) {
+            stack.emplace_back();
+            stack.back().reserve(solutions.size());
+            for (auto node : top) {
+                stack.back().emplace_back(node->children[childIndex].get());
+            }
+        }
+
+        if (top.front()->getType() == STAGE_IXSCAN ||
+            top.front()->getType() == STAGE_DISTINCT_SCAN) {
+            std::vector<const IndexBounds*> bounds{};
+            bounds.reserve(solutions.size());
+
+            for (auto&& node : top) {
+                const IndexBounds* nodeBounds;
+                switch (node->getType()) {
+                    case STAGE_IXSCAN: {
+                        nodeBounds = &static_cast<const IndexScanNode*>(node)->bounds;
+                        break;
+                    }
+                    case STAGE_DISTINCT_SCAN: {
+                        nodeBounds = &static_cast<const DistinctNode*>(node)->bounds;
+                        break;
+                    }
+                    default: {
+                        tasserted(9844200,
+                                  str::stream()
+                                      << "Unexpected node type for index prefix heuristic "
+                                      << node->getType());
+                    }
+                }
+                bounds.emplace_back(nodeBounds);
+            }
+
+            scoreIndexBounds(bounds, solutionScores);
+        }
+    }
+
+    std::vector<size_t> winningSolutionIndices{};
+    winningSolutionIndices.reserve(solutions.size());
+    const auto topScore = max_element(solutionScores.begin(), solutionScores.end());
+    for (size_t index = 0; index < solutionScores.size(); ++index) {
+        if (solutionScores[index] == *topScore) {
+            winningSolutionIndices.emplace_back(index);
+        }
+    }
+
+    return winningSolutionIndices;
+}
+}  // namespace mongo::plan_ranker

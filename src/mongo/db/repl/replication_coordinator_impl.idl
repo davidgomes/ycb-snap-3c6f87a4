@@ -1,0 +1,37 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: mongo::repl
+    mod_visibility: public
+
+server_parameters:
+    numInitialSyncAttempts:
+        description: <-
+            Number of attempts to make at replica set initial synchronization.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: numInitialSyncAttempts
+        default: 10
+        redact: false
+
+    enableElectionHandoff:
+        description: <-
+            Reduce the downtime after the primary steps down from either the
+            rs.stepDown() method or the replSetStepDown command.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: enableElectionHandoff
+        default: true
+        redact: false
+
+    shutdownTimeoutMillisForSignaledShutdown:
+        description: <-
+            The time taken for stepdown and quiesce mode at shutdown in response to SIGTERM.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: shutdownTimeoutMillisForSignaledShutdown
+        default: 15000
+        validator:
+            gte: 0
+        redact: false

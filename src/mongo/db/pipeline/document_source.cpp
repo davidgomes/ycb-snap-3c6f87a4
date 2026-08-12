@@ -1,0 +1,111 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/document_source.h"
+
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/search/document_source_vector_search.h"
+#include "mongo/db/pipeline/stage_params_to_document_source_registry.h"
+#include "mongo/db/query/compiler/dependency_analysis/document_transformation_helpers.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/string_map.h"
+
+#include <string_view>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
+namespace mongo {
+
+using boost::intrusive_ptr;
+
+DocumentSource::DocumentSource(std::string_view stageName,
+                               const intrusive_ptr<ExpressionContext>& pCtx,
+                               SortPattern sortPattern)
+    : _expCtx(pCtx), _sortPattern(std::move(sortPattern)) {}
+
+DocumentSource::Id DocumentSource::allocateId(std::string_view name) {
+    static Atomic<Id> next{kUnallocatedId + 1};
+    auto id = next.fetchAndAdd(1);
+    LOGV2_DEBUG(9901900, 5, "Allocating DocumentSourceId", "id"_attr = id, "name"_attr = name);
+    return id;
+}
+
+bool DocumentSource::hasQuery() const {
+    return false;
+}
+
+BSONObj DocumentSource::getQuery() const {
+    MONGO_UNREACHABLE;
+}
+
+std::list<intrusive_ptr<DocumentSource>> DocumentSource::parse(
+    const intrusive_ptr<ExpressionContext>& expCtx, BSONObj stageObj) {
+    uassert(16435,
+            "A pipeline stage specification object must contain exactly one field.",
+            stageObj.nFields() == 1);
+
+    // Converting the BSONObj to LiteParsed just to immediately convert it to DocumentSource is
+    // convoluted, but this is temporary until we remove the DocumentSource parserMap entirely.
+    auto liteParsed = LiteParsedDocumentSource::parse(expCtx->getNamespaceString(), stageObj);
+    uassert(
+        11458703, "LiteParsedDocumentSource was unable to be initialized from BSONObj", liteParsed);
+    return parseFromLiteParsed(expCtx, *liteParsed);
+}
+
+std::list<intrusive_ptr<DocumentSource>> DocumentSource::parseFromLiteParsed(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const LiteParsedDocumentSource& liteParsed) {
+    return buildDocumentSource(liteParsed, expCtx);
+}
+
+BSONObj DocumentSource::serializeToBSONForDebug() const {
+    std::vector<Value> serialized;
+    auto opts = query_shape::SerializationOptions{
+        .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)};
+    serializeToArray(serialized, opts);
+    if (serialized.empty()) {
+        LOGV2_DEBUG(5943501,
+                    5,
+                    "warning: stage did not serialize to anything as it was trying to be printed "
+                    "for debugging");
+        return BSONObj();
+    }
+    if (serialized.size() > 1) {
+        LOGV2_DEBUG(5943502, 5, "stage serialized to multiple stages. Ignoring all but the first");
+    }
+    return serialized[0].getDocument().toBson();
+}
+
+void DocumentSource::serializeToArray(std::vector<Value>& array,
+                                      const query_shape::SerializationOptions& opts) const {
+    Value entry = serialize(opts);
+    if (!entry.missing()) {
+        array.push_back(std::move(entry));
+    }
+}
+
+void DocumentSource::describeTransformation(
+    document_transformation::DocumentOperationVisitor& visitor) const {
+    // Implement via conversion from GetModPathsReturn.
+    document_transformation::describeGetModPathsReturn(visitor, getModifiedPaths());
+}
+
+MONGO_INITIALIZER_GROUP(BeginDocumentSourceRegistration,
+                        ("default"),
+                        ("EndDocumentSourceRegistration"))
+MONGO_INITIALIZER_GROUP(EndDocumentSourceRegistration, ("BeginDocumentSourceRegistration"), ())
+MONGO_INITIALIZER_GROUP(BeginDocumentSourceIdAllocation,
+                        ("default"),
+                        ("EndDocumentSourceIdAllocation"))
+MONGO_INITIALIZER_GROUP(EndDocumentSourceIdAllocation, ("BeginDocumentSourceIdAllocation"), ())
+MONGO_INITIALIZER_GROUP(BeginDocumentSourceFallbackRegistration,
+                        ("BeginDocumentSourceRegistration"),
+                        ("EndDocumentSourceFallbackRegistration"))
+MONGO_INITIALIZER_GROUP(EndDocumentSourceFallbackRegistration,
+                        ("BeginDocumentSourceFallbackRegistration"),
+                        ("EndDocumentSourceRegistration"))
+}  // namespace mongo

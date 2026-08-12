@@ -1,0 +1,239 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "int_flag", "string_flag")
+load("@poetry//:dependencies.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+genrule(
+    name = "resmoke_mongo_version",
+    srcs = [],
+    outs = [".resmoke_mongo_version.yml"],
+    cmd = """
+    echo mongo_version: $(MONGO_VERSION) > $@
+    """,
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "multiversion_config",
+    srcs = [":resmoke_mongo_version"],
+    outs = [".multiversion_config.yml"],
+    cmd = """
+export GIT_DIR=$$(dirname "$$(readlink -f WORKSPACE.bazel)")/.git
+$(location //buildscripts:resmoke) \
+    --mongoVersionFile $(location :resmoke_mongo_version) \
+    multiversion-config \
+    --config-file-output $@ > /dev/null
+""",
+    tags = [
+        "no-cache",
+        "no-remote",
+    ],
+    tools = ["//buildscripts:resmoke"],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "on_feature_flags",
+    srcs = [],
+    outs = ["on_feature_flags.txt"],
+    cmd = """
+    awk '/^STABLE_on_feature_flags/ { for (i=2; i<=NF; i++) print $$i }' bazel-out/stable-status.txt > $@
+    """,
+    stamp = True,
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "off_feature_flags",
+    srcs = [],
+    outs = ["off_feature_flags.txt"],
+    cmd = """
+    awk '/^STABLE_off_feature_flags/ { for (i=2; i<=NF; i++) print $$i }' bazel-out/stable-status.txt > $@
+    """,
+    stamp = True,
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "unreleased_ifr_flags",
+    srcs = [],
+    outs = ["unreleased_ifr_flags.txt"],
+    cmd = """
+    awk '/^STABLE_unreleased_ifr_flags/ { for (i=2; i<=NF; i++) print $$i }' bazel-out/stable-status.txt > $@
+    """,
+    stamp = True,
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "all_ifr_flags",
+    srcs = [],
+    outs = ["all_ifr_flags.txt"],
+    cmd = """
+    awk '/^STABLE_all_ifr_flags/ { for (i=2; i<=NF; i++) print $$i }' bazel-out/stable-status.txt > $@
+    """,
+    stamp = True,
+    visibility = ["//visibility:public"],
+)
+
+# We want to use keys from volatile-status in the resmoke `py_test`, so this creates a file that
+# it can depend on.
+genrule(
+    name = "volatile_status",
+    srcs = [],
+    outs = ["volatile-status.txt"],
+    cmd = """
+    cat bazel-out/volatile-status.txt  > $@
+    """,
+    stamp = True,
+    tags = [
+        "external",
+        "no-cache",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+bool_flag(
+    name = "in_evergreen",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "in_evergreen_enabled",
+    flag_values = {
+        "//bazel/resmoke:in_evergreen": "True",
+    },
+)
+
+bool_flag(
+    name = "installed_dist_test",
+    build_setting_default = False,
+)
+
+bool_flag(
+    name = "skip_deps_for_cquery",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "skip_deps_for_cquery_enabled",
+    flag_values = {
+        "//bazel/resmoke:skip_deps_for_cquery": "True",
+    },
+)
+
+config_setting(
+    name = "installed_dist_test_enabled",
+    flag_values = {
+        "//bazel/resmoke:installed_dist_test": "True",
+    },
+)
+
+int_flag(
+    name = "test_timeout",
+    build_setting_default = 0,  # 0 results in no timeout.
+    make_variable = "RESMOKE_TEST_TIMEOUT",
+    visibility = ["//visibility:public"],
+)
+
+# Seed for jstestfuzz_generate. Empty (default) makes generation depend on the
+# build's volatile-status, so each run produces a fresh random test set.
+# Set to a numeric value to pin the seed.
+string_flag(
+    name = "jstestfuzz_seed",
+    build_setting_default = "",
+    visibility = ["//visibility:public"],
+)
+
+# MongoDB target version forwarded to jstestfuzz as --branch. Selects which
+# server features the generated tests may use (see jstestfuzz's
+# generate_version_info.ts). Defaults to "master"; release branches and
+# Evergreen tasks should pass the project's branch_name, e.g.
+# --//bazel/resmoke:jstestfuzz_branch=v8.0.
+string_flag(
+    name = "jstestfuzz_branch",
+    build_setting_default = "master",
+    visibility = ["//visibility:public"],
+)
+
+# Seed for config fuzzer suites. Empty (default) derives the seed from
+# volatile-status at build time so each run gets a fresh configuration.
+# Set to a numeric value to pin the seed for reproduction.
+string_flag(
+    name = "config_fuzz_seed",
+    build_setting_default = "",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "download_historic_runtimes",
+    srcs = ["download_historic_runtimes.py"],
+    main = "download_historic_runtimes.py",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "resmoke_config_generator",
+    srcs = ["resmoke_config_generator.py"],
+    main = "resmoke_config_generator.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "typer",
+            group = "core",
+        ),
+        dependency(
+            "pyyaml",
+            group = "core",
+        ),
+    ],
+)
+
+py_library(
+    name = "resource_monitor",
+    srcs = [
+        "resource_monitor.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "psutil",
+            group = "core",
+        ),
+    ],
+)
+
+py_binary(
+    name = "resmoke_shim",
+    srcs = [
+        "resmoke_shim.py",
+    ],
+    main = "resmoke_shim.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":resource_monitor",
+    ],
+)
+
+py_binary(
+    name = "derive_suite_selectors",
+    srcs = [
+        "derive_suite_selectors.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "pyyaml",
+            group = "core",
+        ),
+    ],
+)
+
+exports_files([
+    "resmoke_shim.py",
+])
+
+sh_binary(
+    name = "jstestfuzz_run",
+    srcs = ["jstestfuzz_run.sh"],
+    visibility = ["//visibility:public"],
+)

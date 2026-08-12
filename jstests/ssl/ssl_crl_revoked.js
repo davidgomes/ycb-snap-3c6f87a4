@@ -1,0 +1,32 @@
+// Test a revoked CRL -- ensure that a connection is not allowed.
+// Note: crl_client_revoked.pem is a CRL with the client.pem certificate listed as revoked.
+// This test should test that the user cannot connect with client.pem certificate.
+
+import {requireSSLProvider} from "jstests/ssl/libs/ssl_helpers.js";
+
+requireSSLProvider(["openssl", "windows"], function () {
+    let md = MongoRunner.runMongod({
+        tlsMode: "requireTLS",
+        tlsCertificateKeyFile: getX509Path("server.pem"),
+        tlsCAFile: getX509Path("ca.pem"),
+        tlsCRLFile: getX509Path("crl_client_revoked.pem"),
+    });
+
+    let mongo = runMongoProgram(
+        "mongo",
+        "--port",
+        md.port,
+        "--tls",
+        "--tlsCAFile",
+        getX509Path("ca.pem"),
+        "--tlsCertificateKeyFile",
+        getX509Path("client_revoked.pem"),
+        "--eval",
+        ";",
+    );
+
+    // 1 is the exit code for the shell failing to connect, which is what we want
+    // for a successful test.
+    assert(mongo == 1);
+    MongoRunner.stopMongod(md);
+});

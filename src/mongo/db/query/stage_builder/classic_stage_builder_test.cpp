@@ -1,0 +1,239 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include "mongo/db/query/stage_builder/classic_stage_builder.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_mock.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_mock.h"
+#include "mongo/db/shard_role/shard_role_mock.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/intrusive_counter.h"
+
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace mongo {
+
+const static NamespaceString kNss = NamespaceString::createNamespaceString_forTest("db.dummy");
+
+class ClassicStageBuilderTest : public ServiceContextMongoDTest {
+public:
+    ClassicStageBuilderTest() : ServiceContextMongoDTest(Options{}.useMockClock(true)) {}
+
+    void setUp() override {
+        _opCtx = makeOperationContext();
+        _workingSet = std::make_unique<WorkingSet>();
+
+        auto indexCatalog = std::make_unique<IndexCatalogMock>();
+        IndexSpec spec;
+        spec.version(1).name("a_1").addKeys(BSON("a" << 1));
+        auto desc = IndexDescriptor(IndexNames::BTREE, spec.toBSON());
+        indexCatalog->createIndexEntry(
+            _opCtx.get(), nullptr /*collection*/, std::move(desc), CreateIndexEntryFlags::kNone);
+        _collection = std::make_unique<CollectionMock>(UUID::gen(), kNss, std::move(indexCatalog));
+    }
+
+    void tearDown() override {
+        _opCtx.reset();
+        _workingSet.reset();
+        _planStageQsnMap.clear();
+    }
+
+    /**
+     * Converts a 'QuerySolutionNode' to a 'QuerySolution'.
+     */
+    std::unique_ptr<QuerySolution> makeQuerySolution(std::unique_ptr<QuerySolutionNode> root) {
+        auto querySoln = std::make_unique<QuerySolution>();
+        querySoln->setRoot(std::move(root));
+        return querySoln;
+    }
+
+    /**
+     * Builds a PlanStage using the given WorkingSet and QuerySolution.
+     */
+    std::unique_ptr<PlanStage> buildPlanStage(std::unique_ptr<QuerySolution> querySolution,
+                                              Collection* collection = nullptr) {
+        auto findCommand = std::make_unique<FindCommandRequest>(kNss);
+        auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+            .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx(), *findCommand).build(),
+            .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+
+        // The collection holder is guaranteed to be valid for the lifetime of the test. This
+        // initialization is safe.
+        CollectionPtr collptr =
+            CollectionPtr::CollectionPtr_UNSAFE(collection ? collection : _collection.get());
+        auto coll =
+            shard_role_mock::acquireCollectionMocked(_opCtx.get(), kNss, std::move(collptr));
+        stage_builder::ClassicStageBuilder builder{
+            opCtx(), coll, *cq, *querySolution, workingSet(), &_planStageQsnMap};
+        return builder.build(querySolution->root());
+    }
+
+    /**
+     * A helper to repeatedly call work() until the stage returns a PlanStage::IS_EOF state and
+     * returns the resulting documents as a vector of BSONObj.
+     */
+    std::vector<BSONObj> collectResults(std::unique_ptr<PlanStage> stage) {
+        WorkingSetID id;
+        std::vector<BSONObj> results;
+        auto state = PlanStage::ADVANCED;
+
+        while (state != PlanStage::IS_EOF) {
+            state = stage->work(&id);
+            if (state == PlanStage::ADVANCED) {
+                auto member = workingSet()->get(id);
+                auto doc = member->doc.value().toBson();
+                results.push_back(doc);
+            }
+        }
+        return results;
+    }
+
+    OperationContext* opCtx() {
+        return _opCtx.get();
+    }
+
+    WorkingSet* workingSet() {
+        return _workingSet.get();
+    }
+
+    const stage_builder::PlanStageToQsnMap& planStageQsnMap() const {
+        return _planStageQsnMap;
+    }
+
+private:
+    ServiceContext::UniqueOperationContext _opCtx;
+    std::unique_ptr<WorkingSet> _workingSet;
+    std::unique_ptr<Collection> _collection;
+    stage_builder::PlanStageToQsnMap _planStageQsnMap;
+};
+
+namespace {
+// Builds an IndexEntry whose indexCatalogEntryStorage has the given ident.
+IndexEntry buildIndexEntryWithIdent(const BSONObj& kp, std::string_view ident) {
+    IndexSpec spec;
+    spec.version(1).name("a_1").addKeys(kp);
+    auto mockEntry =
+        std::make_shared<IndexCatalogEntryMock>(nullptr,
+                                                CollectionPtr{},
+                                                std::string(ident),
+                                                IndexDescriptor(IndexNames::BTREE, spec.toBSON()),
+                                                false /* isFrozen */);
+    IndexEntry entry{kp,
+                     IndexNames::nameToType(IndexNames::findPluginName(kp)),
+                     IndexConfig::kLatestIndexVersion,
+                     false,
+                     {},
+                     {},
+                     false,
+                     false,
+                     CoreIndexInfo::Identifier("a_1"),
+                     {},
+                     nullptr,
+                     std::move(mockEntry)};
+    return entry;
+}
+
+IndexEntry buildSimpleIndexEntry(const BSONObj& kp) {
+    return buildIndexEntryWithIdent(kp, "a_1");
+}
+}  // namespace
+
+/**
+ * Verify that a VirtualScanNode can be translated to a MockStage and produce a filtered data
+ * stream.
+ */
+TEST_F(ClassicStageBuilderTest, VirtualScanTranslation) {
+    static const std::vector<BSONArray> kFilteredDocs = std::vector<BSONArray>{
+        BSON_ARRAY(BSON("a" << 1 << "b" << 2)), BSON_ARRAY(BSON("a" << 3 << "b" << 2))};
+    BSONObj query = fromjson("{a: {$ne: 2}}");
+    auto filter = uassertStatusOK(MatchExpressionParser::parse(
+        query, make_intrusive<ExpressionContextForTest>(opCtx(), kNss)));
+
+    std::vector<BSONArray> allDocs = kFilteredDocs;
+    allDocs.insert(allDocs.begin() + 1, BSON_ARRAY(BSON("a" << 2 << "b" << 2)));
+    allDocs.insert(allDocs.end(), BSON_ARRAY(BSON("a" << 2 << "b" << 2)));
+
+    // Construct a QuerySolution consisting of a single VirtualScanNode to test if a stream of
+    // documents can be produced and filtered, according to the provided filter.
+    auto virtScan = std::make_unique<VirtualScanNode>(
+        std::move(allDocs), VirtualScanNode::ScanType::kCollScan, false);
+    virtScan->filter = std::move(filter);
+    // Make a QuerySolution from the root virtual scan node.
+    auto querySolution = makeQuerySolution(std::move(virtScan));
+    ASSERT_EQ(querySolution->root()->nodeId(), 1);
+
+    // Translate the QuerySolution to a classic PlanStage.
+    auto stage = buildPlanStage(std::move(querySolution));
+
+    // Work the stage and collect the results.
+    auto results = collectResults(std::move(stage));
+    ASSERT_EQ(results.size(), kFilteredDocs.size());
+
+    // Check that the results produced from the translated VirtualScanNode meet expectation.
+    for (size_t i = 0; i < kFilteredDocs.size(); ++i) {
+        BSONObjIterator arrIt{kFilteredDocs[i]};
+        auto firstElt = arrIt.next();
+        ASSERT_BSONOBJ_EQ(firstElt.embeddedObject(), results[i]);
+    }
+}
+
+TEST_F(ClassicStageBuilderTest, IndexFetchTranslationPopulatesMap) {
+    auto idxScan = std::make_unique<IndexScanNode>(kNss, buildSimpleIndexEntry(BSON("a" << 1)));
+    QuerySolutionNode* idxScanPtr = idxScan.get();
+    auto fetch = std::make_unique<FetchNode>(std::move(idxScan), kNss);
+    QuerySolutionNode* fetchPtr = fetch.get();
+
+    auto stage = buildPlanStage(makeQuerySolution(std::move(fetch)));
+
+    stage_builder::PlanStageToQsnMap expectedResults = {{stage.get(), fetchPtr},
+                                                        {stage->child().get(), idxScanPtr}};
+    ASSERT_EQ(expectedResults, planStageQsnMap());
+}
+
+// The stage builder looks up the index by ident when building the plan. If the ident is gone
+// from the catalog (index was dropped after planning), it throws QueryPlanKilled.
+TEST_F(ClassicStageBuilderTest, DroppedIndexThrowsQueryPlanKilled) {
+    // Use an empty catalog — no entries at all — so both name and ident lookup fail.
+    // This simulates the index having been dropped with no replacement.
+    auto emptyCollection =
+        std::make_unique<CollectionMock>(UUID::gen(), kNss, std::make_unique<IndexCatalogMock>());
+    auto idxScan = std::make_unique<IndexScanNode>(
+        kNss, buildIndexEntryWithIdent(BSON("a" << 1), "original-ident"));
+    ASSERT_THROWS_CODE(buildPlanStage(makeQuerySolution(std::move(idxScan)), emptyCollection.get()),
+                       DBException,
+                       ErrorCodes::QueryPlanKilled);
+}
+
+// Even when the catalog has an index with the same NAME as the planned index, a different ident
+// means the original index was dropped and replaced. The stage builder detects this via ident
+// comparison (not name lookup) and throws QueryPlanKilled.
+TEST_F(ClassicStageBuilderTest, DroppedAndReplacedIndexThrowsQueryPlanKilled) {
+    // setUp has "a_1" with ident "a_1" in the catalog. The plan refers to "original-ident".
+    // findIndexByName("a_1") would succeed, but findIndexByIdent("original-ident") returns
+    // null — proving the check is ident-based, not name-based.
+    auto idxScan = std::make_unique<IndexScanNode>(
+        kNss, buildIndexEntryWithIdent(BSON("a" << 1), "original-ident"));
+    ASSERT_THROWS_CODE(buildPlanStage(makeQuerySolution(std::move(idxScan))),
+                       DBException,
+                       ErrorCodes::QueryPlanKilled);
+}
+
+}  // namespace mongo

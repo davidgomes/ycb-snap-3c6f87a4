@@ -1,0 +1,263 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+/* Client represents a connection to the database (the server-side) and corresponds
+   to an open socket (or logical connection if pooling on sockets) from a client.
+*/
+
+#include "mongo/db/client.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/operation_cpu_timer.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/logv2/log_service.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <string_view>
+
+#include <boost/functional/hash.hpp>
+
+namespace mongo {
+namespace {
+
+thread_local ServiceContext::UniqueClient currentClient;
+
+void invariantNoCurrentClient() {
+    invariant(!haveClient(),
+              str::stream() << "Already have client on this thread: "  //
+                            << '"' << Client::getCurrent()->desc() << '"');
+}
+
+int64_t generateSeed(const std::string& desc) {
+    size_t seed = 0;
+    boost::hash_combine(seed, Date_t::now().asInt64());
+    boost::hash_combine(seed, desc);
+    return seed;
+}
+
+// In a normal server process, this will be overridden by AuthorizationSessionImpl
+// to examine the active user's privilege set.
+// For UnitTests, this simply fails closed unless explicitly overridden.
+std::function<bool(Client*)> checkAuthForInternalClient = [](Client*) {
+    return false;
+};
+
+}  // namespace
+
+void Client::initThread(std::string_view desc,
+                        Service* service,
+                        std::shared_ptr<transport::Session> session,
+                        ClientOperationKillableByStepdown killable,
+                        ClientExcludedFromInterruptAtShutdown excludedFromInterruptAtShutdown) {
+    invariantNoCurrentClient();
+
+    std::string fullDesc;
+    if (session) {
+        fullDesc = str::stream() << desc << session->id();
+    } else {
+        fullDesc = std::string{desc};
+    }
+
+    setThreadName(fullDesc);
+
+    // Create the client obj, attach to thread
+    currentClient = service->makeClient(
+        fullDesc, std::move(session), killable, excludedFromInterruptAtShutdown);
+    setLogService(toLogService(service));
+}
+
+void Client::setCurrent(ServiceContext::UniqueClient client) {
+    invariantNoCurrentClient();
+    setLogService(toLogService(client.get()->getService()));
+    currentClient = std::move(client);
+    if (auto opCtx = currentClient->_opCtx)
+        if (auto timers = OperationCPUTimers::get(opCtx))
+            timers->onThreadAttach();
+}
+
+ServiceContext::UniqueClient Client::releaseCurrent() {
+    invariant(haveClient(), "No client to release");
+    if (auto opCtx = currentClient->_opCtx)
+        if (auto timers = OperationCPUTimers::get(opCtx))
+            timers->onThreadDetach();
+    setLogService(logv2::LogService::unknown);
+    return std::move(currentClient);
+}
+
+
+Client* Client::getCurrent() {
+    return currentClient.get();
+}
+
+Client::Client(std::string desc,
+               Service* service,
+               std::shared_ptr<transport::Session> session,
+               ClientOperationKillableByStepdown killable,
+               ClientExcludedFromInterruptAtShutdown excludedFromInterruptAtShutdown)
+    : _service(service),
+      _session(std::move(session)),
+      _desc(std::move(desc)),
+      _connectionId(_session ? _session->id() : 0),
+      _operationKillable(killable),
+      _prng(generateSeed(_desc)),
+      _uuid(UUID::gen()),
+      _isPriorityPortClient(_session && _session->isConnectedToPriorityPort()),
+      _excludeFromInterruptAtShutdown(static_cast<bool>(excludedFromInterruptAtShutdown)),
+      _tags(kPending) {}
+
+Client::~Client() = default;
+
+void Client::reportState(BSONObjBuilder& builder) {
+    builder.append("desc", desc());
+
+    if (_connectionId) {
+        builder.appendNumber("connectionId", _connectionId);
+    }
+
+    if (hasRemote()) {
+        builder.append("client", getRemote().toString());
+    }
+}
+
+ServiceContext::UniqueOperationContext Client::makeOperationContext() {
+    return getServiceContext()->makeOperationContext(this);
+}
+
+std::string Client::clientAddress(bool includePort) const {
+    if (!hasRemote()) {
+        return "";
+    }
+    if (includePort) {
+        return getRemote().toString();
+    }
+    return getRemote().host();
+}
+
+Client& cc() {
+    invariant(haveClient());
+    return *Client::getCurrent();
+}
+
+bool haveClient() {
+    return static_cast<bool>(currentClient);
+}
+
+bool isProcessInternalClient(const Client& client) {
+    return client.isInDirectClient() || !client.session();
+}
+
+/**
+ * User connections are listed active so long as they are associated with an opCtx.
+ * Non-user connections are listed active if they have an opCtx and not waiting on a condvar.
+ */
+bool Client::hasAnyActiveCurrentOp() const {
+    if (!_opCtx || _opCtxIsPendingDestruction)
+        return false;
+    if (isFromUserConnection() || !_opCtx->isWaitingForConditionOrInterrupt())
+        return true;
+    return false;
+}
+
+void Client::setKilled() {
+    ClientLock lk(this);
+    _killed.store(true);
+    if (_opCtx) {
+        getServiceContext()->killOperation(lk, _opCtx, ErrorCodes::ClientMarkedKilled);
+    }
+}
+
+ThreadClient::ThreadClient(std::string_view desc,
+                           Service* service,
+                           std::shared_ptr<transport::Session> session,
+                           Killable killable,
+                           ExcludedFromInterruptAtShutdown excludedFromInterruptAtShutdown) {
+    invariantNoCurrentClient();
+    _originalThreadName = getThreadNameRef();
+    Client::initThread(
+        desc, service, std::move(session), killable, excludedFromInterruptAtShutdown);
+}
+
+ThreadClient::~ThreadClient() {
+    invariant(currentClient);
+    currentClient.reset(nullptr);
+    setLogService(logv2::LogService::unknown);
+    setThreadNameRef(std::move(_originalThreadName));
+}
+
+Client* ThreadClient::get() const {
+    return &cc();
+}
+
+AlternativeClientRegion::AlternativeClientRegion(ServiceContext::UniqueClient& clientToUse)
+    : _alternateClient(&clientToUse) {
+    invariant(clientToUse);
+    if (Client::getCurrent()) {
+        _originalClient = Client::releaseCurrent();
+    }
+    Client::setCurrent(std::move(*_alternateClient));
+}
+
+AlternativeClientRegion::~AlternativeClientRegion() {
+    *_alternateClient = Client::releaseCurrent();
+    if (_originalClient) {
+        Client::setCurrent(std::move(_originalClient));
+    }
+}
+
+Client* AlternativeClientRegion::get() const {
+    return &cc();
+}
+
+void Client::setTags(TagMask tagsToSet) {
+    mutateTags([tagsToSet](TagMask originalTags) { return (originalTags | tagsToSet); });
+}
+
+void Client::unsetTags(TagMask tagsToUnset) {
+    mutateTags([tagsToUnset](TagMask originalTags) { return (originalTags & ~tagsToUnset); });
+}
+
+void Client::mutateTags(const std::function<TagMask(TagMask)>& mutateFunc) {
+    TagMask oldValue, newValue;
+    do {
+        oldValue = _tags.load();
+        newValue = mutateFunc(oldValue);
+
+        // Any change to the Client tags automatically clears kPending status.
+        newValue &= ~kPending;
+    } while (!_tags.compareAndSwap(&oldValue, newValue));
+}
+
+Client::TagMask Client::getTags() const {
+    return _tags.load();
+}
+
+int Client::getLocalPort() const {
+    return serverGlobalParams.port;
+}
+
+void Client::_setOperationContext(OperationContext* opCtx) {
+    if (_session) {
+        _session->setInOperation(opCtx != nullptr);
+    }
+    _opCtx = opCtx;
+    _opCtxIsPendingDestruction = false;
+}
+
+bool Client::isInternalClient() {
+    return _isInternalClient && checkAuthForInternalClient(this);
+}
+
+void Client::setCheckAuthForInternalClient(std::function<bool(Client*)> fn) {
+    checkAuthForInternalClient = std::move(fn);
+}
+
+}  // namespace mongo

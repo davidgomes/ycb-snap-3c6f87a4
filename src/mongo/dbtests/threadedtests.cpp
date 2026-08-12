@@ -1,0 +1,227 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/admission/ticketing/admission_context.h"
+#include "mongo/db/admission/ticketing/ticketholder.h"
+#include "mongo/db/client.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
+
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <typeinfo>
+
+#include <boost/version.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+namespace mongo {
+namespace ThreadedTests {
+
+template <int nthreads_param = 10>
+class ThreadedTest {
+public:
+    virtual void setup() {}                     // optional
+    virtual void subthread(int remaining) = 0;  // each thread whatever test work you want done
+    virtual void validate() = 0;                // after work is done
+
+    static const int nthreads = nthreads_param;
+
+    void run() {
+        setup();
+        launch_subthreads(nthreads);
+        validate();
+    }
+
+    virtual ~ThreadedTest() {};  // not necessary, but makes compilers happy
+
+private:
+    void launch_subthreads(int remaining) {
+        if (!remaining)
+            return;
+
+        stdx::thread athread([=, this] { subthread(remaining); });
+        launch_subthreads(remaining - 1);
+        athread.join();
+    }
+};
+
+template <typename _AtomicUInt>
+class IsAtomicWordAtomic : public ThreadedTest<> {
+    static const int iterations = 1000000;
+    typedef typename _AtomicUInt::WordType WordType;
+    _AtomicUInt target;
+
+    void subthread(int) override {
+        for (int i = 0; i < iterations; i++) {
+            target.fetchAndAdd(WordType(1));
+        }
+    }
+    void validate() override {
+        ASSERT_EQUALS(target.load(), unsigned(nthreads * iterations));
+
+        _AtomicUInt u;
+        ASSERT_EQUALS(0u, u.load());
+        ASSERT_EQUALS(0u, u.fetchAndAdd(WordType(1)));
+        ASSERT_EQUALS(2u, u.addAndFetch(WordType(1)));
+        ASSERT_EQUALS(2u, u.fetchAndSubtract(WordType(1)));
+        ASSERT_EQUALS(0u, u.subtractAndFetch(WordType(1)));
+        ASSERT_EQUALS(0u, u.load());
+
+        u.fetchAndAdd(WordType(1));
+        ASSERT_GREATER_THAN(u.load(), WordType(0));
+
+        u.fetchAndSubtract(WordType(1));
+        ASSERT_NOT_GREATER_THAN(u.load(), WordType(0));
+    }
+};
+
+class ThreadPoolTest {
+    static const unsigned iterations = 10000;
+    static const unsigned nThreads = 8;
+
+    Atomic<unsigned> counter;
+    void increment(unsigned n) {
+        for (unsigned i = 0; i < n; i++) {
+            counter.fetchAndAdd(1);
+        }
+    }
+
+public:
+    void run() {
+        ThreadPool::Options options;
+        options.maxThreads = options.minThreads = nThreads;
+        ThreadPool tp(options);
+        tp.startup();
+
+        for (unsigned i = 0; i < iterations; i++) {
+            tp.schedule([=, this](auto status) {
+                ASSERT_OK(status);
+                increment(2);
+            });
+        }
+
+        tp.waitForIdle();
+        tp.shutdown();
+        tp.join();
+
+        ASSERT_EQUALS(counter.load(), iterations * 2);
+    }
+};
+
+void sleepalittle() {
+    Timer t;
+    while (1) {
+        std::this_thread::yield();
+        if (t.micros() > 8)
+            break;
+    }
+}
+
+int once;
+
+/**
+ * Slack is a test to see how long it takes for another thread to pick up
+ * and begin work after another relinquishes the lock.  e.g. a spin lock
+ * would have very little slack.
+ *
+ * This test is to see how long it takes to get a lock after there has been contention -- the OS
+ * will need to reschedule us. if a spinlock, it will be fast of course, but these aren't spin
+ * locks. Experimenting with different # of threads would be a good idea.
+ */
+template <class whichmutex, class scoped>
+class Slack : public ThreadedTest<17> {
+public:
+    Slack() {
+        k.store(0);
+        done.store(false);
+        a = b = 0;
+        locks = 0;
+    }
+
+private:
+    whichmutex m;
+    char pad1[128];
+    unsigned a, b;
+    char pad2[128];
+    unsigned locks;
+    char pad3[128];
+    Atomic<int> k;
+
+    void validate() override {
+        if (once++ == 0) {
+            // <= 1.35 we use a different rwmutex impl so worth noting
+            std::cout << "Boost version : " << BOOST_VERSION << std::endl;
+        }
+        std::cout << typeid(whichmutex).name() << " Slack useful work fraction: " << ((double)a) / b
+                  << " locks:" << locks << std::endl;
+    }
+    void watch() {
+        while (1) {
+            b++;
+            //__sync_synchronize();
+            if (k.load()) {
+                a++;
+            }
+            sleepmillis(0);
+            if (done.load())
+                break;
+        }
+    }
+    Atomic<bool> done;
+    void subthread(int x) override {
+        if (x == 1) {
+            watch();
+            return;
+        }
+        Timer t;
+        unsigned lks = 0;
+        while (1) {
+            scoped lk(m);
+            k.store(1);
+            // not very long, we'd like to simulate about 100K locks per second
+            sleepalittle();
+            lks++;
+            if (done.load() || t.millis() > 1500) {
+                locks += lks;
+                k.store(0);
+                break;
+            }
+            k.store(0);
+            //__sync_synchronize();
+        }
+        done.store(true);
+    }
+};
+
+class StdxMutexSlackTest : public Slack<std::mutex, std::lock_guard<std::mutex>> {};
+class UIsAtomicWordAtomicTest : public IsAtomicWordAtomic<Atomic<unsigned>> {};
+class ULLIsAtomicWordAtomicTest : public IsAtomicWordAtomic<Atomic<unsigned long long>> {};
+
+class All : public unittest::OldStyleSuiteSpecification {
+public:
+    All() : OldStyleSuiteSpecification("threading") {}
+
+    void setupTests() override {
+        add<StdxMutexSlackTest>();
+        add<UIsAtomicWordAtomicTest>();
+        add<ULLIsAtomicWordAtomicTest>();
+        add<ThreadPoolTest>();
+    }
+};
+
+unittest::OldStyleSuiteInitializer<All> myall;
+
+}  // namespace ThreadedTests
+}  // namespace mongo

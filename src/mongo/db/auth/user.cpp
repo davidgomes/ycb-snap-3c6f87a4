@@ -1,0 +1,237 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/auth/user.h"
+
+#include "mongo/base/data_range.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/auth/restriction_environment.h"
+#include "mongo/db/auth/role_name.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/multitenancy_gen.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <absl/meta/type_traits.h>
+
+namespace mongo {
+
+namespace {
+using namespace std::literals::string_view_literals;
+// Field names used when serializing User objects to BSON for usersInfo.
+constexpr auto kIdFieldName = "_id"sv;
+constexpr auto kUserIdFieldName = "userId"sv;
+constexpr auto kUserFieldName = "user"sv;
+constexpr auto kDbFieldName = "db"sv;
+constexpr auto kMechanismsFieldName = "mechanisms"sv;
+constexpr auto kCredentialsFieldName = "credentials"sv;
+constexpr auto kRolesFieldName = "roles"sv;
+constexpr auto kInheritedRolesFieldName = "inheritedRoles"sv;
+constexpr auto kInheritedPrivilegesFieldName = "inheritedPrivileges"sv;
+constexpr auto kInheritedAuthenticationRestrictionsFieldName =
+    "inheritedAuthenticationRestrictions"sv;
+constexpr auto kAuthenticationRestrictionsFieldName = "authenticationRestrictions"sv;
+
+SHA256Block computeDigest(const UserName& name) {
+    auto fn = name.getDisplayName();
+    return SHA256Block::computeHash({ConstDataRange(fn.c_str(), fn.size())});
+};
+
+}  // namespace
+
+std::vector<std::string> UserRequest::getUserNameAndRolesVector(
+    const UserName& userName, const boost::optional<std::set<RoleName>>& roles) {
+    std::vector<std::string> hashElements;
+    hashElements.push_back(userName.getUnambiguousName());
+
+    if (roles) {
+        for (auto& role : *roles) {
+            hashElements.push_back(role.getRole());
+        }
+    }
+
+    return hashElements;
+}
+
+UserRequest::UserRequestCacheKey UserRequestGeneral::generateUserRequestCacheKey() const {
+    return UserRequestCacheKey(getUserName(), getUserNameAndRolesVector(getUserName(), getRoles()));
+}
+
+User::User(std::unique_ptr<UserRequest> request)
+    : _request(std::move(request)),
+      _isInvalidated(false),
+      _digest(computeDigest(_request->getUserName())) {}
+
+template <>
+User::SCRAMCredentials<SHA1Block>& User::CredentialData::scram<SHA1Block>() {
+    return scram_sha1;
+}
+template <>
+const User::SCRAMCredentials<SHA1Block>& User::CredentialData::scram<SHA1Block>() const {
+    return scram_sha1;
+}
+
+template <>
+User::SCRAMCredentials<SHA256Block>& User::CredentialData::scram<SHA256Block>() {
+    return scram_sha256;
+}
+template <>
+const User::SCRAMCredentials<SHA256Block>& User::CredentialData::scram<SHA256Block>() const {
+    return scram_sha256;
+}
+
+RoleNameIterator User::getRoles() const {
+    return makeRoleNameIteratorForContainer(_roles);
+}
+
+RoleNameIterator User::getIndirectRoles() const {
+    return makeRoleNameIteratorForContainer(_indirectRoles);
+}
+
+bool User::hasRole(const RoleName& roleName) const {
+    return _roles.count(roleName);
+}
+
+const User::CredentialData& User::getCredentials() const {
+    return _credentials;
+}
+
+ActionSet User::getActionsForResource(const ResourcePattern& resource) const {
+    if (auto it = _privileges.find(resource); it != _privileges.end()) {
+        return it->second.getActions();
+    }
+
+    return ActionSet();
+}
+
+bool User::hasActionsForResource(const ResourcePattern& resource) const {
+    return !getActionsForResource(resource).empty();
+}
+
+void User::setCredentials(const CredentialData& credentials) {
+    _credentials = credentials;
+}
+
+void User::setRoles(RoleNameIterator roles) {
+    _roles.clear();
+    while (roles.more()) {
+        _roles.insert(roles.next());
+    }
+}
+
+void User::setIndirectRoles(RoleNameIterator indirectRoles) {
+    _indirectRoles.clear();
+    while (indirectRoles.more()) {
+        _indirectRoles.push_back(indirectRoles.next());
+    }
+    // Keep indirectRoles sorted for more efficient comparison against other users.
+    std::sort(_indirectRoles.begin(), _indirectRoles.end());
+}
+
+void User::setPrivileges(const PrivilegeVector& privileges) {
+    _privileges.clear();
+    for (size_t i = 0; i < privileges.size(); ++i) {
+        const Privilege& privilege = privileges[i];
+        _privileges[privilege.getResourcePattern()] = privilege;
+    }
+}
+
+void User::addRole(const RoleName& roleName) {
+    _roles.insert(roleName);
+}
+
+void User::addRoles(const std::vector<RoleName>& roles) {
+    for (std::vector<RoleName>::const_iterator it = roles.begin(); it != roles.end(); ++it) {
+        addRole(*it);
+    }
+}
+
+void User::addPrivilege(const Privilege& privilegeToAdd) {
+    ResourcePrivilegeMap::iterator it = _privileges.find(privilegeToAdd.getResourcePattern());
+    if (it == _privileges.end()) {
+        // No privilege exists yet for this resource
+        _privileges.insert(std::make_pair(privilegeToAdd.getResourcePattern(), privilegeToAdd));
+    } else {
+        dassert(it->first == privilegeToAdd.getResourcePattern());
+        it->second.addActions(privilegeToAdd.getActions());
+    }
+}
+
+void User::addPrivileges(const PrivilegeVector& privileges) {
+    for (PrivilegeVector::const_iterator it = privileges.begin(); it != privileges.end(); ++it) {
+        addPrivilege(*it);
+    }
+}
+
+void User::setRestrictions(RestrictionDocuments restrictions) & {
+    _restrictions = std::move(restrictions);
+}
+
+void User::setIndirectRestrictions(RestrictionDocuments restrictions) & {
+    _indirectRestrictions = std::move(restrictions);
+}
+
+Status User::validateRestrictions(OperationContext* opCtx) const {
+    auto& transportSession = opCtx->getClient()->session();
+    if (!transportSession) {
+        // If Client has no transport session, it must be internal system connection
+        invariant(opCtx->getClient()->isFromSystemConnection());
+        return Status::OK();
+    }
+
+    auto& env = transportSession->getAuthEnvironment();
+    auto status = _restrictions.validate(env);
+    if (!status.isOK()) {
+        return {status.code(),
+                str::stream() << "Evaluation of direct authentication restrictions failed: "
+                              << status.reason()};
+    }
+
+    status = _indirectRestrictions.validate(env);
+    if (!status.isOK()) {
+        return {status.code(),
+                str::stream() << "Evaluation of indirect authentication restrictions failed: "
+                              << status.reason()};
+    }
+
+    return Status::OK();
+}
+
+bool User::hasDifferentRoles(const User& otherUser) const {
+    // If the number of direct or indirect roles in the users' are not the same, they have
+    // different roles.
+    if (_roles.size() != otherUser._roles.size() ||
+        _indirectRoles.size() != otherUser._indirectRoles.size()) {
+        return true;
+    }
+
+    // At this point, it is known that the users have the same number of direct roles. The
+    // direct roles sets are equivalent if all of the roles in the first user's directRoles are
+    // also in the other user's directRoles.
+    for (const auto& role : _roles) {
+        if (otherUser._roles.find(role) == otherUser._roles.end()) {
+            return true;
+        }
+    }
+
+    // Indirect roles should always be sorted.
+    dassert(std::is_sorted(_indirectRoles.begin(), _indirectRoles.end()));
+    dassert(std::is_sorted(otherUser._indirectRoles.begin(), otherUser._indirectRoles.end()));
+
+    return !std::equal(
+        _indirectRoles.begin(), _indirectRoles.end(), otherUser._indirectRoles.begin());
+}
+
+}  // namespace mongo

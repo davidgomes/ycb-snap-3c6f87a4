@@ -1,0 +1,396 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#ifdef _WIN32
+#define NVALGRIND
+#endif
+
+#include "mongo/util/tcmalloc_set_parameter.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/initializer.h"
+#include "mongo/base/parse_number.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/config.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/processinfo.h"
+#include "mongo/util/tcmalloc_parameters_gen.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <functional>
+#include <limits>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+#include <valgrind/valgrind.h>
+
+#ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+#include <tcmalloc/malloc_extension.h>
+#elif defined(MONGO_CONFIG_TCMALLOC_GPERF)
+#include <gperftools/malloc_extension.h>
+#endif  // MONGO_CONFIG_TCMALLOC_GOOGLE
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+namespace mongo {
+namespace {
+
+constexpr absl::string_view toStringView(std::string_view s) {
+    return {s.data(), s.size()};
+}
+
+StatusWith<size_t> validateTCMallocValue(std::string_view name,
+                                         const BSONElement& newValueElement) {
+    if (!newValueElement.isNumber()) {
+        return {ErrorCodes::TypeMismatch,
+                fmt::format(
+                    "Expected server parameter {} to have numeric type, but found {} of type {}",
+                    name,
+                    newValueElement.toString(false),
+                    typeName(newValueElement.type()))};
+    }
+    static constexpr unsigned long long maxOkValue =
+        std::min(static_cast<unsigned long long>(std::numeric_limits<size_t>::max()),
+                 static_cast<unsigned long long>(std::numeric_limits<long long>::max()));
+
+    auto valueULL = static_cast<unsigned long long>(newValueElement.safeNumberLong());
+    if (valueULL > maxOkValue) {
+        return Status(ErrorCodes::BadValue,
+                      fmt::format("Value {} is outside range [0, {}]", name, maxOkValue));
+    }
+    return static_cast<size_t>(valueULL);
+}
+}  // namespace
+
+#ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+// Although there is only one valid property to get, we use a function to conform to the get/set
+// tcmalloc api.
+size_t getTcmallocProperty(std::string_view propName) {
+    iassert(ErrorCodes::InternalError,
+            fmt::format("Failed to retreive tcmalloc property: {}", propName),
+            propName == kMaxPerCPUCacheSizePropertyName);
+    return static_cast<size_t>(tcmalloc::MallocExtension::GetMaxPerCpuCacheSize());
+}
+
+// Although there is only one valid property to set, we use a function to conform to the get/set
+// tcmalloc api.
+void setTcmallocProperty(std::string_view propName, size_t value) {
+    if (!RUNNING_ON_VALGRIND) {  // NOLINT
+        iassert(ErrorCodes::InternalError,
+                fmt::format("Failed to set internal tcmalloc property: {}", propName),
+                propName == kMaxPerCPUCacheSizePropertyName);
+        tcmalloc::MallocExtension::SetMaxPerCpuCacheSize(value);
+    }
+}
+
+TcmallocReleaseRateT getMemoryReleaseRate() {
+    return static_cast<size_t>(tcmalloc::MallocExtension::GetBackgroundReleaseRate());
+}
+
+void setMemoryReleaseRate(TcmallocReleaseRateT val) {
+    tcmalloc::MallocExtension::SetBackgroundReleaseRate(
+        tcmalloc::MallocExtension::BytesPerSecond{static_cast<size_t>(val)});
+}
+
+#elif defined(MONGO_CONFIG_TCMALLOC_GPERF)
+size_t getTcmallocProperty(std::string_view propName) {
+    size_t value;
+    iassert(ErrorCodes::InternalError,
+            fmt::format("Failed to retreive tcmalloc property: {}", propName),
+            MallocExtension::instance()->GetNumericProperty(std::string{propName}.c_str(), &value));
+    return value;
+}
+
+void setTcmallocProperty(std::string_view propName, size_t value) {
+    if (!RUNNING_ON_VALGRIND) {  // NOLINT
+        iassert(
+            ErrorCodes::InternalError,
+            fmt::format("Failed to set internal tcmalloc property: {}", propName),
+            MallocExtension::instance()->SetNumericProperty(std::string{propName}.c_str(), value));
+    }
+}
+
+TcmallocReleaseRateT getMemoryReleaseRate() {
+    return static_cast<size_t>(MallocExtension::instance()->GetMemoryReleaseRate());
+}
+
+void setMemoryReleaseRate(TcmallocReleaseRateT val) {
+    MallocExtension::instance()->SetMemoryReleaseRate(val);
+}
+#endif  // MONGO_CONFIG_TCMALLOC_GOOGLE
+
+namespace {
+template <typename T>
+constexpr std::string_view kParameterName;
+
+template <>
+constexpr std::string_view kParameterName<TCMallocMaxPerCPUCacheSizeServerParameter> =
+    kMaxPerCPUCacheSizePropertyName;
+
+template <>
+constexpr std::string_view kParameterName<TCMallocMaxTotalThreadCacheBytesServerParameter> =
+    kMaxTotalThreadCacheBytesPropertyName;
+
+template <>
+constexpr std::string_view kParameterName<TCMallocAggressiveMemoryDecommitServerParameter> =
+    kAggressiveMemoryDecommitPropertyName;
+
+template <typename T>
+void doAppendProperty(BSONObjBuilder* b, std::string_view name) {
+    try {
+        b->appendNumber(name, static_cast<long long>(getTcmallocProperty(kParameterName<T>)));
+    } catch (const ExceptionFor<ErrorCodes::InternalError>& ex) {
+        LOGV2_ERROR(8646000, "Could not get parameter", "error"_attr = ex.toString());
+    }
+}
+
+template <typename T>
+Status doSetProperty(std::string_view name, const BSONElement& newValueElement) {
+    auto swValue = validateTCMallocValue(name, newValueElement);
+    if (!swValue.isOK()) {
+        return swValue.getStatus();
+    }
+    try {
+        setTcmallocProperty(kParameterName<T>, swValue.getValue());
+        return Status::OK();
+    } catch (const ExceptionFor<ErrorCodes::InternalError>& ex) {
+        return ex.toStatus();
+    }
+}
+
+template <typename T>
+Status doSetPropertyFromString(std::string_view str) {
+    size_t value;
+    Status status = NumberParser{}(str, &value);
+    if (!status.isOK()) {
+        return status;
+    }
+    try {
+        setTcmallocProperty(kParameterName<T>, value);
+        return Status::OK();
+    } catch (const ExceptionFor<ErrorCodes::InternalError>& ex) {
+        return ex.toStatus();
+    }
+}
+}  // namespace
+
+void TCMallocMaxPerCPUCacheSizeServerParameter::append(OperationContext*,
+                                                       BSONObjBuilder* b,
+                                                       std::string_view name,
+                                                       const boost::optional<TenantId>&) {
+#ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+    doAppendProperty<TCMallocMaxPerCPUCacheSizeServerParameter>(b, name);
+#endif  // MONGO_CONFIG_TCMALLOC_GOOGLE
+}
+
+Status TCMallocMaxPerCPUCacheSizeServerParameter::set(const BSONElement& newValueElement,
+                                                      const boost::optional<TenantId>&) {
+#ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+    return doSetProperty<TCMallocMaxPerCPUCacheSizeServerParameter>(name(), newValueElement);
+#endif  // MONGO_CONFIG_TCMALLOC_GOOGLE
+
+    LOGV2_WARNING(
+        8752700,
+        "The tcmallocMaxPerCPUCacheSize server parameter is unavailable when using TCMalloc "
+        "with thread caching enabled. Setting this parameter will have no effect.");
+    return Status::OK();
+}
+
+Status TCMallocMaxPerCPUCacheSizeServerParameter::setFromString(std::string_view str,
+                                                                const boost::optional<TenantId>&) {
+#ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+    return doSetPropertyFromString<TCMallocMaxPerCPUCacheSizeServerParameter>(str);
+#endif  // MONGO_CONFIG_TCMALLOC_GOOGLE
+
+    LOGV2_WARNING(
+        8752701,
+        "The tcmallocMaxPerCPUCacheSize server parameter is unavailable when using TCMalloc "
+        "with thread caching enabled. Setting this parameter will have no effect.");
+    return Status::OK();
+}
+
+void TCMallocMaxTotalThreadCacheBytesServerParameter::append(OperationContext*,
+                                                             BSONObjBuilder* b,
+                                                             std::string_view name,
+                                                             const boost::optional<TenantId>&) {
+#ifdef MONGO_CONFIG_TCMALLOC_GPERF
+    doAppendProperty<TCMallocMaxTotalThreadCacheBytesServerParameter>(b, name);
+#endif  // MONGO_CONFIG_TCMALLOC_GPERF
+}
+
+Status TCMallocMaxTotalThreadCacheBytesServerParameter::set(const BSONElement& newValueElement,
+                                                            const boost::optional<TenantId>&) {
+#ifdef MONGO_CONFIG_TCMALLOC_GPERF
+    return doSetProperty<TCMallocMaxTotalThreadCacheBytesServerParameter>(name(), newValueElement);
+#endif  // MONGO_CONFIG_TCMALLOC_GPERF
+
+    LOGV2_WARNING(
+        8752702,
+        "The tcmallocMaxTotalThreadCacheBytes server parameter is unavailable when using TCMalloc "
+        "with per-cpu caching enabled. Setting this parameter will have no effect.");
+    return Status::OK();
+}
+
+Status TCMallocMaxTotalThreadCacheBytesServerParameter::setFromString(
+    std::string_view str, const boost::optional<TenantId>&) {
+#ifdef MONGO_CONFIG_TCMALLOC_GPERF
+    return doSetPropertyFromString<TCMallocMaxTotalThreadCacheBytesServerParameter>(str);
+#endif  // MONGO_CONFIG_TCMALLOC_GPERF
+
+    LOGV2_WARNING(
+        8752703,
+        "The tcmallocMaxTotalThreadCacheBytes server parameter is unavailable when using TCMalloc "
+        "with per-cpu caching enabled. Setting this parameter will have no effect.");
+    return Status::OK();
+}
+
+void TCMallocAggressiveMemoryDecommitServerParameter::append(OperationContext*,
+                                                             BSONObjBuilder* b,
+                                                             std::string_view name,
+                                                             const boost::optional<TenantId>&) {
+#ifdef MONGO_CONFIG_TCMALLOC_GPERF
+    doAppendProperty<TCMallocAggressiveMemoryDecommitServerParameter>(b, name);
+#endif  //  MONGO_CONFIG_TCMALLOC_GPERF
+}
+
+Status TCMallocAggressiveMemoryDecommitServerParameter::set(const BSONElement& newValueElement,
+                                                            const boost::optional<TenantId>&) {
+#ifdef MONGO_CONFIG_TCMALLOC_GPERF
+    return doSetProperty<TCMallocAggressiveMemoryDecommitServerParameter>(name(), newValueElement);
+#endif  //  MONGO_CONFIG_TCMALLOC_GPERF
+
+    LOGV2_WARNING(
+        8627600,
+        "The tcmallocAggressiveMemoryDecommit server parameter is unavailable when using TCMalloc "
+        "with per-CPU caching enabled. Setting this parameter will have no effect.");
+    return Status::OK();
+}
+
+Status TCMallocAggressiveMemoryDecommitServerParameter::setFromString(
+    std::string_view str, const boost::optional<TenantId>&) {
+#ifdef MONGO_CONFIG_TCMALLOC_GPERF
+    return doSetPropertyFromString<TCMallocAggressiveMemoryDecommitServerParameter>(str);
+#endif  //  MONGO_CONFIG_TCMALLOC_GPERF
+
+    LOGV2_WARNING(
+        8627601,
+        "The tcmallocAggressiveMemoryDecommit server parameter is unavailable when using TCMalloc "
+        "with per-CPU caching enabled. Setting this parameter will have no effect.");
+    return Status::OK();
+}
+
+void TCMallocReleaseRateServerParameter::append(OperationContext*,
+                                                BSONObjBuilder* builder,
+                                                std::string_view fieldName,
+                                                const boost::optional<TenantId>&) {
+    builder->append(fieldName, getMemoryReleaseRate());
+}
+
+Status TCMallocReleaseRateServerParameter::setFromString(std::string_view tcmallocReleaseRate,
+                                                         const boost::optional<TenantId>&) {
+    double value;
+    Status status = NumberParser{}(tcmallocReleaseRate, &value);
+    if (!status.isOK()) {
+        return status;
+    }
+    if (value < 0) {
+        return {ErrorCodes::BadValue,
+                fmt::format("tcmallocReleaseRate cannot be negative: {}", tcmallocReleaseRate)};
+    }
+    if (value >= 1 && value <= 100) {
+        LOGV2_WARNING(8627602,
+                      "The tcmallocReleaseRate value is an amount of bytes to be released "
+                      "per second by the tcmalloc background thread. Setting a low value "
+                      "will likely not result in a noticeable change in behavior.");
+    }
+    setMemoryReleaseRate(value);
+    return Status::OK();
+}
+
+Status onUpdateHeapProfilingSampleIntervalBytes(long long newValue) {
+#ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+    tcmalloc::MallocExtension::SetProfileSamplingRate(newValue);
+#else
+    LOGV2_WARNING(
+        8872800,
+        "The heapProfilingSampleIntervalBytes server parameter is only configurable at startup "
+        "when using the old TCMalloc. Setting this parameter will have no effect.");
+#endif
+
+    return Status::OK();
+}
+
+Status validateHeapProfilingSampleIntervalBytes(long long newValue,
+                                                const boost::optional<TenantId>& tenantId) {
+    const long long heapProfilerMinRate = 10000;  // 10kB
+    if (newValue == 0 || newValue >= heapProfilerMinRate) {
+        return Status::OK();
+    }
+
+    return {
+        ErrorCodes::BadValue,
+        fmt::format("heapProfilingSampleIntervalBytes must have a minimum rate of {} bytes or be "
+                    "disabled with a rate of 0.",
+                    heapProfilerMinRate)};
+}
+
+// Callback function pointer for updating heap profiler max objects.
+// This is set by heap_profiler.cpp at startup if heap profiling is available.
+std::function<void(long long)> heapProfilingMaxObjectsCallback;
+
+void setHeapProfilingMaxObjectsCallback(std::function<void(long long)> callback) {
+    heapProfilingMaxObjectsCallback = std::move(callback);
+}
+
+Status onUpdateHeapProfilingMaxObjects(long long newValue) {
+    if (heapProfilingMaxObjectsCallback) {
+        heapProfilingMaxObjectsCallback(newValue);
+    } else {
+        LOGV2_WARNING(11746200,
+                      "heapProfilingMaxObjects runtime update ignored. Runtime updates require "
+                      "tcmalloc-google on POSIX. Startup values are still applied.");
+    }
+    return Status::OK();
+}
+
+namespace {
+
+MONGO_INITIALIZER_GENERAL(TcmallocConfigurationDefaults, (), ("BeginStartupOptionHandling"))
+(InitializerContext*) {
+#ifdef MONGO_CONFIG_TCMALLOC_GPERF
+    ProcessInfo pi;
+    size_t systemMemorySizeMB = pi.getMemSizeMB();
+    // Before processing the command line options, if the user has not specified a value in via
+    // the environment, set tcmalloc.max_total_thread_cache_bytes to its default value.
+    if (getenv("TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES")) {
+        return;
+    }
+    size_t defaultTcMallocCacheSize = 1024 * 1024 * 1024;  // 1024MB in bytes
+    size_t derivedTcMallocCacheSize =
+        (systemMemorySizeMB / 8) * 1024 * 1024;  // 1/8 of system memory in bytes
+    size_t cacheSize = std::min(defaultTcMallocCacheSize, derivedTcMallocCacheSize);
+
+    try {
+        setTcmallocProperty(kMaxTotalThreadCacheBytesPropertyName, cacheSize);
+    } catch (const ExceptionFor<ErrorCodes::InternalError>& ex) {
+        LOGV2_ERROR(8646001,
+                    "Could not set tcmallocMaxTotalThreadCacheBytes",
+                    "reason"_attr = ex.toString());
+    }
+
+#elif defined(MONGO_CONFIG_TCMALLOC_GOOGLE)
+    tcmalloc::MallocExtension::SetProfileSamplingRate(HeapProfilingSampleIntervalBytes);
+#endif  // MONGO_CONFIG_TCMALLOC_GPERF
+}
+
+}  // namespace
+}  // namespace mongo

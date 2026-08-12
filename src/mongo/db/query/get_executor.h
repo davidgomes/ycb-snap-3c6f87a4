@@ -1,0 +1,212 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/exec/classic/delete_stage.h"
+#include "mongo/db/exec/classic/update_stage.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/canonical_distinct.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/count_command_gen.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/query/write_ops/canonical_delete.h"
+#include "mongo/db/query/write_ops/canonical_update.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/update/update_driver.h"
+#include "mongo/executor/task_executor_cursor.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <memory>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+
+class Collection;
+class CollectionPtr;
+class CountRequest;
+
+/**
+ * Make an ExpressionContext to be used for non-aggregate commands. The result of this can be passed
+ * into any of the getExecutor* functions.
+ *
+ * Note that the getExecutor* functions may change the collation on the returned ExpressionContext
+ * if the collection has a default collation and no collation was specifically requested
+ * ('requestCollation' is empty).
+ */
+boost::intrusive_ptr<ExpressionContext> makeExpressionContextForGetExecutor(
+    OperationContext* opCtx,
+    const BSONObj& requestCollation,
+    const NamespaceString& nss,
+    boost::optional<ExplainOptions::Verbosity> verbosity);
+
+/**
+ * Gets a plan executor for a query. If the query is valid and an executor could be created, returns
+ * a StatusWith with the PlanExecutor. If the query cannot be executed, returns a Status indicating
+ * why.
+ *
+ * If the caller provides a 'pipeline' pointer and the query is eligible for running in SBE, a
+ * prefix of the pipeline might be moved into the provided 'canonicalQuery' for pushing down into
+ * the find layer.
+ */
+[[MONGO_MOD_PUBLIC]] StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
+getExecutorFind(OperationContext* opCtx,
+                const MultipleCollectionAccessor& collections,
+                std::unique_ptr<CanonicalQuery> canonicalQuery,
+                PlanYieldPolicy::YieldPolicy yieldPolicy,
+                size_t plannerOptions = QueryPlannerParams::DEFAULT,
+                Pipeline* pipeline = nullptr,
+                bool needsMerge = false,
+                boost::optional<TraversalPreference> traversalPreference = boost::none);
+
+StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getSearchMetadataExecutorSBE(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ExpressionContext& expCtx,
+    std::unique_ptr<executor::TaskExecutorCursor> metadataCursor);
+
+/**
+ * Attempts to get a query solution that uses a DISTINCT_SCAN, intended for either a "distinct"
+ * command or an aggregation pipeline that uses a $group stage with distinct-like semantics. If a
+ * DISTINCT_SCAN cannot be created for the given arguments, returns
+ * ErrorCodes::NoQueryExecutionPlans.
+ *
+ * Specify the QueryPlannerParams::STRICT_DISTINCT_ONLY flag in the 'plannerOptions' argument to
+ * ensure that any resulting plan _guarantees_ it will return exactly one document per value of the
+ * distinct field. For example, a DISTINCT_SCAN over index {a: 1, b: 1} will return documents that
+ * are equal on both the 'a' and 'b' fields, meaning that there might be duplicated values of 'b' if
+ * the corresponding values of 'a' are distinct. The distinct('b') command can reduce this set
+ * further to only return distinct values of 'b', but {$group: {_id: '$b'}} doesn't do the further
+ * reduction and instead would set the STRICT_DISTINCT_ONLY flag to prevent choosing a DISTINCT_SCAN
+ * over the {a: 1, b: 1} index.
+ *
+ * Providing QueryPlannerParams::STRICT_DISTINCT_ONLY also implies that the resulting plan will not
+ * "unwind" arrays. That is, it will not return separate values for each element in an array. For
+ * example, in a collection with documents {a: [10, 11]}, {a: 12}, the distinct('a') command
+ * should return "unwound" values 10, 11, and 12, but {$group: {_id: '$a'}} needs to see the
+ * documents for the original [10, 11] and 12 values. Thus, the latter would use the
+ * STRICT_DISTINCT_ONLY option to preserve the arrays.
+ *
+ * A third meaning of QueryPlannerParams::STRICT_DISTINCT_ONLY is to indicate we expect to not
+ * perform a distinct scan if its over a sparse index. For example, if the collection has a document
+ * {b: 5} and an index on {a: 1}, the distinct('a') command would return no results since the
+ * distinct command ignores missing fields. If the index {a: 1} was sparse, this would not affect
+ * the results as the sparse index does not cover missing fields. However, {$group: {_id: '$a'}}
+ * should return the result {_id: null} because $group treats missing fields as null. Thus, the
+ * $group would use the STRICT_DISTINCT_ONLY option to ensure that we do not ignore missing fields
+ * by using a distinct scan over a sparse index.
+ */
+StatusWith<std::unique_ptr<QuerySolution>> tryGetQuerySolutionForDistinct(
+    const MultipleCollectionAccessor& collections,
+    size_t plannerOptions,
+    const CanonicalQuery& canonicalQuery,
+    bool flipDistinctScanDirection = false);
+
+/**
+ * Get a PlanExecutor for a query solution that includes a DISTINCT_SCAN.
+ */
+StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
+    const MultipleCollectionAccessor& collections,
+    size_t plannerOptions,
+    std::unique_ptr<CanonicalQuery> canonicalQuery,
+    std::unique_ptr<QuerySolution> soln);
+
+/*
+ * Get a PlanExecutor for a query executing as part of a count command.
+ *
+ * Count doesn't care about actually examining its results; it just wants to walk through them.
+ * As such, with certain covered queries, we can skip the overhead of fetching etc. when
+ * executing a count.
+ *
+ * 'count' is required because the skip and limit values are not propagated from the count command
+ * to 'parsedFind' when calling parsed_find_command::parseFromCount.
+ */
+StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const CollectionAcquisition& collection,
+    std::unique_ptr<ParsedFindCommand> parsedFind,
+    const CountCommandRequest& count);
+
+/**
+ * Get a PlanExecutor for a delete operation. 'canonicalDelete' describes the query predicate
+ * and delete flags like 'isMulti'. The caller must hold the appropriate MODE_X or MODE_IX
+ * locks, and must not release these locks until after the returned PlanExecutor is deleted.
+ *
+ * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
+ *
+ * If the delete operation is executed in explain mode, the 'verbosity' parameter should be
+ * set to the requested verbosity level, or boost::none otherwise.
+ *
+ * The returned PlanExecutor will used the YieldPolicy returned by canonicalDelete->yieldPolicy().
+ *
+ * Does not take ownership of its arguments.
+ *
+ * If the query is valid and an executor could be created, returns a StatusWith with the
+ * PlanExecutor.
+ *
+ * If the query cannot be executed, returns a Status indicating why.
+ */
+[[MONGO_MOD_PUBLIC]] StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
+getExecutorDelete(OpDebug* opDebug,
+                  CollectionAcquisition coll,
+                  CanonicalDelete& canonicalDelete,
+                  boost::optional<ExplainOptions::Verbosity> verbosity);
+
+/**
+ * Get a PlanExecutor for an update operation. 'canonicalUpdate' describes the query predicate
+ * and update modifiers. The caller must hold the appropriate MODE_X or MODE_IX locks prior
+ * to calling this function, and must not release these locks until after the returned
+ * PlanExecutor is deleted.
+ *
+ * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
+ *
+ * If the delete operation is executed in explain mode, the 'verbosity' parameter should be
+ * set to the requested verbosity level, or boost::none otherwise.
+ *
+ * The returned PlanExecutor will used the YieldPolicy returned by canonicalUpdate->yieldPolicy().
+ *
+ * Does not take ownership of its arguments.
+ *
+ * If the query is valid and an executor could be created, returns a StatusWith with the
+ * PlanExecutor.
+ *
+ * If the query cannot be executed, returns a Status indicating why.
+ */
+[[MONGO_MOD_PUBLIC]] StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
+getExecutorUpdate(OpDebug* opDebug,
+                  CollectionAcquisition coll,
+                  CanonicalUpdate& canonicalUpdate,
+                  boost::optional<ExplainOptions::Verbosity> verbosity);
+
+/**
+ * Direction of collection scan plan executor returned by makeCollectionScanPlanExecutor() below.
+ */
+enum class [[MONGO_MOD_PUBLIC]] CollectionScanDirection {
+    kForward = 1,
+    kBackward = -1,
+};
+
+[[MONGO_MOD_PUBLIC]] std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> getCollectionScanExecutor(
+    OperationContext* opCtx,
+    const CollectionAcquisition& collection,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    CollectionScanDirection scanDirection,
+    const boost::optional<RecordId>& resumeAfterRecordId = boost::none);
+
+}  // namespace mongo

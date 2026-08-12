@@ -1,0 +1,226 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/query/search/search_task_executors.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/commands/server_status/server_status.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/search/mongot_options.h"
+#include "mongo/db/query/search/search_index_options.h"
+#include "mongo/executor/connection_pool_controllers.h"
+#include "mongo/executor/connection_pool_stats.h"
+#include "mongo/executor/network_interface_factory.h"
+#include "mongo/executor/network_interface_thread_pool.h"
+#include "mongo/executor/pinned_connection_task_executor_registry.h"
+#include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/synchronized_value.h"
+
+#include <memory>
+#include <string_view>
+#include <utility>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kExecutor
+
+
+namespace mongo {
+namespace executor {
+
+namespace {
+
+ConnectionPool::Options makeMongotConnPoolOptions() {
+    ConnectionPool::Options mongotOptions;
+    mongotOptions.skipAuthentication = globalMongotParams.skipAuthToMongot;
+    mongotOptions.controllerFactory = [] {
+        return std::make_shared<DynamicLimitController>(
+            [] { return globalMongotParams.minConnections.load(); },
+            [] { return globalMongotParams.maxConnections.load(); },
+            "MongotDynamicLimitController");
+    };
+    return mongotOptions;
+}
+
+struct State {
+    State() {
+        constexpr std::string_view kMongotExecutorName = "MongotExecutor";
+        constexpr std::string_view kSearchIndexManagementExecutorName = "SearchIndexMgmtExecutor";
+
+        std::unique_ptr<NetworkInterface> mongotExecutorNetworkInterface;
+        std::unique_ptr<NetworkInterface> searchIdxNetworkInterface;
+
+        if (globalMongotParams.useGRPC) {
+#ifdef MONGO_CONFIG_GRPC
+            mongotExecutorNetworkInterface = makeNetworkInterfaceGRPC(kMongotExecutorName);
+            searchIdxNetworkInterface =
+                makeNetworkInterfaceGRPC(kSearchIndexManagementExecutorName);
+#else
+            uasserted(ErrorCodes::InvalidOptions,
+                      "useGrpcForSearch is enabled but this build was compiled without gRPC "
+                      "support. Rebuild with gRPC or disable useGrpcForSearch.");
+#endif
+        } else {
+            mongotExecutorNetworkInterface = makeNetworkInterface(
+                kMongotExecutorName, nullptr, nullptr, makeMongotConnPoolOptions());
+
+            // Make a separate search index management NetworkInterface that's independently
+            // configurable.
+            ConnectionPool::Options searchIndexPoolOptions;
+            searchIndexPoolOptions.skipAuthentication =
+                globalSearchIndexParams.skipAuthToSearchIndexServer;
+            searchIdxNetworkInterface = makeNetworkInterface(kSearchIndexManagementExecutorName,
+                                                             nullptr,
+                                                             nullptr,
+                                                             std::move(searchIndexPoolOptions));
+        }
+
+        auto mongotThreadPool =
+            std::make_unique<NetworkInterfaceThreadPool>(mongotExecutorNetworkInterface.get());
+        mongotExecutor = ThreadPoolTaskExecutor::create(std::move(mongotThreadPool),
+                                                        std::move(mongotExecutorNetworkInterface));
+
+        auto searchIndexThreadPool =
+            std::make_unique<NetworkInterfaceThreadPool>(searchIdxNetworkInterface.get());
+        searchIndexMgmtExecutor = ThreadPoolTaskExecutor::create(
+            std::move(searchIndexThreadPool), std::move(searchIdxNetworkInterface));
+    }
+
+    synchronized_value<std::shared_ptr<TaskExecutor>> mongotExecutor;
+    synchronized_value<std::shared_ptr<TaskExecutor>> searchIndexMgmtExecutor;
+};
+
+const auto getExecutorHolder = ServiceContext::declareDecoration<State>();
+
+Rarely _shutdownLogSampler;
+
+void destroyTaskExecutor(synchronized_value<std::shared_ptr<TaskExecutor>>& executor) {
+    // We have just shut down this TaskExecutor, so it should start rejecting all new requests and
+    // we should soon be able to destroy it. We want to make sure that the TaskExecutor gets
+    // destructed here so that it frees all its resources (e.g. GRPC clients) before continuing.
+    // However, any in progress search operations also keep a shared_ptr reference to the object, so
+    // they may still be concurrently accessing the object, and their reference count will keep the
+    // object alive - resetting the global pointer isn't enough to guarantee that it is destructed.
+    // We exchange our shared_ptr for a weak pointer here and wait for it to be expired so that we
+    // know that all references are gone. This line will result in setting the input parameter to
+    // null.
+    std::weak_ptr<executor::TaskExecutor> weakReference(std::exchange(**executor, {}));
+
+    // Tick the log sampler in advance to avoid logging immediately - only log if it's a long wait.
+    _shutdownLogSampler.tick();
+
+    while (!weakReference.expired()) {
+        if (_shutdownLogSampler.tick()) {
+            LOGV2_INFO(11323800, "Waiting for search task executor to be destroyed.");
+        }
+        sleepFor(Milliseconds(100));
+    }
+}
+
+void shutdownTaskExecutor(ServiceContext* svc,
+                          synchronized_value<std::shared_ptr<TaskExecutor>>& executor) {
+    {
+        auto execPtr = executor.get();
+        // The underlying TaskExecutor must outlive any PinnedConnectionTaskExecutor that uses it,
+        // so we must drain PCTEs first and then shut down the executor.
+        shutdownPinnedExecutors(svc, execPtr);
+        execPtr->shutdown();
+        execPtr->join();
+    }
+    destroyTaskExecutor(executor);
+}
+
+// TODO (SERVER-126178): Remove this server status section and add to connPoolStats.
+class SearchTaskExecutorServerStatusSection : public ServerStatusSection {
+public:
+    using ServerStatusSection::ServerStatusSection;
+
+    bool includeByDefault() const override {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement&) const override {
+        BSONObjBuilder bob;
+        auto* svc = opCtx->getServiceContext();
+
+        auto appendStats = [&](std::string_view key,
+                               const StatusWith<std::shared_ptr<TaskExecutor>>& sw) {
+            if (!sw.isOK())
+                return;
+            auto& exec = sw.getValue();
+            BSONObjBuilder sub = bob.subobjStart(key);
+            {
+                BSONObjBuilder diagnosticInfo = sub.subobjStart("diagnosticInfo");
+                exec->appendDiagnosticBSON(&diagnosticInfo);
+            }
+            {
+                BSONObjBuilder networkInterface = sub.subobjStart("networkInterface");
+                exec->appendNetworkInterfaceStats(networkInterface, true /*forServerStatus*/);
+            }
+            {
+                BSONObjBuilder connectionPool = sub.subobjStart("connectionPool");
+                executor::ConnectionPoolStats poolStats{};
+                exec->appendConnectionStats(&poolStats);
+                poolStats.appendToBSON(connectionPool);
+            }
+        };
+
+        appendStats("mongot", getMongotTaskExecutor(svc));
+        appendStats("searchIndex", getSearchIndexManagementTaskExecutor(svc));
+        return bob.obj();
+    }
+};
+
+const auto& searchTaskExecutorSection =
+    *ServerStatusSectionBuilder<SearchTaskExecutorServerStatusSection>("searchTaskExecutorMetrics");
+
+}  // namespace
+
+StatusWith<std::shared_ptr<TaskExecutor>> getMongotTaskExecutor(ServiceContext* svc) {
+    if (auto mongotExec = getExecutorHolder(svc).mongotExecutor.get()) {
+        return mongotExec;
+    }
+    return {ErrorCodes::ShutdownInProgress, "mongot task executor is shutting down"};
+}
+
+StatusWith<std::shared_ptr<TaskExecutor>> getSearchIndexManagementTaskExecutor(
+    ServiceContext* svc) {
+    if (auto indexMgmtExec = getExecutorHolder(svc).searchIndexMgmtExecutor.get()) {
+        return indexMgmtExec;
+    }
+    return {ErrorCodes::ShutdownInProgress,
+            "search index management task executor is shutting down"};
+}
+
+void startupSearchExecutorsIfNeeded(ServiceContext* svc) {
+    auto& holder = getExecutorHolder(svc);
+    if (!globalMongotParams.host.empty()) {
+        LOGV2_INFO(8267400, "Starting up mongot task executor.");
+        (**holder.mongotExecutor)->startup();
+    }
+
+    if (!globalSearchIndexParams.host.empty()) {
+        LOGV2_INFO(8267401, "Starting up search index management task executor.");
+        (**holder.searchIndexMgmtExecutor)->startup();
+    }
+}
+
+void shutdownSearchExecutorsIfNeeded(ServiceContext* svc) {
+    auto& state = getExecutorHolder(svc);
+    if (!globalMongotParams.host.empty()) {
+        LOGV2_INFO(10026102, "Shutting down mongot task executor.");
+        shutdownTaskExecutor(svc, state.mongotExecutor);
+        LOGV2_INFO(11323801, "Finished shutting down mongot task executor.");
+    }
+
+    if (!globalSearchIndexParams.host.empty()) {
+        LOGV2_INFO(10026103, "Shutting down search index management task executor.");
+        shutdownTaskExecutor(svc, state.searchIndexMgmtExecutor);
+        LOGV2_INFO(11323802, "Finished shutting down search index management task executor.");
+    }
+}
+
+}  // namespace executor
+}  // namespace mongo

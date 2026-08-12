@@ -1,0 +1,156 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_cache/sbe_plan_cache.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_explainer.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/serialization_context.h"
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+class Collection;
+class MultipleCollectionAccessor;
+class OperationContext;
+class PlanExecutorPipeline;
+struct PlanSummaryStats;
+
+/**
+ * Namespace for the collection of static methods used to generate explain information.
+ */
+class Explain {
+public:
+    struct PlannerContext {
+        bool mainCollExists;
+        boost::optional<uint32_t> planCacheShapeHash;
+        boost::optional<uint32_t> planCacheKeyHash;
+        bool indexFilterSet;
+    };
+
+    /**
+     * Get explain BSON for the execution stages contained by 'exec'. Use this function if you
+     * have a PlanExecutor and want to convert it into a human readable explain format. Any
+     * operation which has a query component (e.g. find, update, group) can be explained via
+     * this function.
+     *
+     * The explain information is extracted from 'exec' and added to the out-parameter 'out'.
+     *
+     * The explain information is generated with the level of detail specified by 'verbosity'.
+     *
+     * The 'extraInfo' parameter specifies additional information to include into the output.
+     *
+     * The 'command' parameter represents the command object that is being explained.
+     *
+     * Does not take ownership of its arguments.
+     *
+     * During this call it may be required to execute the plan to collect statistics. If the
+     * PlanExecutor uses 'kLockExternally' lock policy, the caller should hold at least an IS lock
+     * on the collection the that the query runs on, even if 'collection' parameter is nullptr.
+     *
+     * If there is an error during the execution of the query, the error message and code are
+     * added to the "executionStats" section of the explain.
+     */
+    static void explainStages(PlanExecutor* exec,
+                              const CollectionAcquisition& collection,
+                              ExplainOptions::Verbosity verbosity,
+                              BSONObj extraInfo,
+                              const SerializationContext& serializationContext,
+                              const BSONObj& command,
+                              BSONObjBuilder* out);
+
+    /**
+     * Similar to the above function, but takes in multiple collections instead to support
+     * aggregation that involves multiple collections (e.g. $lookup).
+     */
+    static void explainStages(PlanExecutor* exec,
+                              const MultipleCollectionAccessor& collections,
+                              ExplainOptions::Verbosity verbosity,
+                              BSONObj extraInfo,
+                              const SerializationContext& serializationContext,
+                              const BSONObj& command,
+                              BSONObjBuilder* out);
+
+    /**
+     * Adds "queryPlanner" and "executionStats" (if requested in verbosity) fields to 'out'. Unlike
+     * the other overload of explainStages() above, this one does not add the "serverInfo" section.
+     *
+     * - 'exec' is the stage tree for the operation being explained.
+     * - 'collections' are the relevant main and secondary collections (e.g. for $lookup). If the
+     * PlanExecutor uses 'kLockExternally' lock policy, the caller should hold the necessary db_raii
+     * object on the involved collections.
+     * - 'verbosity' is the verbosity level of the explain.
+     * - 'extraInfo' specifies additional information to include into the output.
+     * - 'executePlanStatus' is the status returned after executing the query (Status::OK if the
+     * query wasn't executed).
+     * - 'winningPlanTrialStats' is the stats of the winning plan during the trial period. May be
+     * nullptr.
+     * - 'command' represents the command object that is being explained.
+     * - 'out' is the builder for the explain output.
+     */
+    static void explainStages(
+        PlanExecutor* exec,
+        const MultipleCollectionAccessor& collections,
+        ExplainOptions::Verbosity verbosity,
+        Status executePlanStatus,
+        boost::optional<PlanExplainer::PlanStatsDetails> winningPlanTrialStats,
+        BSONObj extraInfo,
+        const SerializationContext& serializationContext,
+        const BSONObj& command,
+        BSONObjBuilder* out);
+
+    /**
+     * Like the helper above but it accepts cached collection information from the catalog as
+     * context to generate the planner info
+     */
+    static void explainStages(
+        PlanExecutor* exec,
+        const PlannerContext& plannerContext,
+        ExplainOptions::Verbosity verbosity,
+        Status executePlanStatus,
+        boost::optional<PlanExplainer::PlanStatsDetails> winningPlanTrialStats,
+        BSONObj extraInfo,
+        const SerializationContext& serializationContext,
+        const BSONObj& command,
+        BSONObjBuilder* out);
+
+    /**
+     * Gets explain BSON for the document sources contained by 'exec'. Use this function if you have
+     * a PlanExecutor for a pipeline and want to turn it into a human readable explain format.
+     *
+     * The explain information is generated with the level of detail specified by 'verbosity'.
+     *
+     * If 'verbosity' >= 'kExecStats' the 'executePipeline' flag is used to indicate whether the
+     * pipeline needs to be executed first, before the stats is collected. Otherwise, it is assumed
+     * that the plan was already executed until EOF and the stats are ready for collection.
+     *
+     * The 'command' parameter represents the command object that is being explained.
+     */
+    static void explainPipeline(PlanExecutor* exec,
+                                bool executePipeline,
+                                ExplainOptions::Verbosity verbosity,
+                                const BSONObj& command,
+                                BSONObjBuilder* out);
+
+    /**
+     * Serializes a PlanCacheEntry to the provided BSON object builder. The output format is
+     * intended to be human readable, and useful for debugging query performance problems related to
+     * the plan cache.
+     */
+    static void planCacheEntryToBSON(const mongo::PlanCacheEntry& entry, BSONObjBuilder* out);
+    static void planCacheEntryToBSON(const mongo::sbe::PlanCacheEntry& entry, BSONObjBuilder* out);
+
+    static Explain::PlannerContext makePlannerContext(
+        const PlanExecutor& exec, const MultipleCollectionAccessor& collections);
+};
+
+}  // namespace mongo

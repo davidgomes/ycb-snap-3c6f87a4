@@ -1,0 +1,182 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/util/modules.h"
+
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+[[MONGO_MOD_PUBLIC]];
+
+namespace mongo {
+
+/** Context of an initialization process. Passed as a parameter to initialization functions. */
+class InitializerContext {
+public:
+    explicit InitializerContext(std::vector<std::string> args) : _args(std::move(args)) {}
+
+    const std::vector<std::string>& args() const {
+        return _args;
+    }
+
+private:
+    std::vector<std::string> _args;
+};
+
+/** Context of a deinitialization process. Passed as a parameter to deinitialization functions. */
+class DeinitializerContext {
+public:
+    DeinitializerContext() = default;
+    DeinitializerContext(const DeinitializerContext&) = delete;
+    DeinitializerContext& operator=(const DeinitializerContext&) = delete;
+};
+
+/**
+ * An InitializerFunction implements the behavior of an initializer operation.
+ * It may inspect and mutate the supplied InitializerContext.
+ * Throws on failure.
+ */
+using InitializerFunction = std::function<void(InitializerContext*)>;
+
+/**
+ * A DeinitializerFunction implements the behavior of a deinitializer operation.
+ * It may inspect and mutate the supplied DeinitializerContext.
+ * Throws on failure.
+ */
+using DeinitializerFunction = std::function<void(DeinitializerContext*)>;
+
+
+/**
+ * Class representing an initialization process.
+ *
+ * Such a process is described by a directed acyclic graph of initialization operations, the
+ * InitializerDependencyGraph. One constructs an initialization process by adding nodes and
+ * edges to the graph.  Then, one executes the process, causing each initialization operation to
+ * execute in an order that respects the programmer-established prerequistes.
+ *
+ * The initialize and delinitialize process can repeat, a features which
+ * supports embedded contexts.  However, the graph cannot be modified with
+ * `addInitializer` after the first initialization. Latecomers are rejected.
+ */
+class Initializer {
+public:
+    Initializer();
+    ~Initializer();
+
+    /**
+     * Add a new initializer node, with the specified `name`, to the dependency graph, with the
+     * given behavior, `initFn`, `deinitFn`, and with the given `prerequisites` and `dependents`,
+     * which are the names of other initializers which will be in the graph when `topSort`
+     * is called. `initFn` must be non-null, but null-valued `deinitFn` are allowed.
+     *
+     * - Throws `ErrorCodes::BadValue` if `initFn` is null-valued.
+     *
+     * - Throws with `ErrorCodes::CannotMutateObject` if the graph has been frozen
+     *   by a previous call to `executeInitializers`.
+     */
+    void addInitializer(std::string name,
+                        InitializerFunction initFn,
+                        DeinitializerFunction deinitFn,
+                        std::vector<std::string> prerequisites,
+                        std::vector<std::string> dependents);
+
+    /**
+     * Execute the initializer process, using the given args as input.
+     * This call freezes the graph, so that addInitializer will reject any latecomers.
+     *
+     * Throws on initialization failures, or on invalid call sequences
+     * (double-init, double-deinit, etc) and the thing being initialized should
+     * be considered dead in the water.
+     */
+    void executeInitializers(const std::vector<std::string>& args);
+
+    /**
+     * Executes all deinit functions in reverse order from init order.
+     * Note that this does not unfreeze the graph. Freezing is permanent.
+     */
+    void executeDeinitializers();
+
+    /**
+     * Returns the function mapped to `name`, for testing only.
+     *
+     * Throws with `ErrorCodes::BadValue` if name is not mapped to a node.
+     */
+    InitializerFunction getInitializerFunctionForTesting(const std::string& name);
+
+private:
+    class Graph;
+
+    /**
+     *  kNeverInitialized
+     *  |
+     *  +-> kUninitialized <----------+
+     *      |                         |
+     *      +-> kInitializing         |
+     *          |                     |
+     *          +-> kInitialized      |
+     *              |                 |
+     *              +-> kDeinitializing
+     */
+    enum class State {
+        kNeverInitialized,  ///< still accepting addInitializer calls
+        kUninitialized,
+        kInitializing,
+        kInitialized,
+        kDeinitializing,
+    };
+
+    void _transition(State expected, State next);
+
+    std::unique_ptr<Graph> _graph;  // pimpl
+    std::vector<std::string> _sortedNodes;
+    State _lifecycleState = State::kNeverInitialized;
+};
+
+/**
+ * In order to more easily debug failures in the dependency graph between initializers,
+ * the --initializerShuffleSeed option specifies the shuffle order used to sort the initializer
+ * graph. However, we have not yet parsed the server options, and so the parameter's value is
+ * extracted here.
+ */
+unsigned extractRandomSeedFromOptions(const std::vector<std::string>& argsList);
+
+/**
+ * Get the process-global initializer object.
+ */
+Initializer& getGlobalInitializer();
+
+/**
+ * Run the global initializers.
+ *
+ * It's a programming error for this to fail, but if it does it will return a status other
+ * than Status::OK.
+ *
+ * This means that the few initializers that might want to terminate the program by failing
+ * should probably arrange to terminate the process themselves.
+ */
+Status runGlobalInitializers(const std::vector<std::string>& argv);
+
+/**
+ * Same as runGlobalInitializers(), except prints a brief message to std::cerr
+ * and terminates the process on failure.
+ */
+void runGlobalInitializersOrDie(const std::vector<std::string>& argv);
+
+/**
+ * Run the global deinitializers. They will execute in reverse order from initialization.
+ *
+ * It's a programming error for this to fail, but if it does it will return a status other
+ * than Status::OK.
+ *
+ * This means that the few initializers that might want to terminate the program by failing
+ * should probably arrange to terminate the process themselves.
+ */
+Status runGlobalDeinitializers();
+
+}  // namespace mongo

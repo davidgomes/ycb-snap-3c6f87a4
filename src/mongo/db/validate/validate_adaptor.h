@@ -1,0 +1,165 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/validate/key_string_index_consistency.h"
+#include "mongo/db/validate/validate_results.h"
+#include "mongo/db/validate/validate_state.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/progress_meter.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <span>
+
+namespace mongo {
+
+namespace collection_validation {
+/**
+ * Returns the number of additional characters (N) we are appending to each hashPrefix
+ * that is passed in.
+ *
+ * The value of N is determined by the number of hashPrefixes provided. For each hashPrefix
+ * provided, adding N characters means we will have potentially 16 ^ N buckets being created.
+ * "Potentially" because some buckets may not be created if no documents hash to those buckets.
+ *
+ * Therefore this function ensures that we attach a number of characters so that we don't create
+ * too many buckets, as creating too many buckets would mean exceeding the maximum BSON size
+ * in our final response to the client.
+ *
+ * numHashPrefixes must be greater than 0, and hashPrefixLength must be less than or equal to
+ * the size of a hash.
+ */
+size_t getNumberOfAdditionalCharactersForHashDrillDown(size_t numHashPrefixes,
+                                                       size_t hashPrefixLength);
+}  // namespace collection_validation
+
+class IndexDescriptor;
+class OperationContext;
+
+/**
+ * The validate adaptor is used to keep track of collection and index consistency during a running
+ * collection validation operation.
+ */
+class ValidateAdaptor {
+public:
+    ValidateAdaptor(OperationContext* opCtx, collection_validation::ValidateState* validateState)
+
+        : _keyBasedIndexConsistency(opCtx, validateState), _validateState(validateState) {}
+
+    struct ValidateRecordResult {
+        Status status{Status::OK()};
+        int dataSize{0};
+        boost::optional<std::string> errorMessage{boost::none};
+    };
+    /**
+     * Validates the record data and traverses through its key set to keep track of the index
+     * consistency. Returns the status from the record validation, and if a specific error was added
+     * during record validation, returns that error as well.
+     */
+    auto validateRecord(OperationContext* opCtx,
+                        const RecordId& recordId,
+                        const RecordData& record,
+                        long long& nNonCompliantDocuments,
+                        long long& nInvalidDocuments,
+                        ValidateResults* results,
+                        std::span<const IndexCatalogEntry*> indexCatalogEntries,
+                        ValidationVersion validationVersion = currentValidationVersion)
+        -> ValidateRecordResult;
+    /**
+     * Traverses the record store to retrieve every record and go through its document key
+     * set to keep track of the index consistency during a validation.
+     */
+    void traverseRecordStore(OperationContext* opCtx,
+                             ValidateResults* results,
+                             ValidationVersion validationVersion);
+    /**
+     * Computes the hash of the collection's local catalog idents and sets it in 'results'.
+     **/
+    void computeMetadataHash(OperationContext* opCtx,
+                             const CollectionPtr& coll,
+                             ValidateResults* results);
+
+    /**
+     * For a given set of hash prefixes, outputs an order independent hash of all the documents
+     * whose _id hashes to each hash prefix.
+     **/
+    void hashDrillDown(OperationContext* opCtx, ValidateResults* results);
+
+    /**
+     * Traverses the index getting index entries to validate them and keep track of the index keys
+     * for index consistency.
+     */
+    void traverseIndex(OperationContext* opCtx,
+                       const IndexCatalogEntry* index,
+                       int64_t* numTraversedKeys,
+                       ValidateResults* results);
+
+    /**
+     * Traverses a record on the underlying index consistency objects.
+     */
+    void traverseRecord(OperationContext* opCtx,
+                        const CollectionPtr& coll,
+                        const IndexCatalogEntry* index,
+                        const RecordId& recordId,
+                        const BSONObj& record,
+                        ValidateResults* results);
+
+    /**
+     * Validates that the number of document keys matches the number of index keys previously
+     * traversed in traverseIndex().
+     */
+    void validateIndexKeyCount(OperationContext* opCtx,
+                               const IndexCatalogEntry* index,
+                               IndexValidateResults& results);
+
+    /**
+     * Informs the index consistency objects that we're advancing to the second phase of index
+     * validation.
+     */
+    void setSecondPhase();
+
+    /**
+     * Sets up the index consistency objects to limit memory usage in the second phase of index
+     * validation. Returns whether the memory limit is sufficient to report at least one index entry
+     * inconsistency and continue with the second phase of validation.
+     */
+    bool limitMemoryUsageForSecondPhase(ValidateResults* result);
+
+    /**
+     * Returns true if the underlying index consistency objects have entry mismatches.
+     */
+    bool haveEntryMismatch() const;
+
+    /**
+     * If repair mode enabled, try inserting _missingIndexEntries into indexes.
+     */
+    void repairIndexEntries(OperationContext* opCtx, ValidateResults* results);
+
+    /**
+     * Records the errors gathered from the second phase of index validation into the provided
+     * ValidateResultsMap and ValidateResults.
+     */
+    void addIndexEntryErrors(OperationContext* opCtx, ValidateResults* results);
+
+private:
+    KeyStringIndexConsistency _keyBasedIndexConsistency;
+    collection_validation::ValidateState* _validateState;
+
+    // Saves the record count from the record store traversal to be used later to validate the index
+    // entries count. Reset every time traverseRecordStore() is called.
+    long long _numRecords = 0;
+
+    // For reporting progress during record store and index traversal.
+    ProgressMeterHolder _progress;
+};
+}  // namespace mongo

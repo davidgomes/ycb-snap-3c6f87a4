@@ -1,0 +1,1386 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/util/net/ssl_manager.h"
+
+#include "mongo/base/data_view.h"
+#include "mongo/base/init.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/internal_auth.h"
+#include "mongo/config.h"
+#include "mongo/db/auth/sasl_command_constants.h"
+#include "mongo/db/commands/server_status/server_status.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/overflow_arithmetic.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer_manager.h"
+#include "mongo/util/ctype.h"
+#include "mongo/util/hex.h"
+#include "mongo/util/icu.h"
+#include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_parameters_gen.h"
+#include "mongo/util/net/ssl_types.h"
+#include "mongo/util/str.h"
+#include "mongo/util/synchronized_value.h"
+#include "mongo/util/text.h"
+
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/algorithm/string.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+SSLManagerCoordinator* theSSLManagerCoordinator;
+
+namespace {
+
+// This function returns true if the character is supposed to be escaped according to the rules
+// in RFC4514. The exception to the RFC the space character ' ' and the '#', because we've not
+// required users to escape spaces or sharps in DNs in the past.
+inline bool isEscaped(char ch) {
+    switch (ch) {
+        case '"':
+        case '+':
+        case ',':
+        case ';':
+        case '<':
+        case '>':
+        case '\\':
+            return true;
+        default:
+            return false;
+    }
+}
+
+// These characters may appear escaped in a string or not, but must not appear as the first
+// character.
+inline bool isMayBeEscaped(char ch) {
+    switch (ch) {
+        case ' ':
+        case '#':
+        case '=':
+            return true;
+        default:
+            return false;
+    }
+}
+
+/*
+ * This class parses out the components of a DN according to RFC4514.
+ *
+ * It takes in a std::string_view to the DN to be parsed, the buffer containing the std::string_view
+ * must remain in scope for the duration that it is being parsed.
+ */
+class RFC4514Parser {
+public:
+    explicit RFC4514Parser(std::string_view sd) : _str(sd), _it(_str.begin()) {}
+
+    std::string extractAttributeName();
+
+    enum ValueTerminator {
+        NewRDN,      // The value ended in ','
+        MultiValue,  // The value ended in '+'
+        Done         // The value ended with the end of the string
+    };
+
+    // Returns a decoded string representing one value in an RDN, and the way the value was
+    // terminated.
+    std::pair<std::string, ValueTerminator> extractValue();
+
+    bool done() const {
+        return _it == _str.end();
+    }
+
+    void skipSpaces() {
+        while (!done() && _cur() == ' ') {
+            _advance();
+        }
+    }
+
+private:
+    char _cur() const {
+        uassert(51036, "Overflowed string while parsing DN string", !done());
+        return *_it;
+    }
+
+    char _advance() {
+        invariant(!done());
+        ++_it;
+        return done() ? '\0' : _cur();
+    }
+
+    std::string_view _str;
+    std::string_view::const_iterator _it;
+};
+
+// Parses an attribute name according to the rules for the "descr" type defined in
+// https://tools.ietf.org/html/rfc4512
+std::string RFC4514Parser::extractAttributeName() {
+    StringBuilder sb;
+
+    auto ch = _cur();
+    std::function<bool(char ch)> characterCheck;
+    // If the first character is a digit, then this is an OID and can only contain
+    // numbers and '.'
+    if (ctype::isDigit(ch)) {
+        characterCheck = [](char ch) {
+            return ctype::isDigit(ch) || ch == '.';
+        };
+        // If the first character is an alpha, then this is a short name and can only
+        // contain alpha/digit/hyphen characters.
+    } else if (ctype::isAlpha(ch)) {
+        characterCheck = [](char ch) {
+            return ctype::isAlnum(ch) || ch == '-';
+        };
+        // Otherwise this is an invalid attribute name
+    } else {
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "DN attribute names must begin with either a digit or an alpha"
+                                << " not \'" << ch << "\'");
+    }
+
+    for (; ch != '=' && !done(); ch = _advance()) {
+        if (ch == ' ') {
+            continue;
+        }
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "DN attribute name contains an invalid character \'" << ch << "\'",
+                characterCheck(ch));
+        sb << ch;
+    }
+
+    if (!done()) {
+        _advance();
+    }
+
+    return sb.str();
+}
+
+std::pair<std::string, RFC4514Parser::ValueTerminator> RFC4514Parser::extractValue() {
+    StringBuilder sb;
+
+    // The RFC states the spaces at the beginning and end of the value must be escaped, which
+    // means we should skip any leading unescaped spaces.
+    skipSpaces();
+
+    // Every time we see an escaped space ("\ "), we increment this counter. Every time we see
+    // anything non-space character we reset this counter to zero. That way we'll know the number
+    // of consecutive escaped spaces at the end of the string there are.
+    int trailingSpaces = 0;
+
+    char ch = _cur();
+    uassert(ErrorCodes::BadValue, "Raw DER sequences are not supported in DN strings", ch != '#');
+    for (; ch != ',' && ch != '+' && !done(); ch = _advance()) {
+        if (ch == '\\') {
+            ch = _advance();
+            if (isEscaped(ch)) {
+                sb << ch;
+                trailingSpaces = 0;
+            } else if (ctype::isXdigit(ch)) {
+                const std::array<char, 2> hexValStr = {ch, _advance()};
+
+                uassert(ErrorCodes::BadValue,
+                        str::stream() << "Escaped hex value contains invalid character \'"
+                                      << hexValStr[1] << "\'",
+                        ctype::isXdigit(hexValStr[1]));
+                const char hexVal = hexblob::decodePair(std::string_view(hexValStr.data(), 2));
+                sb << hexVal;
+                if (hexVal != ' ') {
+                    trailingSpaces = 0;
+                } else {
+                    trailingSpaces++;
+                }
+            } else if (isMayBeEscaped(ch)) {
+                // It is legal to escape whitespace, but we don't count it as an "escaped"
+                // character because we don't require it to be escaped within the value, that is
+                // "C=New York" is legal, and so is "C=New\ York"
+                //
+                // The exception is that leading and trailing whitespace must be escaped or else
+                // it will be trimmed.
+                sb << ch;
+                if (ch == ' ') {
+                    trailingSpaces++;
+                } else {
+                    trailingSpaces = 0;
+                }
+            } else {
+                uasserted(ErrorCodes::BadValue,
+                          str::stream() << "Invalid escaped character \'" << ch << "\'");
+            }
+        } else if (isEscaped(ch)) {
+            uasserted(ErrorCodes::BadValue,
+                      str::stream()
+                          << "Found unescaped character that should be escaped: \'" << ch << "\'");
+        } else {
+            if (ch != ' ') {
+                trailingSpaces = 0;
+            }
+            sb << ch;
+        }
+    }
+
+    std::string val = sb.str();
+    // It's legal to have trailing spaces as long as they are escaped, so if we have some trailing
+    // escaped spaces, trim the size of the string to the last non-space character + the number of
+    // escaped trailing spaces.
+    if (trailingSpaces > 0) {
+        auto lastNonSpace = val.find_last_not_of(' ');
+        lastNonSpace += trailingSpaces + 1;
+        val.erase(lastNonSpace);
+    }
+
+    // Consume the + or , character
+    if (!done()) {
+        _advance();
+    }
+
+    switch (ch) {
+        case '+':
+            return {std::move(val), MultiValue};
+        case ',':
+            return {std::move(val), NewRDN};
+        default:
+            invariant(done());
+            return {std::move(val), Done};
+    }
+}
+
+const auto getTLSVersionCounts = ServiceContext::declareDecoration<TLSVersionCounts>();
+
+constexpr std::string_view kOID_DC = "0.9.2342.19200300.100.1.25"sv;
+constexpr std::string_view kOID_O = "2.5.4.10"sv;
+constexpr std::string_view kOID_OU = "2.5.4.11"sv;
+
+static const stdx::unordered_set<std::string> defaultMatchingAttributes = {
+    std::string{kOID_DC},
+    std::string{kOID_O},
+    std::string{kOID_OU},
+};
+
+synchronized_value<boost::optional<SSLX509Name>> clusterAuthDNOverride;
+boost::optional<SSLX509Name> getClusterAuthDNOverrideParameter() {
+    auto guarded_value = clusterAuthDNOverride.synchronize();
+    auto& value = *guarded_value;
+    if (!value) {
+        return boost::none;
+    }
+    return value;
+}
+
+StatusWith<SSLX509Name> parseClusterAuthX509Attributes(std::string_view attributes) try {
+    auto attributesAsDN = uassertStatusOK(parseDN(attributes));
+    uassertStatusOK(attributesAsDN.normalizeStrings());
+
+    return attributesAsDN;
+} catch (const DBException& ex) {
+    return ex.toStatus();
+}
+}  // namespace
+
+SSLManagerCoordinator* SSLManagerCoordinator::get() {
+    return theSSLManagerCoordinator;
+}
+
+std::shared_ptr<SSLManagerInterface> SSLManagerCoordinator::createTransientSSLManager(
+    const TransientSSLParams& transientSSLParams) const {
+    return SSLManagerInterface::create(
+        sslGlobalParams, transientSSLParams, false /* isSSLServer */);
+}
+
+std::shared_ptr<SSLManagerInterface> SSLManagerCoordinator::getSSLManager() {
+    return *_manager;
+}
+
+void logCert(const CertInformationToLog& cert, std::string_view certType, const int logNum) {
+    auto attrs = cert.getDynamicAttributes();
+    attrs.add("type", certType);
+    LOGV2(logNum, "Certificate information", attrs);
+}
+
+logv2::DynamicAttributes CertInformationToLog::getDynamicAttributes() const {
+    logv2::DynamicAttributes attrs;
+    attrs.add("subject", subject);
+    attrs.add("issuer", issuer);
+    attrs.add("thumbprint", std::string_view(hexEncodedThumbprint));
+    attrs.add("notValidBefore", validityNotBefore);
+    attrs.add("notValidAfter", validityNotAfter);
+    if (keyFile) {
+        attrs.add("keyFile", std::string_view(*keyFile));
+    }
+    if (targetClusterURI) {
+        attrs.add("targetClusterURI", std::string_view(*targetClusterURI));
+    }
+    return attrs;
+}
+
+void logCRL(const CRLInformationToLog& crl, const int logNum) {
+    LOGV2(logNum,
+          "CRL information",
+          "thumbprint"_attr = hexblob::encode(crl.thumbprint.data(), crl.thumbprint.size()),
+          "notValidBefore"_attr = crl.validityNotBefore.toString(),
+          "notValidAfter"_attr = crl.validityNotAfter.toString());
+}
+
+void logSSLInfo(const SSLInformationToLog& info,
+                const int logNumPEM,
+                const int logNumCluster,
+                const int logNumCrl) {
+    if (!(sslGlobalParams.sslPEMKeyFile.empty())) {
+        logCert(info.server, "Server", logNumPEM);
+    }
+    if (info.cluster.has_value()) {
+        logCert(info.cluster.value(), "Cluster", logNumCluster);
+    }
+    if (info.crl.has_value()) {
+        logCRL(info.crl.value(), logNumCrl);
+    }
+}
+
+void SSLManagerCoordinator::rotate() {
+    std::lock_guard lockGuard(_lock);
+
+    std::shared_ptr<SSLManagerInterface> manager =
+        SSLManagerInterface::create(sslGlobalParams, isSSLServer);
+
+    auto svcCtx = getGlobalServiceContext();
+    const auto clusterAuthMode = ClusterAuthMode::get(svcCtx);
+    if (clusterAuthMode.sendsX509()) {
+        auth::setInternalUserAuthParams(auth::createInternalX509AuthCredential(
+            std::string_view(manager->getSSLConfiguration().clientSubjectName.toString())));
+    }
+
+    auto tl = svcCtx->getTransportLayerManager();
+    invariant(tl != nullptr);
+    uassertStatusOK(tl->rotateCertificates(manager, false));
+
+    std::shared_ptr<SSLManagerInterface> originalManager;
+
+    {
+        auto synchronizedManager = _manager.synchronize();
+        originalManager = *synchronizedManager;
+        *synchronizedManager = manager;
+
+        LOGV2(4913400, "Successfully rotated X509 certificates.");
+        logSSLInfo(synchronizedManager->get()->getSSLInformationToLog());
+    }
+
+    originalManager->stopJobs();
+}
+
+SSLManagerCoordinator::SSLManagerCoordinator()
+    : _manager(SSLManagerInterface::create(sslGlobalParams, isSSLServer)) {
+    logSSLInfo(_manager->get()->getSSLInformationToLog());
+}
+
+void ClusterAuthDNOverrideParameter::append(OperationContext* opCtx,
+                                            BSONObjBuilder* b,
+                                            std::string_view name,
+                                            const boost::optional<TenantId>&) {
+    auto value = clusterAuthDNOverride.get();
+    if (value) {
+        b->append(name, value->toString());
+    }
+}
+
+Status ClusterAuthDNOverrideParameter::setFromString(std::string_view str,
+                                                     const boost::optional<TenantId>&) {
+    if (str.empty()) {
+        *clusterAuthDNOverride = boost::none;
+        return Status::OK();
+    }
+
+    auto swFullDN = parseDN(str);
+    if (!swFullDN.isOK()) {
+        return swFullDN.getStatus();
+    }
+    auto fullDN = std::move(swFullDN.getValue());
+    auto status = fullDN.normalizeStrings();
+    if (!status.isOK()) {
+        return status;
+    }
+
+    *clusterAuthDNOverride = {std::move(fullDN)};
+    return Status::OK();
+}
+
+SSLX509Name filterClusterDN(const SSLX509Name& fullClusterDN,
+                            const stdx::unordered_set<std::string>& filteredAttributes) {
+    std::vector<std::vector<SSLX509Name::Entry>> ret;
+
+    for (const auto& rdn : fullClusterDN.entries()) {
+        std::vector<SSLX509Name::Entry> filteredRdn;
+        for (const auto& entry : rdn) {
+            if (filteredAttributes.contains(entry.oid)) {
+                filteredRdn.push_back(entry);
+            }
+        }
+
+        if (!filteredRdn.empty()) {
+            ret.push_back(filteredRdn);
+        }
+    }
+
+    return SSLX509Name(ret);
+}
+
+StatusWith<SSLX509Name> parseDN(std::string_view sd) try {
+    uassert(ErrorCodes::BadValue, "DN strings must be valid UTF-8 strings", isValidUTF8(sd));
+    RFC4514Parser parser(sd);
+
+    std::vector<std::vector<SSLX509Name::Entry>> entries;
+    auto curRDN = entries.emplace(entries.end());
+    while (!parser.done()) {
+        // Allow spaces to separate RDNs for readability, e.g. "CN=foo, OU=bar, DC=bizz"
+        parser.skipSpaces();
+        auto attributeName = parser.extractAttributeName();
+        auto oid = x509ShortNameToOid(attributeName);
+        uassert(ErrorCodes::BadValue, str::stream() << "DN contained an unknown OID " << oid, oid);
+        std::string value;
+        char terminator;
+        std::tie(value, terminator) = parser.extractValue();
+        curRDN->emplace_back(std::move(*oid), kASN1UTF8String, std::move(value));
+        if (terminator == RFC4514Parser::NewRDN) {
+            curRDN = entries.emplace(entries.end());
+        }
+    }
+
+    uassert(ErrorCodes::BadValue,
+            "Cannot parse empty DN",
+            entries.size() > 1 || !entries.front().empty());
+
+    return SSLX509Name(std::move(entries));
+} catch (const DBException& e) {
+    return e.toStatus();
+}
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
+// OpenSSL has a more complete library of OID to SN mappings.
+std::string x509OidToShortName(const std::string& name) {
+    const auto nid = OBJ_txt2nid(name.c_str());
+    if (nid == 0) {
+        return name;
+    }
+
+    const auto* sn = OBJ_nid2sn(nid);
+    if (!sn) {
+        return name;
+    }
+
+    return sn;
+}
+
+using UniqueASN1Object =
+    std::unique_ptr<ASN1_OBJECT, OpenSSLDeleter<decltype(ASN1_OBJECT_free), ASN1_OBJECT_free>>;
+
+boost::optional<std::string> x509ShortNameToOid(const std::string& name) {
+    // Converts the OID to an ASN1_OBJECT
+    UniqueASN1Object obj(OBJ_txt2obj(name.c_str(), 0));
+    if (!obj) {
+        return boost::none;
+    }
+
+    // OBJ_obj2txt doesn't let you pass in a NULL buffer and a negative size to discover how
+    // big the buffer should be, but the man page gives 80 as a good guess for buffer size.
+    constexpr auto kDefaultBufferSize = 80;
+    std::vector<char> buffer(kDefaultBufferSize);
+    size_t realSize = OBJ_obj2txt(buffer.data(), buffer.size(), obj.get(), 1);
+
+    // Resize the buffer down or up to the real size.
+    buffer.resize(realSize);
+
+    // If the real size is greater than the default buffer size we picked, then just call
+    // OBJ_obj2txt again now that the buffer is correctly sized.
+    if (realSize > kDefaultBufferSize) {
+        OBJ_obj2txt(buffer.data(), buffer.size(), obj.get(), 1);
+    }
+
+    return std::string(buffer.data(), buffer.size());
+}
+#else
+// On Apple/Windows we have to provide our own mapping.
+// Generate the 2.5.4.* portions of this list from OpenSSL sources with:
+// grep -E '^X509 ' "$OPENSSL/crypto/objects/objects.txt" | tr -d '\t' |
+//   sed -e 's/^X509 *\([0-9]\+\) *\(: *\)\+\([[:alnum:]]\+\).*/{"2.5.4.\1", "\3"},/g'
+static const std::initializer_list<std::pair<std::string_view, std::string_view>>
+    kX509OidToShortNameMappings = {
+        {"0.9.2342.19200300.100.1.1"sv, "UID"sv},
+        {"0.9.2342.19200300.100.1.25"sv, "DC"sv},
+        {"1.2.840.113549.1.9.1"sv, "emailAddress"sv},
+        {"2.5.29.17"sv, "subjectAltName"sv},
+
+        // X509 OIDs Generated from objects.txt
+        {"2.5.4.3"sv, "CN"sv},
+        {"2.5.4.4"sv, "SN"sv},
+        {"2.5.4.5"sv, "serialNumber"sv},
+        {"2.5.4.6"sv, "C"sv},
+        {"2.5.4.7"sv, "L"sv},
+        {"2.5.4.8"sv, "ST"sv},
+        {"2.5.4.9"sv, "street"sv},
+        {"2.5.4.10"sv, "O"sv},
+        {"2.5.4.11"sv, "OU"sv},
+        {"2.5.4.12"sv, "title"sv},
+        {"2.5.4.13"sv, "description"sv},
+        {"2.5.4.14"sv, "searchGuide"sv},
+        {"2.5.4.15"sv, "businessCategory"sv},
+        {"2.5.4.16"sv, "postalAddress"sv},
+        {"2.5.4.17"sv, "postalCode"sv},
+        {"2.5.4.18"sv, "postOfficeBox"sv},
+        {"2.5.4.19"sv, "physicalDeliveryOfficeName"sv},
+        {"2.5.4.20"sv, "telephoneNumber"sv},
+        {"2.5.4.21"sv, "telexNumber"sv},
+        {"2.5.4.22"sv, "teletexTerminalIdentifier"sv},
+        {"2.5.4.23"sv, "facsimileTelephoneNumber"sv},
+        {"2.5.4.24"sv, "x121Address"sv},
+        {"2.5.4.25"sv, "internationaliSDNNumber"sv},
+        {"2.5.4.26"sv, "registeredAddress"sv},
+        {"2.5.4.27"sv, "destinationIndicator"sv},
+        {"2.5.4.28"sv, "preferredDeliveryMethod"sv},
+        {"2.5.4.29"sv, "presentationAddress"sv},
+        {"2.5.4.30"sv, "supportedApplicationContext"sv},
+        {"2.5.4.31"sv, "member"sv},
+        {"2.5.4.32"sv, "owner"sv},
+        {"2.5.4.33"sv, "roleOccupant"sv},
+        {"2.5.4.34"sv, "seeAlso"sv},
+        {"2.5.4.35"sv, "userPassword"sv},
+        {"2.5.4.36"sv, "userCertificate"sv},
+        {"2.5.4.37"sv, "cACertificate"sv},
+        {"2.5.4.38"sv, "authorityRevocationList"sv},
+        {"2.5.4.39"sv, "certificateRevocationList"sv},
+        {"2.5.4.40"sv, "crossCertificatePair"sv},
+        {"2.5.4.41"sv, "name"sv},
+        {"2.5.4.42"sv, "GN"sv},
+        {"2.5.4.43"sv, "initials"sv},
+        {"2.5.4.44"sv, "generationQualifier"sv},
+        {"2.5.4.45"sv, "x500UniqueIdentifier"sv},
+        {"2.5.4.46"sv, "dnQualifier"sv},
+        {"2.5.4.47"sv, "enhancedSearchGuide"sv},
+        {"2.5.4.48"sv, "protocolInformation"sv},
+        {"2.5.4.49"sv, "distinguishedName"sv},
+        {"2.5.4.50"sv, "uniqueMember"sv},
+        {"2.5.4.51"sv, "houseIdentifier"sv},
+        {"2.5.4.52"sv, "supportedAlgorithms"sv},
+        {"2.5.4.53"sv, "deltaRevocationList"sv},
+        {"2.5.4.54"sv, "dmdName"sv},
+        {"2.5.4.65"sv, "pseudonym"sv},
+        {"2.5.4.72"sv, "role"sv},
+};
+
+std::string x509OidToShortName(const std::string& oid) {
+    auto it = std::find_if(kX509OidToShortNameMappings.begin(),
+                           kX509OidToShortNameMappings.end(),
+                           [&](const std::pair<std::string_view, std::string_view>& entry) {
+                               return entry.first == oid;
+                           });
+
+    if (it == kX509OidToShortNameMappings.end()) {
+        return oid;
+    }
+    return std::string{it->second};
+}
+
+boost::optional<std::string> x509ShortNameToOid(const std::string& name) {
+    auto it = std::find_if(kX509OidToShortNameMappings.begin(),
+                           kX509OidToShortNameMappings.end(),
+                           [&](const std::pair<std::string_view, std::string_view>& entry) {
+                               return entry.second == name;
+                           });
+
+    if (it == kX509OidToShortNameMappings.end()) {
+        // If the name is a known oid in our mapping list then just return it.
+        if (std::find_if(kX509OidToShortNameMappings.begin(),
+                         kX509OidToShortNameMappings.end(),
+                         [&](const auto& entry) { return entry.first == name; }) !=
+            kX509OidToShortNameMappings.end()) {
+            return name;
+        }
+        return boost::none;
+    }
+    return std::string{it->first};
+}
+#endif
+
+TLSVersionCounts& TLSVersionCounts::get(ServiceContext* serviceContext) {
+    return getTLSVersionCounts(serviceContext);
+}
+
+MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager"))
+(InitializerContext*) {
+    if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
+        const auto& config = SSLManagerCoordinator::get()->getSSLManager()->getSSLConfiguration();
+        if (!config.clientSubjectName.empty()) {
+            LOGV2_DEBUG(
+                23214, 1, "Client certificate name", "name"_attr = config.clientSubjectName);
+        }
+        if (!config.serverSubjectName().empty()) {
+            LOGV2_DEBUG(
+                23215, 1, "Server certificate name", "name"_attr = config.serverSubjectName());
+            LOGV2_DEBUG(23216,
+                        1,
+                        "Server certificate expiration",
+                        "expiration"_attr = config.serverCertificateExpirationDate);
+        }
+    }
+}
+
+Status SSLX509Name::normalizeStrings() {
+    for (auto& rdn : _entries) {
+        for (auto& entry : rdn) {
+            switch (entry.type) {
+                // For each type of valid DirectoryString, do the string prep algorithm.
+                case kASN1UTF8String:
+                case kASN1PrintableString:
+                case kASN1TeletexString:
+                case kASN1UniversalString:
+                case kASN1BMPString:
+                case kASN1IA5String:
+                case kASN1OctetString: {
+                    // Technically https://tools.ietf.org/html/rfc5280#section-4.1.2.4 requires
+                    // that DN component values must be at least 1 code point long, but we've
+                    // supported empty components before (see SERVER-39107) so we special-case
+                    // normalizing empty values to an empty UTF-8 string
+                    if (entry.value.empty()) {
+                        entry.type = kASN1UTF8String;
+                        break;
+                    }
+
+                    auto res = icuX509DNPrep(entry.value);
+                    if (!res.isOK()) {
+                        return res.getStatus();
+                    }
+                    entry.value = std::move(res.getValue());
+                    entry.type = kASN1UTF8String;
+                    break;
+                }
+                default:
+                    LOGV2_DEBUG(23217,
+                                1,
+                                "Certificate subject name contains unknown string type",
+                                "entryType"_attr = entry.type,
+                                "entryValue"_attr = entry.value);
+                    break;
+            }
+        }
+    }
+
+    return Status::OK();
+}
+
+bool SSLX509Name::contains(const SSLX509Name& other) const {
+    return std::all_of(
+        other.entries().begin(), other.entries().end(), [this](const auto& attribute) {
+            return std::find(_entries.begin(), _entries.end(), attribute) != _entries.end();
+        });
+}
+
+StatusWith<std::string> SSLX509Name::getOID(std::string_view oid) const {
+    for (const auto& rdn : _entries) {
+        for (const auto& entry : rdn) {
+            if (entry.oid == oid) {
+                return entry.value;
+            }
+        }
+    }
+    return {ErrorCodes::KeyNotFound, "OID does not exist"};
+}
+
+StringBuilder& operator<<(StringBuilder& os, const SSLX509Name& name) {
+    std::string comma;
+    for (const auto& rdn : name._entries) {
+        std::string plus;
+        os << comma;
+        for (const auto& entry : rdn) {
+            os << plus << x509OidToShortName(entry.oid) << "=" << escapeRfc2253(entry.value);
+            plus = "+";
+        }
+        comma = ",";
+    }
+    return os;
+}
+
+std::string SSLX509Name::toString() const {
+    StringBuilder os;
+    os << *this;
+    return os.str();
+}
+
+Status SSLConfiguration::setServerSubjectName(SSLX509Name name) {
+    auto status = name.normalizeStrings();
+    if (!status.isOK()) {
+        return status;
+    }
+    _serverSubjectName = std::move(name);
+    return Status::OK();
+}
+
+Status SSLConfiguration::setClusterAuthX509Config() try {
+    bool isAttrsSet = !sslGlobalParams.clusterAuthX509Attributes.empty();
+    bool isExtensionSet = !sslGlobalParams.clusterAuthX509ExtensionValue.empty();
+    bool isAttrsOverrideSet = !sslGlobalParams.clusterAuthX509OverrideAttributes.empty();
+    bool isExtensionOverrideSet = !sslGlobalParams.clusterAuthX509OverrideExtensionValue.empty();
+
+    bool isClusterAuthX509Set =
+        isAttrsSet || isExtensionSet || isAttrsOverrideSet || isExtensionOverrideSet;
+    bool isClusterAuthDNOverrideSet = getClusterAuthDNOverrideParameter().has_value();
+
+    if (isClusterAuthX509Set) {
+        uassert(ErrorCodes::InvalidSSLConfiguration,
+                "tlsX509ClusterAuthDNOverride cannot be set alongside "
+                "tlsClusterAuthX509Attributes, "
+                "tlsClusterAuthX509OverrideAttributes, tlsClusterAuthX509ExtensionValue, or "
+                "tlsClusterAuthX509OverrideExtensionValue",
+                !isClusterAuthDNOverrideSet);
+    }
+
+    auto setConfigOptions = [&]() {
+        if (isAttrsSet) {
+            auto attributesAsDN = uassertStatusOK(
+                parseClusterAuthX509Attributes(sslGlobalParams.clusterAuthX509Attributes));
+            uassert(ErrorCodes::InvalidSSLConfiguration,
+                    "The server certificate's DN does not contain the attributes specified "
+                    "in tlsClusterAuthX509Attributes",
+                    isAttrsOverrideSet || isExtensionOverrideSet ||
+                        (_serverSubjectName.contains(attributesAsDN) &&
+                         clientSubjectName.contains(attributesAsDN)));
+
+            _clusterAuthX509Config._configCriteria = std::move(attributesAsDN);
+        } else if (isExtensionSet) {
+            _clusterAuthX509Config._configCriteria = sslGlobalParams.clusterAuthX509ExtensionValue;
+        }
+    };
+
+    auto setOverrideOptions = [&]() {
+        if (isAttrsOverrideSet) {
+            _clusterAuthX509Config._overrideCriteria = uassertStatusOK(
+                parseClusterAuthX509Attributes(sslGlobalParams.clusterAuthX509OverrideAttributes));
+        } else if (isExtensionOverrideSet) {
+            _clusterAuthX509Config._overrideCriteria =
+                sslGlobalParams.clusterAuthX509OverrideExtensionValue;
+        }
+    };
+
+    setConfigOptions();
+    setOverrideOptions();
+
+    return Status::OK();
+} catch (const DBException& ex) {
+    return ex.toStatus();
+}
+
+/**
+ * The behavior of isClusterMember() is subtly different when passed
+ * an SSLX509Name versus a std::string_view.
+ *
+ * The SSLX509Name version (immediately below) compares distinguished
+ * names in their normalized, unescaped forms and provides a more reliable match.
+ *
+ * The std::string_view version attempts to canonicalize the stringified subject name
+ * according to RFC4514 and compare that to the normalized/unescaped version of
+ * the server's distinguished name.
+ */
+bool SSLConfiguration::isClusterMember(
+    SSLX509Name subject, const boost::optional<std::string>& clusterExtensionValue) const {
+    if (auto status = subject.normalizeStrings(); !status.isOK()) {
+        LOGV2_WARNING(23220, "Unable to normalize client subject name", "error"_attr = status);
+        return false;
+    }
+
+    auto visitor = OverloadedVisitor{
+        [&](const SSLX509Name& attributes) { return subject.contains(attributes); },
+        [&](const std::string& extensionValue) {
+            return clusterExtensionValue && (clusterExtensionValue == extensionValue);
+        }};
+
+    // If either net.tls.clusterAuthX509.attributes or net.tls.clusterAuthX509.extensionValue have
+    // been specified, use them to determine cluster membership. Otherwise, check whether DC, O,
+    // and/or OU from the server member certificate's subject DN match the client subject DN.
+    if (_clusterAuthX509Config._configCriteria) {
+        bool matchesClusterAuthX509Config =
+            visit(visitor, _clusterAuthX509Config._configCriteria.value());
+        if (matchesClusterAuthX509Config) {
+            return true;
+        }
+    } else {
+        auto defaultFilteredSubjectDN =
+            filterClusterDN(_serverSubjectName, defaultMatchingAttributes);
+        if (!defaultFilteredSubjectDN.empty() && subject.contains(defaultFilteredSubjectDN)) {
+            return true;
+        }
+    }
+
+    // If the certificate did not meet either of the above criteria, then it can still be a cluster
+    // member if tlsClusterX509AuthOverride is specified and it meets the attribute or extension
+    // policy specified.
+    if (_clusterAuthX509Config._overrideCriteria) {
+        return visit(visitor, _clusterAuthX509Config._overrideCriteria.value());
+    }
+
+    // If tlsClusterX509AuthOverride was not specified, then the only way that it
+    // could still be accepted as a cluster member is if it contains the DC, O, and/or OU in the
+    // tlsClusterAuthDNOverride DN.
+    auto altClusterDN = getClusterAuthDNOverrideParameter();
+    if (altClusterDN) {
+        auto defaultFilteredAltClusterDN =
+            filterClusterDN(*altClusterDN, defaultMatchingAttributes);
+        return !defaultFilteredAltClusterDN.empty() &&
+            subject.contains(defaultFilteredAltClusterDN);
+    }
+
+    return false;
+}
+
+bool SSLConfiguration::isClusterMember(
+    std::string_view subjectName, const boost::optional<std::string>& clusterExtensionValue) const {
+    auto swClient = parseDN(subjectName);
+    if (!swClient.isOK()) {
+        LOGV2_WARNING(
+            23219, "Unable to parse client subject name", "error"_attr = swClient.getStatus());
+        return false;
+    }
+
+    return isClusterMember(swClient.getValue(), clusterExtensionValue);
+}
+
+void SSLConfiguration::getServerStatusBSON(BSONObjBuilder* security) const {
+    security->append("SSLServerSubjectName", _serverSubjectName.toString());
+    security->appendDate("SSLServerCertificateExpirationDate", serverCertificateExpirationDate);
+}
+
+SSLManagerInterface::~SSLManagerInterface() {}
+
+SSLConnectionInterface::~SSLConnectionInterface() {}
+
+namespace {
+
+/**
+ * Enum of supported Abstract Syntax Notation One (ASN.1) Distinguished Encoding Rules (DER) types.
+ *
+ * This is a subset of all DER types.
+ */
+enum class DERType : char {
+    // Primitive, not supported by the parser
+    // Only exists when BER indefinite form is used which is not valid DER.
+    EndOfContent = 0,
+
+    // Primitive
+    INTEGER = 2,
+
+    // Primitive
+    UTF8String = 12,
+
+    // Sequence or Sequence Of, Constructed
+    SEQUENCE = 16,
+
+    // Set or Set Of, Constructed
+    SET = 17,
+};
+
+/**
+ * Distinguished Encoding Rules (DER) are a strict subset of Basic Encoding Rules (BER).
+ *
+ * For more details, see X.690 from ITU-T.
+ *
+ * It is a Tag + Length + Value format. The tag is generally 1 byte, the length is 1 or more
+ * and then followed by the value.
+ */
+class DERToken {
+public:
+    DERToken() {}
+    DERToken(DERType type, size_t length, const char* const data)
+        : _type(type), _length(length), _data(data) {}
+
+    /**
+     * Get the ASN.1 type of the current token.
+     */
+    DERType getType() const {
+        return _type;
+    }
+
+    /**
+     * Get a ConstDataRange for the value of this SET or SET OF.
+     */
+    ConstDataRange getSetRange() {
+        invariant(_type == DERType::SET);
+        return ConstDataRange(_data, _data + _length);
+    }
+
+    /**
+     * Get a ConstDataRange for the value of this SEQUENCE or SEQUENCE OF.
+     */
+    ConstDataRange getSequenceRange() {
+        invariant(_type == DERType::SEQUENCE);
+        return ConstDataRange(_data, _data + _length);
+    }
+
+    /**
+     * Get a std::string for the value of this Utf8String.
+     */
+    std::string readUtf8String() {
+        invariant(_type == DERType::UTF8String);
+        return std::string(_data, _length);
+    }
+
+    /**
+     * Get a vector representation for the value of this DER INTEGER
+     */
+    DERInteger readInt() {
+        invariant(_type == DERType::INTEGER);
+        DERInteger out(_length);
+        std::copy(_data, _data + _length, out.begin());
+        return out;
+    }
+
+    /**
+     * Parse a buffer of bytes and return the number of bytes we read for this token.
+     *
+     * Returns a DERToken which consists of the (tag, length, value) tuple.
+     */
+    static StatusWith<DERToken> parse(ConstDataRange cdr, size_t* outLength);
+
+private:
+    DERType _type{DERType::EndOfContent};
+    size_t _length{0};
+    const char* _data{nullptr};
+};
+
+}  // namespace
+
+template <>
+struct DataType::Handler<DERToken> {
+    static Status load(DERToken* t,
+                       const char* ptr,
+                       size_t length,
+                       size_t* advanced,
+                       std::ptrdiff_t debug_offset) {
+        size_t outLength;
+
+        auto swPair = DERToken::parse(ConstDataRange(ptr, length), &outLength);
+
+        if (!swPair.isOK()) {
+            return swPair.getStatus();
+        }
+
+        if (t) {
+            *t = std::move(swPair.getValue());
+        }
+
+        if (advanced) {
+            *advanced = outLength;
+        }
+
+        return Status::OK();
+    }
+
+    static DERToken defaultConstruct() {
+        return DERToken();
+    }
+};
+
+namespace {
+
+StatusWith<std::string> readDERString(ConstDataRangeCursor& cdc) {
+    auto swString = cdc.readAndAdvanceNoThrow<DERToken>();
+    if (!swString.isOK()) {
+        return swString.getStatus();
+    }
+
+    auto derString = swString.getValue();
+
+    if (derString.getType() != DERType::UTF8String) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream()
+                          << "Unexpected DER Tag, Got " << static_cast<char>(derString.getType())
+                          << ", Expected UTF8String");
+    }
+
+    return derString.readUtf8String();
+}
+
+StatusWith<DERInteger> readDERInt(ConstDataRangeCursor& cdc) {
+    auto swInt = cdc.readAndAdvanceNoThrow<DERToken>();
+    if (!swInt.isOK()) {
+        return swInt.getStatus();
+    }
+
+    auto derInt = swInt.getValue();
+
+    if (derInt.getType() != DERType::INTEGER) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "Unexpected DER Tag, Got "
+                                    << static_cast<char>(derInt.getType()) << ", Expected INTEGER");
+    }
+
+    return derInt.readInt();
+}
+
+
+StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
+    const size_t kTagLength = 1;
+    const size_t kTagLengthAndInitialLengthByteLength = kTagLength + 1;
+
+    ConstDataRangeCursor cdrc(cdr);
+
+    auto swTagByte = cdrc.readAndAdvanceNoThrow<char>();
+    if (!swTagByte.getStatus().isOK()) {
+        return swTagByte.getStatus();
+    }
+
+    const char tagByte = swTagByte.getValue();
+
+    // Get the tag number from the first 5 bits
+    const char tag = tagByte & 0x1f;
+
+    // Check the 6th bit
+    const bool constructed = tagByte & 0x20;
+    const bool primitive = !constructed;
+
+    // Check bits 7 and 8 for the tag class, we only want Universal (i.e. 0)
+    const char tagClass = tagByte & 0xC0;
+    if (tagClass != 0) {
+        return Status(ErrorCodes::InvalidSSLConfiguration, "Unsupported tag class");
+    }
+
+    // Validate the 6th bit is correct, and it is a known type
+    switch (static_cast<DERType>(tag)) {
+        case DERType::UTF8String:
+            if (!primitive) {
+                return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
+            }
+            break;
+        case DERType::INTEGER:
+            if (!primitive) {
+                return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
+            }
+            break;
+        case DERType::SEQUENCE:
+        case DERType::SET:
+            if (!constructed) {
+                return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
+            }
+            break;
+        default:
+            return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
+    }
+
+    // Do we have at least 1 byte for the length
+    if (cdrc.length() < kTagLengthAndInitialLengthByteLength) {
+        return Status(ErrorCodes::InvalidSSLConfiguration, "Invalid DER length");
+    }
+
+    // Read length
+    // Depending on the high bit, either read 1 byte or N bytes
+    auto swInitialLengthByte = cdrc.readAndAdvanceNoThrow<char>();
+    if (!swInitialLengthByte.getStatus().isOK()) {
+        return swInitialLengthByte.getStatus();
+    }
+
+    const char initialLengthByte = swInitialLengthByte.getValue();
+
+
+    uint64_t derLength = 0;
+
+    // How many bytes does it take to encode the length?
+    size_t encodedLengthBytesCount = 1;
+
+    if (initialLengthByte & 0x80) {
+        // Length is > 127 bytes, i.e. Long form of length
+        const size_t lengthBytesCount = 0x7f & initialLengthByte;
+
+        // If length is encoded in more then 8 bytes, we disallow it
+        if (lengthBytesCount > 8) {
+            return Status(ErrorCodes::InvalidSSLConfiguration, "Invalid DER length");
+        }
+
+        // Ensure we have enough data for the length bytes
+        const char* lengthLongFormPtr = cdrc.data();
+
+        Status statusLength = cdrc.advanceNoThrow(lengthBytesCount);
+        if (!statusLength.isOK()) {
+            return statusLength;
+        }
+
+        encodedLengthBytesCount = 1 + lengthBytesCount;
+
+        std::array<char, 8> lengthBuffer;
+        lengthBuffer.fill(0);
+
+        // Copy the length into the end of the buffer
+        memcpy(lengthBuffer.data() + (8 - lengthBytesCount), lengthLongFormPtr, lengthBytesCount);
+
+        // We now have 0x00..NN in the buffer and it can be properly decoded as BigEndian
+        derLength = ConstDataView(lengthBuffer.data()).read<BigEndian<uint64_t>>();
+    } else {
+        // Length is <= 127 bytes, i.e. short form of length
+        derLength = ConstDataView(&initialLengthByte).read<uint8_t>();
+    }
+
+    // This is the total length of the TLV and all data
+    // This will not overflow since encodedLengthBytesCount <= 9
+    const uint64_t tagAndLengthByteCount = kTagLength + encodedLengthBytesCount;
+
+    // This may overflow since derLength is from user data so check our arithmetic carefully.
+    if (overflow::add(tagAndLengthByteCount, derLength, outLength) || *outLength > cdr.length()) {
+        return Status(ErrorCodes::InvalidSSLConfiguration, "Invalid DER length");
+    }
+
+    return DERToken(static_cast<DERType>(tag), derLength, cdr.data() + tagAndLengthByteCount);
+}
+}  // namespace
+
+StatusWith<std::string> parseDERString(ConstDataRange cdrExtension) {
+    ConstDataRangeCursor cdcExtension(cdrExtension);
+    return readDERString(cdcExtension);
+}
+
+StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExtension) {
+    stdx::unordered_set<RoleName> roles;
+
+    ConstDataRangeCursor cdcExtension(cdrExtension);
+
+    /**
+     * MongoDBAuthorizationGrants ::= SET OF MongoDBAuthorizationGrant
+     *
+     * MongoDBAuthorizationGrant ::= CHOICE {
+     *  MongoDBRole,
+     *  ...!UTF8String:"Unrecognized entity in MongoDBAuthorizationGrant"
+     * }
+     */
+    auto swSet = cdcExtension.readAndAdvanceNoThrow<DERToken>();
+    if (!swSet.isOK()) {
+        return swSet.getStatus();
+    }
+
+    if (swSet.getValue().getType() != DERType::SET) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream()
+                          << "Unexpected DER Tag, Got "
+                          << static_cast<char>(swSet.getValue().getType()) << ", Expected SET");
+    }
+
+    ConstDataRangeCursor cdcSet(swSet.getValue().getSetRange());
+
+    while (!cdcSet.empty()) {
+        /**
+         * MongoDBRole ::= SEQUENCE {
+         *  role     UTF8String,
+         *  database UTF8String
+         * }
+         */
+        auto swSequence = cdcSet.readAndAdvanceNoThrow<DERToken>();
+        if (!swSequence.isOK()) {
+            return swSequence.getStatus();
+        }
+
+        auto sequenceStart = swSequence.getValue();
+
+        if (sequenceStart.getType() != DERType::SEQUENCE) {
+            return Status(ErrorCodes::InvalidSSLConfiguration,
+                          str::stream() << "Unexpected DER Tag, Got "
+                                        << static_cast<char>(sequenceStart.getType())
+                                        << ", Expected SEQUENCE");
+        }
+
+        ConstDataRangeCursor cdcSequence(sequenceStart.getSequenceRange());
+
+        auto swRole = readDERString(cdcSequence);
+        if (!swRole.isOK()) {
+            return swRole.getStatus();
+        }
+
+        auto swDatabase = readDERString(cdcSequence);
+        if (!swDatabase.isOK()) {
+            return swDatabase.getStatus();
+        }
+
+        // Catch errors resulting from conversion of swDatabase to a DatabaseName.
+        try {
+            RoleName rn(swRole.getValue(), swDatabase.getValue());
+            roles.emplace(std::move(rn));
+        } catch (DBException& e) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream()
+                              << "Failed to parse RoleName from (\"" << swRole.getValue()
+                              << "\", \"" << swDatabase.getValue() << "): " << e.toString());
+        }
+    }
+
+    return roles;
+}
+
+StatusWith<std::vector<DERInteger>> parseTLSFeature(ConstDataRange cdrExtension) {
+    std::vector<DERInteger> features;
+    ConstDataRangeCursor cdcExtension(cdrExtension);
+
+    /**
+     * FEATURES ::= SEQUENCE OF INTEGER
+     */
+    auto swSeq = cdcExtension.readAndAdvanceNoThrow<DERToken>();
+    if (!swSeq.isOK()) {
+        return swSeq.getStatus();
+    }
+
+    if (swSeq.getValue().getType() != DERType::SEQUENCE) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "Unexpected DER Tag, Got "
+                                    << static_cast<char>(swSeq.getValue().getType())
+                                    << ", Expected SEQUENCE");
+    }
+
+    ConstDataRangeCursor cdcSeq(swSeq.getValue().getSequenceRange());
+
+    while (!cdcSeq.empty()) {
+        auto swDERInt = readDERInt(cdcSeq);
+        if (!swDERInt.isOK()) {
+            return swDERInt.getStatus();
+        }
+
+        features.emplace_back(swDERInt.getValue());
+    }
+
+    return std::move(features);
+}
+
+std::string removeFQDNRoot(std::string name) {
+    if (name.back() == '.') {
+        name.pop_back();
+    }
+    return name;
+};
+
+namespace {
+
+// Characters that need to be escaped in RFC 2253
+const std::array<char, 7> rfc2253EscapeChars = {',', '+', '"', '\\', '<', '>', ';'};
+
+}  // namespace
+
+// See section "2.4 Converting an AttributeValue from ASN.1 to a String" in RFC 2243
+std::string escapeRfc2253(std::string_view str) {
+    std::string ret;
+
+    if (str.size() > 0) {
+        size_t pos = 0;
+
+        // a space or "#" character occurring at the beginning of the string
+        if (str[0] == ' ') {
+            ret = "\\ ";
+            pos = 1;
+        } else if (str[0] == '#') {
+            ret = "\\#";
+            pos = 1;
+        }
+
+        while (pos < str.size()) {
+            if (static_cast<signed char>(str[pos]) < 0) {
+                ret += '\\';
+                ret += unsignedHex(str[pos]);
+            } else {
+                if (std::find(rfc2253EscapeChars.cbegin(), rfc2253EscapeChars.cend(), str[pos]) !=
+                    rfc2253EscapeChars.cend()) {
+                    ret += '\\';
+                }
+
+                ret += str[pos];
+            }
+            ++pos;
+        }
+
+        // a space character occurring at the end of the string
+        if (ret.size() > 2 && ret[ret.size() - 1] == ' ') {
+            ret[ret.size() - 1] = '\\';
+            ret += ' ';
+        }
+    }
+
+    return ret;
+}
+
+void recordTLSVersion(TLSVersion version, const HostAndPort& hostForLogging) {
+    std::string_view versionString;
+    auto& counts = mongo::TLSVersionCounts::get(getGlobalServiceContext());
+    switch (version) {
+        case TLSVersion::kTLS10:
+            counts.tls10.addAndFetch(1);
+            if (std::find(sslGlobalParams.tlsLogVersions.cbegin(),
+                          sslGlobalParams.tlsLogVersions.cend(),
+                          SSLParams::Protocols::TLS1_0) != sslGlobalParams.tlsLogVersions.cend()) {
+                versionString = "1.0"sv;
+            }
+            break;
+        case TLSVersion::kTLS11:
+            counts.tls11.addAndFetch(1);
+            if (std::find(sslGlobalParams.tlsLogVersions.cbegin(),
+                          sslGlobalParams.tlsLogVersions.cend(),
+                          SSLParams::Protocols::TLS1_1) != sslGlobalParams.tlsLogVersions.cend()) {
+                versionString = "1.1"sv;
+            }
+            break;
+        case TLSVersion::kTLS12:
+            counts.tls12.addAndFetch(1);
+            if (std::find(sslGlobalParams.tlsLogVersions.cbegin(),
+                          sslGlobalParams.tlsLogVersions.cend(),
+                          SSLParams::Protocols::TLS1_2) != sslGlobalParams.tlsLogVersions.cend()) {
+                versionString = "1.2"sv;
+            }
+            break;
+        case TLSVersion::kTLS13:
+            counts.tls13.addAndFetch(1);
+            if (std::find(sslGlobalParams.tlsLogVersions.cbegin(),
+                          sslGlobalParams.tlsLogVersions.cend(),
+                          SSLParams::Protocols::TLS1_3) != sslGlobalParams.tlsLogVersions.cend()) {
+                versionString = "1.3"sv;
+            }
+            break;
+        default:
+            counts.tlsUnknown.addAndFetch(1);
+            if (!sslGlobalParams.tlsLogVersions.empty()) {
+                versionString = "unknown"sv;
+            }
+            break;
+    }
+
+    if (!versionString.empty()) {
+        LOGV2(23218,
+              "Accepted connection with TLS",
+              "tlsVersion"_attr = versionString,
+              "remoteHost"_attr = hostForLogging);
+    }
+}
+
+// TODO SERVER-11601 Use NFC Unicode canonicalization
+bool hostNameMatchForX509Certificates(std::string nameToMatch, std::string certHostName) {
+    nameToMatch = removeFQDNRoot(std::move(nameToMatch));
+    certHostName = removeFQDNRoot(std::move(certHostName));
+
+    if (certHostName.size() < 2) {
+        return false;
+    }
+
+    // match wildcard DNS names
+    if (certHostName[0] == '*' && certHostName[1] == '.') {
+        // allow name.example.com if the cert is *.example.com, '*' does not match '.'
+        const char* subName = strchr(nameToMatch.c_str(), '.');
+        return subName && !str::caseInsensitiveCompare(certHostName.c_str() + 1, subName);
+    } else {
+        return !str::caseInsensitiveCompare(nameToMatch.c_str(), certHostName.c_str());
+    }
+}
+
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer) {
+    LOGV2_WARNING(23221, "Peer certificate expires soon", "peerSubjectName"_attr = peer);
+}
+
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer, Days days) {
+    LOGV2_WARNING(23222,
+                  "Peer certificate expiration information",
+                  "peerSubjectName"_attr = peer,
+                  "days"_attr = days);
+}
+
+}  // namespace mongo

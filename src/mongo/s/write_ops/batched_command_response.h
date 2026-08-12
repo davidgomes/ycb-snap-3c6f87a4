@@ -1,0 +1,199 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/rpc/write_concern_error_detail.h"
+#include "mongo/s/write_ops/batched_upsert_detail.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+
+/**
+ * This class represents the layout and content of a insert/update/delete runCommand,
+ * the response side.
+ */
+class BatchedCommandResponse {
+    BatchedCommandResponse(const BatchedCommandResponse&) = delete;
+    BatchedCommandResponse& operator=(const BatchedCommandResponse&) = delete;
+
+public:
+    static const BSONField<long long> n;
+    static const BSONField<long long> nModified;
+    static const BSONField<std::vector<BatchedUpsertDetail*>> upsertDetails;
+    static const BSONField<OID> electionId;
+    static const BSONField<WriteConcernErrorDetail*> writeConcernError;
+    static const BSONField<std::vector<std::string>> errorLabels;
+    static const BSONField<std::vector<StmtId>> retriedStmtIds;
+
+    BatchedCommandResponse();
+    ~BatchedCommandResponse();
+
+    BatchedCommandResponse(BatchedCommandResponse&&) = default;
+    BatchedCommandResponse& operator=(BatchedCommandResponse&&) = default;
+
+    BSONObj toBSON() const;
+    bool parseBSON(const BSONObj& source, std::string* errMsg);
+    void clear();
+
+    //
+    // individual field accessors
+    //
+
+    /**
+     * This group of getters/setters is only for the top-level command status. If you want to know
+     * if all writes succeeded, use toStatus() below which considers all of the ways that writes can
+     * fail.
+     */
+    void setStatus(Status status);
+    Status getTopLevelStatus() const {
+        dassert(_isStatusSet);
+        return _status;
+    }
+    bool getOk() const {
+        dassert(_isStatusSet);
+        return _status.isOK();
+    }
+
+    /**
+     * Converts the specified command response into a status, based on all of its contents.
+     */
+    Status toStatus() const;
+
+    void setNModified(long long n);
+    long long getNModified() const;
+    boost::optional<long long> getNModifiedOpt() const;
+
+    void setN(long long n);
+    long long getN() const;
+    boost::optional<long long> getNOpt() const;
+
+    void setUpsertDetails(const std::vector<BatchedUpsertDetail*>& upsertDetails);
+    void addToUpsertDetails(BatchedUpsertDetail* upsertDetails);
+    void unsetUpsertDetails();
+    bool isUpsertDetailsSet() const;
+    std::size_t sizeUpsertDetails() const;
+    const std::vector<BatchedUpsertDetail*>& getUpsertDetails() const;
+    const BatchedUpsertDetail* getUpsertDetailsAt(std::size_t pos) const;
+
+    void setLastOp(repl::OpTime lastOp);
+    bool isLastOpSet() const;
+    repl::OpTime getLastOp() const;
+
+    void setElectionId(const OID& electionId);
+    bool isElectionIdSet() const;
+    OID getElectionId() const;
+
+    // errDetails ownership is transferred to here.
+    void addToErrDetails(write_ops::WriteError error);
+    void unsetErrDetails();
+    bool isErrDetailsSet() const;
+    std::size_t sizeErrDetails() const;
+    std::vector<write_ops::WriteError>& getErrDetails();
+    const std::vector<write_ops::WriteError>& getErrDetails() const;
+    const write_ops::WriteError& getErrDetailsAt(std::size_t pos) const;
+
+    void setWriteConcernError(WriteConcernErrorDetail* error);
+    bool isWriteConcernErrorSet() const;
+    const WriteConcernErrorDetail* getWriteConcernError() const;
+
+    bool isErrorLabelsSet() const;
+    const std::vector<std::string>& getErrorLabels() const;
+
+    bool areRetriedStmtIdsSet() const;
+    const std::vector<StmtId>& getRetriedStmtIds() const;
+    void setRetriedStmtIds(std::vector<StmtId> retriedStmtIds);
+
+    bool areQueryStatsMetricsSet() const;
+    const std::vector<write_ops::QueryStatsMetrics>& getQueryStatsMetrics() const;
+    void setQueryStatsMetrics(std::vector<write_ops::QueryStatsMetrics>&& queryStatsMetrics);
+
+private:
+    // Convention: (M)andatory, (O)ptional
+
+    // (M) The top-level command status.
+    Status _status = Status::OK();
+    bool _isStatusSet;
+
+    // (M)  number of documents affected
+    long long _n;
+    bool _isNSet;
+
+    // (O)  number of documents updated
+    long long _nModified;
+    bool _isNModifiedSet;
+
+    // (O)  Array of upserted items' _id's
+    //      Should only be present if _singleUpserted is not.
+    std::unique_ptr<std::vector<BatchedUpsertDetail*>> _upsertDetails;
+
+    // (O)  repl::OpTime assigned to the write op when it was written to the oplog.
+    //      Normally, getLastError can use Client::_lastOp, but this is not valid for
+    //      mongos which loses track of the session due to RCAR.  Therefore, we must
+    //      keep track of the lastOp manually ourselves.
+    repl::OpTime _lastOp;
+    bool _isLastOpSet;
+
+    // (O)  In addition to keeping track of the above lastOp repl::OpTime, we must also keep
+    //      track of the primary we talked to.  This is because if the primary moves,
+    //      subsequent calls to getLastError are invalid.  The only way we know if an
+    //      election has occurred is to use the unique electionId.
+    OID _electionId;
+    bool _isElectionIdSet;
+
+    // (O)  Array of item-level error information
+    boost::optional<std::vector<write_ops::WriteError>> _writeErrors;
+
+    // (O)  errors that occurred while trying to satisfy the write concern.
+    std::unique_ptr<WriteConcernErrorDetail> _wcErrDetails;
+
+    // (O)  array containing the error labels in string format.
+    std::vector<std::string> _errorLabels;
+
+    // (O)  Array containing the retried statement ids from the response.
+    std::vector<StmtId> _retriedStmtIds;
+
+    // (O)  Array of item-level QueryStatsMetrics
+    boost::optional<std::vector<write_ops::QueryStatsMetrics>> _queryStatsMetrics;
+};
+
+/**
+ * Error, which is very specific to the batch write commands execution and should never be used
+ * internally between the cluster nodes. Indicates that more than one type of error occurred while
+ * executing a batch write command and contains the details for each type.
+ */
+class MultipleErrorsOccurredInfo final : public ErrorExtraInfo {
+public:
+    static constexpr auto code = ErrorCodes::MultipleErrorsOccurred;
+
+    MultipleErrorsOccurredInfo(BSONArray arr) : _arr(std::move(arr)) {}
+
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj);
+    void serialize(BSONObjBuilder* bob) const override;
+
+private:
+    BSONArray _arr;
+};
+
+}  // namespace mongo

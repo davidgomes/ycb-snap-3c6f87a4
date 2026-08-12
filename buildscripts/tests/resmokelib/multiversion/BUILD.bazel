@@ -1,0 +1,25 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "test_multiversion_service",
+    srcs = [
+        "__init__.py",
+        "test_multiversion_service.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+    ],
+)
+
+py_test(
+    name = "test_previous_release_tag",
+    srcs = [
+        "__init__.py",
+        "test_previous_release_tag.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+    ],
+)

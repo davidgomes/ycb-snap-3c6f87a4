@@ -1,0 +1,265 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/fts/fts_index_format.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonelement_comparator_interface.h"
+#include "mongo/db/fts/fts_spec.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/query/bson/multikey_dotted_path_support.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/hex.h"
+#include "mongo/util/md5.h"
+#include "mongo/util/murmur3.h"
+#include "mongo/util/str.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/container/vector.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(enableCompoundTextIndexes);
+
+namespace fts {
+
+using std::string;
+using std::vector;
+
+namespace mdps = ::mongo::multikey_dotted_path_support;
+
+namespace {
+BSONObj nullObj;
+BSONElement nullElt;
+
+// New in textIndexVersion 2. If the term is longer than 32 characters, it may result in the
+// generated key being too large for the index. In that case, we generate a 64-character key from
+// the concatenation of the first 32 characters and the hex string of the murmur3 hash value of the
+// entire term value.
+const size_t termKeyPrefixLengthV2 = 32U;
+// 128-bit hash value expressed in hex = 32 characters
+const size_t termKeySuffixLengthV2 = 32U;
+const size_t termKeyLengthV2 = termKeyPrefixLengthV2 + termKeySuffixLengthV2;
+
+// TextIndexVersion 3. If the term is longer than 256 characters, it may result in the generated key
+// being too large for the index. In that case, we generate a 256-character key from the
+// concatenation of the first 224 characters and the hex string of the md5 hash value of the entire
+// term value.
+const size_t termKeyPrefixLengthV3 = 224U;
+// 128-bit hash value expressed in hex = 32 characters
+const size_t termKeySuffixLengthV3 = 32U;
+const size_t termKeyLengthV3 = termKeyPrefixLengthV3 + termKeySuffixLengthV3;
+
+/**
+ * Given an object being indexed, 'obj', and a path through 'obj', returns the corresponding BSON
+ * element, according to the indexing rules for the non-text fields of an FTS index key pattern.
+ *
+ * Specifically, throws a user assertion if an array is encountered while traversing the 'path'. It
+ * is not legal for there to be an array along the path of the non-text prefix or suffix fields of a
+ * text index, unless a particular array index is specified, as in "a.3".
+ */
+BSONElement extractNonFTSKeyElement(const BSONObj& obj, std::string_view path) {
+    BSONElementSet indexedElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents arrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, path, indexedElements, expandArrayOnTrailingField, &arrayComponents);
+
+    if (MONGO_unlikely(enableCompoundTextIndexes.shouldFail())) {
+        return nullElt;
+    }
+    uassert(ErrorCodes::CannotBuildIndexKeys,
+            str::stream() << "Field '" << path
+                          << "' of text index contains an array in document: " << obj,
+            arrayComponents.empty());
+
+    // Since there aren't any arrays, there cannot be more than one extracted element on 'path'.
+    invariant(indexedElements.size() <= 1U);
+    return indexedElements.empty() ? nullElt : *indexedElements.begin();
+}
+
+/**
+ * Legacy version of extractNonFTSKeyElement that uses pre-SERVER-76875 dotted path extraction.
+ */
+BSONElement extractNonFTSKeyElementLegacy(const BSONObj& obj, std::string_view path) {
+    BSONElementSet indexedElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents arrayComponents;
+    // Use the legacy extraction function that checks for literal field names with dots first.
+    mdps::extractAllElementsAlongPathLegacy_forValidationOnly(
+        obj, path, indexedElements, expandArrayOnTrailingField, &arrayComponents);
+
+    if (MONGO_unlikely(enableCompoundTextIndexes.shouldFail())) {
+        return nullElt;
+    }
+    uassert(ErrorCodes::CannotBuildIndexKeys,
+            str::stream() << "Field '" << path
+                          << "' of text index contains an array in document: " << obj,
+            arrayComponents.empty());
+
+    // Since there aren't any arrays, there cannot be more than one extracted element on 'path'.
+    invariant(indexedElements.size() <= 1U);
+    return indexedElements.empty() ? nullElt : *indexedElements.begin();
+}
+}  // namespace
+
+MONGO_INITIALIZER(FTSIndexFormat)(InitializerContext* context) {
+    BSONObjBuilder b;
+    b.appendNull("");
+    nullObj = b.obj();
+    nullElt = nullObj.firstElement();
+}
+
+BSONObj FTSIndexFormat::getIndexKey(double weight,
+                                    const string& term,
+                                    const BSONObj& indexPrefix,
+                                    TextIndexVersion textIndexVersion) {
+    BSONObjBuilder b;
+
+    BSONObjIterator i(indexPrefix);
+    while (i.more()) {
+        b.appendAs(i.next(), "");
+    }
+
+    key_string::Builder keyString(key_string::Version::kLatestVersion, key_string::ALL_ASCENDING);
+    _appendIndexKey(keyString, weight, term, textIndexVersion);
+    auto key = key_string::toBson(keyString, key_string::ALL_ASCENDING);
+
+    return b.appendElements(key).obj();
+}
+
+template <typename KeyStringBuilder>
+void FTSIndexFormat::_appendIndexKey(KeyStringBuilder& keyString,
+                                     double weight,
+                                     const string& term,
+                                     TextIndexVersion textIndexVersion) {
+    invariant(weight >= 0 && weight <= MAX_WEIGHT);  // FTSmaxweight =  defined in fts_header
+    // Terms are added to index key verbatim.
+    if (TEXT_INDEX_VERSION_1 == textIndexVersion) {
+        keyString.appendString(term);
+    }
+    // See comments at the top of file for termKeyPrefixLengthV2.
+    // Apply hash for text index version 2 to long terms (longer than 32 characters).
+    else if (TEXT_INDEX_VERSION_2 == textIndexVersion) {
+        if (term.size() <= termKeyPrefixLengthV2) {
+            keyString.appendString(term);
+        } else {
+            std::array<char, 16> hash;
+            uint32_t seed = 0;
+            murmur3(std::string_view{term}, seed, hash);
+            string keySuffix = hexblob::encodeLower(hash.data(), hash.size());
+            invariant(termKeySuffixLengthV2 == keySuffix.size());
+            keyString.appendString(term.substr(0, termKeyPrefixLengthV2) + keySuffix);
+        }
+    } else {
+        invariant(TEXT_INDEX_VERSION_3 == textIndexVersion);
+        if (term.size() <= termKeyPrefixLengthV3) {
+            keyString.appendString(term);
+        } else {
+            string keySuffix = md5simpledigest_deprecated(term);
+            invariant(termKeySuffixLengthV3 == keySuffix.size());
+            keyString.appendString(term.substr(0, termKeyPrefixLengthV3) + keySuffix);
+        }
+    }
+    keyString.appendNumberDouble(weight);
+}
+
+template <typename ExtractorFunction>
+void FTSIndexFormat::_getKeysImpl(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                  const FTSSpec& spec,
+                                  const BSONObj& obj,
+                                  KeyStringSet* keys,
+                                  key_string::Version keyStringVersion,
+                                  Ordering ordering,
+                                  const boost::optional<RecordId>& id,
+                                  ExtractorFunction extractFn) {
+    vector<BSONElement> extrasBefore;
+    vector<BSONElement> extrasAfter;
+
+    // Compute the non FTS key elements for the prefix.
+    for (unsigned i = 0; i < spec.numExtraBefore(); i++) {
+        auto indexedElement = extractFn(obj, spec.extraBefore(i));
+        extrasBefore.push_back(indexedElement);
+    }
+
+    // Compute the non FTS key elements for the suffix.
+    for (unsigned i = 0; i < spec.numExtraAfter(); i++) {
+        auto indexedElement = extractFn(obj, spec.extraAfter(i));
+        extrasAfter.push_back(indexedElement);
+    }
+
+    TermFrequencyMap term_freqs;
+    spec.scoreDocument(obj, &term_freqs);
+
+    auto sequence = keys->extract_sequence();
+    for (TermFrequencyMap::const_iterator i = term_freqs.begin(); i != term_freqs.end(); ++i) {
+        const string& term = i->first;
+        double weight = i->second;
+
+        key_string::PooledBuilder keyString(pooledBufferBuilder, keyStringVersion, ordering);
+        for (const auto& elem : extrasBefore) {
+            keyString.appendBSONElement(elem);
+        }
+        _appendIndexKey(keyString, weight, term, spec.getTextIndexVersion());
+        for (const auto& elem : extrasAfter) {
+            keyString.appendBSONElement(elem);
+        }
+
+        if (id) {
+            keyString.appendRecordId(*id);
+        }
+
+        sequence.push_back(keyString.release());
+    }
+    keys->adopt_sequence(std::move(sequence));
+}
+
+void FTSIndexFormat::getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                             const FTSSpec& spec,
+                             const BSONObj& obj,
+                             KeyStringSet* keys,
+                             key_string::Version keyStringVersion,
+                             Ordering ordering,
+                             const boost::optional<RecordId>& id) {
+    // Use current extraction that traverses nested objects for dotted paths.
+    _getKeysImpl(pooledBufferBuilder,
+                 spec,
+                 obj,
+                 keys,
+                 keyStringVersion,
+                 ordering,
+                 id,
+                 extractNonFTSKeyElement);
+}
+
+void FTSIndexFormat::getKeysLegacy_forValidationOnly(
+    SharedBufferFragmentBuilder& pooledBufferBuilder,
+    const FTSSpec& spec,
+    const BSONObj& obj,
+    KeyStringSet* keys,
+    key_string::Version keyStringVersion,
+    Ordering ordering,
+    const boost::optional<RecordId>& id) {
+    // Use legacy extraction that checks for literal field names with dots before traversing.
+    _getKeysImpl(pooledBufferBuilder,
+                 spec,
+                 obj,
+                 keys,
+                 keyStringVersion,
+                 ordering,
+                 id,
+                 extractNonFTSKeyElementLegacy);
+}
+}  // namespace fts
+}  // namespace mongo

@@ -1,0 +1,261 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/storage/backup_block.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/util/modules.h"
+
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+[[MONGO_MOD_PUBLIC]];
+
+namespace mongo {
+
+class JournalListener;
+
+/**
+ * The devnull storage engine is intended for unit and performance testing.
+ */
+class DevNullKVEngine : public KVEngine {
+public:
+    DevNullKVEngine();
+    ~DevNullKVEngine() override;
+
+    std::unique_ptr<RecoveryUnit> newRecoveryUnit() override;
+
+    Status createRecordStore(const rss::PersistenceProvider&,
+                             RecoveryUnit& ru,
+                             const NamespaceString& nss,
+                             std::string_view ident,
+                             const RecordStore::Options& options) override {
+        return Status::OK();
+    }
+
+    std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                std::string_view ident,
+                                                const RecordStore::Options& options,
+                                                boost::optional<UUID> uuid) override;
+
+    std::unique_ptr<RecordStore> getInternalRecordStore(RecoveryUnit& ru,
+                                                        std::string_view ident,
+                                                        KeyFormat keyFormat) override;
+
+    std::unique_ptr<RecordStore> makeInternalRecordStore(RecoveryUnit& ru,
+                                                         std::string_view ident,
+                                                         KeyFormat keyFormat) override;
+
+    Status createSortedDataInterface(
+        const rss::PersistenceProvider&,
+        RecoveryUnit&,
+        const NamespaceString& nss,
+        const UUID& uuid,
+        std::string_view ident,
+        const IndexConfig& indexConfig,
+        const boost::optional<mongo::BSONObj>& storageEngineOptions) override {
+        return Status::OK();
+    }
+
+    Status dropSortedDataInterface(RecoveryUnit&, std::string_view ident) override {
+        return Status::OK();
+    }
+
+    std::unique_ptr<SortedDataInterface> getSortedDataInterface(OperationContext* opCtx,
+                                                                RecoveryUnit& ru,
+                                                                const NamespaceString& nss,
+                                                                const UUID& uuid,
+                                                                std::string_view ident,
+                                                                const IndexConfig& config,
+                                                                KeyFormat keyFormat) override;
+
+    Status dropIdent(RecoveryUnit& ru,
+                     std::string_view ident,
+                     bool identHasSizeInfo,
+                     const StorageEngine::DropIdentCallback& onDrop,
+                     boost::optional<uint64_t> schemaEpoch,
+                     bool waitForLocks) override {
+        return Status::OK();
+    }
+
+    void dropIdentForImport(Interruptible&, RecoveryUnit&, std::string_view ident) override {}
+
+    bool isEphemeral() const override {
+        return true;
+    }
+
+    int64_t getIdentSize(RecoveryUnit&, std::string_view ident) override {
+        return 1;
+    }
+
+    Status repairIdent(RecoveryUnit&, std::string_view ident) override {
+        return Status::OK();
+    }
+
+    bool hasIdent(RecoveryUnit&, std::string_view ident) const override {
+        return true;
+    }
+
+    std::vector<std::string> getAllIdents(RecoveryUnit&) const override {
+        return std::vector<std::string>();
+    }
+
+    void cleanShutdown(bool memLeakAllowed) override {}
+
+    void setJournalListener(JournalListener* jl) override {}
+
+    Timestamp getAllDurableTimestamp() const override {
+        return Timestamp();
+    }
+
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const override {
+        return boost::none;
+    }
+
+    Status beginBackup() override {
+        return Status::OK();
+    }
+
+    void endBackup() override {}
+
+    StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
+        const StorageEngine::BackupOptions& options) override;
+
+    void endNonBlockingBackup() override {}
+
+    Timestamp getBackupCheckpointTimestamp() override {
+        return Timestamp(0, 0);
+    }
+
+    StatusWith<std::deque<std::string>> extendBackupCursor() override;
+
+    boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override {
+        return boost::none;
+    }
+
+    Timestamp getOldestTimestamp() const override {
+        return Timestamp();
+    }
+
+    boost::optional<Timestamp> getRecoveryTimestamp() const override {
+        return boost::none;
+    }
+
+    void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) override {}
+
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                 RecordStore* recordsStore) const override {}
+
+    Status oplogDiskLocRegister(RecoveryUnit&,
+                                RecordStore* oplogRecordStore,
+                                const Timestamp& opTime,
+                                bool orderedCommit) override {
+        return Status::OK();
+    }
+
+    bool waitUntilDurable(OperationContext* opCtx) override {
+        return true;
+    }
+
+    bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx, bool) override {
+        return true;
+    }
+
+    StatusWith<Timestamp> pinOldestTimestamp(RecoveryUnit&,
+                                             const std::string& requestingServiceName,
+                                             Timestamp requestedTimestamp,
+                                             bool roundUpIfTooOld) override {
+        return Timestamp(0, 0);
+    }
+
+    void unpinOldestTimestamp(const std::string& requestingServiceName) override {}
+
+    bool underCachePressure(int concurrentOpOuts) override {
+        return false;
+    }
+
+    BSONObj setFlagToStorageOptions(const BSONObj& storageEngineOptions,
+                                    std::string_view flagName,
+                                    boost::optional<bool> flagValue) const override {
+        return storageEngineOptions;
+    }
+
+    boost::optional<bool> getFlagFromStorageOptions(const BSONObj& storageEngineOptions,
+                                                    std::string_view flagName) const override {
+        return boost::none;
+    }
+
+    [[nodiscard]] BSONObj setStorageTierToStorageOptions(
+        const BSONObj& storageEngineOptions, StorageTierLevelEnum value) const override {
+        return storageEngineOptions;
+    }
+
+    boost::optional<StorageTierLevelEnum> getStorageTierFromStorageOptions(
+        const BSONObj& storageEngineOptions) const override {
+        return boost::none;
+    }
+
+    void dump() const override {}
+
+    Status insertIntoIdent(RecoveryUnit& ru,
+                           std::string_view ident,
+                           IdentKey key,
+                           std::span<const char> value,
+                           BlindWritePolicy policy) override {
+        return Status::OK();
+    }
+
+    Status updateInIdent(RecoveryUnit& ru,
+                         std::string_view ident,
+                         IdentKey key,
+                         std::span<const char> value,
+                         BlindWritePolicy policy) override {
+        return Status::OK();
+    }
+
+    StatusWith<UniqueBuffer> getFromIdent(RecoveryUnit& ru,
+                                          std::string_view ident,
+                                          IdentKey key) override {
+        return Status::OK();
+    }
+
+    Status deleteFromIdent(RecoveryUnit& ru,
+                           std::string_view ident,
+                           IdentKey key,
+                           BlindWritePolicy policy) override {
+        return Status::OK();
+    }
+
+    // This sets the results of the backup cursor for unit tests.
+    [[MONGO_MOD_PUBLIC]] void setBackupBlocks_forTest(std::deque<KVBackupBlock> newBackupBlocks) {
+        _mockBackupBlocks = std::move(newBackupBlocks);
+    }
+
+private:
+    std::shared_ptr<void> _catalogInfo;
+    int _cachePressureForTest = 0;
+    std::deque<KVBackupBlock> _mockBackupBlocks;
+    boost::filesystem::path _engineDbPath;
+};
+}  // namespace mongo
