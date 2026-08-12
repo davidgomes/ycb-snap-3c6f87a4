@@ -2687,28 +2687,38 @@ static void
 validate_compressed_batch_input(HeapTupleHeader input, TupleDesc input_desc)
 {
 	bool has_count_metadata = false;
+	bool has_compressed_column = false;
+	const Oid compressed_data_type_oid =
+		ts_custom_type_cache_get(CUSTOM_TYPE_COMPRESSED_DATA)->type_oid;
+	const Oid input_relid = get_typ_typrelid(HeapTupleHeaderGetTypeId(input));
 
 	for (int i = 0; i < input_desc->natts; i++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(input_desc, i);
 
-		if (attr->attisdropped ||
-			strcmp(NameStr(attr->attname), COMPRESSION_COLUMN_METADATA_COUNT_NAME) != 0)
+		if (attr->attisdropped)
 		{
 			continue;
 		}
 
-		if (attr->atttypid != INT4OID)
+		if (strcmp(NameStr(attr->attname), COMPRESSION_COLUMN_METADATA_COUNT_NAME) == 0)
 		{
-			error_not_compressed_batch();
-		}
+			if (attr->atttypid != INT4OID)
+			{
+				error_not_compressed_batch();
+			}
 
-		has_count_metadata = true;
+			has_count_metadata = true;
+		}
+		else if (attr->atttypid == compressed_data_type_oid)
+		{
+			has_compressed_column = true;
+		}
 	}
 
 	if (!has_count_metadata ||
-		!ts_relation_is_compressed_chunk_relation(
-			get_typ_typrelid(HeapTupleHeaderGetTypeId(input))))
+		(OidIsValid(input_relid) && !ts_relation_is_compressed_chunk_relation(input_relid)) ||
+		(!OidIsValid(input_relid) && !has_compressed_column))
 	{
 		error_not_compressed_batch();
 	}

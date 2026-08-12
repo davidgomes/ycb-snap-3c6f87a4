@@ -74,6 +74,8 @@ SELECT count(*) AS one_batch_difference_count FROM diff;
 
 CREATE TABLE not_a_compressed_batch(value integer);
 CREATE TABLE wrong_batch_metadata(value integer, _ts_meta_count text);
+INSERT INTO not_a_compressed_batch VALUES (1);
+INSERT INTO wrong_batch_metadata VALUES (1, '1');
 
 \set ON_ERROR_STOP 0
 SELECT *
