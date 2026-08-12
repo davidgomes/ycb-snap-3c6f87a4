@@ -54,9 +54,10 @@ class ShreddingArrayBsonContainsArrayExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array_view = bson.ParseAsArrayAtOffset(0);
             if (!array_view.has_value()) {
-                res[i] = false;
+                res[i] = valid_res[i] = false;
                 continue;
             }
+            valid_res[i] = true;
             bool matched = false;
             for (const auto& sub_value : array_view.value()) {
                 auto sub_array = milvus::BsonView::GetValueFromBsonView<
@@ -102,9 +103,10 @@ class ShreddingArrayBsonContainsAllArrayExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array_view = bson.ParseAsArrayAtOffset(0);
             if (!array_view.has_value()) {
-                res[i] = false;
+                res[i] = valid_res[i] = false;
                 continue;
             }
+            valid_res[i] = true;
             std::set<int> exist_elements_index;
             for (const auto& sub_value : array_view.value()) {
                 auto sub_array = milvus::BsonView::GetValueFromBsonView<
@@ -156,9 +158,10 @@ class ShreddingArrayBsonContainsAnyExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array_view = bson.ParseAsArrayAtOffset(0);
             if (!array_view.has_value()) {
-                res[i] = false;
+                res[i] = valid_res[i] = false;
                 continue;
             }
+            valid_res[i] = true;
             bool matched = false;
             for (const auto& element : array_view.value()) {
                 if constexpr (std::is_same_v<GetType, int64_t> ||
@@ -212,9 +215,10 @@ class ShreddingArrayBsonContainsAllExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array_view = bson.ParseAsArrayAtOffset(0);
             if (!array_view.has_value()) {
-                res[i] = false;
+                res[i] = valid_res[i] = false;
                 continue;
             }
+            valid_res[i] = true;
             std::set<GetType> tmp_elements(elements_);
             for (const auto& element : array_view.value()) {
                 auto value = milvus::BsonView::GetValueFromBsonView<GetType>(
@@ -259,9 +263,10 @@ class ShreddingArrayBsonContainsAllWithDiffTypeExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array = bson.ParseAsArrayAtOffset(0);
             if (!array.has_value()) {
-                res[i] = false;
+                res[i] = valid_res[i] = false;
                 continue;
             }
+            valid_res[i] = true;
             std::set<int> tmp_elements_index(elements_index_);
             for (const auto& sub_value : array.value()) {
                 int idx = -1;
@@ -372,9 +377,10 @@ class ShreddingArrayBsonContainsAnyWithDiffTypeExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array = bson.ParseAsArrayAtOffset(0);
             if (!array.has_value()) {
-                res[i] = false;
+                res[i] = valid_res[i] = false;
                 continue;
             }
+            valid_res[i] = true;
             bool matched = false;
             for (const auto& sub_value : array.value()) {
                 for (auto const& element : elements_) {

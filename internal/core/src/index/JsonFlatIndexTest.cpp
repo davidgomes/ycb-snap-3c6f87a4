@@ -238,6 +238,17 @@ TEST_F(JsonFlatIndexTest, TestExistsQuery) {
     ASSERT_TRUE(result[0]);   // Alice
     ASSERT_FALSE(result[1]);  // null
     ASSERT_FALSE(result[2]);  // not exist
+
+    auto comparable = executor->IsNotNull();
+    ASSERT_TRUE(comparable[0]);
+    ASSERT_FALSE(comparable[1]);
+    ASSERT_FALSE(comparable[2]);
+
+    std::string alice = "Alice";
+    auto not_alice = executor->NotIn(1, &alice);
+    ASSERT_FALSE(not_alice[0]);
+    ASSERT_FALSE(not_alice[1]);
+    ASSERT_FALSE(not_alice[2]);
 }
 
 TEST_F(JsonFlatIndexTest, TestNotInQuery) {

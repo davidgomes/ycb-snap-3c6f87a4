@@ -128,18 +128,6 @@ class JsonScalarIndexWrapper : public BaseIndex {
         return exists_bitset_.clone();
     }
 
-    // JSON brute-force semantics: NotEqual on error (path missing / cast fail)
-    // returns TRUE. Base indexes mask invalid rows to false via valid_bitset_,
-    // which is correct for regular nullable columns but wrong for JSON path
-    // indexes. Fix: OR back the invalid rows after the base NotIn.
-    const TargetBitmap
-    NotIn(size_t n, const T* values) override {
-        auto result = BaseIndex::NotIn(n, values);
-        auto null_rows = BaseIndex::IsNull();
-        result |= null_rows;
-        return result;
-    }
-
     // v2 format: serialize non_exist_offsets (and null_offset for inverted).
     BinarySet
     Serialize(const Config& config) override {

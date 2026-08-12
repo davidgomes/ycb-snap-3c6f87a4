@@ -821,6 +821,124 @@ TEST_P(ExprTest, TestTermWithJSONNullable) {
     }
 }
 
+TEST(JsonUnknownTest, RawPredicatesPreserveUnknown) {
+    auto schema = std::make_shared<Schema>();
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    auto segment = segcore::CreateSealedSegment(schema);
+
+    std::vector<std::string> json_strings = {
+        R"({"a":{"b":1},"arr":[1,2],"s":"abc"})",
+        R"({"a":null,"arr":null,"s":null})",
+        R"({"a":{}})",
+        R"({"a":5,"arr":"bad","s":5})",
+        R"({"a":{"b":null},"arr":[],"s":"xyz"})",
+        R"({"a":{"b":"1"},"arr":[3],"s":"def"})",
+        R"({"a":{"b":2},"arr":[1],"s":"abc"})",
+        R"({"a":{"b":3},"arr":[0,4],"s":"zzz"})",
+        R"(null)",
+    };
+    std::vector<milvus::Json> jsons;
+    jsons.reserve(json_strings.size());
+    for (const auto& value : json_strings) {
+        jsons.emplace_back(simdjson::padded_string(value));
+    }
+    auto json_field =
+        std::make_shared<FieldData<milvus::Json>>(DataType::JSON, false);
+    json_field->add_json_data(jsons);
+    auto cm = milvus::storage::RemoteChunkManagerSingleton::GetInstance()
+                  .GetRemoteChunkManager();
+    auto load_info = PrepareSingleFieldInsertBinlog(
+        0, 0, 0, json_fid.get(), {json_field}, cm);
+    segment->LoadFieldData(load_info);
+
+    auto eval = [&](const auto& expression) {
+        auto plan = std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID,
+                                                           expression);
+        return milvus::test::gen_filter_res(
+            plan.get(), segment.get(), json_strings.size(), MAX_TIMESTAMP);
+    };
+    auto expect = [](const ColumnVectorPtr& result,
+                     const std::vector<bool>& data,
+                     const std::vector<bool>& valid) {
+        ASSERT_NE(result, nullptr);
+        ASSERT_EQ(result->size(), data.size());
+        ASSERT_EQ(result->size(), valid.size());
+        TargetBitmapView result_data(result->GetRawData(), result->size());
+        for (size_t i = 0; i < data.size(); ++i) {
+            EXPECT_EQ(result_data[i], data[i]) << "row " << i;
+            EXPECT_EQ(result->ValidAt(i), valid[i]) << "row " << i;
+        }
+    };
+
+    proto::plan::GenericValue one;
+    one.set_int64_val(1);
+    auto column = expr::ColumnInfo(json_fid, DataType::JSON, {"a", "b"});
+    auto not_equal = std::make_shared<expr::UnaryRangeFilterExpr>(
+        column,
+        proto::plan::OpType::NotEqual,
+        one,
+        std::vector<proto::plan::GenericValue>());
+    std::vector<bool> scalar_valid = {
+        true, false, false, false, false, false, true, true, false};
+    std::vector<bool> not_equal_data = {
+        false, false, false, false, false, false, true, true, false};
+    expect(eval(not_equal), not_equal_data, scalar_valid);
+
+    auto equal = std::make_shared<expr::UnaryRangeFilterExpr>(
+        column,
+        proto::plan::OpType::Equal,
+        one,
+        std::vector<proto::plan::GenericValue>());
+    auto not_equal_composed = std::make_shared<expr::LogicalUnaryExpr>(
+        expr::LogicalUnaryExpr::OpType::LogicalNot, equal);
+    expect(eval(not_equal_composed), not_equal_data, scalar_valid);
+
+    auto term = std::make_shared<expr::TermFilterExpr>(
+        column, std::vector<proto::plan::GenericValue>{one}, false);
+    expect(eval(term),
+           {true, false, false, false, false, false, false, false, false},
+           scalar_valid);
+
+    proto::plan::GenericValue two;
+    two.set_int64_val(2);
+    auto range = std::make_shared<expr::BinaryRangeFilterExpr>(
+        column, one, two, true, true);
+    expect(eval(range),
+           {true, false, false, false, false, false, true, false, false},
+           scalar_valid);
+
+    auto contains = std::make_shared<expr::JsonContainsExpr>(
+        expr::ColumnInfo(json_fid, DataType::JSON, {"arr"}),
+        proto::plan::JSONContainsExpr_JSONOp_Contains,
+        true,
+        std::vector<proto::plan::GenericValue>{one});
+    expect(eval(contains),
+           {true, false, false, false, false, false, true, false, false},
+           {true, false, false, false, true, true, true, true, false});
+
+    auto array_index_not_equal = std::make_shared<expr::UnaryRangeFilterExpr>(
+        expr::ColumnInfo(json_fid, DataType::JSON, {"arr", "1"}),
+        proto::plan::OpType::NotEqual,
+        two,
+        std::vector<proto::plan::GenericValue>());
+    expect(eval(array_index_not_equal),
+           {false, false, false, false, false, false, false, true, false},
+           {true, false, false, false, false, false, false, true, false});
+
+    proto::plan::GenericValue regex;
+    regex.set_string_val("a.*");
+    auto regex_match = std::make_shared<expr::UnaryRangeFilterExpr>(
+        expr::ColumnInfo(json_fid, DataType::JSON, {"s"}),
+        proto::plan::OpType::RegexMatch,
+        regex,
+        std::vector<proto::plan::GenericValue>());
+    auto not_regex_match = std::make_shared<expr::LogicalUnaryExpr>(
+        expr::LogicalUnaryExpr::OpType::LogicalNot, regex_match);
+    expect(eval(not_regex_match),
+           {false, false, false, false, true, true, false, true, false},
+           {true, false, false, false, true, true, true, true, false});
+}
+
 TEST_P(ExprTest, TestExistsWithJSON) {
     // Test cases: {expression string, reference function, json key}
     std::vector<std::tuple<std::string, std::function<bool(bool)>, std::string>>

@@ -124,7 +124,7 @@ struct BinaryRangeElementFunc {
         if constexpr (std::is_same_v<GetType, int64_t>) {              \
             auto x = src[offset].at_numeric(pointer);                  \
             if (x.error()) {                                           \
-                res[i] = false;                                        \
+                res[i] = valid_res[i] = false;                         \
                 break;                                                 \
             }                                                          \
             auto n = x.value();                                        \
@@ -140,7 +140,7 @@ struct BinaryRangeElementFunc {
         } else {                                                       \
             auto x = src[offset].template at<GetType>(pointer);        \
             if (x.error()) {                                           \
-                res[i] = false;                                        \
+                res[i] = valid_res[i] = false;                         \
                 break;                                                 \
             }                                                          \
             auto value = x.value();                                    \
@@ -222,28 +222,28 @@ struct BinaryRangeElementFuncForArray {
             }
             if constexpr (lower_inclusive && upper_inclusive) {
                 if (index >= src[offset].length()) {
-                    res[i] = false;
+                    res[i] = valid_res[i] = false;
                     continue;
                 }
                 auto value = src[offset].get_data<GetType>(index);
                 res[i] = val1 <= value && value <= val2;
             } else if constexpr (lower_inclusive && !upper_inclusive) {
                 if (index >= src[offset].length()) {
-                    res[i] = false;
+                    res[i] = valid_res[i] = false;
                     continue;
                 }
                 auto value = src[offset].get_data<GetType>(index);
                 res[i] = val1 <= value && value < val2;
             } else if constexpr (!lower_inclusive && upper_inclusive) {
                 if (index >= src[offset].length()) {
-                    res[i] = false;
+                    res[i] = valid_res[i] = false;
                     continue;
                 }
                 auto value = src[offset].get_data<GetType>(index);
                 res[i] = val1 < value && value <= val2;
             } else {
                 if (index >= src[offset].length()) {
-                    res[i] = false;
+                    res[i] = valid_res[i] = false;
                     continue;
                 }
                 auto value = src[offset].get_data<GetType>(index);

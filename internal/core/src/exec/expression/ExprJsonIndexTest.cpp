@@ -285,7 +285,15 @@ TEST(JsonIndexTest, TestJsonNotEqualExpr) {
         std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, unary_expr);
     auto final =
         ExecuteQueryExpr(plan, seg.get(), 2 * json_strs.size(), MAX_TIMESTAMP);
-    EXPECT_EQ(final.count(), 2 * json_strs.size() - 2);
+    EXPECT_EQ(final.count(), 2);
+
+    auto col_vec = milvus::test::gen_filter_res(
+        plan.get(), seg.get(), 2 * json_strs.size(), MAX_TIMESTAMP);
+    ASSERT_NE(col_vec, nullptr);
+    for (size_t i = 0; i < 2 * json_strs.size(); ++i) {
+        auto row = i % json_strs.size();
+        EXPECT_EQ(col_vec->ValidAt(i), row == 0 || row == 2) << "row " << i;
+    }
 }
 
 class JsonIndexExistsTest : public ::testing::TestWithParam<std::string> {};

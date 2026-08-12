@@ -664,7 +664,7 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonStats() {
 
         cached_index_chunk_res_ = std::make_shared<TargetBitmap>(active_count_);
         cached_index_chunk_valid_res_ =
-            std::make_shared<TargetBitmap>(active_count_, true);
+            std::make_shared<TargetBitmap>(active_count_, false);
         TargetBitmapView res_view(*cached_index_chunk_res_);
         TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
 
@@ -676,6 +676,7 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonStats() {
             auto target_field = index->GetShreddingField(pointer, json_type);
             if (!target_field.empty()) {
                 using ColType = decltype(GetType);
+                valid_res_view.set();
                 auto shredding_executor =
                     [val1, val2, lower_inclusive, upper_inclusive](
                         const ColType* src,
@@ -725,7 +726,7 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonStats() {
                 // and double compare
                 TargetBitmap res_double(active_count_, false);
                 TargetBitmapView res_double_view(res_double);
-                TargetBitmap res_double_valid(active_count_, true);
+                TargetBitmap res_double_valid(active_count_, false);
                 TargetBitmapView valid_res_double_view(res_double_valid);
                 try_execute(milvus::index::JSONType::DOUBLE,
                             res_double_view,
@@ -743,7 +744,7 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonStats() {
                 // and int64 compare
                 TargetBitmap res_int64(active_count_, false);
                 TargetBitmapView res_int64_view(res_int64);
-                TargetBitmap res_int64_valid(active_count_, true);
+                TargetBitmap res_int64_valid(active_count_, false);
                 TargetBitmapView valid_res_int64_view(res_int64_valid);
                 try_execute(milvus::index::JSONType::INT64,
                             res_int64_view,
@@ -762,50 +763,55 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonStats() {
         }
 
         // process shared data
-        auto shared_executor =
-            [val1, val2, lower_inclusive, upper_inclusive, &res_view](
-                milvus::BsonView bson, uint32_t row_id, uint32_t value_offset) {
-                if constexpr (std::is_same_v<GetType, int64_t> ||
-                              std::is_same_v<GetType, double>) {
-                    auto val = bson.ParseAsValueAtOffset<double>(value_offset);
-                    if (!val.has_value()) {
-                        res_view[row_id] = false;
-                        return;
-                    }
-                    if (lower_inclusive && upper_inclusive) {
-                        res_view[row_id] =
-                            val.value() >= val1 && val.value() <= val2;
-                    } else if (lower_inclusive && !upper_inclusive) {
-                        res_view[row_id] =
-                            val.value() >= val1 && val.value() < val2;
-                    } else if (!lower_inclusive && upper_inclusive) {
-                        res_view[row_id] =
-                            val.value() > val1 && val.value() <= val2;
-                    } else {
-                        res_view[row_id] =
-                            val.value() > val1 && val.value() < val2;
-                    }
-                } else {
-                    auto val = bson.ParseAsValueAtOffset<GetType>(value_offset);
-                    if (!val.has_value()) {
-                        res_view[row_id] = false;
-                        return;
-                    }
-                    if (lower_inclusive && upper_inclusive) {
-                        res_view[row_id] =
-                            val.value() >= val1 && val.value() <= val2;
-                    } else if (lower_inclusive && !upper_inclusive) {
-                        res_view[row_id] =
-                            val.value() >= val1 && val.value() < val2;
-                    } else if (!lower_inclusive && upper_inclusive) {
-                        res_view[row_id] =
-                            val.value() > val1 && val.value() <= val2;
-                    } else {
-                        res_view[row_id] =
-                            val.value() > val1 && val.value() < val2;
-                    }
+        auto shared_executor = [val1,
+                                val2,
+                                lower_inclusive,
+                                upper_inclusive,
+                                &res_view,
+                                &valid_res_view](milvus::BsonView bson,
+                                                 uint32_t row_id,
+                                                 uint32_t value_offset) {
+            if constexpr (std::is_same_v<GetType, int64_t> ||
+                          std::is_same_v<GetType, double>) {
+                auto val = bson.ParseAsValueAtOffset<double>(value_offset);
+                if (!val.has_value()) {
+                    res_view[row_id] = false;
+                    return;
                 }
-            };
+                valid_res_view[row_id] = true;
+                if (lower_inclusive && upper_inclusive) {
+                    res_view[row_id] =
+                        val.value() >= val1 && val.value() <= val2;
+                } else if (lower_inclusive && !upper_inclusive) {
+                    res_view[row_id] =
+                        val.value() >= val1 && val.value() < val2;
+                } else if (!lower_inclusive && upper_inclusive) {
+                    res_view[row_id] =
+                        val.value() > val1 && val.value() <= val2;
+                } else {
+                    res_view[row_id] = val.value() > val1 && val.value() < val2;
+                }
+            } else {
+                auto val = bson.ParseAsValueAtOffset<GetType>(value_offset);
+                if (!val.has_value()) {
+                    res_view[row_id] = false;
+                    return;
+                }
+                valid_res_view[row_id] = true;
+                if (lower_inclusive && upper_inclusive) {
+                    res_view[row_id] =
+                        val.value() >= val1 && val.value() <= val2;
+                } else if (lower_inclusive && !upper_inclusive) {
+                    res_view[row_id] =
+                        val.value() >= val1 && val.value() < val2;
+                } else if (!lower_inclusive && upper_inclusive) {
+                    res_view[row_id] =
+                        val.value() > val1 && val.value() <= val2;
+                } else {
+                    res_view[row_id] = val.value() > val1 && val.value() < val2;
+                }
+            }
+        };
         {
             milvus::ScopedTimer timer(
                 "binary_range_json_stats_shared_data",
@@ -818,8 +824,10 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonStats() {
         CachePut(CacheElapsedUs(cache_compute_start));
     }
 
-    auto res = MoveOrSliceBitmap(
-        *cached_index_chunk_res_, current_data_global_pos_, real_batch_size);
+    auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
+                                 *cached_index_chunk_valid_res_,
+                                 current_data_global_pos_,
+                                 real_batch_size);
     MoveCursor();
     return res;
 }  // namespace exec

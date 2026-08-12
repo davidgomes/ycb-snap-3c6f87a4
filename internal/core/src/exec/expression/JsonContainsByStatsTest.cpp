@@ -29,6 +29,7 @@
 #include "common/Tracer.h"
 #include "common/Types.h"
 #include "common/protobuf_utils.h"
+#include "exec/expression/ExprCache.h"
 #include "exec/expression/UnaryExpr.h"
 #include "expr/ITypeExpr.h"
 #include "filemanager/InputStream.h"
@@ -52,6 +53,7 @@
 #include "storage/Types.h"
 #include "storage/Util.h"
 #include "test_utils/Constants.h"
+#include "test_utils/GenExprProto.h"
 #include "test_utils/storage_test_utils.h"
 
 using namespace milvus;
@@ -274,9 +276,16 @@ TEST(JsonContainsByStatsTest, BasicContainsAnyOnArray) {
         bool should_match = ((i % 7) == 0) || ((i % 7) == 2) || ((i % 7) == 5);
         EXPECT_EQ(bool(result[i]), should_match);
     }
+
+    auto col_vec = milvus::test::gen_filter_res(
+        plan.get(), segment.get(), N, MAX_TIMESTAMP);
+    ASSERT_NE(col_vec, nullptr);
+    for (int i = 0; i < N; ++i) {
+        EXPECT_EQ(col_vec->ValidAt(i), i % 7 != 4) << "row " << i;
+    }
 }
 
-TEST(JsonStatsUnaryRangeTest, NotEqualKeepsJsonPathErrorsButMasksFieldNull) {
+TEST(JsonStatsUnaryRangeTest, NotEqualPreservesUnknownJsonPaths) {
     auto schema = std::make_shared<Schema>();
     auto json_fid = schema->AddDebugField("json", DataType::JSON, true);
 
@@ -285,10 +294,10 @@ TEST(JsonStatsUnaryRangeTest, NotEqualKeepsJsonPathErrorsButMasksFieldNull) {
     std::vector<std::string> json_raw_data = {
         R"({"a": "1"})",    // equal, filtered out
         R"({"a": "123"})",  // string mismatch, kept
-        R"({"a": 1})",      // type mismatch for string compare, kept
-        R"({"b": 1})",      // path missing, kept
-        R"({"a": null})",   // JSON path error, kept
-        R"({})",            // path missing, kept
+        R"({"a": 1})",      // type mismatch for string compare, unknown
+        R"({"b": 1})",      // path missing, unknown
+        R"({"a": null})",   // JSON null, unknown
+        R"({})",            // path missing, unknown
         R"({"a": "321"})",  // string mismatch, kept
         R"({"a": "123"})",  // field-level null, filtered out by valid data
     };
@@ -338,9 +347,74 @@ TEST(JsonStatsUnaryRangeTest, NotEqualKeepsJsonPathErrorsButMasksFieldNull) {
 
     ASSERT_EQ(result.size(), json_raw_data.size());
     EXPECT_FALSE(result[0]);
-    for (int i = 1; i <= 6; ++i) {
-        EXPECT_TRUE(result[i]) << "row " << i;
-    }
+    EXPECT_TRUE(result[1]);
+    EXPECT_TRUE(result[6]);
+    EXPECT_FALSE(result[2]);
+    EXPECT_FALSE(result[3]);
+    EXPECT_FALSE(result[4]);
+    EXPECT_FALSE(result[5]);
     EXPECT_FALSE(result[7]);
-    EXPECT_EQ(result.count(), 6);
+    EXPECT_EQ(result.count(), 2);
+
+    auto& cache = exec::ExprResCacheManager::Instance();
+    cache.SetCapacityBytes(1 << 20);
+    cache.Clear();
+    exec::ExprResCacheManager::SetEnabled(true);
+    auto col_vec = milvus::test::gen_filter_res(
+        plan.get(), segment.get(), json_raw_data.size(), MAX_TIMESTAMP);
+    auto cached_col_vec = milvus::test::gen_filter_res(
+        plan.get(), segment.get(), json_raw_data.size(), MAX_TIMESTAMP);
+    cache.Clear();
+    exec::ExprResCacheManager::SetEnabled(false);
+    ASSERT_NE(col_vec, nullptr);
+    ASSERT_NE(cached_col_vec, nullptr);
+    std::vector<bool> expected_valid = {
+        true, true, false, false, false, false, true, false};
+    for (size_t i = 0; i < expected_valid.size(); ++i) {
+        EXPECT_EQ(col_vec->ValidAt(i), expected_valid[i]) << "row " << i;
+        EXPECT_EQ(cached_col_vec->ValidAt(i), expected_valid[i])
+            << "cached row " << i;
+    }
+
+    auto term_expr = std::make_shared<expr::TermFilterExpr>(
+        expr::ColumnInfo(json_fid, DataType::JSON, {"a"}),
+        std::vector<proto::plan::GenericValue>{val},
+        false);
+    auto term_plan =
+        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, term_expr);
+    auto term_col_vec = milvus::test::gen_filter_res(
+        term_plan.get(), segment.get(), json_raw_data.size(), MAX_TIMESTAMP);
+    ASSERT_NE(term_col_vec, nullptr);
+    for (size_t i = 0; i < expected_valid.size(); ++i) {
+        EXPECT_EQ(term_col_vec->ValidAt(i), expected_valid[i])
+            << "term row " << i;
+    }
+
+    proto::plan::GenericValue upper;
+    upper.set_string_val("200");
+    auto range_expr = std::make_shared<expr::BinaryRangeFilterExpr>(
+        expr::ColumnInfo(json_fid, DataType::JSON, {"a"}),
+        val,
+        upper,
+        true,
+        true);
+    auto range_plan =
+        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, range_expr);
+    auto range_col_vec = milvus::test::gen_filter_res(
+        range_plan.get(), segment.get(), json_raw_data.size(), MAX_TIMESTAMP);
+    ASSERT_NE(range_col_vec, nullptr);
+    for (size_t i = 0; i < expected_valid.size(); ++i) {
+        EXPECT_EQ(range_col_vec->ValidAt(i), expected_valid[i])
+            << "range row " << i;
+    }
+
+    auto not_expr = std::make_shared<expr::LogicalUnaryExpr>(
+        expr::LogicalUnaryExpr::OpType::LogicalNot, unary_expr);
+    auto not_plan =
+        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, not_expr);
+    auto not_result = query::ExecuteQueryExpr(
+        not_plan, segment.get(), json_raw_data.size(), MAX_TIMESTAMP);
+    ASSERT_EQ(not_result.size(), json_raw_data.size());
+    EXPECT_TRUE(not_result[0]);
+    EXPECT_EQ(not_result.count(), 1);
 }
