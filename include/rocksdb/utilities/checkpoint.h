@@ -153,6 +153,18 @@ class Checkpoint {
                                   uint64_t log_size_for_flush = 0,
                                   uint64_t* sequence_number_ptr = nullptr);
 
+  // Builds an openable snapshot containing only the specified column families
+  // and the default column family. An empty column_families vector creates a
+  // checkpoint containing all column families, as in the overload above.
+  // All handles must be non-null, belong to the DB used to create this object,
+  // and refer to column families that have not been dropped. Duplicate handles
+  // are coalesced by column family ID.
+  virtual Status CreateCheckpoint(
+      const std::string& checkpoint_dir,
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      uint64_t log_size_for_flush = 0,
+      uint64_t* sequence_number_ptr = nullptr);
+
   // Exports all live SST files of a specified Column Family onto export_dir,
   // returning SST files information in metadata.
   // - SST files will be created as hard links when the directory specified

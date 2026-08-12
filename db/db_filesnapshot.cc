@@ -198,6 +198,26 @@ Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
+  return GetLiveFilesStorageInfoImpl(opts, nullptr, files, nullptr);
+}
+
+Status DBImpl::GetLiveFilesStorageInfoForColumnFamilies(
+    const LiveFilesStorageInfoOptions& opts,
+    const std::unordered_set<uint32_t>& included_column_family_ids,
+    std::vector<LiveFileStorageInfo>* files,
+    std::vector<uint32_t>* excluded_column_family_ids) {
+  assert(!included_column_family_ids.empty());
+  assert(excluded_column_family_ids != nullptr);
+  excluded_column_family_ids->clear();
+  return GetLiveFilesStorageInfoImpl(
+      opts, &included_column_family_ids, files, excluded_column_family_ids);
+}
+
+Status DBImpl::GetLiveFilesStorageInfoImpl(
+    const LiveFilesStorageInfoOptions& opts,
+    const std::unordered_set<uint32_t>* included_column_family_ids,
+    std::vector<LiveFileStorageInfo>* files,
+    std::vector<uint32_t>* excluded_column_family_ids) {
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
@@ -280,6 +300,11 @@ Status DBImpl::GetLiveFilesStorageInfo(
   // Make a set of all of the live table and blob files
   for (auto cfd : *versions_->GetColumnFamilySet()) {
     if (cfd->IsDropped()) {
+      continue;
+    }
+    if (included_column_family_ids != nullptr &&
+        included_column_family_ids->count(cfd->GetID()) == 0) {
+      excluded_column_family_ids->push_back(cfd->GetID());
       continue;
     }
     VersionStorageInfo& vsi = *cfd->current()->storage_info();

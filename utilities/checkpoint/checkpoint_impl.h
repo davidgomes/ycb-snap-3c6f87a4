@@ -6,6 +6,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_set>
 
 #include "file/filename.h"
 #include "rocksdb/db.h"
@@ -24,13 +25,21 @@ class CheckpointImpl : public Checkpoint {
                           uint64_t log_size_for_flush,
                           uint64_t* sequence_number_ptr) override;
 
+  Status CreateCheckpoint(
+      const std::string& checkpoint_dir,
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      uint64_t log_size_for_flush,
+      uint64_t* sequence_number_ptr) override;
+
   // Shared by the legacy Checkpoint API and CheckpointEngine. engine == nullptr
   // links/copies serially; otherwise work runs on the pool, awaited before the
   // staging dir is committed.
   Status CreateCheckpointImpl(const std::string& checkpoint_dir,
                               uint64_t log_size_for_flush,
                               uint64_t* sequence_number_ptr, CopyEngine* engine,
-                              bool use_link, RateLimiter* copy_rate_limiter);
+                              bool use_link, RateLimiter* copy_rate_limiter,
+                              const std::unordered_set<uint32_t>*
+                                  included_column_family_ids = nullptr);
 
   Status ExportColumnFamily(ColumnFamilyHandle* handle,
                             const std::string& export_dir,
@@ -53,10 +62,18 @@ class CheckpointImpl : public Checkpoint {
                            const std::string& contents, FileType type)>
           create_file_cb,
       uint64_t* sequence_number, uint64_t log_size_for_flush,
-      bool get_live_table_checksum = false, bool atomic_flush = false);
+      bool get_live_table_checksum = false, bool atomic_flush = false,
+      const std::unordered_set<uint32_t>* included_column_family_ids = nullptr,
+      std::vector<uint32_t>* excluded_column_family_ids = nullptr,
+      std::string* manifest_filename = nullptr,
+      uint64_t* manifest_size = nullptr);
 
  private:
   Status CleanStagingDirectory(const std::string& path, Logger* info_log);
+  Status AppendColumnFamilyDrops(
+      const std::string& manifest_path, uint64_t manifest_size,
+      const std::vector<uint32_t>& excluded_column_family_ids,
+      bool use_fsync);
 
   // Export logic customization by providing callbacks for link or copy.
   Status ExportFilesInMetaData(

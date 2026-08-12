@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <thread>
 #include <utility>
 
@@ -370,6 +371,184 @@ TEST_F(CheckpointTest, CheckpointWithBlob) {
       ReadOptions(), checkpoint_db->DefaultColumnFamily(), key, &value));
 
   ASSERT_EQ(value, blob);
+}
+
+TEST_F(CheckpointTest, CheckpointWithSelectedColumnFamilies) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.paranoid_checks = true;
+  CreateAndReopenWithCF({"one", "two"}, options);
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put(i, "key", "value" + std::to_string(i)));
+    ASSERT_OK(Flush(i));
+  }
+
+  auto get_data_files = [&](ColumnFamilyHandle* handle) {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(handle, &metadata);
+    std::vector<std::string> files;
+    for (const auto& level : metadata.levels) {
+      for (const auto& file : level.files) {
+        files.push_back(file.relative_filename);
+      }
+    }
+    for (const auto& blob : metadata.blob_files) {
+      std::string name = blob.blob_file_name;
+      if (!name.empty() && name.front() == '/') {
+        name.erase(0, 1);
+      }
+      files.push_back(std::move(name));
+    }
+    return files;
+  };
+
+  const auto default_files = get_data_files(handles_[0]);
+  const auto included_files = get_data_files(handles_[1]);
+  const auto excluded_files = get_data_files(handles_[2]);
+  ASSERT_FALSE(default_files.empty());
+  ASSERT_FALSE(included_files.empty());
+  ASSERT_FALSE(excluded_files.empty());
+
+  std::string source_manifest;
+  std::vector<std::string> source_files;
+  ASSERT_OK(env_->GetChildren(dbname_, &source_files));
+  for (const auto& file : source_files) {
+    uint64_t number;
+    FileType type;
+    if (ParseFileName(file, &number, &type) && type == kDescriptorFile) {
+      source_manifest = dbname_ + "/" + file;
+      break;
+    }
+  }
+  ASSERT_FALSE(source_manifest.empty());
+  uint64_t source_manifest_size = 0;
+  ASSERT_OK(env_->GetFileSize(source_manifest, &source_manifest_size));
+
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint_guard(checkpoint);
+  ASSERT_OK(checkpoint->CreateCheckpoint(
+      snapshot_name_, {handles_[1], handles_[1]},
+      std::numeric_limits<uint64_t>::max()));
+
+  uint64_t source_manifest_size_after = 0;
+  ASSERT_OK(env_->GetFileSize(source_manifest, &source_manifest_size_after));
+  ASSERT_EQ(source_manifest_size, source_manifest_size_after);
+
+  std::vector<std::string> checkpoint_files;
+  ASSERT_OK(env_->GetChildren(snapshot_name_, &checkpoint_files));
+  auto file_is_present = [&](const std::string& file) {
+    return std::find(checkpoint_files.begin(), checkpoint_files.end(), file) !=
+           checkpoint_files.end();
+  };
+  for (const auto& file : default_files) {
+    ASSERT_TRUE(file_is_present(file)) << file;
+  }
+  for (const auto& file : included_files) {
+    ASSERT_TRUE(file_is_present(file)) << file;
+  }
+  for (const auto& file : excluded_files) {
+    ASSERT_FALSE(file_is_present(file)) << file;
+  }
+
+  std::vector<ColumnFamilyDescriptor> included_descriptors = {
+      {kDefaultColumnFamilyName, options}, {"one", options}};
+  std::vector<ColumnFamilyHandle*> checkpoint_handles;
+  std::unique_ptr<DB> checkpoint_db;
+  ASSERT_OK(DB::Open(DBOptions(options), snapshot_name_, included_descriptors,
+                     &checkpoint_handles, &checkpoint_db));
+  std::string value;
+  ASSERT_OK(checkpoint_db->Get(ReadOptions(), checkpoint_handles[0], "key",
+                               &value));
+  ASSERT_EQ("value0", value);
+  ASSERT_OK(checkpoint_db->Get(ReadOptions(), checkpoint_handles[1], "key",
+                               &value));
+  ASSERT_EQ("value1", value);
+  for (auto* handle : checkpoint_handles) {
+    delete handle;
+  }
+  checkpoint_handles.clear();
+  checkpoint_db.reset();
+
+  std::vector<ColumnFamilyDescriptor> all_descriptors = {
+      {kDefaultColumnFamilyName, options}, {"one", options}, {"two", options}};
+  Status s = DB::Open(DBOptions(options), snapshot_name_, all_descriptors,
+                      &checkpoint_handles, &checkpoint_db);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  for (auto* handle : checkpoint_handles) {
+    delete handle;
+  }
+
+  ASSERT_EQ("value2", Get(2, "key"));
+  std::vector<std::string> source_column_families;
+  ASSERT_OK(DB::ListColumnFamilies(DBOptions(options), dbname_,
+                                   &source_column_families));
+  ASSERT_EQ(source_column_families,
+            std::vector<std::string>({kDefaultColumnFamilyName, "one", "two"}));
+}
+
+TEST_F(CheckpointTest, EmptyColumnFamilySelectionCreatesFullCheckpoint) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"one", "two"}, options);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put(i, "key", "value" + std::to_string(i)));
+  }
+
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint_guard(checkpoint);
+  ASSERT_OK(checkpoint->CreateCheckpoint(
+      snapshot_name_, std::vector<ColumnFamilyHandle*>{}));
+
+  std::vector<ColumnFamilyDescriptor> descriptors = {
+      {kDefaultColumnFamilyName, options}, {"one", options}, {"two", options}};
+  std::vector<ColumnFamilyHandle*> checkpoint_handles;
+  std::unique_ptr<DB> checkpoint_db;
+  ASSERT_OK(DB::Open(DBOptions(options), snapshot_name_, descriptors,
+                     &checkpoint_handles, &checkpoint_db));
+  for (int i = 0; i < 3; ++i) {
+    std::string value;
+    ASSERT_OK(checkpoint_db->Get(ReadOptions(), checkpoint_handles[i], "key",
+                                 &value));
+    ASSERT_EQ("value" + std::to_string(i), value);
+  }
+  for (auto* handle : checkpoint_handles) {
+    delete handle;
+  }
+}
+
+TEST_F(CheckpointTest, SelectedColumnFamiliesRejectInvalidHandles) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"one", "two"}, options);
+
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint_guard(checkpoint);
+  ASSERT_TRUE(checkpoint->CreateCheckpoint(
+                            snapshot_name_,
+                            std::vector<ColumnFamilyHandle*>{nullptr})
+                  .IsInvalidArgument());
+
+  const std::string other_db_name =
+      test::PerThreadDBPath(env_, "checkpoint_other_db");
+  ASSERT_OK(DestroyDB(other_db_name, options));
+  std::unique_ptr<DB> other_db;
+  ASSERT_OK(DB::Open(options, other_db_name, &other_db));
+  ColumnFamilyHandle* other_handle = nullptr;
+  ASSERT_OK(other_db->CreateColumnFamily(options, "other", &other_handle));
+  ASSERT_TRUE(
+      checkpoint->CreateCheckpoint(snapshot_name_, {other_handle})
+          .IsInvalidArgument());
+  delete other_handle;
+  other_db.reset();
+  ASSERT_OK(DestroyDB(other_db_name, options));
+
+  ASSERT_OK(db_->DropColumnFamily(handles_[2]));
+  ASSERT_TRUE(
+      checkpoint->CreateCheckpoint(snapshot_name_, {handles_[2]})
+          .IsInvalidArgument());
 }
 
 TEST_F(CheckpointTest, ExportColumnFamilyWithLinks) {
