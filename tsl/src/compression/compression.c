@@ -2234,12 +2234,13 @@ create_per_compressed_column(RowDecompressor *decompressor)
 		is_compressed = compressed_attr->atttypid == compressed_data_type_oid;
 		if (!is_compressed && compressed_attr->atttypid != decompressed_type)
 		{
-			elog(ERROR,
-				 "compressed table type '%s' does not match decompressed table type '%s' for "
-				 "segment-by column \"%s\"",
-				 format_type_be(compressed_attr->atttypid),
-				 format_type_be(decompressed_type),
-				 col_name);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("compressed batch type '%s' does not match output type '%s' for "
+						"segment-by column \"%s\"",
+						format_type_be(compressed_attr->atttypid),
+						format_type_be(decompressed_type),
+						col_name)));
 		}
 
 		*per_compressed_col = (PerCompressedColumn){
@@ -2668,9 +2669,163 @@ row_decompressor_decompress_row_to_tuplesort(RowDecompressor *decompressor,
 	row_decompressor_reset(decompressor);
 }
 
+typedef struct DecompressBatchSRFState
+{
+	RowDecompressor decompressor;
+	int num_rows;
+	int next_row;
+} DecompressBatchSRFState;
+
+static void
+error_not_compressed_batch(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("input record is not a compressed batch")));
+}
+
+static void
+validate_compressed_batch_input(HeapTupleHeader input, TupleDesc input_desc)
+{
+	bool has_count_metadata = false;
+
+	for (int i = 0; i < input_desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(input_desc, i);
+
+		if (attr->attisdropped ||
+			strcmp(NameStr(attr->attname), COMPRESSION_COLUMN_METADATA_COUNT_NAME) != 0)
+		{
+			continue;
+		}
+
+		if (attr->atttypid != INT4OID)
+		{
+			error_not_compressed_batch();
+		}
+
+		has_count_metadata = true;
+	}
+
+	if (!has_count_metadata ||
+		!ts_relation_is_compressed_chunk_relation(
+			get_typ_typrelid(HeapTupleHeaderGetTypeId(input))))
+	{
+		error_not_compressed_batch();
+	}
+}
+
+static void
+validate_decompress_batch_output(const RowDecompressor *decompressor)
+{
+	bool *output_columns = palloc0(sizeof(bool) * decompressor->out_desc->natts);
+
+	for (int i = 0; i < decompressor->in_desc->natts; i++)
+	{
+		Form_pg_attribute input_attr = TupleDescAttr(decompressor->in_desc, i);
+		PerCompressedColumn *column = &decompressor->per_compressed_cols[i];
+
+		if (input_attr->attisdropped ||
+			strcmp(NameStr(input_attr->attname), COMPRESSION_COLUMN_METADATA_COUNT_NAME) == 0 ||
+			strncmp(NameStr(input_attr->attname),
+					COMPRESSION_COLUMN_METADATA_PREFIX,
+					strlen(COMPRESSION_COLUMN_METADATA_PREFIX)) == 0)
+		{
+			continue;
+		}
+
+		if (column->decompressed_column_offset < 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("output row type is missing compressed batch column \"%s\"",
+							NameStr(input_attr->attname))));
+		}
+
+		output_columns[column->decompressed_column_offset] = true;
+	}
+
+	for (int i = 0; i < decompressor->out_desc->natts; i++)
+	{
+		Form_pg_attribute output_attr = TupleDescAttr(decompressor->out_desc, i);
+
+		if (!output_attr->attisdropped && !output_columns[i])
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("output row type has unexpected column \"%s\"",
+							NameStr(output_attr->attname))));
+		}
+	}
+}
+
 /********************/
 /*** SQL Bindings ***/
 /********************/
+
+Datum
+tsl_decompress_batch(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	DecompressBatchSRFState *state;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext old_context;
+		TupleDesc input_desc;
+		HeapTupleData input_tuple;
+		HeapTupleHeader input = PG_GETARG_HEAPTUPLEHEADER(0);
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		old_context = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (get_call_result_type(fcinfo, NULL, &funcctx->tuple_desc) != TYPEFUNC_COMPOSITE)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("function returning record called in context that cannot accept type "
+							"record")));
+		}
+		funcctx->tuple_desc = BlessTupleDesc(funcctx->tuple_desc);
+
+		input_desc = lookup_rowtype_tupdesc(HeapTupleHeaderGetTypeId(input),
+											HeapTupleHeaderGetTypMod(input));
+		validate_compressed_batch_input(input, input_desc);
+
+		state = palloc0(sizeof(*state));
+		state->decompressor =
+			build_decompressor(input_desc, funcctx->tuple_desc, InvalidOid, InvalidOid);
+		ReleaseTupleDesc(input_desc);
+
+		validate_decompress_batch_output(&state->decompressor);
+
+		input_tuple.t_len = HeapTupleHeaderGetDatumLength(input);
+		input_tuple.t_data = input;
+		heap_deform_tuple(&input_tuple,
+						  state->decompressor.in_desc,
+						  state->decompressor.compressed_datums,
+						  state->decompressor.compressed_is_nulls);
+
+		state->num_rows = decompress_batch(&state->decompressor);
+		funcctx->user_fctx = state;
+
+		MemoryContextSwitchTo(old_context);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	state = funcctx->user_fctx;
+
+	if (state->next_row == state->num_rows)
+	{
+		row_decompressor_close(&state->decompressor);
+		SRF_RETURN_DONE(funcctx);
+	}
+
+	SRF_RETURN_NEXT(funcctx,
+					HeapTupleGetDatum(
+						ExecFetchSlotHeapTuple(state->decompressor.decompressed_slots[state->next_row++],
+											   false,
+											   NULL)));
+}
 
 Datum
 tsl_compressed_data_decompress_forward(PG_FUNCTION_ARGS)
