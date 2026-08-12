@@ -355,6 +355,10 @@ class ShardDocIndex {
   SearchResult Search(const OpArgs& op_args, const SearchParams& params,
                       search::SearchAlgorithm* search_algo, bool is_knn_prefilter) const;
 
+  // Gather this shard's corpus statistics for the query terms. Merged across shards so
+  // text scoring (BM25/TFIDF) uses corpus-wide IDF and average field lengths.
+  search::GlobalScoringStats GatherScoringStats(search::SearchAlgorithm* search_algo) const;
+
   // Perform search and load requested values - note params might be interpreted differently.
   std::vector<SearchDocData> SearchForAggregator(const OpArgs& op_args,
                                                  const AggregateParams& params,

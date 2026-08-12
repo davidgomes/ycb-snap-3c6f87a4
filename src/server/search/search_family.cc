@@ -1125,6 +1125,30 @@ void PartialSort(absl::Span<SerializedSearchDoc*> docs, size_t limit, SortOrder 
   partial_sort(docs.begin(), docs.begin() + min(limit, docs.size()), docs.end(), cb);
 }
 
+// Run an extra transaction hop that gathers per-shard corpus statistics for the query terms
+// and merges them, so the scoring pass computes IDF and average field lengths from the whole
+// corpus regardless of how documents are distributed over shards. Returns nullopt for
+// single-shard setups, where local statistics already cover the whole corpus.
+std::optional<search::GlobalScoringStats> GatherGlobalScoringStats(
+    Transaction* tx, std::string_view index_name, search::SearchAlgorithm* search_algo) {
+  if (shard_set->size() < 2)
+    return std::nullopt;
+
+  std::vector<search::GlobalScoringStats> shard_stats(shard_set->size());
+  tx->Execute(
+      [&](Transaction* t, EngineShard* es) {
+        if (auto* index = es->search_indices()->GetIndex(index_name); index)
+          shard_stats[es->shard_id()] = index->GatherScoringStats(search_algo);
+        return OpStatus::OK;
+      },
+      false);
+
+  search::GlobalScoringStats global_stats;
+  for (auto& stats : shard_stats)
+    global_stats.Merge(std::move(stats));
+  return global_stats;
+}
+
 void SearchReply(const SearchParams& params,
                  std::optional<search::KnnScoreSortOption> knn_sort_option,
                  std::string_view inject_score_alias, absl::Span<SearchResult> results,
@@ -1168,9 +1192,21 @@ void SearchReply(const SearchParams& params,
   const size_t end = limit + offset;
 
   // Apply SORTBY if its different from the KNN sort
-  if (params.sort_option && !ignore_sort)
+  const bool text_scored = params.scorer != nullptr || params.with_scores;
+  if (params.sort_option && !ignore_sort) {
     PartialSort(absl::MakeSpan(docs), end, params.sort_option->order,
                 &SerializedSearchDoc::sort_score);
+  } else if (text_scored && !knn_sort_option) {
+    // Each shard returns an independently score-ordered run; merge them into a single
+    // corpus-wide order. Ties are broken by key so the output does not depend on how
+    // documents are distributed over shards.
+    auto cb = [](const SerializedSearchDoc* l, const SerializedSearchDoc* r) {
+      if (l->text_score != r->text_score)
+        return l->text_score > r->text_score;
+      return l->key < r->key;
+    };
+    partial_sort(docs.begin(), docs.begin() + min(end, docs.size()), docs.end(), cb);
+  }
 
   const bool reply_with_ids_only = params.IdsOnly();
   auto* rb = static_cast<RedisReplyBuilder*>(builder);
@@ -2017,7 +2053,16 @@ void CmdFtSearch(CmdArgList args, CommandContext* cmd_cntx) {
 
   // If the query does not contain knn component, or it is a hybrid query.
   // HNSW vector range has no prefilter, so skip per-shard search entirely.
+  std::optional<search::GlobalScoringStats> global_scoring_stats;
   if ((!knn || knn_has_prefilter) && !hnsw_range) {
+    // Text scoring is active: gather corpus-wide statistics first so per-shard scores
+    // (and thus the merged top-K) do not depend on the shard count.
+    if (params->scorer || params->with_scores) {
+      global_scoring_stats = GatherGlobalScoringStats(cmd_cntx->tx(), index_name, &search_algo);
+      if (global_scoring_stats)
+        search_algo.SetGlobalScoringStats(&*global_scoring_stats);
+    }
+
     cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
       if (auto* index = es->search_indices()->GetIndex(index_name); index)
         docs[es->shard_id()] =
@@ -2121,6 +2166,14 @@ void CmdFtProfile(CmdArgList args, CommandContext* cmd_cntx) {
   std::atomic<bool> index_not_found{false};
   std::vector<SearchResult> search_results(shards_count);
   std::vector<absl::Duration> profile_results(shards_count);
+
+  // Gather corpus-wide statistics first so text scores are shard-independent
+  std::optional<search::GlobalScoringStats> global_scoring_stats;
+  if (params->scorer || params->with_scores) {
+    global_scoring_stats = GatherGlobalScoringStats(cmd_cntx->tx(), index_name, &search_algo);
+    if (global_scoring_stats)
+      search_algo.SetGlobalScoringStats(&*global_scoring_stats);
+  }
 
   cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
     auto* index = es->search_indices()->GetIndex(index_name);
@@ -2297,6 +2350,25 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
 
     auto [knn_node, knn] = TryPopHnswKnnNode(search_algo, params->index);
 
+    // Check for HNSW vector range query (mutually exclusive with KNN)
+    const search::AstVectorRangeNode* hnsw_range = nullptr;
+    if (!knn) {
+      if (auto* vr = search_algo.GetVectorRangeNode();
+          vr && GlobalHnswIndexRegistry::Instance().Exist(params->index, vr->field))
+        hnsw_range = vr;
+    }
+
+    // When text scoring is active and a per-shard text search will run, corpus-wide
+    // statistics are gathered first so __score values do not depend on the shard count.
+    // Declared here so it outlives the search hops below.
+    std::optional<search::GlobalScoringStats> global_scoring_stats;
+    const bool text_scoring = params->scorer != nullptr || params->add_scores;
+    auto gather_scoring_stats = [&] {
+      global_scoring_stats = GatherGlobalScoringStats(cmd_cntx->tx(), params->index, &search_algo);
+      if (global_scoring_stats)
+        search_algo.SetGlobalScoringStats(&*global_scoring_stats);
+    };
+
     // Per-shard text scores from prefilter for __score injection in ADDSCORES mode.
     // Indexed by shard_id because local DocIds are not unique across shards.
     // Always allocated to shard_set->size() so the callback can index unconditionally.
@@ -2333,6 +2405,9 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
       std::optional<std::vector<search::GlobalDocId>> prefilter_global_ids;
 
       if (knn_has_prefilter) {
+        if (text_scoring)
+          gather_scoring_stats();
+
         vector<SearchResult> prefilter_docs(shard_set->size());
         cmd_cntx->tx()->Execute(
             [&](Transaction* t, EngineShard* es) {
@@ -2373,9 +2448,7 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
         cmd_cntx->tx()->ScheduleSingleHop(
             make_load_cb(shard_docs, knn->score_alias, prefilter_text_scores));
       }
-    } else if (auto* vr = search_algo.GetVectorRangeNode();
-               vr && GlobalHnswIndexRegistry::Instance().Exist(params->index, vr->field)) {
-      const search::AstVectorRangeNode* hnsw_range = vr;
+    } else if (hnsw_range) {
       auto hnsw_index = GetValidatedHnswRangeIndex(params->index, hnsw_range, builder);
       if (!hnsw_index)
         return;
@@ -2388,6 +2461,9 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
       cmd_cntx->tx()->ScheduleSingleHop(
           make_load_cb(shard_docs, hnsw_range->score_alias, prefilter_text_scores));
     } else {
+      if (text_scoring)
+        gather_scoring_stats();
+
       cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
         if (auto* index = es->search_indices()->GetIndex(params->index); index) {
           query_results[es->shard_id()] =

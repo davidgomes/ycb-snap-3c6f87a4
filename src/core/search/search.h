@@ -150,6 +150,10 @@ class FieldIndices {
   BaseSortIndex* GetSortIndex(std::string_view field) const;
   std::vector<TextIndex*> GetAllTextIndices() const;
 
+  // Same as GetAllTextIndices, but paired with the schema field identifier of each index.
+  // Identifiers are stable keys for merging scoring statistics across shards.
+  std::vector<std::pair<std::string_view, TextIndex*>> GetAllTextIndicesWithIdent() const;
+
   const std::vector<DocId>& GetAllDocs() const;
   const Schema& GetSchema() const;
 
@@ -231,6 +235,17 @@ class SearchAlgorithm {
   SearchResult Search(const FieldIndices* index,
                       size_t cuttoff_limit = std::numeric_limits<size_t>::max()) const;
 
+  // Gather this shard's corpus statistics (document count, per-term document frequency and
+  // field length sums) for the terms this query matches. The per-shard results are merged
+  // with GlobalScoringStats::Merge and passed back via SetGlobalScoringStats so the scoring
+  // pass uses corpus-wide values. Requires a scorer to be set.
+  GlobalScoringStats GatherScoringStats(const FieldIndices* index) const;
+
+  // Provide merged corpus-wide statistics for scoring. When set, Search computes text scores
+  // from these instead of shard-local statistics, making scores independent of sharding.
+  // The pointed-to object must outlive subsequent Search calls.
+  void SetGlobalScoringStats(const GlobalScoringStats* stats);
+
   std::optional<KnnScoreSortOption> GetKnnScoreSortOption() const;
 
   bool IsKnnQuery() const;
@@ -248,6 +263,7 @@ class SearchAlgorithm {
  private:
   bool profiling_enabled_ = false;
   ScorerFn scorer_ = nullptr;
+  const GlobalScoringStats* global_scoring_stats_ = nullptr;  // not owned
   std::unique_ptr<AstNode> query_;
   std::optional<KnnScoreSortOption> knn_hnsw_score_sort_option_;
 };

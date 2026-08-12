@@ -854,6 +854,11 @@ vector<search::SortableValue> ShardDocIndex::KeepTopKSorted(vector<DocId>* ids, 
   return out;
 }
 
+search::GlobalScoringStats ShardDocIndex::GatherScoringStats(
+    search::SearchAlgorithm* search_algo) const {
+  return search_algo->GatherScoringStats(&*indices_);
+}
+
 SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& params,
                                    search::SearchAlgorithm* search_algo,
                                    bool is_knn_prefilter) const {

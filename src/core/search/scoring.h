@@ -4,10 +4,13 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+
 #include <algorithm>
 #include <cmath>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "core/search/base.h"
@@ -28,6 +31,32 @@ struct ScoringTermInfo {
 // Context passed to scorer for a single document
 struct ScoringContext {
   size_t num_docs = 0;  // Total documents in index
+};
+
+// Corpus-wide statistics used to make text scoring shard-independent.
+// Each shard gathers its local slice with SearchAlgorithm::GatherScoringStats, the coordinator
+// merges the slices and hands the result back for the scoring pass, so IDF and average field
+// lengths reflect the whole indexed corpus rather than one shard's subset of documents.
+struct GlobalScoringStats {
+  struct FieldLenStats {
+    size_t total_len = 0;  // Sum of per-document field lengths
+    size_t num_docs = 0;   // Documents with non-empty content in the field
+
+    double AvgLen() const {
+      return num_docs > 0 ? static_cast<double>(total_len) / num_docs : 0.0;
+    }
+  };
+
+  size_t num_docs = 0;  // Total documents across all shards
+
+  // (field identifier, term) -> number of documents containing the term
+  absl::flat_hash_map<std::pair<std::string, std::string>, size_t> term_docs;
+
+  // field identifier -> aggregated field length stats
+  absl::flat_hash_map<std::string, FieldLenStats> field_lens;
+
+  // Accumulate another shard's slice into this one
+  void Merge(GlobalScoringStats&& other);
 };
 
 // Scorer function signature: computes the score for a single (term, document) pair.

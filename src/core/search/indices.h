@@ -146,6 +146,12 @@ template <typename C> struct BaseStringIndex : public BaseIndex {
     return field_num_docs_;
   }
 
+  // Sum of per-document field lengths. Together with GetFieldNumDocs() this allows
+  // computing a corpus-wide average field length across shards.
+  size_t GetFieldTotalDocsLen() const {
+    return field_total_docs_len_;
+  }
+
  protected:
   using StringList = DocumentAccessor::StringList;
 
