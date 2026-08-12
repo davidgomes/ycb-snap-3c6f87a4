@@ -2526,6 +2526,31 @@ static int isValidAnnouncedHostname(char *val, const char **err) {
     return isValidHostnameChars(val, err);
 }
 
+/* Validation function for tls-expected-peer-name.
+ * The value is a space-separated list of names the peer certificate may
+ * present. An empty value clears the setting; otherwise it must contain at
+ * least one name (i.e. must not consist only of spaces), and names must
+ * not contain any whitespace other than the space separators. */
+static int isValidTlsExpectedPeerName(char *val, const char **err) {
+    if (val[0] == '\0') return 1; /* Empty clears/disables the check */
+
+    int names = 0;
+    for (char *p = val; *p; p++) {
+        if (*p == ' ') continue;
+        if (isspace((unsigned char) *p)) {
+            *err = "tls-expected-peer-name must be a list of names "
+                "separated by spaces, with no other whitespace";
+            return 0;
+        }
+        if (p == val || p[-1] == ' ') names++;
+    }
+    if (names == 0) {
+        *err = "tls-expected-peer-name must contain at least one name";
+        return 0;
+    }
+    return 1;
+}
+
 /* Validation function for cluster-announce-ip.
  * Ensures the IP address is valid and rejects control characters. */
 static int isValidClusterAnnounceIp(char *val, const char **err) {
@@ -3489,6 +3514,7 @@ standardConfig static_configs[] = {
     createStringConfig("tls-dh-params-file", NULL, VOLATILE_CONFIG | MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.dh_params_file, NULL, NULL, applyTlsCfg),
     createStringConfig("tls-ca-cert-file", NULL, VOLATILE_CONFIG | MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ca_cert_file, NULL, NULL, applyTlsCfg),
     createStringConfig("tls-ca-cert-dir", NULL, VOLATILE_CONFIG | MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ca_cert_dir, NULL, NULL, applyTlsCfg),
+    createStringConfig("tls-expected-peer-name", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.expected_peer_name, NULL, isValidTlsExpectedPeerName, NULL),
     createStringConfig("tls-protocols", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.protocols, NULL, NULL, applyTlsCfg),
     createStringConfig("tls-ciphers", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphers, NULL, NULL, applyTlsCfg),
     createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, applyTlsCfg),

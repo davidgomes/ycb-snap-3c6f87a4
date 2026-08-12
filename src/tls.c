@@ -30,6 +30,17 @@
 #include <sys/uio.h>
 #include <arpa/inet.h>
 
+/* Peer certificate name verification (tls-expected-peer-name) relies on the
+ * X509_VERIFY_PARAM host checking machinery introduced in OpenSSL 1.0.2.
+ * Building against an older OpenSSL fails by default; define
+ * TLS_NO_PEER_NAME_VERIFICATION to build anyway, in which case setting
+ * tls-expected-peer-name logs a warning and the peer name is not checked
+ * (certificate chain/CA verification still applies). */
+#if !defined(TLS_NO_PEER_NAME_VERIFICATION) && (OPENSSL_VERSION_NUMBER < 0x10002000L)
+#error "tls-expected-peer-name requires OpenSSL >= 1.0.2 for peer name verification. \
+Define TLS_NO_PEER_NAME_VERIFICATION to build without it (peer names will not be checked)."
+#endif
+
 #define REDIS_TLS_PROTO_TLSv1       (1<<0)
 #define REDIS_TLS_PROTO_TLSv1_1     (1<<1)
 #define REDIS_TLS_PROTO_TLSv1_2     (1<<2)
@@ -459,6 +470,70 @@ static void updateTLSError(tls_connection *conn) {
     ERR_error_string_n(ERR_get_error(), conn->ssl_error, 512);
 }
 
+/* Configure the connection's SSL object so that, as part of certificate
+ * chain validation, the peer certificate is required to present one of the
+ * names configured with tls-expected-peer-name. Names are matched against
+ * the certificate SubjectAltName entries, falling back to the Common Name
+ * only when no DNS SubjectAltName entries are present (standard OpenSSL
+ * host checking behavior).
+ *
+ * The expected names come exclusively from local configuration; the dialed
+ * address or anything received over the wire is never used.
+ *
+ * Returns C_OK when verification was set up, or when tls-expected-peer-name
+ * is not configured (nothing to enforce). Returns C_ERR if the expected
+ * names could not be applied, in which case the caller must fail the
+ * connection. */
+static int tlsConfigureExpectedPeerName(tls_connection *conn) {
+    const char *expected = server.tls_ctx_config.expected_peer_name;
+    if (!expected) return C_OK;
+
+#ifdef TLS_NO_PEER_NAME_VERIFICATION
+    /* Compile-time opt-out for builds against an OpenSSL that lacks host
+     * verification: the peer certificate is still verified against the
+     * configured CA, but its name is not checked. */
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        serverLog(LL_WARNING, "tls-expected-peer-name is set, but Redis was built with "
+                "TLS_NO_PEER_NAME_VERIFICATION: peer certificate names will NOT be verified "
+                "(certificate chain verification against the CA still applies).");
+    }
+    return C_OK;
+#else
+    X509_VERIFY_PARAM *param = SSL_get0_param(conn->ssl);
+    int count = 0, applied = 0;
+    sds *names = sdssplitlen(expected, strlen(expected), " ", 1, &count);
+    if (!names) goto error;
+
+    for (int i = 0; i < count; i++) {
+        if (sdslen(names[i]) == 0) continue; /* Skip empty tokens from repeated spaces */
+
+        /* The first name resets any previously configured list; subsequent
+         * names are added as accepted alternatives (match any). */
+        int ret = (applied == 0) ?
+            X509_VERIFY_PARAM_set1_host(param, names[i], sdslen(names[i])) :
+            X509_VERIFY_PARAM_add1_host(param, names[i], sdslen(names[i]));
+        if (!ret) {
+            sdsfreesplitres(names, count);
+            goto error;
+        }
+        applied++;
+    }
+    sdsfreesplitres(names, count);
+
+    /* Config validation rejects whitespace-only values, but fail closed if
+     * we somehow ended up with no names to match. */
+    if (applied == 0) goto error;
+    return C_OK;
+
+error:
+    if (conn->ssl_error) zfree(conn->ssl_error);
+    conn->ssl_error = zstrdup("Failed to configure expected peer name verification");
+    return C_ERR;
+#endif
+}
+
 /* Create a new TLS connection that is already associated with
  * an accepted underlying file descriptor.
  *
@@ -470,6 +545,8 @@ static void updateTLSError(tls_connection *conn) {
  */
 static connection *connCreateAcceptedTLS(struct aeEventLoop *el, int fd, void *priv) {
     int require_auth = *(int *)priv;
+    int verify_peer_name = require_auth & TLS_CLIENT_AUTH_VERIFY_PEER_NAME;
+    require_auth &= ~TLS_CLIENT_AUTH_VERIFY_PEER_NAME;
     tls_connection *conn = (tls_connection *) createTLSConnection(el, 0);
     conn->c.fd = fd;
     conn->c.el = el;
@@ -491,6 +568,16 @@ static connection *connCreateAcceptedTLS(struct aeEventLoop *el, int fd, void *p
         default: /* TLS_CLIENT_AUTH_YES, also fall-secure */
             SSL_set_verify(conn->ssl, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
             break;
+    }
+
+    /* On the cluster bus the connecting peer is another cluster node, so
+     * when tls-expected-peer-name is set its certificate must also carry
+     * one of the expected names. This blocks impersonation even when the
+     * victim never dials the attacker. Ordinary client (data port) accepts
+     * never set this flag and are not name-checked. */
+    if (verify_peer_name && tlsConfigureExpectedPeerName(conn) == C_ERR) {
+        conn->c.state = CONN_STATE_ERROR;
+        return (connection *) conn;
     }
 
     SSL_set_fd(conn->ssl, conn->c.fd);
@@ -923,6 +1010,12 @@ static int connTLSConnect(connection *conn_, const char *addr, int port, const c
     if (conn->c.state != CONN_STATE_NONE) return C_ERR;
     ERR_clear_error();
 
+    /* Outgoing connections are established only towards other servers
+     * (replication, cluster bus, MIGRATE), so enforce the locally configured
+     * expected peer name, if any. Note the dialed address is never used for
+     * verification. */
+    if (tlsConfigureExpectedPeerName(conn) == C_ERR) return C_ERR;
+
     /* Check whether addr is an IP address, if not, use the value for Server Name Indication */
     if (inet_pton(AF_INET, addr, addr_buf) != 1 && inet_pton(AF_INET6, addr, addr_buf) != 1) {
         SSL_set_tlsext_host_name(conn->ssl, addr);
@@ -1061,6 +1154,10 @@ static int connTLSBlockingConnect(connection *conn_, const char *addr, int port,
     int ret;
 
     if (conn->c.state != CONN_STATE_NONE) return C_ERR;
+
+    /* Blocking connects are used for server-to-server communication (e.g.
+     * MIGRATE), so enforce the locally configured expected peer name, if any. */
+    if (tlsConfigureExpectedPeerName(conn) == C_ERR) return C_ERR;
 
     /* Initiate socket blocking connect first */
     if (connectionTypeTcp()->blocking_connect(conn_, addr, port, timeout) == C_ERR) return C_ERR;

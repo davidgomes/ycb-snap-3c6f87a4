@@ -673,6 +673,13 @@ typedef enum {
 #define TLS_CLIENT_AUTH_YES 1
 #define TLS_CLIENT_AUTH_OPTIONAL 2
 
+/* Flag OR'ed into the client authentication mode passed when creating an
+ * accepted TLS connection. When set, and tls-expected-peer-name is
+ * configured, the connecting peer's certificate must also present one of
+ * the expected names. Used on cluster bus accepts, where the connecting
+ * peer is another cluster node and not an ordinary client. */
+#define TLS_CLIENT_AUTH_VERIFY_PEER_NAME (1<<8)
+
 /* TLS Client Certfiicate Authentication */
 #define TLS_CLIENT_FIELD_OFF 0
 #define TLS_CLIENT_FIELD_CN 1
@@ -1973,6 +1980,10 @@ typedef struct redisTLSContextConfig {
     char *dh_params_file;
     char *ca_cert_file;
     char *ca_cert_dir;
+    char *expected_peer_name;       /* Space-separated list of names; on server-to-server
+                                     * connections (replication, cluster bus, MIGRATE) the
+                                     * peer certificate must present one of them in its
+                                     * SubjectAltName (CN as fallback). NULL disables. */
     char *protocols;
     char *ciphers;
     char *ciphersuites;

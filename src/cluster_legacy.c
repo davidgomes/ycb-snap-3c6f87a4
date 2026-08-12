@@ -1267,7 +1267,11 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd;
     int max = MAX_CLUSTER_ACCEPTS_PER_CALL;
     char cip[NET_IP_STR_LEN];
-    int require_auth = TLS_CLIENT_AUTH_YES;
+    /* Cluster bus peers must present a valid client certificate and, when
+     * tls-expected-peer-name is configured, one that carries an expected
+     * name, so a certificate merely signed by the same CA is not enough to
+     * impersonate a cluster node. */
+    int require_auth = TLS_CLIENT_AUTH_YES | TLS_CLIENT_AUTH_VERIFY_PEER_NAME;
     UNUSED(el);
     UNUSED(mask);
     UNUSED(privdata);
