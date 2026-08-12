@@ -331,6 +331,13 @@ Entrypoint for the [OTLP HTTP](https://github.com/open-telemetry/opentelemetry-p
 This endpoint accepts an HTTP POST request with a body that contains a request encoded with [Protocol Buffers](https://developers.google.com/protocol-buffers) and optionally compressed with [GZIP](https://www.gnu.org/software/gzip/).
 You can find the definition of the protobuf message in [metrics.proto](https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto).
 
+When the experimental `-api.otlp-translation-headers-enabled` flag is enabled, clients can override metric name translation for a request:
+
+- `X-Mimir-OTLP-AddSuffixes` accepts `true` or `false` and changes suffix handling while preserving the tenant's configured escaping mode.
+- `X-Mimir-OTLP-TranslationStrategy` accepts `UnderscoreEscapingWithSuffixes`, `UnderscoreEscapingWithoutSuffixes`, `NoUTF8EscapingWithSuffixes`, or `NoTranslation`.
+
+If both headers are present, `X-Mimir-OTLP-TranslationStrategy` takes precedence.
+
 Requires [authentication](#authentication).
 
 ### Influx
