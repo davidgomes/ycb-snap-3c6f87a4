@@ -90,6 +90,11 @@ message ActivityState {
 
   // Set if the activity was terminated
   ActivityTerminateState terminate_state = 12;
+
+  // Time to wait after scheduling before dispatching the first activity task. Only applies to the
+  // first attempt; retries are not delayed by this value. Only supported for standalone
+  // activities.
+  google.protobuf.Duration start_delay = 13;
 }
 
 message ActivityCancelState {
