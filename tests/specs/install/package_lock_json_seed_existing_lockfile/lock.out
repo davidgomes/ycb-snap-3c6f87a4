@@ -1,0 +1,19 @@
+{
+  "version": "5",
+  "specifiers": {
+    "npm:@denotest/has-patch-versions@0.1": "0.1.1"
+  },
+  "npm": {
+    "@denotest/has-patch-versions@0.1.1": {
+      "integrity": "sha512-kMjDYZevBLLzfBJHrfc8A51hWCqgCb+U29DKvZ6eLcr9yUG5e/vgx9ciKRA/zaHPLL+Fct+hOqICDb0ybdUoxQ==",
+      "tarball": "http://localhost:4260/@denotest/has-patch-versions/0.1.1.tgz"
+    }
+  },
+  "workspace": {
+    "packageJson": {
+      "dependencies": [
+        "npm:@denotest/has-patch-versions@0.1"
+      ]
+    }
+  }
+}

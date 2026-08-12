@@ -1,0 +1,82 @@
+{
+  "version": "5",
+  "specifiers": {
+    "npm:@denotest/add@0.5": "0.5.0",
+    "npm:@denotest/different-nested-dep@1": "1.0.0",
+    "npm:@denotest/has-patch-versions@0.1": "0.1.0",
+    "npm:@denotest/multiple-arch-deps@1": "1.0.0",
+    "npm:@denotest/needs-different-nested-dep-child-v2@1": "1.0.0",
+    "npm:@denotest/peer-dep-specific-constraint@1": "1.0.0_@denotest+add@0.5.0"
+  },
+  "npm": {
+    "@denotest/add@0.5.0": {
+      "integrity": "sha512-R2TWOrLTqR4SIcfDdUPudDtcDfNBWYB6I9F7A337Dq+1WIoTqkcCUHtZGWNyxNiaEwyDiwzMKO6ILvCtZZXzQg==",
+      "tarball": "http://localhost:4260/@denotest/add/0.5.0.tgz"
+    },
+    "@denotest/different-nested-dep-child@1.0.0": {
+      "integrity": "sha512-jcu6XMrxJcnrsLWQUubIntMg1ZTaroESjl2O2AJXWi75+QGe367B9bHQGpoeHM4RFTNAQwkzXiTxh0pK9CzQLQ==",
+      "tarball": "http://localhost:4260/@denotest/different-nested-dep-child/1.0.0.tgz"
+    },
+    "@denotest/different-nested-dep-child@2.0.0": {
+      "integrity": "sha512-YcdEbt3vLh5NEr4SNyYD5EGkNSvpaz90CcOBCpPZqWnIlO58ige7NOQK7a5Txh4vcx5TvuMYl0wfiEqKVvQMwQ==",
+      "tarball": "http://localhost:4260/@denotest/different-nested-dep-child/2.0.0.tgz"
+    },
+    "@denotest/different-nested-dep@1.0.0": {
+      "integrity": "sha512-PIZfmNuc+jGwxf0DjPF6a+EXG7pySAc0R9fB2u7nW8NyAKzbMbNT3nMlxKA/mIxeZzhY+1uuG/4RsBKL+7LgxQ==",
+      "dependencies": [
+        "@denotest/different-nested-dep-child@1.0.0"
+      ],
+      "tarball": "http://localhost:4260/@denotest/different-nested-dep/1.0.0.tgz"
+    },
+    "@denotest/has-patch-versions@0.1.0": {
+      "integrity": "sha512-FvCaEQEq2+F05TZkKNaNeWFpbgt2rB+rVdvTYgWxP1eWq6yJdqdhYf4DgiWQmxTH1YmutwCYLx5BtADp4OcuwA==",
+      "tarball": "http://localhost:4260/@denotest/has-patch-versions/0.1.0.tgz"
+    },
+    "@denotest/multiple-arch-deps@1.0.0": {
+      "integrity": "sha512-6OA6YuvdeFAFbYhDQrajQ5DM6Bk74iGGQNWHQ0lVwM4r7rGNKOid6j4JKhx3h/ruNEjATxNN/DHz7JsOX5F25A==",
+      "optionalDependencies": [
+        "@denotest/multiple-arches-win32-arm64",
+        "@denotest/multiple-arches-win32-x64"
+      ],
+      "tarball": "http://localhost:4260/@denotest/multiple-arch-deps/1.0.0.tgz"
+    },
+    "@denotest/multiple-arches-win32-arm64@1.0.0": {
+      "integrity": "sha512-UlTjowBzwpHX2PkqCrg5htCPaCDaZrbsUOSVFZRInZuqqlojsOAuiqNgi5sIMmzqgMroLgacSThdH5ia+Jmoig==",
+      "os": ["win32"],
+      "cpu": ["arm64"],
+      "tarball": "http://localhost:4260/@denotest/multiple-arches-win32-arm64/1.0.0.tgz"
+    },
+    "@denotest/multiple-arches-win32-x64@1.0.0": {
+      "integrity": "sha512-tjm777JzXKEgqhYo7fpTadicJzNuTV+PEJGu7L1vdxWFF+0MYmdAPmRBhLwlatrG/TUDHm5TXWRDrLplvPaqLg==",
+      "os": ["win32"],
+      "cpu": ["x64"],
+      "tarball": "http://localhost:4260/@denotest/multiple-arches-win32-x64/1.0.0.tgz"
+    },
+    "@denotest/needs-different-nested-dep-child-v2@1.0.0": {
+      "integrity": "sha512-LRRs41gGx1q2XgpaML/oAyOVtaCjdFHQY8U3w8frKyhnwTlwlyY9eqvr+8d5qdsiQAOGW5ROkqgzO4k/EmhKiQ==",
+      "dependencies": [
+        "@denotest/different-nested-dep-child@2.0.0"
+      ],
+      "tarball": "http://localhost:4260/@denotest/needs-different-nested-dep-child-v2/1.0.0.tgz"
+    },
+    "@denotest/peer-dep-specific-constraint@1.0.0_@denotest+add@0.5.0": {
+      "integrity": "sha512-Ykce2+nb5V/Wj7OxpIAE35m1vwyvMDxOIrcvtRuRzcPL2UTb9wYwvi+EucmFa5oRX3Lb/1lQMK5mlzuDyLdeCw==",
+      "dependencies": [
+        "@denotest/add"
+      ],
+      "tarball": "http://localhost:4260/@denotest/peer-dep-specific-constraint/1.0.0.tgz"
+    }
+  },
+  "workspace": {
+    "packageJson": {
+      "dependencies": [
+        "npm:@denotest/add@0.5",
+        "npm:@denotest/different-nested-dep@1",
+        "npm:@denotest/has-patch-versions@0.1",
+        "npm:@denotest/multiple-arch-deps@1",
+        "npm:@denotest/needs-different-nested-dep-child-v2@1",
+        "npm:@denotest/peer-dep-specific-constraint@1"
+      ]
+    }
+  }
+}

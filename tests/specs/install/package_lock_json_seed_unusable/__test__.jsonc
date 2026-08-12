@@ -1,0 +1,13 @@
+{
+  "tempDir": true,
+  "steps": [{
+    // the package-lock.json is not usable, so the install falls back to
+    // starting from an empty lockfile without failing (resolving 0.1.1
+    // instead of the 0.1.0 pinned in the npm lockfile)
+    "args": "install",
+    "output": "install.out"
+  }, {
+    "args": ["eval", "console.log(Deno.readTextFileSync('deno.lock').trim());"],
+    "output": "lock.out"
+  }]
+}

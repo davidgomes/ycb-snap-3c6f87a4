@@ -1,0 +1,12 @@
+{
+  "tempDir": true,
+  "steps": [{
+    // a deno.lock already exists, so the package-lock.json (which pins
+    // 0.1.0) is ignored and the deno.lock version (0.1.1) is kept
+    "args": "install",
+    "output": "install.out"
+  }, {
+    "args": ["eval", "console.log(Deno.readTextFileSync('deno.lock').trim());"],
+    "output": "lock.out"
+  }]
+}

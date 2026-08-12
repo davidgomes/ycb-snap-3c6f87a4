@@ -1,0 +1,13 @@
+{
+  "tempDir": true,
+  "steps": [{
+    // only local `deno install` seeds from package-lock.json; other
+    // commands like `deno add` keep starting from an empty lockfile
+    // (resolving 0.1.1 instead of the 0.1.0 pinned in the npm lockfile)
+    "args": "add npm:@denotest/esm-basic",
+    "output": "add.out"
+  }, {
+    "args": ["eval", "console.log(Deno.readTextFileSync('deno.lock').trim());"],
+    "output": "lock.out"
+  }]
+}

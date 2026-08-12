@@ -1,0 +1,25 @@
+{
+  "version": "5",
+  "specifiers": {
+    "npm:@denotest/esm-basic@1": "1.0.0",
+    "npm:@denotest/has-patch-versions@0.1": "0.1.1"
+  },
+  "npm": {
+    "@denotest/esm-basic@1.0.0": {
+      "integrity": "sha512-r3u7l0jDA8/dC4H0Wn6yJQDROfwyky9ZW8r7XvNiSgwDtsLTOPSQwLZY8V4q9MeepSe26sXRGEdSr2tJd7pvHw==",
+      "tarball": "http://localhost:4260/@denotest/esm-basic/1.0.0.tgz"
+    },
+    "@denotest/has-patch-versions@0.1.1": {
+      "integrity": "sha512-kMjDYZevBLLzfBJHrfc8A51hWCqgCb+U29DKvZ6eLcr9yUG5e/vgx9ciKRA/zaHPLL+Fct+hOqICDb0ybdUoxQ==",
+      "tarball": "http://localhost:4260/@denotest/has-patch-versions/0.1.1.tgz"
+    }
+  },
+  "workspace": {
+    "packageJson": {
+      "dependencies": [
+        "npm:@denotest/esm-basic@1",
+        "npm:@denotest/has-patch-versions@0.1"
+      ]
+    }
+  }
+}

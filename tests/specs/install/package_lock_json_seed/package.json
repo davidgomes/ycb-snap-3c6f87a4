@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "@denotest/add": "^0.5.0",
+    "@denotest/different-nested-dep": "^1.0.0",
+    "@denotest/has-patch-versions": "^0.1",
+    "@denotest/multiple-arch-deps": "^1.0.0",
+    "@denotest/peer-dep-specific-constraint": "^1.0.0",
+    "dn2": "npm:@denotest/needs-different-nested-dep-child-v2@^1.0.0"
+  }
+}

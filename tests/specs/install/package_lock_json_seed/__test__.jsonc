@@ -1,0 +1,22 @@
+{
+  "tempDir": true,
+  "steps": [{
+    // the first local `deno install` without a deno.lock seeds the
+    // lockfile from the sibling package-lock.json, preserving the
+    // versions npm had pinned
+    "args": "install",
+    "output": "install.out"
+  }, {
+    // both nested versions of @denotest/different-nested-dep-child
+    // resolve like they did under npm
+    "args": "run main.js",
+    "output": "main.out"
+  }, {
+    "args": ["eval", "console.log(Deno.readTextFileSync('deno.lock').trim());"],
+    "output": "lock.out"
+  }, {
+    // a second install is a no-op and doesn't seed again
+    "args": "install",
+    "output": ""
+  }]
+}

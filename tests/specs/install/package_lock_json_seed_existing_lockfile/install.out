@@ -1,0 +1,11 @@
+Download http://localhost:4260/@denotest/has-patch-versions/0.1.1.tgz
+Initialize @denotest/has-patch-versions@0.1.1
+Installed 1 package in [WILDLINE]
+Reused [WILDLINE] packages from cache
+Downloaded [WILDLINE] packages from JSR
+Downloaded [WILDLINE] package from npm
+[WILDLINE]
+
+Dependencies:
++ npm:@denotest/has-patch-versions 0.1.1
+
