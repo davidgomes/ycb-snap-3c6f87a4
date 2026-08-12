@@ -43,6 +43,7 @@
 #define POLICY_COMPACTION_CHECK_NAME "policy_compaction_check"
 #define POL_COMPACTION_CONF_KEY_MAX_CHUNKS "max_chunks"
 #define POL_COMPACTION_CONF_KEY_INACTIVE_FOR "inactive_for"
+#define POL_COMPACTION_CONF_KEY_MAX_BATCHES "max_batches"
 
 #define SHOW_POLICY_KEY_POLICY_NAME "policy_name"
 #define SHOW_POLICY_KEY_REFRESH_INTERVAL "refresh_interval"
