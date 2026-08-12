@@ -1,0 +1,8 @@
+Initialized lockfile from 'package-lock.json'
+[UNORDERED_START]
+Download http://localhost:4260/@denotest/esm-basic/1.0.0.tgz
+Download http://localhost:4260/@denotest/has-patch-versions/0.1.0.tgz
+Initialize @denotest/esm-basic@1.0.0
+Initialize @denotest/has-patch-versions@0.1.0
+[UNORDERED_END]
+[WILDCARD]

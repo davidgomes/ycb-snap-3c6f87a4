@@ -1,0 +1,6 @@
+Download http://localhost:4260/@denotest%2fhas-patch-versions
+Download http://localhost:4260/@denotest/has-patch-versions/0.1.1.tgz
+
+Dependencies:
++ npm:@denotest/has-patch-versions 0.1.1
+

@@ -1,0 +1,141 @@
+{
+  "tempDir": true,
+  "tests": {
+    // an install without a deno.lock seeds the resolution from the sibling
+    // package-lock.json, preserving the pinned version and integrity
+    "lockfile_only_preserves_pins": {
+      "steps": [
+        {
+          "args": "install --lockfile-only",
+          "cwd": "pinned",
+          "output": "pinned/install.out"
+        },
+        {
+          "args": [
+            "eval",
+            "console.log(Deno.readTextFileSync('./deno.lock').trim())"
+          ],
+          "cwd": "pinned",
+          "output": "pinned/deno.lock.out"
+        }
+      ]
+    },
+    // a full install works from the seeded lockfile and verifies the
+    // downloaded tarballs against the integrity from package-lock.json
+    "full_install": {
+      "steps": [
+        {
+          // generate a package-lock.json with the real integrity hashes
+          // from the test registry
+          "args": "run -A gen.js",
+          "cwd": "full",
+          "output": "generated package-lock.json\n"
+        },
+        {
+          "args": "install",
+          "cwd": "full",
+          "output": "full/install.out"
+        },
+        {
+          "args": "run --cached-only main.js",
+          "cwd": "full",
+          "output": "5\n"
+        },
+        {
+          // the pinned version and integrity hashes were preserved
+          "args": "run -A check.js",
+          "cwd": "full",
+          "output": "0.1.0\nintegrities match\n"
+        }
+      ]
+    },
+    // the integrity hashes seeded from package-lock.json are enforced
+    // when downloading tarballs
+    "wrong_integrity_fails_install": {
+      "steps": [
+        {
+          "args": "install",
+          "cwd": "wrong_integrity",
+          "output": "wrong_integrity/install.out",
+          "exitCode": 1
+        }
+      ]
+    },
+    // an unusable package-lock.json falls back to starting from an
+    // empty lockfile without failing the install
+    "corrupt_package_lock_ignored": {
+      "steps": [
+        {
+          "args": "install --lockfile-only",
+          "cwd": "corrupt",
+          "output": "corrupt/install.out"
+        },
+        {
+          "args": [
+            "eval",
+            "const lock = JSON.parse(Deno.readTextFileSync('./deno.lock')); console.log(Object.keys(lock.npm).join('\\n'))"
+          ],
+          "cwd": "corrupt",
+          "output": "@denotest/has-patch-versions@0.1.1\n"
+        }
+      ]
+    },
+    // a v1 package-lock.json is not supported and falls back to
+    // starting from an empty lockfile
+    "unsupported_lockfile_version_ignored": {
+      "steps": [
+        {
+          "args": "install --lockfile-only",
+          "cwd": "v1",
+          "output": "v1/install.out"
+        },
+        {
+          "args": [
+            "eval",
+            "const lock = JSON.parse(Deno.readTextFileSync('./deno.lock')); console.log(Object.keys(lock.npm).join('\\n'))"
+          ],
+          "cwd": "v1",
+          "output": "@denotest/has-patch-versions@0.1.1\n"
+        }
+      ]
+    },
+    // an existing deno.lock is used as-is even when a package-lock.json
+    // exists
+    "existing_lockfile_not_seeded": {
+      "steps": [
+        {
+          "args": "install --lockfile-only",
+          "cwd": "existing_lockfile",
+          "output": ""
+        },
+        {
+          "args": [
+            "eval",
+            "const lock = JSON.parse(Deno.readTextFileSync('./deno.lock')); console.log(Object.keys(lock.npm).join('\\n'))"
+          ],
+          "cwd": "existing_lockfile",
+          "output": "@denotest/has-patch-versions@0.1.1\n"
+        }
+      ]
+    },
+    // other commands keep their current behavior of starting from an
+    // empty lockfile when no deno.lock exists
+    "other_commands_not_seeded": {
+      "steps": [
+        {
+          "args": "cache npm:@denotest/has-patch-versions@^0.1.0",
+          "cwd": "not_install",
+          "output": "not_install/cache.out"
+        },
+        {
+          "args": [
+            "eval",
+            "const lock = JSON.parse(Deno.readTextFileSync('./deno.lock')); console.log(Object.keys(lock.npm).join('\\n'))"
+          ],
+          "cwd": "not_install",
+          "output": "@denotest/has-patch-versions@0.1.1\n"
+        }
+      ]
+    }
+  }
+}

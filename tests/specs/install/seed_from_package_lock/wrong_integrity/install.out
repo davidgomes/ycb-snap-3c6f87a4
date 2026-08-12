@@ -1,0 +1,9 @@
+Initialized lockfile from 'package-lock.json'
+Download http://localhost:4260/@denotest/esm-basic/1.0.0.tgz
+error: Failed caching npm package '@denotest/esm-basic@1.0.0'
+
+Caused by:
+    Tarball checksum did not match what was provided by npm registry for @denotest/esm-basic@1.0.0.
+    
+    Expected: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa==
+    Actual: [WILDLINE]

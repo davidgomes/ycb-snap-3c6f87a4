@@ -1,0 +1,7 @@
+{
+  "name": "v1",
+  "version": "1.0.0",
+  "dependencies": {
+    "@denotest/has-patch-versions": "^0.1.0"
+  }
+}
