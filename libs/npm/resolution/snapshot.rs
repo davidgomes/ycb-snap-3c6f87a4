@@ -1657,6 +1657,80 @@ mod tests {
     );
   }
 
+  #[test]
+  fn test_snapshot_from_lockfile_seeded_from_npm_package_lock() {
+    // a lockfile seeded from an npm package-lock.json must always form a
+    // valid snapshot, otherwise `deno install` would fail to load it
+    let lockfile = Lockfile::from_npm_package_lock_json(
+      PathBuf::from("/deno.lock"),
+      r#"{
+      "name": "my-project",
+      "lockfileVersion": 3,
+      "packages": {
+        "": {
+          "name": "my-project",
+          "dependencies": { "chalk": "^5.3.0", "@denotest/add": "1" }
+        },
+        "node_modules/chalk": {
+          "version": "5.3.0",
+          "resolved": "https://registry.npmjs.org/chalk/-/chalk-5.3.0.tgz",
+          "integrity": "sha512-integrity1",
+          "dependencies": { "@denotest/add": "^1.0.0" }
+        },
+        "node_modules/chalk/node_modules/@denotest/add": {
+          "version": "1.5.0",
+          "resolved": "https://registry.npmjs.org/@denotest/add/-/add-1.5.0.tgz",
+          "integrity": "sha512-integrity2"
+        },
+        "node_modules/@denotest/add": {
+          "version": "1.0.0",
+          "resolved": "https://registry.npmjs.org/@denotest/add/-/add-1.0.0.tgz",
+          "integrity": "sha512-integrity3"
+        }
+      }
+    }"#,
+    )
+    .unwrap();
+
+    let snapshot = snapshot_from_lockfile(SnapshotFromLockfileParams {
+      lockfile: &lockfile,
+      link_packages: &Default::default(),
+      default_tarball_url: &TestDefaultTarballUrlProvider,
+      dedup_equivalent_peer_variants: false,
+    })
+    .unwrap();
+    let serialized = snapshot.as_serialized();
+    assert_eq!(
+      serialized.root_packages,
+      HashMap::from([
+        (
+          PackageReq::from_str("chalk@^5.3.0").unwrap(),
+          NpmPackageId::from_serialized("chalk@5.3.0").unwrap()
+        ),
+        (
+          PackageReq::from_str("@denotest/add@1").unwrap(),
+          NpmPackageId::from_serialized("@denotest/add@1.0.0").unwrap()
+        )
+      ])
+    );
+    let chalk = serialized
+      .packages
+      .iter()
+      .find(|p| p.id.nv.name.as_str() == "chalk")
+      .unwrap();
+    assert_eq!(
+      chalk.dependencies,
+      HashMap::from([(
+        StackString::from_static("@denotest/add"),
+        NpmPackageId::from_serialized("@denotest/add@1.5.0").unwrap()
+      )])
+    );
+    assert_eq!(
+      chalk.dist.as_ref().unwrap().integrity().for_lockfile(),
+      Some("sha512-integrity1".into())
+    );
+  }
+
   #[tokio::test]
   async fn test_snapshot_from_lockfile_v4() {
     let api = TestNpmRegistryApi::default();

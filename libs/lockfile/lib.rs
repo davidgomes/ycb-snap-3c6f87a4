@@ -5,6 +5,7 @@
 
 mod error;
 mod graphs;
+mod package_lock;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -30,6 +31,7 @@ mod transforms;
 pub use error::DeserializationError;
 pub use error::LockfileError;
 pub use error::LockfileErrorReason;
+pub use package_lock::PackageLockTranslationError;
 pub use transforms::Lockfile5NpmInfo;
 pub use transforms::NpmPackageInfoProvider;
 

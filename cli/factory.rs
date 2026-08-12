@@ -1532,6 +1532,13 @@ fn new_workspace_factory_options(
       .internal
       .root_node_modules_dir_override
       .clone(),
+    // For a local `deno install` in a project migrating from npm, seed the
+    // lockfile from an existing package-lock.json so the versions and
+    // integrity hashes pinned by npm are preserved.
+    seed_lockfile_from_npm_package_lock: matches!(
+      flags.subcommand,
+      DenoSubcommand::Install(InstallFlags::Local(..))
+    ),
     vendor: flags.vendor,
   }
 }

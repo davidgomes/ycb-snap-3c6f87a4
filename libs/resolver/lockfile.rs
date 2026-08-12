@@ -144,6 +144,10 @@ pub struct LockfileReadFromPathOptions {
   pub frozen: bool,
   /// Causes the lockfile to only be read from, but not written to.
   pub skip_write: bool,
+  /// When the lockfile doesn't exist, seed it from a sibling npm
+  /// `package-lock.json` file (lockfileVersion 2 or 3) if present so the
+  /// versions and integrity hashes pinned by npm are preserved.
+  pub seed_from_npm_package_lock: bool,
 }
 
 #[sys_traits::auto_impl]
@@ -181,6 +185,8 @@ pub struct LockfileFlags {
   pub skip_write: bool,
   pub no_config: bool,
   pub no_npm: bool,
+  /// See [`LockfileReadFromPathOptions::seed_from_npm_package_lock`].
+  pub seed_from_npm_package_lock: bool,
 }
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
@@ -349,6 +355,7 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
         file_path,
         frozen,
         skip_write: flags.skip_write,
+        seed_from_npm_package_lock: flags.seed_from_npm_package_lock,
       },
       api,
     )
@@ -513,7 +520,15 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
         .await?
       }
       Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-        Lockfile::new_empty(opts.file_path, false)
+        let maybe_seeded_lockfile = if opts.seed_from_npm_package_lock {
+          seed_lockfile_from_npm_package_lock(&sys, &opts.file_path)
+        } else {
+          None
+        };
+        match maybe_seeded_lockfile {
+          Some(lockfile) => lockfile,
+          None => Lockfile::new_empty(opts.file_path, false),
+        }
       }
       Err(err) => {
         return Err(err).with_context(|| {
@@ -560,6 +575,41 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
       )))
     } else {
       Ok(())
+    }
+  }
+}
+
+/// Creates a lockfile seeded from an npm `package-lock.json` file
+/// (lockfileVersion 2 or 3) found beside where the deno lockfile will be
+/// written, preserving the npm versions and integrity hashes it pins.
+/// Returns `None` when the npm lockfile is missing or unusable so the
+/// caller can fall back to an empty lockfile.
+fn seed_lockfile_from_npm_package_lock<TSys: LockfileSys>(
+  sys: &TSys,
+  lockfile_path: &std::path::Path,
+) -> Option<Lockfile> {
+  let package_lock_path = lockfile_path.parent()?.join("package-lock.json");
+  let package_lock_text = sys.fs_read_to_string(&package_lock_path).ok()?;
+  match Lockfile::from_npm_package_lock_json(
+    lockfile_path.to_path_buf(),
+    &package_lock_text,
+  ) {
+    Ok(lockfile) => {
+      if lockfile.has_content_changed {
+        log::info!(
+          "Resolving npm packages based on '{}'",
+          package_lock_path.display()
+        );
+      }
+      Some(lockfile)
+    }
+    Err(err) => {
+      log::debug!(
+        "Failed creating lockfile from '{}': {:#}",
+        package_lock_path.display(),
+        anyhow::Error::from(err),
+      );
+      None
     }
   }
 }

@@ -1308,6 +1308,7 @@ impl WorkspaceConfigData {
         no_npm: false,
         npm_process_state: None,
         root_node_modules_dir_override: None,
+        seed_lockfile_from_npm_package_lock: false,
         vendor: None,
       },
     );
