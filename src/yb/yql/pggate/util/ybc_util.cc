@@ -26,6 +26,7 @@
 #include "yb/common/transaction_error.h"
 #include "yb/common/wire_protocol.h"
 
+#include "yb/dockv/doc_key.h"
 #include "yb/dockv/partition.h"
 
 #include "yb/gutil/stringprintf.h"
