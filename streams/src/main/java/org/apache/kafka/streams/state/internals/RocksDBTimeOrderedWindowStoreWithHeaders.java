@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.streams.state.internals;
 
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.query.Position;
 import org.apache.kafka.streams.query.PositionBound;
@@ -55,7 +56,9 @@ class RocksDBTimeOrderedWindowStoreWithHeaders extends RocksDBTimeOrderedWindowS
                                     final QueryConfig config) {
         final long start = config.isCollectExecutionInfo() ? System.nanoTime() : -1L;
         final QueryResult<R> result;
-        final Position position = getPosition();
+        final Position position = config.getIsolationLevel() == IsolationLevel.READ_COMMITTED
+            ? wrapped().getCommittedPosition()
+            : getPosition();
 
         synchronized (position) {
             result = QueryResult.forUnknownQueryType(query, this);

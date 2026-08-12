@@ -182,6 +182,20 @@ public class RocksDBTimeOrderedWindowStore<S extends Segment>
         return wrapped().hasIndex();
     }
 
+    private WindowStoreIterator<byte[]> valuesIterator(final KeyValueIterator<Bytes, byte[]> bytesIterator) {
+        return new WindowStoreIteratorWrapper(bytesIterator,
+            windowSize,
+            TimeFirstWindowKeySchema::extractStoreTimestamp,
+            TimeFirstWindowKeySchema::fromStoreBytesKey).valuesIterator();
+    }
+
+    private KeyValueIterator<Windowed<Bytes>, byte[]> keyValueIterator(final KeyValueIterator<Bytes, byte[]> bytesIterator) {
+        return new WindowStoreIteratorWrapper(bytesIterator,
+            windowSize,
+            TimeFirstWindowKeySchema::extractStoreTimestamp,
+            TimeFirstWindowKeySchema::fromStoreBytesKey).keyValueIterator();
+    }
+
     @Override
     public ReadOnlyWindowStore<Bytes, byte[]> readOnly(final IsolationLevel isolationLevel) {
         Objects.requireNonNull(isolationLevel, "isolationLevel cannot be null");
