@@ -38,6 +38,11 @@ struct BaseAccessor;
 using SearchDocData = absl::flat_hash_map<std::string /*field*/, search::SortableValue /*value*/>;
 using Synonyms = search::Synonyms;
 
+// Internal row field carrying the document key in FT.AGGREGATE results when text scoring is
+// active. Used to order merged rows and break score ties deterministically across shards.
+// Hidden from output unless explicitly loaded.
+inline constexpr std::string_view kAggregateDocKeyField = "__key";
+
 std::string_view SearchFieldTypeToString(search::SchemaField::FieldType);
 
 struct SerializedSearchDoc {

@@ -119,13 +119,15 @@ void Aggregator::DoSort(const SortParams& sort_params) {
     return false;
   };
 
+  // Stable sort keeps the incoming row order for equal sort keys, so ties are broken
+  // deterministically (the coordinator pre-orders rows by doc key when scoring is active).
   auto& values = result.values;
   if (sort_params.SortAll()) {
-    rng::sort(values, comparator);
+    rng::stable_sort(values, comparator);
   } else {
     DCHECK_GE(sort_params.max, 0);
     const size_t limit = std::min(values.size(), size_t(sort_params.max));
-    std::partial_sort(values.begin(), values.begin() + limit, values.end(), comparator);
+    rng::stable_sort(values, comparator);
     values.resize(limit);
   }
 

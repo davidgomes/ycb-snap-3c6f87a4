@@ -5857,6 +5857,11 @@ TEST_F(SearchFamilyTest, SearchScoresShardIndependent) {
   // because every title length equals the corpus-wide average (2 tokens).
   check_scores("BM25STD", kLn2);
 
+  // LIMIT cutting through a group of tied scores must select deterministically by key
+  auto limited = Run({"ft.search", "i1", "hello", "WITHSCORES", "SCORER", "TFIDF", "NOCONTENT",
+                      "LIMIT", "0", "2"});
+  EXPECT_THAT(limited, RespArray(ElementsAre(IntArg(4), "d:0", _, "d:1", _)));
+
   // FT.AGGREGATE with SCORER + ADDSCORES must inject the same corpus-wide scores
   auto resp = Run({"ft.aggregate", "i1", "hello", "SCORER", "TFIDF", "ADDSCORES", "SORTBY", "2",
                    "@__score", "DESC"});

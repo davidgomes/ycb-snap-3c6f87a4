@@ -260,6 +260,10 @@ class SearchAlgorithm {
 
   void SetScorer(ScorerFn scorer);
 
+  bool HasScorer() const {
+    return scorer_ != nullptr;
+  }
+
  private:
   bool profiling_enabled_ = false;
   ScorerFn scorer_ = nullptr;

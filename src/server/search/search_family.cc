@@ -2491,6 +2491,20 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
         values.emplace_back(std::move(doc_value));
       }
     }
+
+    // Rows arrive grouped by shard, an order that depends on the shard count. With text
+    // scoring active order them by doc key, so pipelines (in particular the stable SORTBY
+    // used with ADDSCORES) produce shard-count-independent output, ties included.
+    if (text_scoring && !knn && !hnsw_range) {
+      auto key_of = [](const aggregate::DocValues& dv) -> std::string_view {
+        auto it = dv.find(kAggregateDocKeyField);
+        if (it != dv.end() && std::holds_alternative<std::string>(it->second))
+          return std::get<std::string>(it->second);
+        return ""sv;
+      };
+      std::sort(values.begin(), values.end(),
+                [&](const auto& l, const auto& r) { return key_of(l) < key_of(r); });
+    }
   } else {
     const size_t indexes_count = params->joins.size() + 1;
 

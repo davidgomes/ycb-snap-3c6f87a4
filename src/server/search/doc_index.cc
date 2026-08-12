@@ -867,7 +867,12 @@ SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& pa
   // If we don't sort the documents, we don't need to copy more ids than are requested
   // Also for HNSW KNN search we don't cut results at the search stage.
   bool can_cut = !params.sort_option && !search_algo->GetKnnScoreSortOption() && !is_knn_prefilter;
-  size_t id_cutoff_limit = can_cut ? limit : numeric_limits<size_t>::max();
+
+  // With text scoring active, the top-K cut must use a total order that is consistent across
+  // shard counts: (score desc, key asc). The core search doesn't know keys, so skip its cut
+  // and select the top-K below.
+  const bool scored_cut = can_cut && search_algo->HasScorer();
+  size_t id_cutoff_limit = (can_cut && !scored_cut) ? limit : numeric_limits<size_t>::max();
 
   auto result = search_algo->Search(&*indices_, id_cutoff_limit);
   if (!result.error.empty())
@@ -923,13 +928,41 @@ SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& pa
     }
   }
 
-  // Cut off unnecessary items
-  result.ids.resize(min(result.ids.size(), limit));
-
   // Build text score lookup (DocId -> score) if available
   absl::flat_hash_map<search::DocId, float> text_score_map;
   for (const auto& [doc, score] : result.text_scores)
     text_score_map[doc] = score;
+
+  // Select top-K by (score desc, key asc). Keys break ties deterministically, so the shard
+  // level selection agrees with the coordinator's merge order regardless of sharding.
+  if (scored_cut) {
+    auto score_of = [&](search::DocId id) {
+      auto it = text_score_map.find(id);
+      return it != text_score_map.end() ? it->second : 0.0f;
+    };
+    size_t k = min(limit, result.ids.size());
+    partial_sort(result.ids.begin(), result.ids.begin() + k, result.ids.end(),
+                 [&](search::DocId l, search::DocId r) {
+                   float ls = score_of(l), rs = score_of(r);
+                   if (ls != rs)
+                     return ls > rs;
+                   return key_index_.Get(l) < key_index_.Get(r);
+                 });
+
+    // knn_scores are consumed positionally; realign them to the new id order
+    if (!result.knn_scores.empty()) {
+      absl::flat_hash_map<search::DocId, float> knn_by_id(result.knn_scores.begin(),
+                                                          result.knn_scores.end());
+      result.knn_scores.clear();
+      for (search::DocId doc : result.ids) {
+        if (auto it = knn_by_id.find(doc); it != knn_by_id.end())
+          result.knn_scores.emplace_back(doc, it->second);
+      }
+    }
+  }
+
+  // Cut off unnecessary items
+  result.ids.resize(min(result.ids.size(), limit));
 
   // Serialize documents
   vector<SerializedSearchDoc> out;
@@ -1025,13 +1058,17 @@ vector<SearchDocData> ShardDocIndex::LoadDocEntriesWithScores(
   auto [fields_to_load, sort_indicies] =
       PreprocessAggregateFields(base_->schema, params, params.load_fields);
 
+  // With text scoring, rows carry the doc key (hidden unless explicitly loaded) so the
+  // coordinator can order the merged rows deterministically and break score ties by key.
+  const bool inject_key = params.scorer != nullptr || params.add_scores;
+
   vector<SearchDocData> out;
   out.reserve(ids.size());
   for (DocId doc : ids) {
     auto entry = LoadEntry(doc, op_args);
     if (!entry)
       continue;
-    auto& [_, accessor] = *entry;
+    auto& [key, accessor] = *entry;
 
     SearchDocData extracted_sort_indicies;
     extracted_sort_indicies.reserve(sort_indicies.size());
@@ -1053,6 +1090,9 @@ vector<SearchDocData> ShardDocIndex::LoadDocEntriesWithScores(
       if (auto it = text_score_map.find(doc); it != text_score_map.end())
         out.back()["__score"] = static_cast<double>(it->second);
     }
+
+    if (inject_key)
+      out.back()[string{kAggregateDocKeyField}] = string{key};
   }
   return out;
 }
