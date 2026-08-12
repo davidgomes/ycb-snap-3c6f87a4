@@ -975,6 +975,11 @@ ALTER TYPE eventlog SET SCHEMA testing;
 ALTER TYPE testing.eventlog SET SCHEMA public
 
 statement ok
+CREATE DOMAIN domain_eventlog AS INT;
+ALTER DOMAIN domain_eventlog SET SCHEMA testing;
+ALTER DOMAIN testing.domain_eventlog SET SCHEMA public
+
+statement ok
 ALTER TYPE eventlog RENAME TO eventlog_renamed
 
 query ITT
@@ -989,9 +994,12 @@ ORDER BY "timestamp", info
 1  alter_type_drop_value    {"EventType": "alter_type_drop_value", "Statement": "ALTER TYPE defaultdb.public.eventlog DROP VALUE 'testing'", "Tag": "ALTER TYPE", "TypeName": "defaultdb.public.eventlog", "User": "root", "Value": "testing"}
 1  set_schema               {"DescriptorName": "defaultdb.public.eventlog", "DescriptorType": "type", "EventType": "set_schema", "NewDescriptorName": "defaultdb.testing.eventlog", "Statement": "ALTER TYPE defaultdb.public.eventlog SET SCHEMA testing", "Tag": "ALTER TYPE", "User": "root"}
 1  set_schema               {"DescriptorName": "defaultdb.testing.eventlog", "DescriptorType": "type", "EventType": "set_schema", "NewDescriptorName": "defaultdb.public.eventlog", "Statement": "ALTER TYPE defaultdb.testing.eventlog SET SCHEMA public", "Tag": "ALTER TYPE", "User": "root"}
+1  set_schema               {"DescriptorName": "defaultdb.public.domain_eventlog", "DescriptorType": "domain", "EventType": "set_schema", "NewDescriptorName": "defaultdb.testing.domain_eventlog", "Statement": "ALTER DOMAIN defaultdb.public.domain_eventlog SET SCHEMA testing", "Tag": "ALTER DOMAIN", "User": "root"}
+1  set_schema               {"DescriptorName": "defaultdb.testing.domain_eventlog", "DescriptorType": "domain", "EventType": "set_schema", "NewDescriptorName": "defaultdb.public.domain_eventlog", "Statement": "ALTER DOMAIN defaultdb.testing.domain_eventlog SET SCHEMA public", "Tag": "ALTER DOMAIN", "User": "root"}
 1  rename_type              {"EventType": "rename_type", "NewTypeName": "eventlog_renamed", "Statement": "ALTER TYPE defaultdb.public.eventlog RENAME TO eventlog_renamed", "Tag": "ALTER TYPE", "TypeName": "defaultdb.public.eventlog", "User": "root"}
 
 statement ok
+DROP DOMAIN domain_eventlog;
 DROP TYPE eventlog_renamed
 
 query ITT

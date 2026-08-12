@@ -224,8 +224,95 @@ subtest end
 
 subtest set_schema
 
-statement error pgcode 0A000 ALTER DOMAIN SET SCHEMA is not supported
-ALTER DOMAIN d SET SCHEMA public
+statement ok
+CREATE SCHEMA domain_schema_1;
+CREATE SCHEMA domain_schema_2;
+CREATE DOMAIN domain_schema_test AS INT;
+CREATE TABLE domain_schema_ref (v domain_schema_test);
+INSERT INTO domain_schema_ref VALUES (1)
+
+# Moving a domain must move its implicit array type too.
+statement ok
+ALTER DOMAIN domain_schema_test SET SCHEMA domain_schema_1
+
+query I
+SELECT 1::domain_schema_1.domain_schema_test
+----
+1
+
+query T
+SELECT ARRAY[1]::domain_schema_1._domain_schema_test
+----
+{1}
+
+# Moving to the current schema is a no-op.
+statement ok
+ALTER DOMAIN domain_schema_1.domain_schema_test SET SCHEMA domain_schema_1
+
+# A table refers to the domain descriptor ID, so it remains usable.
+query I
+SELECT v FROM domain_schema_ref
+----
+1
+
+statement ok
+INSERT INTO domain_schema_ref VALUES (2)
+
+query I
+SELECT v FROM domain_schema_ref ORDER BY v
+----
+1
+2
+
+statement ok
+ALTER DOMAIN domain_schema_1.domain_schema_test SET SCHEMA domain_schema_2
+
+query I
+SELECT 2::domain_schema_2.domain_schema_test
+----
+2
+
+query T
+SELECT ARRAY[2]::domain_schema_2._domain_schema_test
+----
+{2}
+
+statement error pq: unknown schema "does_not_exist"
+ALTER DOMAIN domain_schema_2.domain_schema_test SET SCHEMA does_not_exist
+
+statement error pq: cannot move objects into or out of virtual schemas
+ALTER DOMAIN domain_schema_2.domain_schema_test SET SCHEMA information_schema
+
+statement ok
+SET experimental_enable_temp_tables = 'on';
+CREATE TEMPORARY TABLE domain_schema_temp ()
+
+let $temp_schema
+SELECT schema_name FROM [show schemas] WHERE schema_name LIKE '%pg_temp%'
+
+statement error pq: cannot move objects into or out of temporary schemas
+ALTER DOMAIN domain_schema_2.domain_schema_test SET SCHEMA $temp_schema
+
+# Check collisions for both the domain and its implicit array type.
+statement ok
+CREATE DOMAIN domain_schema_1.domain_schema_test AS STRING
+
+statement error pq: type "test.domain_schema_1.domain_schema_test" already exists
+ALTER DOMAIN domain_schema_2.domain_schema_test SET SCHEMA domain_schema_1
+
+statement ok
+DROP DOMAIN domain_schema_1.domain_schema_test;
+CREATE TYPE domain_schema_1."_domain_schema_test" AS ENUM ('conflict')
+
+statement error pq: type "test.domain_schema_1._domain_schema_test" already exists
+ALTER DOMAIN domain_schema_2.domain_schema_test SET SCHEMA domain_schema_1
+
+statement ok
+DROP TYPE domain_schema_1."_domain_schema_test";
+DROP TABLE domain_schema_ref;
+DROP DOMAIN domain_schema_2.domain_schema_test;
+DROP SCHEMA domain_schema_1;
+DROP SCHEMA domain_schema_2
 
 subtest end
 
