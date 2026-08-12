@@ -15,6 +15,7 @@
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator_extension.h"
 
 #include "test/common/tls/mock_ssl_handshaker.h"
+#include "test/mocks/access_log/mocks.h"
 #include "test/mocks/api/mocks.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/server/factory_context.h"
@@ -1832,6 +1833,20 @@ TEST_F(ReverseConnectionIOHandleTest, OnConnectionDoneSuccess) {
   io_handle_ = createTestIOHandle(config);
   EXPECT_NE(io_handle_, nullptr);
 
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  extension_->access_logs_ = {access_log};
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& metadata = stream_info.dynamicMetadata().filter_metadata().at(
+            "envoy.reverse_tunnel.initiator");
+        EXPECT_EQ(metadata.fields().at("event").string_value(), "handshake_success");
+        EXPECT_EQ(metadata.fields().at("node_id").string_value(), "test-node");
+        EXPECT_EQ(metadata.fields().at("cluster_id").string_value(), "test-cluster");
+        EXPECT_EQ(metadata.fields().at("upstream_cluster").string_value(), "test-cluster");
+        EXPECT_EQ(metadata.fields().at("host_address").string_value(), "192.168.1.1");
+        EXPECT_EQ(metadata.fields().at("error").string_value(), "");
+      }));
+
   // Create trigger pipe BEFORE initiating connection to ensure it's ready.
   createTriggerPipe();
   EXPECT_TRUE(isTriggerPipeReady());
@@ -2013,6 +2028,21 @@ TEST_F(ReverseConnectionIOHandleTest, OnConnectionDoneFailureAndRecovery) {
   io_handle_ = createTestIOHandle(config);
   EXPECT_NE(io_handle_, nullptr);
 
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  extension_->access_logs_ = {access_log};
+  std::vector<std::string> lifecycle_events;
+  EXPECT_CALL(*access_log, log(_, _))
+      .Times(2)
+      .WillRepeatedly(
+          Invoke([&](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+            const auto& metadata = stream_info.dynamicMetadata().filter_metadata().at(
+                "envoy.reverse_tunnel.initiator");
+            lifecycle_events.push_back(metadata.fields().at("event").string_value());
+            if (lifecycle_events.size() == 1) {
+              EXPECT_EQ(metadata.fields().at("error").string_value(), "connection timeout");
+            }
+          }));
+
   // Set up mock thread local cluster.
   auto mock_thread_local_cluster = std::make_shared<NiceMock<Upstream::MockThreadLocalCluster>>();
   EXPECT_CALL(cluster_manager_, getThreadLocalCluster("test-cluster"))
@@ -2065,6 +2095,8 @@ TEST_F(ReverseConnectionIOHandleTest, OnConnectionDoneFailureAndRecovery) {
 
   // Step 2: Simulate connection failure by calling onConnectionDone with error.
   io_handle_->onConnectionDone("connection timeout", wrapper_ptr, true);
+  ASSERT_EQ(lifecycle_events.size(), 1);
+  EXPECT_EQ(lifecycle_events[0], "handshake_failure");
 
   // Verify wrapper was removed from tracking maps after failure.
   EXPECT_EQ(getConnWrapperToHostMap().size(), 0);
@@ -2173,6 +2205,18 @@ TEST_F(ReverseConnectionIOHandleTest, OnDownstreamConnectionClosedTriggersReInit
   io_handle_ = createTestIOHandle(config);
   EXPECT_NE(io_handle_, nullptr);
 
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  extension_->access_logs_ = {access_log};
+  std::vector<std::string> lifecycle_events;
+  EXPECT_CALL(*access_log, log(_, _))
+      .Times(2)
+      .WillRepeatedly(
+          Invoke([&](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+            const auto& metadata = stream_info.dynamicMetadata().filter_metadata().at(
+                "envoy.reverse_tunnel.initiator");
+            lifecycle_events.push_back(metadata.fields().at("event").string_value());
+          }));
+
   // Create trigger pipe BEFORE initiating connection to ensure it's ready.
   createTriggerPipe();
   EXPECT_TRUE(isTriggerPipeReady());
@@ -2264,6 +2308,9 @@ TEST_F(ReverseConnectionIOHandleTest, OnDownstreamConnectionClosedTriggersReInit
 
   // Step 4: Simulate downstream connection closure.
   io_handle_->onDownstreamConnectionClosed(connection_key);
+  ASSERT_EQ(lifecycle_events.size(), 2);
+  EXPECT_EQ(lifecycle_events[0], "handshake_success");
+  EXPECT_EQ(lifecycle_events[1], "connection_closed");
 
   // Verify connection key is removed from host tracking.
   host_it = getHostToConnInfoMap().find("192.168.1.1");

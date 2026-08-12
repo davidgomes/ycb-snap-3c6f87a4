@@ -8,6 +8,7 @@
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator.h"
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator_extension.h"
 
+#include "test/mocks/access_log/mocks.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/thread_local/mocks.h"
@@ -123,10 +124,71 @@ TEST_F(ReverseTunnelInitiatorExtensionTest, InitializeWithDefaultConfig) {
 
   EXPECT_NE(extension_with_default, nullptr);
   EXPECT_EQ(extension_with_default->statPrefix(), "reverse_tunnel_initiator");
+  EXPECT_TRUE(extension_with_default->accessLogs().empty());
 }
 
 TEST_F(ReverseTunnelInitiatorExtensionTest, InitializeWithCustomStatPrefix) {
   EXPECT_EQ(extension_->statPrefix(), "reverse_connections");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogWithoutConfiguredLoggersIsNoOp) {
+  EXPECT_NO_THROW(extension_->emitAccessLog(dispatcher_.timeSource(), "handshake_success", "node",
+                                            "cluster", "tenant", "upstream", "127.0.0.1:9000",
+                                            "127.0.0.1:12345", ""));
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogPopulatesInitiatorDynamicMetadata) {
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  extension_->access_logs_ = {access_log};
+
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& filter_metadata = stream_info.dynamicMetadata().filter_metadata();
+        ASSERT_EQ(filter_metadata.size(), 1);
+        const auto& metadata = filter_metadata.at("envoy.reverse_tunnel.initiator");
+        EXPECT_EQ(metadata.fields().at("event").string_value(), "handshake_failure");
+        EXPECT_EQ(metadata.fields().at("node_id").string_value(), "node-a");
+        EXPECT_EQ(metadata.fields().at("cluster_id").string_value(), "cluster-a");
+        EXPECT_EQ(metadata.fields().at("tenant_id").string_value(), "");
+        EXPECT_EQ(metadata.fields().at("upstream_cluster").string_value(), "upstream-a");
+        EXPECT_EQ(metadata.fields().at("host_address").string_value(), "");
+        EXPECT_EQ(metadata.fields().at("connection_key").string_value(), "10.0.0.1:10000");
+        EXPECT_EQ(metadata.fields().at("error").string_value(),
+                  "HTTP handshake failed with status 503");
+      }));
+
+  extension_->emitAccessLog(dispatcher_.timeSource(), "handshake_failure", "node-a", "cluster-a",
+                            "", "upstream-a", "", "10.0.0.1:10000",
+                            "HTTP handshake failed with status 503");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogIncludesEmptyErrorForNonFailureEvent) {
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  extension_->access_logs_ = {access_log};
+
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& metadata = stream_info.dynamicMetadata().filter_metadata().at(
+            "envoy.reverse_tunnel.initiator");
+        ASSERT_TRUE(metadata.fields().contains("error"));
+        EXPECT_EQ(metadata.fields().at("event").string_value(), "handshake_success");
+        EXPECT_EQ(metadata.fields().at("error").string_value(), "");
+      }));
+
+  extension_->emitAccessLog(dispatcher_.timeSource(), "handshake_success", "node-a", "cluster-a",
+                            "tenant-a", "upstream-a", "10.0.0.2:9000", "10.0.0.1:10001", "");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogCallsEveryConfiguredLogger) {
+  auto first_access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  auto second_access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  extension_->access_logs_ = {first_access_log, second_access_log};
+
+  EXPECT_CALL(*first_access_log, log(_, _)).Times(1);
+  EXPECT_CALL(*second_access_log, log(_, _)).Times(1);
+
+  extension_->emitAccessLog(dispatcher_.timeSource(), "connection_closed", "node-a", "cluster-a",
+                            "tenant-a", "upstream-a", "10.0.0.2:9000", "10.0.0.1:10001", "");
 }
 
 TEST_F(ReverseTunnelInitiatorExtensionTest, HandshakeRequestPathDefaults) {
