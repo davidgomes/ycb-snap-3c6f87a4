@@ -181,8 +181,10 @@ pub fn lockfile_content_from_npm_package_lock_json(
     if entry.link || is_node_modules_path(importer_path) {
       continue;
     }
-    for (alias, range) in
-      entry.dependencies.iter().chain(entry.dev_dependencies.iter())
+    for (alias, range) in entry
+      .dependencies
+      .iter()
+      .chain(entry.dev_dependencies.iter())
     {
       let Ok(PackageJsonDepValue::Req(req)) =
         PackageJsonDepValue::parse(alias, range)
@@ -430,8 +432,7 @@ fn version_matches_req(
 ) -> bool {
   // a dist tag can't be verified locally, but npm resolved it when the
   // lockfile was written, so trust the pinned version
-  req.version_req.tag().is_some()
-    || req.version_req.matches(&node.nv.version)
+  req.version_req.tag().is_some() || req.version_req.matches(&node.nv.version)
 }
 
 /// Marks nodes that have an unresolvable regular dependency as invalid and
@@ -492,9 +493,8 @@ fn retain_reachable_packages(content: &mut LockfileContent) {
   let mut reachable: HashSet<StackString> = HashSet::new();
   let mut pending: VecDeque<StackString> = VecDeque::new();
   for (req, version) in &content.packages.specifiers {
-    let mut id = StackString::with_capacity(
-      req.req.name.len() + 1 + version.len(),
-    );
+    let mut id =
+      StackString::with_capacity(req.req.name.len() + 1 + version.len());
     id.push_str(&req.req.name);
     id.push('@');
     id.push_str(version);
@@ -516,10 +516,7 @@ fn retain_reachable_packages(content: &mut LockfileContent) {
       }
     }
   }
-  content
-    .packages
-    .npm
-    .retain(|id, _| reachable.contains(id));
+  content.packages.npm.retain(|id, _| reachable.contains(id));
 }
 
 /// Ensures the translated content loads as a valid npm resolution snapshot,
@@ -572,8 +569,7 @@ mod test {
     expected: serde_json::Value,
   ) {
     let expected = {
-      let content =
-        LockfileContent::from_json(expected).unwrap();
+      let content = LockfileContent::from_json(expected).unwrap();
       deno_lockfile::Lockfile {
         overwrite: false,
         has_content_changed: false,
