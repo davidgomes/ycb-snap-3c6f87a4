@@ -347,6 +347,22 @@ void ReverseConnectionIOHandle::onEvent(Network::ConnectionEvent event) {
 
 int ReverseConnectionIOHandle::getPipeMonitorFd() const { return trigger_pipe_read_fd_; }
 
+void ReverseConnectionIOHandle::emitInitiatorAccessLog(absl::string_view event,
+                                                       const std::string& cluster_name,
+                                                       const std::string& host_address,
+                                                       const std::string& connection_key,
+                                                       const std::string& error_message) {
+  auto* extension = getDownstreamExtension();
+  // Check the configured loggers before fetching a time source so that this is a true no-op
+  // when access logging is not configured.
+  if (extension == nullptr || extension->accessLogs().empty()) {
+    return;
+  }
+  extension->emitAccessLog(getTimeSource(), std::string(event), config_.src_node_id,
+                           config_.src_cluster_id, config_.src_tenant_id, cluster_name,
+                           host_address, connection_key, error_message);
+}
+
 // Get time source for consistent time operations.
 TimeSource& ReverseConnectionIOHandle::getTimeSource() const {
   // Try to get time source from thread-local dispatcher first.
@@ -805,6 +821,9 @@ void ReverseConnectionIOHandle::onDownstreamConnectionClosed(const std::string& 
   // Remove connection state tracking.
   removeConnectionState(host_address, cluster_name, connection_key);
 
+  emitInitiatorAccessLog(kInitiatorEventConnectionClosed, cluster_name, host_address,
+                         connection_key);
+
   // The next call to maintainClusterConnections() will detect the missing connection
   // and re-initiate it automatically.
   ENVOY_LOG(debug,
@@ -1109,6 +1128,9 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
     updateConnectionState(host_address, cluster_name, connection_key,
                           ReverseConnectionState::Failed);
 
+    emitInitiatorAccessLog(kInitiatorEventHandshakeFailure, cluster_name, host_address,
+                           connection_key, error);
+
     // Safely close connection if still valid.
     if (connection) {
       if (connection->getSocket()) {
@@ -1126,6 +1148,9 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
     resetHostBackoff(host_address);
     updateConnectionState(host_address, cluster_name, connection_key,
                           ReverseConnectionState::Connected);
+
+    emitInitiatorAccessLog(kInitiatorEventHandshakeSuccess, cluster_name, host_address,
+                           connection_key);
 
     // Only proceed if connection is still valid.
     if (!connection) {

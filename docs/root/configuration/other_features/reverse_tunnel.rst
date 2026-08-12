@@ -55,6 +55,43 @@ Downstream socket interface
 
 This extension enables the initiator Envoy to establish and maintain reverse tunnel connections to the responder Envoy.
 
+.. _config_reverse_tunnel_initiator_access_logs:
+
+Initiator access logs
+~~~~~~~~~~~~~~~~~~~~~
+
+The downstream socket interface can emit access logs for reverse-tunnel lifecycle events on the
+initiator. Configure the ``access_log`` field on
+``envoy.bootstrap.reverse_tunnel.downstream_socket_interface`` to log handshake results and
+connection teardown:
+
+.. literalinclude:: /_configs/reverse_connection/initiator-envoy.yaml
+    :language: yaml
+    :lines: 7-27
+    :linenos:
+    :lineno-start: 7
+    :caption: :download:`initiator-envoy.yaml </_configs/reverse_connection/initiator-envoy.yaml>`
+
+The initiator emits the following event names:
+
+* ``handshake_success`` – a reverse tunnel handshake completed successfully.
+* ``handshake_failure`` – a reverse tunnel handshake failed; the ``error`` field carries the failure reason.
+* ``connection_closed`` – an established reverse tunnel connection was torn down.
+
+The dynamic metadata namespace is ``envoy.reverse_tunnel.initiator``, so any field can be
+referenced in access log formats with
+``%DYNAMIC_METADATA(envoy.reverse_tunnel.initiator:<field>)%``. Each entry carries the following
+string fields:
+
+* ``event`` – the lifecycle event name.
+* ``node_id`` – the local node identifier (``src_node_id``).
+* ``cluster_id`` – the local cluster identifier (``src_cluster_id``).
+* ``tenant_id`` – the local tenant identifier (``src_tenant_id``).
+* ``upstream_cluster`` – the remote cluster the tunnel targets.
+* ``host_address`` – the remote host address the tunnel targets.
+* ``connection_key`` – the key correlating handshake and close events for the same connection.
+* ``error`` – failure details for ``handshake_failure`` events; empty string otherwise.
+
 .. _config_reverse_tunnel_listener:
 
 Reverse tunnel listener
@@ -67,9 +104,9 @@ are reachable through the reverse tunnel.
 
 .. literalinclude:: /_configs/reverse_connection/initiator-envoy.yaml
     :language: yaml
-    :lines: 17-50
+    :lines: 32-65
     :linenos:
-    :lineno-start: 17
+    :lineno-start: 32
     :caption: :download:`initiator-envoy.yaml </_configs/reverse_connection/initiator-envoy.yaml>`
 
 The special ``rc://`` address format encodes connection and identity metadata:
@@ -94,9 +131,9 @@ The ``downstream-service`` cluster in the example refers to the service behind t
 
 .. literalinclude:: /_configs/reverse_connection/initiator-envoy.yaml
     :language: yaml
-    :lines: 69-80
+    :lines: 84-95
     :linenos:
-    :lineno-start: 69
+    :lineno-start: 84
     :caption: :download:`initiator-envoy.yaml </_configs/reverse_connection/initiator-envoy.yaml>`
 
 Upstream cluster
@@ -108,9 +145,9 @@ This cluster can be defined statically in the bootstrap configuration or added d
 
 .. literalinclude:: /_configs/reverse_connection/initiator-envoy.yaml
     :language: yaml
-    :lines: 54-65
+    :lines: 69-80
     :linenos:
-    :lineno-start: 54
+    :lineno-start: 69
     :caption: :download:`initiator-envoy.yaml </_configs/reverse_connection/initiator-envoy.yaml>`
 
 Multiple cluster support

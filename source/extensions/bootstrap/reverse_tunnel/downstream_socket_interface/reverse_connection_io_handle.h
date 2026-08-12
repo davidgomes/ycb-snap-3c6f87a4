@@ -25,6 +25,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 
 namespace Envoy {
@@ -322,6 +323,19 @@ public:
   bool useHttpUpgrade() const { return config_.use_http_upgrade; }
 
 private:
+  /**
+   * Emit a reverse tunnel lifecycle access log entry via the bootstrap extension.
+   * No-op when the extension is unavailable or no access logs are configured.
+   * @param event the lifecycle event name (e.g., "handshake_success").
+   * @param cluster_name the remote cluster the tunnel targets.
+   * @param host_address the remote host address the tunnel targets.
+   * @param connection_key the key identifying the connection.
+   * @param error_message failure details for "handshake_failure" events; empty otherwise.
+   */
+  void emitInitiatorAccessLog(absl::string_view event, const std::string& cluster_name,
+                              const std::string& host_address, const std::string& connection_key,
+                              const std::string& error_message = "");
+
   /**
    * Get time source for consistent time operations.
    * @return reference to the time source

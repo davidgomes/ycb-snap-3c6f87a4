@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package envoy.extensions.bootstrap.reverse_tunnel.downstream_socket_interface.v3;
 
+import "envoy/config/accesslog/v3/accesslog.proto";
 import "envoy/config/core/v3/base.proto";
 
 import "udpa/annotations/status.proto";
@@ -18,6 +19,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // Configuration for the downstream reverse connection socket interface.
 // This interface initiates reverse connections to upstream Envoys and provides
 // them as socket connections for downstream requests.
+// [#next-free-field: 5]
 message DownstreamReverseConnectionSocketInterface {
   // HTTP handshake settings for initiator envoy initiated reverse tunnels.
   message HttpHandshakeConfig {
@@ -46,4 +48,13 @@ message DownstreamReverseConnectionSocketInterface {
   // Optional HTTP handshake configuration. When unset, the initiator envoy uses the defaults
   // provided by ``HttpHandshakeConfig``.
   HttpHandshakeConfig http_handshake = 3;
+
+  // Access logs emitted for reverse tunnel lifecycle events on the initiator. Entries are
+  // generated when a reverse tunnel handshake succeeds (``handshake_success``), when a
+  // handshake fails (``handshake_failure``), and when an established reverse tunnel
+  // connection is closed (``connection_closed``). Reverse-tunnel metadata is exposed to
+  // access log formatters as dynamic metadata under the
+  // ``envoy.reverse_tunnel.initiator`` namespace, e.g.
+  // ``%DYNAMIC_METADATA(envoy.reverse_tunnel.initiator:event)%``.
+  repeated config.accesslog.v3.AccessLog access_log = 4;
 }
