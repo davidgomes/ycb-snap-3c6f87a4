@@ -200,6 +200,8 @@ public class SymbolResolverClassTests extends ProcessorTestCase {
                 int add(int a, int b);
 
                 class FakeSymbolResolver implements SymbolResolver {
+                    public FakeSymbolResolver() {}
+
                     public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
                         return new ResolvedSymbol("native_add_v2", MemorySegment.ofAddress(1L));
                     }
@@ -207,6 +209,8 @@ public class SymbolResolverClassTests extends ProcessorTestCase {
 
                 class RecordingMethodHandleResolver implements MethodHandleResolver {
                     public static boolean invoked;
+
+                    public RecordingMethodHandleResolver() {}
 
                     public MethodHandle resolve(ResolvedSymbol symbol, FunctionDescriptor descriptor, Linker linker, Linker.Option... options) {
                         invoked = symbol.name().equals("native_add_v2");
