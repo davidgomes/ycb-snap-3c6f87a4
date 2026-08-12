@@ -105,6 +105,15 @@ auth::authentication_option_set auth::certificate_authenticator::alterable_optio
 }
 
 future<std::optional<auth::authenticated_user>> auth::certificate_authenticator::authenticate(session_dn_func f) const {
+    const bool certificate_lookup_available = bool(f);
+    auto user = co_await authenticate_if_present(std::move(f));
+    if (!user && certificate_lookup_available) {
+        throw exceptions::authentication_exception("No valid certificate found");
+    }
+    co_return user;
+}
+
+future<std::optional<auth::authenticated_user>> auth::certificate_authenticator::authenticate_if_present(session_dn_func f) const {
     if (auto user = utils::get_local_injector().inject_parameter("transport_early_auth_bypass")) {
         co_return auth::authenticated_user{sstring(*user)};
     }
@@ -113,7 +122,7 @@ future<std::optional<auth::authenticated_user>> auth::certificate_authenticator:
     }
     auto dninfo = co_await f();
     if (!dninfo) {
-        throw exceptions::authentication_exception("No valid certificate found");
+        co_return std::nullopt;
     }
 
     auto& subject = dninfo->subject;

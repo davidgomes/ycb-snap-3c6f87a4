@@ -44,6 +44,41 @@ Procedure
 
    Restart the cluster.
 
+Certificate and password authentication on one port
+---------------------------------------------------
+
+Use ``CertificateOrPasswordAuthenticator`` while migrating clients from passwords to
+client certificates. The qualified authenticator name is
+``com.scylladb.auth.CertificateOrPasswordAuthenticator``.
+
+Configure TLS to request a client certificate without requiring one:
+
+.. code-block:: yaml
+
+   authenticator: com.scylladb.auth.CertificateOrPasswordAuthenticator
+   auth_certificate_role_queries:
+      - source: SUBJECT
+        query: CN=([^,\s]+)
+
+   client_encryption_options:
+      enabled: true
+      certificate: <server cert>
+      keyfile: <server key>
+      truststore: <trusted client certificate authorities>
+      require_client_auth: optional
+
+``require_client_auth: optional`` makes the TLS server request a client certificate.
+Clients without one can complete the TLS handshake and authenticate with a user name
+and password. Do not set ``require_client_auth: true`` during this migration: that
+mode rejects clients without certificates during the TLS handshake, before password
+authentication can start. Setting it to ``false`` does not request client certificates.
+
+When a client presents a certificate, ScyllaDB validates it during the TLS handshake
+and uses ``auth_certificate_role_queries`` to select the role. It does not offer
+password authentication if role extraction or certificate authentication fails.
+An untrusted certificate fails the TLS handshake. Connections to an enabled plain CQL
+port do not have a certificate and use password authentication.
+
 
 Additional Resources
 --------------------

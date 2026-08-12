@@ -26,11 +26,13 @@ class raft_group0_client;
 namespace auth {
 
 class cache;
+class certificate_or_password_authenticator;
 struct config;
 
 class certificate_authenticator : public authenticator {
     enum class query_source;
     std::vector<std::pair<query_source, boost::regex>> _queries;
+    friend class certificate_or_password_authenticator;
 public:
     certificate_authenticator(cql3::query_processor&, ::service::raft_group0_client&, ::service::migration_manager&, cache&, const config&);
     ~certificate_authenticator();
@@ -62,6 +64,7 @@ public:
         return make_ready_future<>();
     }
 private:
+    future<std::optional<authenticated_user>> authenticate_if_present(session_dn_func) const;
 };
 
 }

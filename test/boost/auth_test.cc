@@ -27,6 +27,7 @@
 
 #include "auth/allow_all_authenticator.hh"
 #include "auth/authenticator.hh"
+#include "auth/certificate_or_password_authenticator.hh"
 #include "auth/password_authenticator.hh"
 #include "auth/service.hh"
 #include "auth/authenticated_user.hh"
@@ -45,6 +46,13 @@ cql_test_config auth_on(bool with_authorizer = true) {
     return cfg;
 }
 
+cql_test_config certificate_or_password_auth_on(std::string_view name) {
+    cql_test_config cfg;
+    cfg.db_config->authorizer("CassandraAuthorizer");
+    cfg.db_config->authenticator(sstring(name));
+    return cfg;
+}
+
 SEASTAR_TEST_CASE(test_default_authenticator) {
     co_await do_with_cql_env_thread([](cql_test_env& env) {
         auto& a = env.local_auth_service().underlying_authenticator();
@@ -59,6 +67,48 @@ SEASTAR_TEST_CASE(test_password_authenticator_attributes) {
         BOOST_REQUIRE(a.require_authentication());
         BOOST_REQUIRE_EQUAL(a.qualified_java_name(), auth::password_authenticator_name);
     }, auth_on(false));
+}
+
+SEASTAR_TEST_CASE(test_certificate_or_password_authenticator_qualified_name) {
+    co_await do_with_cql_env_thread([](cql_test_env& env) {
+        auto& a = env.local_auth_service().underlying_authenticator();
+        BOOST_REQUIRE(a.require_authentication());
+        BOOST_REQUIRE_EQUAL(a.qualified_java_name(), auth::certificate_or_password_authenticator_name);
+        BOOST_REQUIRE(a.uses_password_hashes());
+    }, certificate_or_password_auth_on("com.scylladb.auth.CertificateOrPasswordAuthenticator"));
+}
+
+SEASTAR_TEST_CASE(test_certificate_or_password_authenticator_paths) {
+    co_await do_with_cql_env_thread([](cql_test_env& env) {
+        auto& a = env.local_auth_service().underlying_authenticator();
+
+        auto no_certificate = a.authenticate(auth::session_dn_func([] {
+            return make_ready_future<std::optional<auth::certificate_info>>(std::nullopt);
+        })).get();
+        BOOST_REQUIRE(!no_certificate);
+
+        auto certificate_user = a.authenticate(auth::session_dn_func([] {
+            return make_ready_future<std::optional<auth::certificate_info>>(
+                    auth::certificate_info{"CN=certificate_user,OU=test", {}});
+        })).get();
+        BOOST_REQUIRE(certificate_user);
+        BOOST_REQUIRE_EQUAL(*certificate_user->name, "certificate_user");
+
+        BOOST_REQUIRE_THROW(a.authenticate(auth::session_dn_func([] {
+            return make_ready_future<std::optional<auth::certificate_info>>(
+                    auth::certificate_info{"OU=test", {}});
+        })).get(), exceptions::authentication_exception);
+
+        cquery_nofail(env, "CREATE ROLE password_user WITH PASSWORD = 'correct' AND LOGIN = true");
+        auth::authenticator::credentials_map credentials{
+                {auth::authenticator::USERNAME_KEY, "password_user"},
+                {auth::authenticator::PASSWORD_KEY, "correct"}};
+        auto password_user = a.authenticate(credentials).get();
+        BOOST_REQUIRE_EQUAL(*password_user.name, "password_user");
+
+        credentials[auth::authenticator::PASSWORD_KEY] = "wrong";
+        BOOST_REQUIRE_THROW(a.authenticate(credentials).get(), exceptions::authentication_exception);
+    }, certificate_or_password_auth_on("CertificateOrPasswordAuthenticator"));
 }
 
 static future<auth::authenticated_user>
