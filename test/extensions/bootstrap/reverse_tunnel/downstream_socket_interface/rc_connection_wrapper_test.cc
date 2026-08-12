@@ -11,6 +11,7 @@
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator.h"
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator_extension.h"
 
+#include "test/mocks/access_log/mocks.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/thread_local/mocks.h"
@@ -107,6 +108,10 @@ protected:
 
   const absl::flat_hash_map<RCConnectionWrapper*, std::string>& getConnWrapperToHostMap() const {
     return io_handle_->conn_wrapper_to_host_map_;
+  }
+
+  void setAccessLogs(AccessLog::InstanceSharedPtrVector access_logs) {
+    extension_->access_logs_ = std::move(access_logs);
   }
 
   // Test Data Setup Helpers.
@@ -659,6 +664,22 @@ TEST_F(RCConnectionWrapperTest, OnHandshakeSuccess) {
       Stats::Utility::counterFromStatNames(stats_scope, {stat_storage.statName()}, tags);
   uint64_t initial_handshake_success_count = handshake_success_counter.value();
 
+  auto access_log = std::make_shared<testing::StrictMock<AccessLog::MockInstance>>();
+  setAccessLogs({access_log});
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& metadata = stream_info.dynamicMetadata().filter_metadata().at(
+            "envoy.reverse_tunnel.initiator");
+        EXPECT_EQ(metadata.fields().at("event").string_value(), "handshake_success");
+        EXPECT_EQ(metadata.fields().at("node_id").string_value(), "test-node");
+        EXPECT_EQ(metadata.fields().at("cluster_id").string_value(), "test-cluster");
+        EXPECT_EQ(metadata.fields().at("tenant_id").string_value(), "");
+        EXPECT_EQ(metadata.fields().at("upstream_cluster").string_value(), "test-cluster");
+        EXPECT_EQ(metadata.fields().at("host_address").string_value(), "192.168.1.1:8080");
+        EXPECT_FALSE(metadata.fields().at("connection_key").string_value().empty());
+        EXPECT_EQ(metadata.fields().at("error").string_value(), "");
+      }));
+
   // Call onHandshakeSuccess.
   wrapper_ptr->onHandshakeSuccess();
 
@@ -756,6 +777,17 @@ TEST_F(RCConnectionWrapperTest, OnHandshakeFailure) {
   auto& handshake_failed_counter =
       Stats::Utility::counterFromStatNames(stats_scope, {stat_storage.statName()}, tags);
   uint64_t initial_handshake_failed_count = handshake_failed_counter.value();
+
+  auto access_log = std::make_shared<testing::StrictMock<AccessLog::MockInstance>>();
+  setAccessLogs({access_log});
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& metadata = stream_info.dynamicMetadata().filter_metadata().at(
+            "envoy.reverse_tunnel.initiator");
+        EXPECT_EQ(metadata.fields().at("event").string_value(), "handshake_failure");
+        EXPECT_EQ(metadata.fields().at("error").string_value(),
+                  "HTTP handshake failed with status 401");
+      }));
 
   // Call onHandshakeFailure with HTTP status error.
   wrapper_ptr->onHandshakeFailure(HandshakeFailureReason::httpStatusError("401"));

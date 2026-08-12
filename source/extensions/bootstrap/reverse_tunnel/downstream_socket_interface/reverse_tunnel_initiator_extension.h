@@ -2,7 +2,10 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
+#include "envoy/access_log/access_log.h"
+#include "envoy/common/time.h"
 #include "envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3/downstream_reverse_connection_socket_interface.pb.h"
 #include "envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3/downstream_reverse_connection_socket_interface.pb.validate.h"
 #include "envoy/server/bootstrap_extension_config.h"
@@ -28,32 +31,14 @@ class ReverseTunnelInitiatorExtension : public Server::BootstrapExtension,
                                         public Logger::Loggable<Logger::Id::connection> {
   // Friend class for testing
   friend class ReverseTunnelInitiatorExtensionTest;
+  friend class ReverseConnectionIOHandleTest;
+  friend class RCConnectionWrapperTest;
 
 public:
   ReverseTunnelInitiatorExtension(
       Server::Configuration::ServerFactoryContext& context,
       const envoy::extensions::bootstrap::reverse_tunnel::downstream_socket_interface::v3::
-          DownstreamReverseConnectionSocketInterface& config)
-      : context_(context), config_(config) {
-    stat_prefix_ = PROTOBUF_GET_STRING_OR_DEFAULT(config, stat_prefix, "reverse_tunnel_initiator");
-    // Configure detailed stats flag (defaults to false).
-    enable_detailed_stats_ = config.enable_detailed_stats();
-    if (config.has_http_handshake() && !config.http_handshake().request_path().empty()) {
-      handshake_request_path_ = config.http_handshake().request_path();
-    } else {
-      handshake_request_path_ =
-          std::string(ReverseConnectionUtility::DEFAULT_REVERSE_TUNNEL_REQUEST_PATH);
-    }
-    if (config.has_http_handshake()) {
-      additional_headers_ = {config.http_handshake().additional_headers().begin(),
-                             config.http_handshake().additional_headers().end()};
-      use_http_upgrade_ = config.http_handshake().use_http_upgrade();
-    }
-    ENVOY_LOG(debug,
-              "ReverseTunnelInitiatorExtension: creating downstream reverse connection "
-              "socket interface with stat_prefix: {}",
-              stat_prefix_);
-  }
+          DownstreamReverseConnectionSocketInterface& config);
 
   void onServerInitialized(Server::Instance&) override;
   void onWorkerThreadInitialized() override;
@@ -124,6 +109,20 @@ public:
   bool handshakeUsesHttpUpgrade() const { return use_http_upgrade_; }
 
   /**
+   * @return configured reverse tunnel initiator access loggers.
+   */
+  const AccessLog::InstanceSharedPtrVector& accessLogs() const { return access_logs_; }
+
+  /**
+   * Emit an initiator lifecycle access log with reverse tunnel metadata.
+   */
+  void emitAccessLog(TimeSource& time_source, const std::string& event,
+                     const std::string& node_id, const std::string& cluster_id,
+                     const std::string& tenant_id, const std::string& upstream_cluster,
+                     const std::string& host_address, const std::string& connection_key,
+                     const std::string& error_message);
+
+  /**
    * Increment handshake stats for reverse tunnel connections (per-worker only).
    * Only tracks stats if enable_detailed_stats flag is true.
    * @param cluster_id the cluster identifier for the connection
@@ -154,6 +153,7 @@ private:
   std::string handshake_request_path_;
   std::vector<envoy::config::core::v3::HeaderValueOption> additional_headers_;
   bool use_http_upgrade_{false};
+  AccessLog::InstanceSharedPtrVector access_logs_;
 
   /**
    * Update per-worker connection stats for debugging purposes.

@@ -1,5 +1,6 @@
 #include <memory>
 
+#include "envoy/extensions/access_loggers/stream/v3/stream.pb.h"
 #include "envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3/downstream_reverse_connection_socket_interface.pb.h"
 #include "envoy/server/factory_context.h"
 #include "envoy/thread_local/thread_local.h"
@@ -8,10 +9,12 @@
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator.h"
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator_extension.h"
 
+#include "test/mocks/access_log/mocks.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/thread_local/mocks.h"
 #include "test/mocks/upstream/mocks.h"
+#include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -85,6 +88,10 @@ protected:
     extension_->setTestOnlyTLSRegistry(std::move(another_tls_slot_));
   }
 
+  void setAccessLogs(AccessLog::InstanceSharedPtrVector access_logs) {
+    extension_->access_logs_ = std::move(access_logs);
+  }
+
   void TearDown() override {
     tls_slot_.reset();
     thread_local_registry_.reset();
@@ -123,10 +130,74 @@ TEST_F(ReverseTunnelInitiatorExtensionTest, InitializeWithDefaultConfig) {
 
   EXPECT_NE(extension_with_default, nullptr);
   EXPECT_EQ(extension_with_default->statPrefix(), "reverse_tunnel_initiator");
+  EXPECT_TRUE(extension_with_default->accessLogs().empty());
 }
 
 TEST_F(ReverseTunnelInitiatorExtensionTest, InitializeWithCustomStatPrefix) {
   EXPECT_EQ(extension_->statPrefix(), "reverse_connections");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogIsNoOpWithoutConfiguredLoggers) {
+  EXPECT_NO_THROW(extension_->emitAccessLog(dispatcher_.timeSource(), "handshake_success", "node",
+                                            "cluster", "tenant", "upstream", "host", "key", ""));
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogPopulatesInitiatorMetadata) {
+  auto access_log = std::make_shared<StrictMock<AccessLog::MockInstance>>();
+  setAccessLogs({access_log});
+
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& filter_metadata = stream_info.dynamicMetadata().filter_metadata();
+        ASSERT_EQ(filter_metadata.size(), 1);
+        const auto& metadata = filter_metadata.at("envoy.reverse_tunnel.initiator");
+        EXPECT_EQ(metadata.fields().size(), 8);
+        EXPECT_EQ(metadata.fields().at("event").string_value(), "handshake_failure");
+        EXPECT_EQ(metadata.fields().at("node_id").string_value(), "node-a");
+        EXPECT_EQ(metadata.fields().at("cluster_id").string_value(), "cluster-a");
+        EXPECT_EQ(metadata.fields().at("tenant_id").string_value(), "tenant-a");
+        EXPECT_EQ(metadata.fields().at("upstream_cluster").string_value(), "upstream-a");
+        EXPECT_EQ(metadata.fields().at("host_address").string_value(), "10.0.0.1:9000");
+        EXPECT_EQ(metadata.fields().at("connection_key").string_value(), "127.0.0.1:12345");
+        EXPECT_EQ(metadata.fields().at("error").string_value(),
+                  "HTTP handshake failed with status 503");
+      }));
+
+  extension_->emitAccessLog(dispatcher_.timeSource(), "handshake_failure", "node-a", "cluster-a",
+                            "tenant-a", "upstream-a", "10.0.0.1:9000", "127.0.0.1:12345",
+                            "HTTP handshake failed with status 503");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogPreservesEmptyStringFields) {
+  auto access_log = std::make_shared<StrictMock<AccessLog::MockInstance>>();
+  setAccessLogs({access_log});
+
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& metadata = stream_info.dynamicMetadata().filter_metadata().at(
+            "envoy.reverse_tunnel.initiator");
+        EXPECT_EQ(metadata.fields().size(), 8);
+        for (const auto* field : {"node_id", "cluster_id", "tenant_id", "upstream_cluster",
+                                  "host_address", "connection_key", "error"}) {
+          ASSERT_NE(metadata.fields().find(field), metadata.fields().end());
+          EXPECT_TRUE(metadata.fields().at(field).string_value().empty());
+        }
+      }));
+
+  extension_->emitAccessLog(dispatcher_.timeSource(), "connection_closed", "", "", "", "", "", "",
+                            "");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogInvokesEveryConfiguredLogger) {
+  auto first_access_log = std::make_shared<StrictMock<AccessLog::MockInstance>>();
+  auto second_access_log = std::make_shared<StrictMock<AccessLog::MockInstance>>();
+  setAccessLogs({first_access_log, second_access_log});
+
+  EXPECT_CALL(*first_access_log, log(_, _)).Times(1);
+  EXPECT_CALL(*second_access_log, log(_, _)).Times(1);
+
+  extension_->emitAccessLog(dispatcher_.timeSource(), "handshake_success", "node", "cluster",
+                            "tenant", "upstream", "host", "key", "");
 }
 
 TEST_F(ReverseTunnelInitiatorExtensionTest, HandshakeRequestPathDefaults) {
@@ -687,6 +758,24 @@ TEST_F(ConfigValidationTest, EmptyStatPrefix) {
 
   // Should not throw and should use default prefix.
   EXPECT_NO_THROW(initiator.createBootstrapExtension(config_, context_));
+}
+
+TEST_F(ConfigValidationTest, AccessLogConfigurationIsInstantiated) {
+  auto* access_log = config_.add_access_log();
+  access_log->set_name("envoy.access_loggers.stdout");
+  envoy::extensions::access_loggers::stream::v3::StdoutAccessLog stdout_access_log;
+  stdout_access_log.mutable_log_format()->mutable_text_format_source()->set_inline_string(
+      "%DYNAMIC_METADATA(envoy.reverse_tunnel.initiator:event)%\n");
+  access_log->mutable_typed_config()->PackFrom(stdout_access_log);
+
+  EXPECT_CALL(context_, messageValidationVisitor())
+      .WillRepeatedly(ReturnRef(ProtobufMessage::getStrictValidationVisitor()));
+
+  ReverseTunnelInitiator initiator(context_);
+  auto extension = initiator.createBootstrapExtension(config_, context_);
+  auto* reverse_tunnel_extension = dynamic_cast<ReverseTunnelInitiatorExtension*>(extension.get());
+  ASSERT_NE(reverse_tunnel_extension, nullptr);
+  EXPECT_EQ(reverse_tunnel_extension->accessLogs().size(), 1);
 }
 
 } // namespace ReverseConnection

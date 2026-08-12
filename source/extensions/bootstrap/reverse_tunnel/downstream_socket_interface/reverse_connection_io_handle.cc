@@ -794,6 +794,12 @@ void ReverseConnectionIOHandle::onDownstreamConnectionClosed(const std::string& 
   ENVOY_LOG(debug, "Found connection {} belongs to host {} in cluster {}", connection_key,
             host_address, cluster_name);
 
+  if (extension_ != nullptr && !extension_->accessLogs().empty()) {
+    extension_->emitAccessLog(getTimeSource(), "connection_closed", config_.src_node_id,
+                              config_.src_cluster_id, config_.src_tenant_id, cluster_name,
+                              host_address, connection_key, "");
+  }
+
   // Remove the connection key from the host's connection set.
   auto host_it = host_to_conn_info_map_.find(host_address);
   if (host_it != host_to_conn_info_map_.end()) {

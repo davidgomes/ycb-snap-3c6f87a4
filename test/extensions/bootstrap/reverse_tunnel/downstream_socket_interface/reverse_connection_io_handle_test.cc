@@ -15,6 +15,7 @@
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator_extension.h"
 
 #include "test/common/tls/mock_ssl_handshaker.h"
+#include "test/mocks/access_log/mocks.h"
 #include "test/mocks/api/mocks.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/server/factory_context.h"
@@ -106,6 +107,10 @@ protected:
     config.enable_circuit_breaker = true;
     config.remote_clusters.push_back(RemoteClusterConnectionConfig("remote-cluster", 2));
     return config;
+  }
+
+  void setAccessLogs(AccessLog::InstanceSharedPtrVector access_logs) {
+    extension_->access_logs_ = std::move(access_logs);
   }
 
   NiceMock<Server::Configuration::MockServerFactoryContext> context_;
@@ -2261,6 +2266,22 @@ TEST_F(ReverseConnectionIOHandleTest, OnDownstreamConnectionClosedTriggersReInit
     connection_key = "192.168.1.1:12345";
     ENVOY_LOG_MISC(debug, "No connection key found, using mock: {}", connection_key);
   }
+
+  auto access_log = std::make_shared<StrictMock<AccessLog::MockInstance>>();
+  setAccessLogs({access_log});
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([&](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& metadata = stream_info.dynamicMetadata().filter_metadata().at(
+            "envoy.reverse_tunnel.initiator");
+        EXPECT_EQ(metadata.fields().at("event").string_value(), "connection_closed");
+        EXPECT_EQ(metadata.fields().at("node_id").string_value(), "test-node");
+        EXPECT_EQ(metadata.fields().at("cluster_id").string_value(), "test-cluster");
+        EXPECT_EQ(metadata.fields().at("tenant_id").string_value(), "");
+        EXPECT_EQ(metadata.fields().at("upstream_cluster").string_value(), "test-cluster");
+        EXPECT_EQ(metadata.fields().at("host_address").string_value(), "192.168.1.1");
+        EXPECT_EQ(metadata.fields().at("connection_key").string_value(), connection_key);
+        EXPECT_EQ(metadata.fields().at("error").string_value(), "");
+      }));
 
   // Step 4: Simulate downstream connection closure.
   io_handle_->onDownstreamConnectionClosed(connection_key);

@@ -211,6 +211,10 @@ private:
   Upstream::HostDescriptionConstSharedPtr host_;
   std::string cluster_name_;
   std::string connection_key_;
+  std::string host_address_;
+  std::string src_node_id_;
+  std::string src_cluster_id_;
+  std::string src_tenant_id_;
   bool http_handshake_sent_{false};
   bool handshake_completed_{false};
   bool shutdown_called_{false};
@@ -220,6 +224,11 @@ private:
    * @return pointer to ReverseTunnelInitiatorExtension
    */
   ReverseTunnelInitiatorExtension* getDownstreamExtension() const;
+
+  /**
+   * Emit a reverse tunnel initiator lifecycle access log when configured.
+   */
+  void emitAccessLog(const std::string& event, const std::string& error_message);
 
 public:
   // Dispatch incoming bytes to HTTP/1 codec.

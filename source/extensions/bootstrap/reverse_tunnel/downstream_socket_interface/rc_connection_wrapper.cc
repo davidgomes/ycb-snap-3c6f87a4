@@ -51,6 +51,11 @@ void RCConnectionWrapper::onEvent(Network::ConnectionEvent event) {
     ENVOY_LOG(debug, "RCConnectionWrapper: connection: {}, found connection {} remote closed",
               connectionId, connectionKey);
 
+    if (!handshake_completed_) {
+      handshake_completed_ = true;
+      emitAccessLog("handshake_failure", "Connection closed");
+    }
+
     // Don't call shutdown() here as it may cause cleanup during event processing
     // Instead, just notify parent of closure.
     parent_.onConnectionDone("Connection closed", this, true);
@@ -74,11 +79,17 @@ Network::FilterStatus SimpleConnReadFilter::onData(Buffer::Instance& buffer, boo
 std::string RCConnectionWrapper::connect(const std::string& src_tenant_id,
                                          const std::string& src_cluster_id,
                                          const std::string& src_node_id) {
+  src_tenant_id_ = src_tenant_id;
+  src_cluster_id_ = src_cluster_id;
+  src_node_id_ = src_node_id;
+  host_address_ = host_ != nullptr && host_->address() != nullptr ? host_->address()->asString() : "";
+
   // Register connection callbacks.
   ENVOY_LOG(debug, "RCConnectionWrapper: connection: {}, adding connection callbacks",
             connection_->id());
   connection_->addConnectionCallbacks(*this);
   connection_->connect();
+  connection_key_ = connection_->connectionInfoProvider().localAddress()->asString();
 
   // Use HTTP handshake.
   ENVOY_LOG(debug,
@@ -182,7 +193,7 @@ std::string RCConnectionWrapper::connect(const std::string& src_tenant_id,
     onHandshakeFailure(HandshakeFailureReason::encodeError());
   }
 
-  return connection_->connectionInfoProvider().localAddress()->asString();
+  return connection_key_;
 }
 
 void RCConnectionWrapper::decodeHeaders(Http::ResponseHeaderMapPtr&& headers, bool) {
@@ -210,9 +221,23 @@ ReverseTunnelInitiatorExtension* RCConnectionWrapper::getDownstreamExtension() c
   return parent_.getDownstreamExtension();
 }
 
+void RCConnectionWrapper::emitAccessLog(const std::string& event,
+                                        const std::string& error_message) {
+  auto* extension = getDownstreamExtension();
+  if (extension == nullptr || extension->accessLogs().empty() || connection_ == nullptr) {
+    return;
+  }
+
+  extension->emitAccessLog(connection_->dispatcher().timeSource(), event, src_node_id_,
+                           src_cluster_id_, src_tenant_id_, cluster_name_, host_address_,
+                           connection_key_, error_message);
+}
+
 void RCConnectionWrapper::onHandshakeSuccess() {
   std::string message = "reverse connection accepted";
   ENVOY_LOG(debug, "handshake succeeded: {}", message);
+  handshake_completed_ = true;
+  emitAccessLog("handshake_success", "");
 
   // Track handshake success stats.
   auto* extension = getDownstreamExtension();
@@ -228,6 +253,8 @@ void RCConnectionWrapper::onHandshakeFailure(const HandshakeFailureReason& reaso
   const std::string stats_failure_reason = reason.getNameForStats();
 
   ENVOY_LOG(trace, "handshake failed: {}", error_message);
+  handshake_completed_ = true;
+  emitAccessLog("handshake_failure", error_message);
 
   // Track handshake failure stats.
   auto* extension = getDownstreamExtension();
