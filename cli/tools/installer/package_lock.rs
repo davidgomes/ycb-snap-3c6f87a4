@@ -366,7 +366,7 @@ fn package_id(
   let name = if level == 0 {
     package.name.to_string()
   } else {
-    package.name.replace('/', "+")
+    package.name.replace("/", "+").to_string()
   };
   let mut id = format!("{name}@{}", package.version);
   if !visiting.insert(path.to_string()) {
