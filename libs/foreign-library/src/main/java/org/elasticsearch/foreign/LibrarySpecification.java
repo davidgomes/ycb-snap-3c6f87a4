@@ -62,9 +62,12 @@ import java.lang.annotation.Target;
  *
  * <pre>{@code
  * public class PrefixResolver implements SymbolResolver {
- *     public MemorySegment resolve(String symbolName, SymbolLookup lookup) {
- *         return lookup.find("mylib_" + symbolName).orElseThrow(
- *             () -> new UnsatisfiedLinkError(symbolName));
+ *     public ResolvedSymbol resolve(String symbolName, SymbolLookup lookup) {
+ *         String mangled = "mylib_" + symbolName;
+ *         return new ResolvedSymbol(
+ *             mangled,
+ *             lookup.find(mangled).orElseThrow(
+ *                 () -> new UnsatisfiedLinkError(symbolName)));
  *     }
  * }
  *
@@ -74,6 +77,12 @@ import java.lang.annotation.Target;
  *     int compress(MemorySegment src, int len);
  * }
  * }</pre>
+ *
+ * <p>To customize how downcall {@link java.lang.invoke.MethodHandle}s are created from a resolved
+ * symbol, specify a custom {@link MethodHandleResolver} via {@link #methodHandleResolver()}. The
+ * default ({@link DefaultMethodHandleResolver}) calls {@code linker.downcallHandle} on the
+ * resolved address. A custom resolver can inspect {@link ResolvedSymbol#name()} and, for example,
+ * adjust the function descriptor or apply {@link java.lang.invoke.MethodHandles#insertArguments}.
  */
 @Retention(RetentionPolicy.SOURCE)
 @Target(ElementType.TYPE)
@@ -95,4 +104,13 @@ public @interface LibrarySpecification {
      * Defaults to {@link DefaultSymbolResolver}, which looks up symbols by their exact name.
      */
     Class<? extends SymbolResolver> symbolResolver() default DefaultSymbolResolver.class;
+
+    /**
+     * Custom method-handle resolver for this library. After a {@link SymbolResolver} produces a
+     * {@link ResolvedSymbol}, this resolver creates the downcall {@link java.lang.invoke.MethodHandle}
+     * used to invoke it. Defaults to {@link DefaultMethodHandleResolver}, which calls
+     * {@code linker.downcallHandle} on the resolved address with the descriptor and linker options
+     * derived from the Java method.
+     */
+    Class<? extends MethodHandleResolver> methodHandleResolver() default DefaultMethodHandleResolver.class;
 }
