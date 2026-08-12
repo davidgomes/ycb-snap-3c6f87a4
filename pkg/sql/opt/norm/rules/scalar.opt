@@ -7,6 +7,7 @@
 # handle both combinations.
 [CommuteVar, Normalize]
 (Eq | Ne | Is | IsNot | Plus | Mult | Bitand | Bitor | Bitxor
+        | VectorDistance | VectorCosDistance | VectorNegInnerProduct
     $left:^(Variable)
     $right:(Variable)
 )
@@ -33,6 +34,7 @@
 # patterns can rely on this normal form and only handle one combination.
 [CommuteConst, Normalize]
 (Eq | Ne | Is | IsNot | Plus | Mult | Bitand | Bitor | Bitxor
+        | VectorDistance | VectorCosDistance | VectorNegInnerProduct
     $left:(ConstValue)
     $right:^(ConstValue)
 )

@@ -859,10 +859,13 @@ func (b *Builder) constructBinary(
 	case treebin.JSONFetchTextPath:
 		return b.factory.ConstructFetchTextPath(left, right)
 	case treebin.Distance:
+		left, right = commuteVectorDistanceArgs(left, right)
 		return b.factory.ConstructVectorDistance(left, right)
 	case treebin.CosDistance:
+		left, right = commuteVectorDistanceArgs(left, right)
 		return b.factory.ConstructVectorCosDistance(left, right)
 	case treebin.NegInnerProduct:
+		left, right = commuteVectorDistanceArgs(left, right)
 		return b.factory.ConstructVectorNegInnerProduct(left, right)
 	case treebin.FirstContains:
 		return b.factory.ConstructFirstContains(left, right)
@@ -981,6 +984,19 @@ func (sb *ScalarBuilder) Build(expr tree.Expr) (_ opt.ScalarExpr, retErr error) 
 	typedExpr := sb.scope.resolveType(expr, types.AnyElement)
 	scalar := sb.buildScalar(typedExpr, &sb.scope, nil, nil, nil)
 	return scalar, nil
+}
+
+// commuteVectorDistanceArgs puts a variable vector column on the left of a
+// commutative vector distance operator when the other operand is not a
+// variable. This matches CommuteVar and lets GenerateVectorSearch match
+// regardless of which side the query vector was written on.
+func commuteVectorDistanceArgs(left, right opt.ScalarExpr) (opt.ScalarExpr, opt.ScalarExpr) {
+	if _, rightIsVar := right.(*memo.VariableExpr); rightIsVar {
+		if _, leftIsVar := left.(*memo.VariableExpr); !leftIsVar {
+			return right, left
+		}
+	}
+	return left, right
 }
 
 // reType is similar to tree.ReType, except that it panics with an internal

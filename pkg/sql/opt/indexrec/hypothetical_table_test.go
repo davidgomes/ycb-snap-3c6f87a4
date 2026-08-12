@@ -11,7 +11,7 @@ func TestBuildOptAndHypTableMaps(t *testing.T) {
 	tables, indexCols := testTablesAndIndexCols()
 	table1 := tables[0]
 	table2 := tables[1]
-	indexCandidates := testIndexCandidates1(tables, indexCols)
+	indexCandidates := toCandidates(testIndexCandidates1(tables, indexCols))
 
 	oldTables, hypTables := BuildOptAndHypTableMaps(nil, indexCandidates)
 

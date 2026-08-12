@@ -238,6 +238,18 @@ func testTablesAndIndexCols() ([]cat.Table, []cat.IndexColumn) {
 	return []cat.Table{&table1, &table2}, []cat.IndexColumn{indexCol1, indexCol2, indexCol3}
 }
 
+func toCandidates(m map[cat.Table][][]cat.IndexColumn) map[cat.Table][]Candidate {
+	out := make(map[cat.Table][]Candidate, len(m))
+	for t, indexes := range m {
+		cands := make([]Candidate, len(indexes))
+		for i, cols := range indexes {
+			cands[i] = Candidate{Cols: cols}
+		}
+		out[t] = cands
+	}
+	return out
+}
+
 func candidatesAreEqual(leftCandidates, rightCandidates map[cat.Table][][]cat.IndexColumn) bool {
 	// Check that both candidate sets have the same table keys.
 	for t := range leftCandidates {

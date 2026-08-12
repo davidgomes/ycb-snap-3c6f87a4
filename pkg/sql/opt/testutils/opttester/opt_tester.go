@@ -2245,15 +2245,19 @@ func (ot *OptTester) IndexCandidates() (string, error) {
 		tableSb.WriteString(tableName.String())
 		tableSb.WriteString(":\n")
 		indexesOutput := make([]string, len(indexes))
-		for i, index := range indexes {
+		for i, cand := range indexes {
 			var indexSb strings.Builder
 			indexSb.WriteString(" (")
-			for j, indexCol := range index {
+			for j, indexCol := range cand.Cols {
 				if j > 0 {
 					indexSb.WriteString(", ")
 				}
 				colName := indexCol.Column.ColName()
 				indexSb.WriteString(colName.String())
+				if cand.IsVector && j == len(cand.Cols)-1 {
+					indexSb.WriteByte(' ')
+					indexSb.WriteString(string(indexrec.VectorOpClass(cand.VecMetric)))
+				}
 				if indexCol.Descending {
 					indexSb.WriteString(" DESC")
 				}

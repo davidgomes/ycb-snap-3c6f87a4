@@ -12,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
 
@@ -42,6 +43,11 @@ import (
 //  7. For JSON and array columns, we create single column inverted indexes. We
 //     also create the following multi-column combination candidates for each
 //     inverted column: eq + 'inverted column', EQ + 'inverted column'.
+//  8. For vector columns used in distance operators (<->, <=>, <#>), we create
+//     single-column vector indexes using the metric implied by the operator.
+//     Operand order does not matter. We also create the following multi-column
+//     combination candidates for each vector column: eq + 'vector column',
+//     EQ + 'vector column'.
 //
 // TODO(nehageorge): Add a rule for columns that are referenced in the statement
 // but do not fall into one of these categories. In order to account for this,
@@ -50,12 +56,23 @@ import (
 // RFC for inspiration: https://github.com/cockroachdb/cockroach/pull/71784. We
 // may also consider matching more types of SQL expressions, including LIKE
 // expressions.
-func FindIndexCandidateSet(rootExpr opt.Expr, md *opt.Metadata) map[cat.Table][][]cat.IndexColumn {
+func FindIndexCandidateSet(rootExpr opt.Expr, md *opt.Metadata) map[cat.Table][]Candidate {
 	var candidateSet indexCandidateSet
 	candidateSet.init(md)
 	candidateSet.categorizeIndexCandidates(rootExpr)
 	candidateSet.combineIndexCandidates()
 	return candidateSet.overallCandidates
+}
+
+// Candidate is a potential index identified by FindIndexCandidateSet.
+type Candidate struct {
+	// Cols is the list of explicit index columns.
+	Cols []cat.IndexColumn
+	// IsVector is true when this candidate is a vector index.
+	IsVector bool
+	// VecMetric is the distance metric for a vector index candidate. It is only
+	// meaningful when IsVector is true.
+	VecMetric vecpb.DistanceMetric
 }
 
 // indexCandidateSet stores potential indexes that could be recommended for a
@@ -66,7 +83,8 @@ type indexCandidateSet struct {
 	rangeCandidates    map[cat.Table][][]cat.IndexColumn
 	joinCandidates     map[cat.Table][][]cat.IndexColumn
 	invertedCandidates map[cat.Table][][]cat.IndexColumn
-	overallCandidates  map[cat.Table][][]cat.IndexColumn
+	vectorCandidates   map[cat.Table][]Candidate
+	overallCandidates  map[cat.Table][]Candidate
 }
 
 // init allocates memory for the maps in the set.
@@ -77,7 +95,8 @@ func (ics *indexCandidateSet) init(md *opt.Metadata) {
 	ics.rangeCandidates = make(map[cat.Table][][]cat.IndexColumn, numTables)
 	ics.joinCandidates = make(map[cat.Table][][]cat.IndexColumn, numTables)
 	ics.invertedCandidates = make(map[cat.Table][][]cat.IndexColumn, numTables)
-	ics.overallCandidates = make(map[cat.Table][][]cat.IndexColumn, numTables)
+	ics.vectorCandidates = make(map[cat.Table][]Candidate, numTables)
+	ics.overallCandidates = make(map[cat.Table][]Candidate, numTables)
 }
 
 // combineIndexCandidates adds index candidates that are combinations of
@@ -85,26 +104,29 @@ func (ics *indexCandidateSet) init(md *opt.Metadata) {
 // FindIndexCandidateSet.
 func (ics *indexCandidateSet) combineIndexCandidates() {
 	// Copy indexes in each category to overallCandidates without duplicates.
-	copyIndexes(ics.equalCandidates, ics.overallCandidates)
-	copyIndexes(ics.rangeCandidates, ics.overallCandidates)
-	copyIndexes(ics.joinCandidates, ics.overallCandidates)
-	copyIndexes(ics.invertedCandidates, ics.overallCandidates)
+	copyIndexColsToCandidates(ics.equalCandidates, ics.overallCandidates)
+	copyIndexColsToCandidates(ics.rangeCandidates, ics.overallCandidates)
+	copyIndexColsToCandidates(ics.joinCandidates, ics.overallCandidates)
+	copyIndexColsToCandidates(ics.invertedCandidates, ics.overallCandidates)
+	copyVectorCandidates(ics.vectorCandidates, ics.overallCandidates)
 
-	numTables := len(ics.overallCandidates)
+	numTables := len(ics.md.AllTables())
 	equalJoinCandidates := make(map[cat.Table][][]cat.IndexColumn, numTables)
 	equalGroupedCandidates := make(map[cat.Table][][]cat.IndexColumn, numTables)
 
 	// Construct EQ, EQ + R, J + R, EQ + J, EQ + J + R, eq + (inverted),
-	// EQ + (inverted).
+	// EQ + (inverted), eq + (vector), EQ + (vector).
 	groupIndexesByTable(ics.equalCandidates, equalGroupedCandidates)
-	copyIndexes(equalGroupedCandidates, ics.overallCandidates)
-	constructIndexCombinations(equalGroupedCandidates, ics.rangeCandidates, ics.overallCandidates)
-	constructIndexCombinations(ics.joinCandidates, ics.rangeCandidates, ics.overallCandidates)
+	copyIndexColsToCandidates(equalGroupedCandidates, ics.overallCandidates)
+	constructAndCopyIndexCombinations(equalGroupedCandidates, ics.rangeCandidates, ics.overallCandidates)
+	constructAndCopyIndexCombinations(ics.joinCandidates, ics.rangeCandidates, ics.overallCandidates)
 	constructIndexCombinations(equalGroupedCandidates, ics.joinCandidates, equalJoinCandidates)
-	copyIndexes(equalJoinCandidates, ics.overallCandidates)
-	constructIndexCombinations(equalJoinCandidates, ics.rangeCandidates, ics.overallCandidates)
-	constructIndexCombinations(ics.equalCandidates, ics.invertedCandidates, ics.overallCandidates)
-	constructIndexCombinations(equalGroupedCandidates, ics.invertedCandidates, ics.overallCandidates)
+	copyIndexColsToCandidates(equalJoinCandidates, ics.overallCandidates)
+	constructAndCopyIndexCombinations(equalJoinCandidates, ics.rangeCandidates, ics.overallCandidates)
+	constructAndCopyIndexCombinations(ics.equalCandidates, ics.invertedCandidates, ics.overallCandidates)
+	constructAndCopyIndexCombinations(equalGroupedCandidates, ics.invertedCandidates, ics.overallCandidates)
+	constructVectorIndexCombinations(ics.equalCandidates, ics.vectorCandidates, ics.overallCandidates)
+	constructVectorIndexCombinations(equalGroupedCandidates, ics.vectorCandidates, ics.overallCandidates)
 }
 
 // categorizeIndexCandidates finds potential index candidates for a given
@@ -114,7 +136,7 @@ func (ics *indexCandidateSet) categorizeIndexCandidates(expr opt.Expr) {
 	case *memo.SortExpr:
 		ics.addOrderingIndex(expr.ProvidedPhysical().Ordering)
 	case *memo.GroupByExpr:
-		ics.addMultiColumnIndex(expr.GroupingCols.ToList(), nil /* desc */, ics.overallCandidates)
+		ics.addMultiColumnIndexOverall(expr.GroupingCols.ToList(), nil /* desc */)
 	case *memo.EqExpr:
 		ics.addVariableExprIndex(expr.Left, ics.equalCandidates)
 		ics.addVariableExprIndex(expr.Right, ics.equalCandidates)
@@ -178,21 +200,27 @@ func (ics *indexCandidateSet) categorizeIndexCandidates(expr opt.Expr) {
 	case *memo.ExceptAllExpr:
 		ics.addSetOperationIndexes(expr.LeftCols, expr.RightCols)
 	case *memo.FetchValExpr:
-		ics.addVariableExprIndex(expr.Json, ics.overallCandidates)
+		ics.addVariableExprOverall(expr.Json)
 	case *memo.ContainsExpr:
-		ics.addVariableExprIndex(expr.Left, ics.overallCandidates)
-		ics.addVariableExprIndex(expr.Right, ics.overallCandidates)
+		ics.addVariableExprOverall(expr.Left)
+		ics.addVariableExprOverall(expr.Right)
 	case *memo.ContainedByExpr:
-		ics.addVariableExprIndex(expr.Left, ics.overallCandidates)
-		ics.addVariableExprIndex(expr.Right, ics.overallCandidates)
+		ics.addVariableExprOverall(expr.Left)
+		ics.addVariableExprOverall(expr.Right)
 	case *memo.FunctionExpr:
-		ics.addGeoSpatialIndexes(expr, ics.overallCandidates)
+		ics.addGeoSpatialIndexes(expr)
 	case *memo.BBoxCoversExpr:
-		ics.addVariableExprIndex(expr.Left, ics.overallCandidates)
-		ics.addVariableExprIndex(expr.Right, ics.overallCandidates)
+		ics.addVariableExprOverall(expr.Left)
+		ics.addVariableExprOverall(expr.Right)
 	case *memo.BBoxIntersectsExpr:
-		ics.addVariableExprIndex(expr.Left, ics.overallCandidates)
-		ics.addVariableExprIndex(expr.Right, ics.overallCandidates)
+		ics.addVariableExprOverall(expr.Left)
+		ics.addVariableExprOverall(expr.Right)
+	case *memo.VectorDistanceExpr:
+		ics.addVectorDistanceIndexes(expr.Left, expr.Right, vecpb.L2SquaredDistance)
+	case *memo.VectorCosDistanceExpr:
+		ics.addVectorDistanceIndexes(expr.Left, expr.Right, vecpb.CosineDistance)
+	case *memo.VectorNegInnerProductExpr:
+		ics.addVectorDistanceIndexes(expr.Left, expr.Right, vecpb.InnerProductDistance)
 	}
 	for i, n := 0, expr.ChildCount(); i < n; i++ {
 		ics.categorizeIndexCandidates(expr.Child(i))
@@ -202,8 +230,8 @@ func (ics *indexCandidateSet) categorizeIndexCandidates(expr opt.Expr) {
 // addSetOperationIndexes is used to add index candidates on the output columns
 // of set operations (UNION, INTERSECT, INTERSECT ALL, EXCEPT, EXCEPT ALL).
 func (ics *indexCandidateSet) addSetOperationIndexes(leftCols, rightCols opt.ColList) {
-	ics.addMultiColumnIndex(leftCols, nil /* desc */, ics.overallCandidates)
-	ics.addMultiColumnIndex(rightCols, nil /* desc */, ics.overallCandidates)
+	ics.addMultiColumnIndexOverall(leftCols, nil /* desc */)
+	ics.addMultiColumnIndexOverall(rightCols, nil /* desc */)
 }
 
 // addOrderingIndex adds indexes for a *memo.SortExpr. One index is constructed
@@ -231,7 +259,7 @@ func (ics indexCandidateSet) addOrderingIndex(ordering opt.Ordering) {
 		descList = append(descList, orderingCol.Descending())
 	}
 	if len(columnList) > 0 {
-		ics.addMultiColumnIndex(columnList, descList, ics.overallCandidates)
+		ics.addMultiColumnIndexOverall(columnList, descList)
 	}
 }
 
@@ -242,16 +270,110 @@ func (ics indexCandidateSet) addOrderingIndex(ordering opt.Ordering) {
 func (ics *indexCandidateSet) addJoinIndexes(expr memo.FiltersExpr) {
 	outerCols := expr.OuterCols().ToList()
 	for _, col := range outerCols {
+		typ := ics.md.ColumnMeta(col).Type
+		if colinfo.ColumnTypeIsVectorIndexable(typ) {
+			// Vector columns are added only from distance operators.
+			continue
+		}
 		// TODO (Shivam): Index recommendations should not only allow JSON columns
 		// to be part of inverted indexes since they are also forward indexable.
-		if colinfo.ColumnTypeIsIndexable(ics.md.ColumnMeta(col).Type) &&
-			ics.md.ColumnMeta(col).Type.Family() != types.JsonFamily {
+		if colinfo.ColumnTypeIsIndexable(typ) && typ.Family() != types.JsonFamily {
 			ics.addSingleColumnIndex(col, false /* desc */, ics.joinCandidates)
 		} else {
 			ics.addSingleColumnIndex(col, false /* desc */, ics.invertedCandidates)
 		}
 	}
 	ics.addMultiColumnIndex(outerCols, nil /* desc */, ics.joinCandidates)
+}
+
+// copyIndexColsToCandidates copies column-only indexes into a Candidate map,
+// getting rid of duplicates in the output map.
+func copyIndexColsToCandidates(
+	inputIndexMap map[cat.Table][][]cat.IndexColumn, outputIndexMap map[cat.Table][]Candidate,
+) {
+	for t, indexes := range inputIndexMap {
+		for _, index := range indexes {
+			addIndexCandidate(Candidate{Cols: index}, t, outputIndexMap)
+		}
+	}
+}
+
+// copyVectorCandidates copies vector index candidates from one map to another,
+// getting rid of duplicates in the output map.
+func copyVectorCandidates(inputIndexMap, outputIndexMap map[cat.Table][]Candidate) {
+	for t, indexes := range inputIndexMap {
+		for _, index := range indexes {
+			addIndexCandidate(index, t, outputIndexMap)
+		}
+	}
+}
+
+// constructAndCopyIndexCombinations concatenates left and right indexes and
+// copies the results into a Candidate map.
+func constructAndCopyIndexCombinations(
+	leftIndexMap, rightIndexMap map[cat.Table][][]cat.IndexColumn,
+	outputIndexes map[cat.Table][]Candidate,
+) {
+	temp := make(map[cat.Table][][]cat.IndexColumn)
+	constructIndexCombinations(leftIndexMap, rightIndexMap, temp)
+	copyIndexColsToCandidates(temp, outputIndexes)
+}
+
+// constructVectorIndexCombinations concatenates equality/prefix columns with
+// vector index candidates, keeping the vector column last and preserving the
+// distance metric.
+func constructVectorIndexCombinations(
+	leftIndexMap map[cat.Table][][]cat.IndexColumn,
+	vectorIndexMap map[cat.Table][]Candidate,
+	outputIndexes map[cat.Table][]Candidate,
+) {
+	for t, leftIndexes := range leftIndexMap {
+		rightIndexes, found := vectorIndexMap[t]
+		if !found {
+			continue
+		}
+		for _, leftIndex := range leftIndexes {
+			var leftIndexColSet intsets.Fast
+			for _, leftCol := range leftIndex {
+				leftIndexColSet.Add(int(leftCol.ColID()))
+			}
+			for _, rightIndex := range rightIndexes {
+				updatedRight := make([]cat.IndexColumn, 0, len(rightIndex.Cols))
+				for _, rightCol := range rightIndex.Cols {
+					if !leftIndexColSet.Contains(int(rightCol.ColID())) {
+						updatedRight = append(updatedRight, rightCol)
+					}
+				}
+				if len(updatedRight) == 0 {
+					continue
+				}
+				combined := make([]cat.IndexColumn, 0, len(leftIndex)+len(updatedRight))
+				combined = append(combined, leftIndex...)
+				combined = append(combined, updatedRight...)
+				addIndexCandidate(
+					Candidate{
+						Cols:      combined,
+						IsVector:  true,
+						VecMetric: rightIndex.VecMetric,
+					},
+					t,
+					outputIndexes,
+				)
+			}
+		}
+	}
+}
+
+func (ics *indexCandidateSet) addVariableExprOverall(expr opt.Expr) {
+	temp := make(map[cat.Table][][]cat.IndexColumn)
+	ics.addVariableExprIndex(expr, temp)
+	copyIndexColsToCandidates(temp, ics.overallCandidates)
+}
+
+func (ics *indexCandidateSet) addMultiColumnIndexOverall(cols opt.ColList, desc []bool) {
+	temp := make(map[cat.Table][][]cat.IndexColumn)
+	ics.addMultiColumnIndex(cols, desc, temp)
+	copyIndexColsToCandidates(temp, ics.overallCandidates)
 }
 
 // copyIndexes copies indexes from one map to another, getting rid of duplicates
@@ -331,15 +453,57 @@ func (ics *indexCandidateSet) addVariableExprIndex(
 	switch expr := expr.(type) {
 	case *memo.VariableExpr:
 		col := expr.Col
+		typ := ics.md.ColumnMeta(col).Type
+		if colinfo.ColumnTypeIsVectorIndexable(typ) {
+			// Vector columns are added only from distance operators.
+			return
+		}
 		// TODO (Shivam): Index recommendations should not only allow JSON columns
 		// to be part of inverted indexes since they are also forward indexable.
-		if colinfo.ColumnTypeIsIndexable(ics.md.ColumnMeta(col).Type) &&
-			ics.md.ColumnMeta(col).Type.Family() != types.JsonFamily {
+		if colinfo.ColumnTypeIsIndexable(typ) && typ.Family() != types.JsonFamily {
 			ics.addSingleColumnIndex(col, false /* desc */, indexCandidates)
 		} else {
 			ics.addSingleColumnIndex(col, false /* desc */, ics.invertedCandidates)
 		}
 	}
+}
+
+// addVectorDistanceIndexes adds vector index candidates for any fixed-width
+// vector columns used as operands of a vector distance operator. Either operand
+// may be the indexed column.
+func (ics *indexCandidateSet) addVectorDistanceIndexes(
+	left, right opt.Expr, metric vecpb.DistanceMetric,
+) {
+	ics.maybeAddVectorOperandIndex(left, metric)
+	ics.maybeAddVectorOperandIndex(right, metric)
+}
+
+func (ics *indexCandidateSet) maybeAddVectorOperandIndex(
+	expr opt.Expr, metric vecpb.DistanceMetric,
+) {
+	v, ok := expr.(*memo.VariableExpr)
+	if !ok {
+		return
+	}
+	columnMeta := ics.md.ColumnMeta(v.Col)
+	if !colinfo.ColumnTypeIsVectorIndexable(columnMeta.Type) || columnMeta.Type.Width() <= 0 {
+		return
+	}
+	tableID := columnMeta.Table
+	if tableID == 0 {
+		return
+	}
+	currTable := ics.md.Table(tableID)
+	currCol := currTable.Column(tableID.ColumnOrdinal(v.Col))
+	addIndexCandidate(
+		Candidate{
+			Cols:      []cat.IndexColumn{{Column: currCol}},
+			IsVector:  true,
+			VecMetric: metric,
+		},
+		currTable,
+		ics.vectorCandidates,
+	)
 }
 
 // addMultiColumnIndex adds indexes to indexCandidates for groups of columns
@@ -437,11 +601,9 @@ func addIndexToCandidates(
 	indexCandidates[currTable] = append(indexCandidates[currTable], newIndex)
 }
 
-// AddGeoSpatialIndexes is used to add single-column indexes to indexCandidates
-// for spatial functions that can be index-accelerated.
-func (ics *indexCandidateSet) addGeoSpatialIndexes(
-	expr *memo.FunctionExpr, indexCandidates map[cat.Table][][]cat.IndexColumn,
-) {
+// addGeoSpatialIndexes adds single-column inverted indexes for spatial
+// functions that can be index-accelerated.
+func (ics *indexCandidateSet) addGeoSpatialIndexes(expr *memo.FunctionExpr) {
 	// Ensure that the function is a spatial function AND can be index-accelerated.
 	_, ok := geoindex.RelationshipMap[expr.Name]
 	if ok {
@@ -450,7 +612,51 @@ func (ics *indexCandidateSet) addGeoSpatialIndexes(
 			var child = expr.Args.Child(i)
 			// Spatial Indexes should be added to inverted candidates group in
 			// addVariableExprIndex.
-			ics.addVariableExprIndex(child, indexCandidates)
+			ics.addVariableExprOverall(child)
 		}
 	}
+}
+
+// addIndexCandidate adds an index to indexCandidates if it does not already
+// exist.
+func addIndexCandidate(
+	newIndex Candidate, currTable cat.Table, indexCandidates map[cat.Table][]Candidate,
+) {
+	// Do not add candidates from system or virtual tables.
+	if currTable.IsVirtualTable() || currTable.IsSystemTable() {
+		return
+	}
+
+	// Do not add indexes to PARTITION ALL BY tables.
+	// TODO(rytaft): Support these tables by adding implicit partitioning columns.
+	if currTable.IsPartitionAllBy() {
+		return
+	}
+
+	// Do not add duplicate indexes. Vector indexes with the same columns but
+	// different distance metrics are not duplicates.
+	for _, existingIndex := range indexCandidates[currTable] {
+		if candidatesEqual(existingIndex, newIndex) {
+			return
+		}
+	}
+	indexCandidates[currTable] = append(indexCandidates[currTable], newIndex)
+}
+
+func candidatesEqual(left, right Candidate) bool {
+	if left.IsVector != right.IsVector {
+		return false
+	}
+	if left.IsVector && left.VecMetric != right.VecMetric {
+		return false
+	}
+	if len(left.Cols) != len(right.Cols) {
+		return false
+	}
+	for i := range left.Cols {
+		if left.Cols[i] != right.Cols[i] {
+			return false
+		}
+	}
+	return true
 }

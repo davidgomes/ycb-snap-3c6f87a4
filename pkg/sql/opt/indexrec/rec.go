@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
 
@@ -84,6 +85,8 @@ func (rc recCollector) addIndexRec(md *opt.Metadata, expr opt.Expr) {
 	case *memo.ZigzagJoinExpr:
 		rc.addIndex(md, expr.LeftIndex, expr.Cols, expr.LeftTable)
 		rc.addIndex(md, expr.RightIndex, expr.Cols, expr.RightTable)
+	case *memo.VectorSearchExpr:
+		rc.addIndex(md, expr.Index, expr.Cols, expr.Table)
 	}
 	for i, n := 0, expr.ChildCount(); i < n; i++ {
 		rc.addIndexRec(md, expr.Child(i))
@@ -465,7 +468,12 @@ func (ir *indexRecommendation) indexCols() []tree.IndexElem {
 			direction = tree.Descending
 		}
 
-		indexCols[i] = tree.IndexElem{Column: colName, Direction: direction}
+		elem := tree.IndexElem{Column: colName, Direction: direction}
+		if ir.index.Type() == idxtype.VECTOR && i == len(ir.index.cols)-1 {
+			elem.OpClass = VectorOpClass(ir.index.vecConfig.DistanceMetric)
+			elem.Direction = tree.DefaultDirection
+		}
+		indexCols[i] = elem
 	}
 
 	return indexCols
@@ -484,4 +492,16 @@ func (ir *indexRecommendation) storingColumns() []tree.Name {
 		storingCols = append(storingCols, colName)
 	})
 	return storingCols
+}
+
+// VectorOpClass returns the operator class name for a vector distance metric.
+func VectorOpClass(metric vecpb.DistanceMetric) tree.Name {
+	switch metric {
+	case vecpb.CosineDistance:
+		return "vector_cosine_ops"
+	case vecpb.InnerProductDistance:
+		return "vector_ip_ops"
+	default:
+		return "vector_l2_ops"
+	}
 }
