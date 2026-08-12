@@ -5842,6 +5842,145 @@ TEST_F(SearchFamilyTest, AggregateAddScoresAutoVisible) {
   EXPECT_TRUE(found_score) << "__score should be visible with ADDSCORES even without LOAD/pipeline";
 }
 
+// Regression test for the shard-dependent scoring bug: BM25STD/TFIDF/TFIDF.DOCNORM used to
+// compute IDF and average field length from each shard's local documents only, so the same
+// corpus and query could yield different top-K keys/scores depending on the proactor/shard
+// count. Build the same diverse corpus once with a single shard and once spread across 4
+// shards, and verify FT.SEARCH WITHSCORES and FT.AGGREGATE ADDSCORES+SORTBY agree.
+TEST_F(SearchFamilyTest, MultiShardScoringConsistency) {
+  // Diverse corpus: term repetition (TF) and document length vary per-doc via co-prime-ish
+  // moduli so BM25/TFIDF have a real, near-collision-free signal to rank on (ties are
+  // inherently ambiguous to break deterministically without a canonical secondary sort key,
+  // which isn't the bug under test here) — and so shard-local IDF/avgdl would actually
+  // differ across shards without the fix.
+  const vector<string> filler = {"banana", "cherry", "date", "elderberry", "fig", "grape"};
+  vector<pair<string, string>> corpus;  // (key, title)
+  for (int i = 0; i < 60; i++) {
+    string title;
+    // A fifth of the docs don't mention "apple" at all, so it doesn't match every document
+    // (TFIDF's IDF is intentionally 0 for a term with no discriminating power - see
+    // scoring.h - which would make this test vacuous for TFIDF/TFIDF.DOCNORM otherwise).
+    // Periods 7/5/6 below are pairwise coprime-ish (combined period 210 > corpus size 60),
+    // so each matching doc's term frequency and total field length is unique, avoiding
+    // exact score ties (which are inherently ambiguous to break deterministically without a
+    // canonical secondary sort key - not the bug under test here).
+    if (i % 5 != 0) {
+      for (int k = 0; k < 1 + (i % 7); k++)
+        absl::StrAppend(&title, "apple ");
+    }
+    for (int k = 0; k < 1 + ((i * 3) % 5); k++)
+      absl::StrAppend(&title, "common ");
+    for (int k = 0; k < 1 + ((i * 11) % 6); k++)
+      absl::StrAppend(&title, filler[i % filler.size()], " ");
+    corpus.emplace_back(absl::StrCat("d:", i), title);
+  }
+
+  auto build_corpus = [&] {
+    EXPECT_EQ(Run({"ft.create", "i1", "ON", "HASH", "PREFIX", "1", "d:", "SCHEMA", "title", "TEXT",
+                   "idx", "NUMERIC"}),
+              "OK");
+    for (size_t i = 0; i < corpus.size(); i++)
+      Run({"hset", corpus[i].first, "title", corpus[i].second, "idx", absl::StrCat(i)});
+  };
+
+  // Ordered (key, score) pairs, as returned (i.e. reflects the actual response ordering).
+  using Ranking = vector<pair<string, double>>;
+  // key -> score, order-independent (used to check score correctness without being
+  // sensitive to how exactly-tied scores happen to be ordered - ties are inherently
+  // ambiguous to break deterministically without a canonical secondary sort key, which
+  // isn't the bug under test here).
+  using ScoreMap = std::map<string, double>;
+
+  auto run_search_topk = [&](string_view scorer, size_t k) -> Ranking {
+    auto resp = Run({"ft.search", "i1", "@title:apple", "WITHSCORES", "SCORER", scorer, "LIMIT",
+                     "0", absl::StrCat(k)});
+    EXPECT_THAT(resp, ArgType(RespExpr::ARRAY)) << "resp=" << resp;
+    auto results = resp.GetVec();
+    Ranking out;
+    for (size_t i = 1; i < results.size(); i += 3)
+      out.emplace_back(results[i].GetString(), std::stod(results[i + 1].GetString()));
+    return out;
+  };
+
+  // Every matching doc's score, keyed by key (FT.SEARCH) or idx (FT.AGGREGATE).
+  auto run_search_all = [&](string_view scorer) -> ScoreMap {
+    ScoreMap out;
+    for (auto& [key, score] : run_search_topk(scorer, corpus.size()))
+      out[key] = score;
+    return out;
+  };
+
+  auto run_aggregate_all = [&](string_view scorer) -> ScoreMap {
+    auto resp = Run(
+        {"ft.aggregate", "i1", "@title:apple", "LOAD", "1", "@idx", "SCORER", scorer, "ADDSCORES"});
+    EXPECT_THAT(resp, ArgType(RespExpr::ARRAY)) << "resp=" << resp;
+    auto results = resp.GetVec();
+    ScoreMap out;
+    for (size_t g = 1; g < results.size(); g++) {
+      auto row = results[g].GetVec();
+      string idx;
+      double score = 0;
+      for (size_t j = 0; j < row.size(); j += 2) {
+        if (row[j].GetString() == "idx")
+          idx = row[j + 1].GetString();
+        else if (row[j].GetString() == "__score")
+          score = std::stod(row[j + 1].GetString());
+      }
+      out[idx] = score;
+    }
+    return out;
+  };
+
+  // Small enough that (with this corpus) no ties fall across the cutoff, so top-K
+  // keys/order are also directly comparable, in addition to the full score map below.
+  constexpr size_t kTopK = 4;
+
+  for (string_view scorer : {"BM25STD", "TFIDF", "TFIDF.DOCNORM"}) {
+    num_threads_ = 1;
+    ResetService();
+    build_corpus();
+    Ranking single_shard_top = run_search_topk(scorer, kTopK);
+    ScoreMap single_shard_search_all = run_search_all(scorer);
+    ScoreMap single_shard_agg_all = run_aggregate_all(scorer);
+    ASSERT_FALSE(single_shard_top.empty()) << "scorer=" << scorer;
+    ASSERT_FALSE(single_shard_agg_all.empty()) << "scorer=" << scorer;
+
+    num_threads_ = 4;
+    ResetService();
+    build_corpus();
+    Ranking multi_shard_top = run_search_topk(scorer, kTopK);
+    ScoreMap multi_shard_search_all = run_search_all(scorer);
+    ScoreMap multi_shard_agg_all = run_aggregate_all(scorer);
+
+    // Top-K keys and order must match exactly (FT.SEARCH WITHSCORES, no SORTBY).
+    ASSERT_EQ(multi_shard_top.size(), single_shard_top.size()) << "scorer=" << scorer;
+    for (size_t i = 0; i < single_shard_top.size(); i++) {
+      EXPECT_EQ(multi_shard_top[i].first, single_shard_top[i].first)
+          << "scorer=" << scorer << " rank=" << i << ": top-K keys must match regardless of "
+          << "shard count";
+      EXPECT_NEAR(multi_shard_top[i].second, single_shard_top[i].second, 1e-4)
+          << "scorer=" << scorer << " key=" << single_shard_top[i].first;
+    }
+
+    // Every matching doc's score (FT.SEARCH and FT.AGGREGATE ADDSCORES) must be shard-count
+    // independent, within a small floating-point tolerance.
+    ASSERT_EQ(multi_shard_search_all.size(), single_shard_search_all.size())
+        << "scorer=" << scorer;
+    for (auto& [key, score] : single_shard_search_all) {
+      auto it = multi_shard_search_all.find(key);
+      ASSERT_NE(it, multi_shard_search_all.end()) << "scorer=" << scorer << " key=" << key;
+      EXPECT_NEAR(it->second, score, 1e-4) << "scorer=" << scorer << " key=" << key;
+    }
+
+    ASSERT_EQ(multi_shard_agg_all.size(), single_shard_agg_all.size()) << "scorer=" << scorer;
+    for (auto& [idx, score] : single_shard_agg_all) {
+      auto it = multi_shard_agg_all.find(idx);
+      ASSERT_NE(it, multi_shard_agg_all.end()) << "scorer=" << scorer << " idx=" << idx;
+      EXPECT_NEAR(it->second, score, 1e-4) << "scorer=" << scorer << " idx=" << idx;
+    }
+  }
+}
+
 // DocKeyIndex: empty-key documents must survive Serialize/Restore and not be
 // confused with freed slots (which also have keys_[id] == "").
 
