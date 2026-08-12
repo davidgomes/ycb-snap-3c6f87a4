@@ -62,6 +62,50 @@ both TCP and TLS available, but you'll need to assign different ports.
 To make a Replica connect to the master using TLS, use `--tls-replication yes`,
 and to make Redis Cluster use TLS across nodes use `--tls-cluster yes`.
 
+Peer Identity Verification (Trust Model)
+----------------------------------------
+
+By default, TLS peer verification only confirms that the peer's certificate
+chains to the configured CA (`tls-ca-cert-file`/`tls-ca-cert-dir`) and is not
+expired. The trust model is therefore "anyone holding a certificate signed by
+the CA". This is appropriate when a dedicated CA is used for a single
+cluster/replication group, but under a shared, organizational or public CA it
+allows any CA-signed certificate holder to impersonate a master (capturing
+replication AUTH credentials via MITM) or a cluster peer (the cluster bus has
+no per-message authentication - the sender is just a node ID in the message
+header - so an impostor can open a bus connection and forge messages such as
+FAIL).
+
+Setting `tls-expected-peer-name` (space-separated list of names, match any)
+narrows this trust model for *server-to-server* connections: the peer
+certificate must additionally present one of the configured names in its
+SubjectAltName extension (Common Name is used as a fallback only when the
+certificate carries no DNS SubjectAltName entries). The name is verified by
+OpenSSL as part of certificate chain validation. This applies to:
+
+* Outgoing connections: replication links, cluster bus links, and MIGRATE
+  (including its blocking connect path).
+* Incoming cluster bus connections, where the connecting node's client
+  certificate is checked, so impersonation is blocked even when this node
+  never dials the attacker.
+
+Ordinary client connections on the data port are not affected: client
+identity there remains the responsibility of AUTH/ACL. The expected names
+come only from local configuration; the dialed address or anything received
+over the wire is never used.
+
+Operationally this means the identity SAN must be present on the certificate
+each node uses in **both** its server role (`tls-cert-file`) and its client
+role (`tls-client-cert-file`, when configured), since cluster nodes and
+replication peers act in both roles.
+
+Peer name verification requires OpenSSL >= 1.0.2 (the `X509_VERIFY_PARAM`
+host checking machinery). Building TLS against an older OpenSSL fails with a
+clear compile-time error by default. Defining `TLS_NO_PEER_NAME_VERIFICATION`
+at compile time (e.g. `make BUILD_TLS=yes REDIS_CFLAGS=-DTLS_NO_PEER_NAME_VERIFICATION`)
+opts out: the build succeeds, and if `tls-expected-peer-name` is set a warning
+is logged and the name check is skipped (CA verification still applies).
+
 Connections
 -----------
 
