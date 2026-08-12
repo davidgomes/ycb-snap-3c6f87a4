@@ -15,7 +15,17 @@ struct CountCmdShapeComponents : public CmdSpecificShapeComponents {
     // variable because 'request' never includes the skip or limit, even if the count command
     // contains a skip and/or limit. See the comment in parsed_find_command::parseFromCount for
     // more information.
-    CountCmdShapeComponents(const ParsedFindCommand& request, bool hasLimit, bool hasSkip);
+    //
+    // Similarly, 'rawData' must be passed in explicitly, since 'request' is a find command
+    // synthesized from a count command and never carries the count command's own 'rawData' field.
+    // It is normalized so that only an explicit value of 'true' is tracked as part of the shape -
+    // both an absent 'rawData' and an explicit 'false' are treated identically (i.e. not
+    // present), so that they continue to share a query shape (and hash) with count commands that
+    // never mention 'rawData' at all.
+    CountCmdShapeComponents(const ParsedFindCommand& request,
+                            bool hasLimit,
+                            bool hasSkip,
+                            bool rawData = false);
 
     void HashValue(absl::HashState state) const final;
 
@@ -26,6 +36,9 @@ struct CountCmdShapeComponents : public CmdSpecificShapeComponents {
     const struct HasField {
         bool limit : 1;
         bool skip : 1;
+        // True only when 'rawData' was explicitly set to true - normalized so that an absent
+        // 'rawData' and an explicit 'false' compare and hash identically.
+        bool rawData : 1;
     } hasField;
 
     const BSONObj representativeQuery;
@@ -33,7 +46,10 @@ struct CountCmdShapeComponents : public CmdSpecificShapeComponents {
 
 class CountCmdShape final : public Shape {
 public:
-    CountCmdShape(const ParsedFindCommand& find, bool hasLimit, bool hasSkip);
+    CountCmdShape(const ParsedFindCommand& find,
+                 bool hasLimit,
+                 bool hasSkip,
+                 bool rawData = false);
 
     const CmdSpecificShapeComponents& specificComponents() const final;
 

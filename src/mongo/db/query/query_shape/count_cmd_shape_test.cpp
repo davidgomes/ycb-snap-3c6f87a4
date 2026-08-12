@@ -23,8 +23,10 @@ public:
         const query_shape::SerializationOptions serializationOptions) {
         const auto parsedRequest = uassertStatusOK(
             parsed_find_command::parseFromCount(expCtx, ccr, extensionsCallback, testNss));
-        auto shape = std::make_unique<CountCmdShape>(
-            *parsedRequest, ccr.getLimit().has_value(), ccr.getSkip().has_value());
+        auto shape = std::make_unique<CountCmdShape>(*parsedRequest,
+                                                      ccr.getLimit().has_value(),
+                                                      ccr.getSkip().has_value(),
+                                                      bool(ccr.getRawData()));
         ASSERT_BSONOBJ_EQ(expectedShape,
                           shape->toBson(expCtx->getOperationContext(), serializationOptions, {}));
         return shape;
@@ -40,8 +42,10 @@ public:
                              SerializationContext::stateDefault())));
         const auto parsedFind = uassertStatusOK(parsed_find_command::parseFromCount(
             expCtx, *countCommand, extensionsCallback, testNss));
-        const auto shape = std::make_unique<CountCmdShape>(
-            *parsedFind, countCommand->getLimit().has_value(), countCommand->getSkip().has_value());
+        const auto shape = std::make_unique<CountCmdShape>(*parsedFind,
+                                                            countCommand->getLimit().has_value(),
+                                                            countCommand->getSkip().has_value(),
+                                                            bool(countCommand->getRawData()));
         return shape->sha256Hash(expCtx->getOperationContext(), {});
     }
 
@@ -134,6 +138,32 @@ TEST_F(CountCmdShapeTest, CountSkipShape) {
         })");
     const auto shape = checkShapeBSON(*ccr, expectedShape, representativeShapeOptions);
     ASSERT_TRUE(shape->components.hasField.skip);
+}
+
+// Test that the rawData field of the count command is included in the shape only when explicitly
+// true.
+TEST_F(CountCmdShapeTest, CountRawDataShape) {
+    const auto ccr = std::make_unique<CountCommandRequest>(testNss);
+    ccr->setRawData(true);
+    const auto expectedShape = fromjson(
+        R"({
+            cmdNs: { db: "testdb", coll: "testcoll" },
+            command: "count",
+            rawData: true
+        })");
+    const auto shape = checkShapeBSON(*ccr, expectedShape, representativeShapeOptions);
+    ASSERT_TRUE(shape->components.hasField.rawData);
+}
+
+// Test that 'rawData: false' is normalized like an absent 'rawData' - it must not show up in the
+// shape.
+TEST_F(CountCmdShapeTest, CountRawDataFalseShape) {
+    const auto ccr = std::make_unique<CountCommandRequest>(testNss);
+    ccr->setRawData(false);
+    const auto expectedShape =
+        fromjson(R"({ cmdNs: { db: "testdb", coll: "testcoll" }, command: "count"})");
+    const auto shape = checkShapeBSON(*ccr, expectedShape, representativeShapeOptions);
+    ASSERT_FALSE(shape->components.hasField.rawData);
 }
 
 // Test that the query, limit, and skip fields are properly serialized when using the debug format.
@@ -277,6 +307,38 @@ TEST_F(CountCmdShapeTest, CompareSkipHashes) {
     const auto hash2 = makeShapeHash(count2);
 
     ASSERT_EQ(hash1, hash2);
+}
+
+// Test that a 'rawData: true' count command produces a different query shape hash from the same
+// command without 'rawData' (or with 'rawData: false'), and that 'rawData: false' is normalized
+// to hash identically to an absent 'rawData'.
+TEST_F(CountCmdShapeTest, CompareRawDataHashes) {
+    const auto countNoRawData =
+        R"({
+            count: "testcoll",
+            $db: "testdb"
+        })";
+
+    const auto countRawDataFalse =
+        R"({
+            count: "testcoll",
+            $db: "testdb",
+            rawData: false
+        })";
+
+    const auto countRawDataTrue =
+        R"({
+            count: "testcoll",
+            $db: "testdb",
+            rawData: true
+        })";
+
+    const auto hashNoRawData = makeShapeHash(countNoRawData);
+    const auto hashRawDataFalse = makeShapeHash(countRawDataFalse);
+    const auto hashRawDataTrue = makeShapeHash(countRawDataTrue);
+
+    ASSERT_EQ(hashNoRawData, hashRawDataFalse);
+    ASSERT_NOT_EQUALS(hashNoRawData, hashRawDataTrue);
 }
 
 // Verifies that count command shape hash value is stable (does not change between the versions

@@ -30,8 +30,10 @@ public:
     std::unique_ptr<query_shape::CountCmdShape> makeCountShapeFromRequest(CountCommandRequest req) {
         const std::unique_ptr<ParsedFindCommand> parsedRequest = uassertStatusOK(
             parsed_find_command::parseFromCount(expCtx, req, ExtensionsCallbackNoop(), testNss));
-        return std::make_unique<query_shape::CountCmdShape>(
-            *parsedRequest, req.getLimit().has_value(), req.getSkip().has_value());
+        return std::make_unique<query_shape::CountCmdShape>(*parsedRequest,
+                                                             req.getLimit().has_value(),
+                                                             req.getSkip().has_value(),
+                                                             bool(req.getRawData()));
     }
 };
 
@@ -182,6 +184,28 @@ TEST_F(CountKeyTest, DifferentOriginalQueryShapeHashesProduceDifferentKeys) {
     auto keyB = makeKeyWithHash("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
 
     ASSERT_NE(absl::HashOf(*keyA), absl::HashOf(*keyB));
+}
+
+// Verifies that a count command with 'rawData: true' produces a query stats store key that does
+// not collide (and therefore does not merge in $queryStats) with the same command without
+// 'rawData' or with 'rawData: false'. Also verifies that 'rawData: false' collides with an absent
+// 'rawData', since it is normalized to behave identically.
+TEST_F(CountKeyTest, RawDataProducesDistinctKeyHash) {
+    auto makeKeyWithRawData = [&](boost::optional<bool> rawData) {
+        CountCommandRequest request = CountCommandRequest(testNss);
+        if (rawData.has_value()) {
+            request.setRawData(*rawData);
+        }
+        return std::make_unique<CountKey>(
+            expCtx, request, makeCountShapeFromRequest(request), collectionType);
+    };
+
+    auto keyNoRawData = makeKeyWithRawData(boost::none);
+    auto keyRawDataFalse = makeKeyWithRawData(false);
+    auto keyRawDataTrue = makeKeyWithRawData(true);
+
+    ASSERT_EQ(absl::HashOf(*keyNoRawData), absl::HashOf(*keyRawDataFalse));
+    ASSERT_NE(absl::HashOf(*keyNoRawData), absl::HashOf(*keyRawDataTrue));
 }
 
 }  // namespace

@@ -114,7 +114,10 @@ inline void createShapeAndRegisterQueryStats(const boost::intrusive_ptr<Expressi
     OperationContext* opCtx = expCtx->getOperationContext();
     const query_shape::DeferredQueryShape deferredShape{[&]() {
         return shape_helpers::tryMakeShape<query_shape::CountCmdShape>(
-            *parsedFind, countRequest.getLimit().has_value(), countRequest.getSkip().has_value());
+            *parsedFind,
+            countRequest.getLimit().has_value(),
+            countRequest.getSkip().has_value(),
+            bool(countRequest.getRawData()));
     }};
     boost::optional<query_shape::QueryShapeHash> queryShapeHash =
         CurOp::get(opCtx)->debug().ensureQueryShapeHash(opCtx, [&]() {
@@ -501,7 +504,8 @@ public:
                         return shape_helpers::tryMakeShape<query_shape::CountCmdShape>(
                             *parsedFind,
                             countRequestForShard.getLimit().has_value(),
-                            countRequestForShard.getSkip().has_value());
+                            countRequestForShard.getSkip().has_value(),
+                            bool(countRequestForShard.getRawData()));
                     }};
 
                     CurOp::get(opCtx)->debug().ensureQueryShapeHash(opCtx, [&]() {

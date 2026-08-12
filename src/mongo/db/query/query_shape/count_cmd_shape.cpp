@@ -9,23 +9,30 @@ namespace mongo::query_shape {
 
 CountCmdShapeComponents::CountCmdShapeComponents(const ParsedFindCommand& request,
                                                  const bool hasLimit,
-                                                 const bool hasSkip)
-    : hasField({.limit = hasLimit, .skip = hasSkip}),
+                                                 const bool hasSkip,
+                                                 const bool rawData)
+    : hasField({.limit = hasLimit, .skip = hasSkip, .rawData = rawData}),
       representativeQuery(request.filter->serialize(
           query_shape::SerializationOptions::kRepresentativeQueryShapeSerializeOptions)) {}
 
 void CountCmdShapeComponents::HashValue(absl::HashState state) const {
-    absl::HashState::combine(
-        std::move(state), simpleHash(representativeQuery), hasField.limit, hasField.skip);
+    absl::HashState::combine(std::move(state),
+                             simpleHash(representativeQuery),
+                             hasField.limit,
+                             hasField.skip,
+                             hasField.rawData);
 }
 
 size_t CountCmdShapeComponents::size() const {
     return sizeof(CountCmdShapeComponents) + representativeQuery.objsize();
 }
 
-CountCmdShape::CountCmdShape(const ParsedFindCommand& find, const bool hasLimit, const bool hasSkip)
+CountCmdShape::CountCmdShape(const ParsedFindCommand& find,
+                             const bool hasLimit,
+                             const bool hasSkip,
+                             const bool rawData)
     : Shape(find.findCommandRequest->getNamespaceOrUUID(), find.findCommandRequest->getCollation()),
-      components(find, hasLimit, hasSkip) {}
+      components(find, hasLimit, hasSkip, rawData) {}
 
 const CmdSpecificShapeComponents& CountCmdShape::specificComponents() const {
     return components;
@@ -68,6 +75,11 @@ void CountCmdShape::appendCmdSpecificShapeComponents(
     if (components.hasField.skip) {
         opts.appendLiteral(&bob, CountCommandRequest::kSkipFieldName, 1ll);
     }
+
+    // rawData.
+    if (components.hasField.rawData) {
+        bob.append(CountCommandRequest::kRawDataFieldName, true);
+    }
 }
 
 QueryShapeHash CountCmdShape::sha256Hash(OperationContext*, const SerializationContext&) const {
@@ -88,10 +100,14 @@ QueryShapeHash CountCmdShape::sha256Hash(OperationContext*, const SerializationC
     countCommandShapeBuffer.appendBuf(nssDataRange.data(), nssDataRange.length());
     countCommandShapeBuffer.appendBuf(collation.objdata(), collation.objsize());
 
-    // Encode whether or not skip and limit are included in command.
+    // Encode whether or not skip, limit, and rawData are included in command. 'rawData' takes
+    // its own bit rather than being folded into 'commandOptions' above so that count commands
+    // which never mention 'rawData' continue to hash identically to before 'rawData' was
+    // considered part of the shape.
     std::uint8_t skipAndLimit{0};
     skipAndLimit |= static_cast<uint8_t>(components.hasField.skip);
     skipAndLimit |= static_cast<uint8_t>(components.hasField.limit) << 1;
+    skipAndLimit |= static_cast<uint8_t>(components.hasField.rawData) << 2;
     countCommandShapeBuffer.appendNum(static_cast<char>(skipAndLimit));
 
     return SHA256Block::computeHash({

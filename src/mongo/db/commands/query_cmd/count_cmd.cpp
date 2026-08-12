@@ -255,7 +255,10 @@ public:
             // Compute QueryShapeHash and record it in CurOp.
             query_shape::DeferredQueryShape deferredShape{[&]() {
                 return shape_helpers::tryMakeShape<query_shape::CountCmdShape>(
-                    *parsedFind, request().getLimit().has_value(), request().getSkip().has_value());
+                    *parsedFind,
+                    request().getLimit().has_value(),
+                    request().getSkip().has_value(),
+                    bool(request().getRawData()));
             }};
 
             CurOp::get(opCtx)->debug().ensureQueryShapeHash(opCtx, [&]() {
@@ -503,7 +506,10 @@ public:
             // Compute QueryShapeHash and record it in CurOp.
             query_shape::DeferredQueryShape deferredShape{[&]() {
                 return shape_helpers::tryMakeShape<query_shape::CountCmdShape>(
-                    parsedFind, req.getLimit().has_value(), req.getSkip().has_value());
+                    parsedFind,
+                    req.getLimit().has_value(),
+                    req.getSkip().has_value(),
+                    bool(req.getRawData()));
             }};
             boost::optional<query_shape::QueryShapeHash> queryShapeHash =
                 CurOp::get(opCtx)->debug().ensureQueryShapeHash(opCtx, [&]() {
