@@ -794,6 +794,13 @@ void ReverseConnectionIOHandle::onDownstreamConnectionClosed(const std::string& 
   ENVOY_LOG(debug, "Found connection {} belongs to host {} in cluster {}", connection_key,
             host_address, cluster_name);
 
+  // Emit an access log entry for the closed reverse tunnel connection.
+  if (extension_) {
+    extension_->emitAccessLog(getTimeSource(), "connection_closed", config_.src_node_id,
+                              config_.src_cluster_id, config_.src_tenant_id, cluster_name,
+                              host_address, connection_key, "");
+  }
+
   // Remove the connection key from the host's connection set.
   auto host_it = host_to_conn_info_map_.find(host_address);
   if (host_it != host_to_conn_info_map_.end()) {
@@ -1109,6 +1116,13 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
     updateConnectionState(host_address, cluster_name, connection_key,
                           ReverseConnectionState::Failed);
 
+    // Emit an access log entry for the failed handshake.
+    if (extension_) {
+      extension_->emitAccessLog(getTimeSource(), "handshake_failure", config_.src_node_id,
+                                config_.src_cluster_id, config_.src_tenant_id, cluster_name,
+                                host_address, connection_key, error);
+    }
+
     // Safely close connection if still valid.
     if (connection) {
       if (connection->getSocket()) {
@@ -1126,6 +1140,13 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
     resetHostBackoff(host_address);
     updateConnectionState(host_address, cluster_name, connection_key,
                           ReverseConnectionState::Connected);
+
+    // Emit an access log entry for the successful handshake.
+    if (extension_) {
+      extension_->emitAccessLog(getTimeSource(), "handshake_success", config_.src_node_id,
+                                config_.src_cluster_id, config_.src_tenant_id, cluster_name,
+                                host_address, connection_key, "");
+    }
 
     // Only proceed if connection is still valid.
     if (!connection) {

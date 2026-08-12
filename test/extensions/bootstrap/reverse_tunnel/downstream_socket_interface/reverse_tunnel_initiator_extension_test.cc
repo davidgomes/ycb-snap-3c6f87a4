@@ -1,5 +1,6 @@
 #include <memory>
 
+#include "envoy/extensions/access_loggers/stream/v3/stream.pb.h"
 #include "envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3/downstream_reverse_connection_socket_interface.pb.h"
 #include "envoy/server/factory_context.h"
 #include "envoy/thread_local/thread_local.h"
@@ -8,10 +9,12 @@
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator.h"
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator_extension.h"
 
+#include "test/mocks/access_log/mocks.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/thread_local/mocks.h"
 #include "test/mocks/upstream/mocks.h"
+#include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -83,6 +86,11 @@ protected:
 
     // Set the slot in the extension using the test-only method.
     extension_->setTestOnlyTLSRegistry(std::move(another_tls_slot_));
+  }
+
+  // Helper to inject mock access loggers into the extension (friend access).
+  void injectTestAccessLogs(AccessLog::InstanceSharedPtrVector access_logs) {
+    extension_->access_logs_ = std::move(access_logs);
   }
 
   void TearDown() override {
@@ -646,6 +654,98 @@ TEST_F(ReverseTunnelInitiatorExtensionTest, GetConnectionStatsSyncFiltersConnect
               accepted_connections.end());
 }
 
+// Access logging tests.
+TEST_F(ReverseTunnelInitiatorExtensionTest, AccessLogsEmptyByDefault) {
+  // No access logs are configured in the default test config.
+  EXPECT_TRUE(extension_->accessLogs().empty());
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogNoOpWithoutLoggers) {
+  // With no configured access logs, emitAccessLog should be a no-op and not crash.
+  ASSERT_TRUE(extension_->accessLogs().empty());
+  extension_->emitAccessLog(context_.timeSource(), "handshake_success", "node-1", "cluster-1",
+                            "tenant-1", "upstream-cluster", "10.0.0.1:443", "conn-key-1", "");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogPopulatesDynamicMetadata) {
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  injectTestAccessLogs({access_log});
+  EXPECT_EQ(extension_->accessLogs().size(), 1);
+
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([&](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& filter_metadata = stream_info.dynamicMetadata().filter_metadata();
+        ASSERT_TRUE(filter_metadata.contains(std::string(kInitiatorAccessLogMetadataNamespace)));
+        const auto& metadata =
+            filter_metadata.at(std::string(kInitiatorAccessLogMetadataNamespace));
+        EXPECT_EQ(metadata.fields().at("event").string_value(), "handshake_success");
+        EXPECT_EQ(metadata.fields().at("node_id").string_value(), "node-1");
+        EXPECT_EQ(metadata.fields().at("cluster_id").string_value(), "cluster-1");
+        EXPECT_EQ(metadata.fields().at("tenant_id").string_value(), "tenant-1");
+        EXPECT_EQ(metadata.fields().at("upstream_cluster").string_value(), "upstream-cluster");
+        EXPECT_EQ(metadata.fields().at("host_address").string_value(), "10.0.0.1:443");
+        EXPECT_EQ(metadata.fields().at("connection_key").string_value(), "conn-key-1");
+        // The error field is present but empty for non-failure events.
+        EXPECT_EQ(metadata.fields().at("error").string_value(), "");
+      }));
+
+  extension_->emitAccessLog(context_.timeSource(), "handshake_success", "node-1", "cluster-1",
+                            "tenant-1", "upstream-cluster", "10.0.0.1:443", "conn-key-1", "");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogHandshakeFailureIncludesError) {
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  injectTestAccessLogs({access_log});
+
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([&](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& metadata = stream_info.dynamicMetadata().filter_metadata().at(
+            std::string(kInitiatorAccessLogMetadataNamespace));
+        EXPECT_EQ(metadata.fields().at("event").string_value(), "handshake_failure");
+        EXPECT_EQ(metadata.fields().at("error").string_value(), "http.503");
+      }));
+
+  extension_->emitAccessLog(context_.timeSource(), "handshake_failure", "node-1", "cluster-1",
+                            "tenant-1", "upstream-cluster", "10.0.0.1:443", "conn-key-1",
+                            "http.503");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogEmptyOptionalFieldsStillPresent) {
+  auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  injectTestAccessLogs({access_log});
+
+  EXPECT_CALL(*access_log, log(_, _))
+      .WillOnce(Invoke([&](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& metadata = stream_info.dynamicMetadata().filter_metadata().at(
+            std::string(kInitiatorAccessLogMetadataNamespace));
+        // All fields are present even when the values are empty.
+        EXPECT_EQ(metadata.fields().at("event").string_value(), "connection_closed");
+        EXPECT_EQ(metadata.fields().at("node_id").string_value(), "");
+        EXPECT_EQ(metadata.fields().at("cluster_id").string_value(), "");
+        EXPECT_EQ(metadata.fields().at("tenant_id").string_value(), "");
+        EXPECT_EQ(metadata.fields().at("upstream_cluster").string_value(), "");
+        EXPECT_EQ(metadata.fields().at("host_address").string_value(), "");
+        EXPECT_EQ(metadata.fields().at("connection_key").string_value(), "");
+        EXPECT_EQ(metadata.fields().at("error").string_value(), "");
+      }));
+
+  extension_->emitAccessLog(context_.timeSource(), "connection_closed", "", "", "", "", "", "",
+                            "");
+}
+
+TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogInvokesAllConfiguredLoggers) {
+  auto access_log_1 = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  auto access_log_2 = std::make_shared<NiceMock<AccessLog::MockInstance>>();
+  injectTestAccessLogs({access_log_1, access_log_2});
+  EXPECT_EQ(extension_->accessLogs().size(), 2);
+
+  EXPECT_CALL(*access_log_1, log(_, _));
+  EXPECT_CALL(*access_log_2, log(_, _));
+
+  extension_->emitAccessLog(context_.timeSource(), "connection_closed", "node-1", "cluster-1",
+                            "tenant-1", "upstream-cluster", "10.0.0.1:443", "conn-key-1", "");
+}
+
 // Configuration validation tests.
 class ConfigValidationTest : public testing::Test {
 protected:
@@ -687,6 +787,25 @@ TEST_F(ConfigValidationTest, EmptyStatPrefix) {
 
   // Should not throw and should use default prefix.
   EXPECT_NO_THROW(initiator.createBootstrapExtension(config_, context_));
+}
+
+TEST_F(ConfigValidationTest, AccessLogConfigurationIsAccepted) {
+  auto* access_log = config_.add_access_log();
+  access_log->set_name("envoy.access_loggers.stdout");
+  envoy::extensions::access_loggers::stream::v3::StdoutAccessLog stdout_access_log;
+  stdout_access_log.mutable_log_format()->mutable_text_format_source()->set_inline_string(
+      "%DYNAMIC_METADATA(envoy.reverse_tunnel.initiator:event)%\n");
+  access_log->mutable_typed_config()->PackFrom(stdout_access_log);
+
+  EXPECT_CALL(context_, messageValidationVisitor())
+      .WillRepeatedly(testing::ReturnRef(ProtobufMessage::getStrictValidationVisitor()));
+
+  ReverseTunnelInitiator initiator(context_);
+  auto extension = initiator.createBootstrapExtension(config_, context_);
+  auto* reverse_tunnel_extension =
+      dynamic_cast<ReverseTunnelInitiatorExtension*>(extension.get());
+  ASSERT_NE(reverse_tunnel_extension, nullptr);
+  EXPECT_EQ(reverse_tunnel_extension->accessLogs().size(), 1);
 }
 
 } // namespace ReverseConnection
