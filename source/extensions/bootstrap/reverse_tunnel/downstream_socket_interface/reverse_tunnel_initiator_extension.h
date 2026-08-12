@@ -3,6 +3,8 @@
 #include <memory>
 #include <string>
 
+#include "envoy/access_log/access_log.h"
+#include "envoy/common/time.h"
 #include "envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3/downstream_reverse_connection_socket_interface.pb.h"
 #include "envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3/downstream_reverse_connection_socket_interface.pb.validate.h"
 #include "envoy/server/bootstrap_extension_config.h"
@@ -49,6 +51,7 @@ public:
                              config.http_handshake().additional_headers().end()};
       use_http_upgrade_ = config.http_handshake().use_http_upgrade();
     }
+    initializeAccessLogs();
     ENVOY_LOG(debug,
               "ReverseTunnelInitiatorExtension: creating downstream reverse connection "
               "socket interface with stat_prefix: {}",
@@ -134,6 +137,36 @@ public:
                                const std::string& failure_reason = "");
 
   /**
+   * @return the access loggers configured for reverse tunnel lifecycle events.
+   */
+  const AccessLog::InstanceSharedPtrVector& accessLogs() const { return access_logs_; }
+
+  /**
+   * Emit an access log entry for a reverse tunnel lifecycle event. A no-op when no access
+   * loggers are configured. An ephemeral StreamInfo is created for each entry and the
+   * reverse-tunnel metadata is exposed as dynamic metadata under the
+   * ``envoy.reverse_tunnel.initiator`` namespace with string fields ``event``, ``node_id``,
+   * ``cluster_id``, ``tenant_id``, ``upstream_cluster``, ``host_address``, ``connection_key``
+   * and ``error``.
+   * @param time_source the time source used to create the ephemeral StreamInfo.
+   * @param event the lifecycle event name, e.g. "handshake_success", "handshake_failure" or
+   *        "connection_closed".
+   * @param node_id the local node identifier of the initiator.
+   * @param cluster_id the local cluster identifier of the initiator.
+   * @param tenant_id the local tenant identifier of the initiator.
+   * @param upstream_cluster the remote cluster the reverse tunnel targets.
+   * @param host_address the remote host address the reverse tunnel targets.
+   * @param connection_key the key identifying the connection; correlates handshake and close
+   *        events for the same connection.
+   * @param error_message failure reason for "handshake_failure" events; empty string otherwise.
+   */
+  void emitAccessLog(TimeSource& time_source, const std::string& event,
+                     const std::string& node_id, const std::string& cluster_id,
+                     const std::string& tenant_id, const std::string& upstream_cluster,
+                     const std::string& host_address, const std::string& connection_key,
+                     const std::string& error_message);
+
+  /**
    * Test-only method to set the thread local slot for testing purposes.
    * This allows tests to inject a custom thread local registry and is used
    * in unit tests to simulate different worker threads.
@@ -144,7 +177,19 @@ public:
     tls_slot_ = std::move(slot);
   }
 
+  /**
+   * Test-only method to replace the lifecycle access loggers.
+   */
+  void setTestOnlyAccessLogs(AccessLog::InstanceSharedPtrVector access_logs) {
+    access_logs_ = std::move(access_logs);
+  }
+
 private:
+  /**
+   * Instantiate the access loggers configured in the bootstrap extension config.
+   */
+  void initializeAccessLogs();
+
   Server::Configuration::ServerFactoryContext& context_;
   const envoy::extensions::bootstrap::reverse_tunnel::downstream_socket_interface::v3::
       DownstreamReverseConnectionSocketInterface config_;
@@ -154,6 +199,7 @@ private:
   std::string handshake_request_path_;
   std::vector<envoy::config::core::v3::HeaderValueOption> additional_headers_;
   bool use_http_upgrade_{false};
+  AccessLog::InstanceSharedPtrVector access_logs_;
 
   /**
    * Update per-worker connection stats for debugging purposes.
