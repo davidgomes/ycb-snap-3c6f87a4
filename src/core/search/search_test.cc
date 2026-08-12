@@ -3216,9 +3216,10 @@ TEST_F(ScoringTest, GatherScoringStatsBasic) {
 
   EXPECT_EQ(stats.num_docs, 3u);
   ASSERT_TRUE(stats.fields.contains("field"));
-  EXPECT_EQ(stats.fields.at("field").total_len, 7u);
+  // 7 raw tokens + 1 stem shadow entry ("goodbye" -> "goodby")
+  EXPECT_EQ(stats.fields.at("field").total_len, 8u);
   EXPECT_EQ(stats.fields.at("field").num_docs, 3u);
-  EXPECT_DOUBLE_EQ(stats.fields.at("field").AvgLen(), 7.0 / 3);
+  EXPECT_DOUBLE_EQ(stats.fields.at("field").AvgLen(), 8.0 / 3);
   ASSERT_TRUE((stats.term_docs.contains(std::pair<std::string, std::string>{"field", "hello"})));
   EXPECT_EQ((stats.term_docs.at(std::pair<std::string, std::string>{"field", "hello"})), 2u);
 }

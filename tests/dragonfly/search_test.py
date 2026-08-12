@@ -1342,9 +1342,7 @@ async def test_ft_scorer_shard_independent(df_factory: DflyInstanceFactory, scor
                 "FT.SEARCH", "idx", query, "WITHSCORES", "SCORER", scorer,
                 "RETURN", "0", "LIMIT", "0", str(top_k),
             )  # fmt: skip
-            search_hits = [
-                (search[i], float(search[i + 1])) for i in range(1, len(search), 2)
-            ]
+            search_hits = [(search[i], float(search[i + 1])) for i in range(1, len(search), 2)]
 
             aggregate = await client.execute_command(
                 "FT.AGGREGATE", "idx", query, "LOAD", "1", "@num",
@@ -1359,9 +1357,7 @@ async def test_ft_scorer_shard_independent(df_factory: DflyInstanceFactory, scor
                 "FT.SEARCH", "idx", query, "WITHSCORES", "SCORER", scorer,
                 "SORTBY", "num", "DESC", "RETURN", "0", "LIMIT", "0", str(top_k),
             )  # fmt: skip
-            sortby_hits = [
-                (sortby[i], float(sortby[i + 1])) for i in range(1, len(sortby), 2)
-            ]
+            sortby_hits = [(sortby[i], float(sortby[i + 1])) for i in range(1, len(sortby), 2)]
 
             out[query] = (search[0], search_hits, agg_rows, sortby[0], sortby_hits)
 
