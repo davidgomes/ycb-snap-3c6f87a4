@@ -234,6 +234,68 @@ public class SymbolResolverClassTests extends ProcessorTestCase {
     }
 
     /**
+     * Custom method handle resolvers must preserve the generated stack expected by
+     * {@code @Critical} fallback adaptation during class initialization.
+     */
+    public void testMethodHandleResolverWithCriticalFallbackIsInvoked() throws Exception {
+        String source = """
+            package test;
+            import java.lang.foreign.FunctionDescriptor;
+            import java.lang.foreign.Linker;
+            import java.lang.foreign.MemorySegment;
+            import java.lang.foreign.SymbolLookup;
+            import java.lang.invoke.MethodHandle;
+            import org.elasticsearch.foreign.Critical;
+            import org.elasticsearch.foreign.Function;
+            import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.MethodHandleResolver;
+            import org.elasticsearch.foreign.ResolvedSymbol;
+            import org.elasticsearch.foreign.SymbolResolver;
+            @LibrarySpecification(
+                symbolResolver = CriticalLib.FakeSymbolResolver.class,
+                methodHandleResolver = CriticalLib.RecordingMethodHandleResolver.class
+            )
+            public interface CriticalLib {
+                @Critical(fallbackAdapter = FallbackAdapter.class)
+                @Function("native_fn")
+                long fn(MemorySegment destination, long destinationCapacity);
+
+                class FakeSymbolResolver implements SymbolResolver {
+                    public FakeSymbolResolver() {}
+
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
+                    }
+                }
+
+                class RecordingMethodHandleResolver implements MethodHandleResolver {
+                    public static boolean invoked;
+
+                    public RecordingMethodHandleResolver() {}
+
+                    public MethodHandle resolve(ResolvedSymbol symbol, FunctionDescriptor descriptor, Linker linker, Linker.Option... options) {
+                        invoked = true;
+                        return linker.downcallHandle(symbol.address(), descriptor, options);
+                    }
+                }
+
+                class FallbackAdapter {
+                    public static long fn(MethodHandle handle, MemorySegment destination, long destinationCapacity) throws Throwable {
+                        return (long) handle.invokeExact(destination, destinationCapacity);
+                    }
+                }
+            }
+            """;
+
+        CompilationResult result = compile("test.CriticalLib", source);
+        assertTrue("Expected compilation to succeed but got errors: " + result.errors(), result.success());
+
+        assertNotNull(result.loadClass("test.CriticalLib$Impl"));
+        Class<?> resolverClass = result.loadClass("test.CriticalLib$RecordingMethodHandleResolver");
+        assertTrue(resolverClass.getField("invoked").getBoolean(null));
+    }
+
+    /**
      * Generated class initialization must route every downcall through the method-handle resolver,
      * rather than directly invoking {@code Linker.downcallHandle}.
      */
