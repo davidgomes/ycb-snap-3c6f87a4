@@ -726,9 +726,9 @@ TEST_F(CheckpointTest, CheckpointColumnFamilySubset) {
   ASSERT_OK(
       DB::ListColumnFamilies(DBOptions(options), snapshot_name_, &cf_names));
   std::sort(cf_names.begin(), cf_names.end());
-  ASSERT_EQ(std::vector<std::string>(
-                {kDefaultColumnFamilyName, "one", "three"}),
-            cf_names);
+  ASSERT_EQ(
+      std::vector<std::string>({kDefaultColumnFamilyName, "one", "three"}),
+      cf_names);
 
   // The checkpoint opens cleanly (default paranoid checks) with exactly the
   // included column families plus default.
@@ -821,10 +821,10 @@ TEST_F(CheckpointTest, CheckpointColumnFamilySubsetInvalidHandles) {
   ASSERT_OK(DestroyDB(other_dbname, other_options));
   std::unique_ptr<DB> other_db;
   ASSERT_OK(DB::Open(other_options, other_dbname, &other_db));
-  ASSERT_TRUE(checkpoint
-                  ->CreateCheckpoint(snapshot_name_,
-                                     {other_db->DefaultColumnFamily()})
-                  .IsInvalidArgument());
+  ASSERT_TRUE(
+      checkpoint
+          ->CreateCheckpoint(snapshot_name_, {other_db->DefaultColumnFamily()})
+          .IsInvalidArgument());
   other_db.reset();
   ASSERT_OK(DestroyDB(other_dbname, other_options));
 
@@ -880,8 +880,7 @@ TEST_F(CheckpointTest, CheckpointColumnFamilySubsetWithBlobFiles) {
                            {kDefaultColumnFamilyName, "one"}, &cp_handles,
                            &snapshot_db));
   std::string result;
-  ASSERT_OK(
-      snapshot_db->Get(ReadOptions(), cp_handles[1], "one_key", &result));
+  ASSERT_OK(snapshot_db->Get(ReadOptions(), cp_handles[1], "one_key", &result));
   ASSERT_EQ("one_value", result);
   CloseSnapshotDB(&cp_handles, &snapshot_db);
 }

@@ -689,8 +689,8 @@ Status CheckpointImpl::AppendDropColumnFamilyRecordsToManifest(
 
   std::unique_ptr<FSWritableFile> manifest_file;
   FileOptions file_opts;
-  io_s = fs->ReopenWritableFile(manifest_path, file_opts, &manifest_file,
-                                nullptr);
+  io_s =
+      fs->ReopenWritableFile(manifest_path, file_opts, &manifest_file, nullptr);
   if (!io_s.ok()) {
     return io_s;
   }

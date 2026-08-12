@@ -26,10 +26,10 @@ class CheckpointImpl : public Checkpoint {
                           uint64_t log_size_for_flush,
                           uint64_t* sequence_number_ptr) override;
 
-  Status CreateCheckpoint(const std::string& checkpoint_dir,
-                          const std::vector<ColumnFamilyHandle*>& column_families,
-                          uint64_t log_size_for_flush,
-                          uint64_t* sequence_number_ptr) override;
+  Status CreateCheckpoint(
+      const std::string& checkpoint_dir,
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      uint64_t log_size_for_flush, uint64_t* sequence_number_ptr) override;
 
   // Shared by the legacy Checkpoint API and CheckpointEngine. engine == nullptr
   // links/copies serially; otherwise work runs on the pool, awaited before the
