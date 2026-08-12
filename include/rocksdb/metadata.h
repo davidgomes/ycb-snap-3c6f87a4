@@ -57,10 +57,10 @@ struct FileStorageInfo {
 // might change in a running DB.
 struct LiveFileStorageInfo : public FileStorageInfo {
   // If non-empty, this string represents the "saved" contents of the file
-  // for the current context. (This field is used for checkpointing CURRENT
-  // file.) In that case, size == replacement_contents.size() and file on disk
-  // should be ignored. If empty string, the file on disk should still have
-  // "saved" contents. (See trim_to_size.)
+  // for the current context. (This field is used for checkpointing generated
+  // files such as CURRENT.) In that case, size == replacement_contents.size()
+  // and file on disk should be ignored. If empty string, the file on disk
+  // should still have "saved" contents. (See trim_to_size.)
   std::string replacement_contents;
 
   // If true, the file on disk is allowed to be larger than `size` but only

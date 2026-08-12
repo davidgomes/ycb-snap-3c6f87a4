@@ -1728,10 +1728,14 @@ class VersionSet {
   };
 
   // Save current contents to *log
+  Status WriteCheckpointManifest(
+      const std::unordered_set<uint32_t>& column_family_ids, log::Writer* log,
+      IOStatus& io_s);
   Status WriteCurrentStateToManifest(
       const WriteOptions& write_options,
       const std::unordered_map<uint32_t, MutableCFState>& curr_state,
-      const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s);
+      const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s,
+      const std::unordered_set<uint32_t>* column_family_ids = nullptr);
 
   // Reopen the existing MANIFEST file for append at the end of Recover()
   // when reuse_manifest_on_open is set, so the next LogAndApply appends

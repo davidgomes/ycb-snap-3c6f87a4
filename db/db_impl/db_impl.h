@@ -20,6 +20,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -588,6 +589,13 @@ class DBImpl : public DB {
   Status GetLiveFilesStorageInfo(
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override;
+  Status GetLiveFilesStorageInfoForColumnFamilies(
+      const std::unordered_set<uint32_t>& column_family_ids,
+      std::vector<LiveFileStorageInfo>* files);
+  Status GetLiveFilesStorageInfoImpl(
+      const LiveFilesStorageInfoOptions& opts,
+      const std::unordered_set<uint32_t>* column_family_ids,
+      std::vector<LiveFileStorageInfo>* files);
 
   Status GetPreparedFileInfoForExternalSstIngestion(
       const std::string& file_path,

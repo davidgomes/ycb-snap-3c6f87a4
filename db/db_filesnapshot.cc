@@ -12,9 +12,11 @@
 
 #include "db/db_impl/db_impl.h"
 #include "db/job_context.h"
+#include "db/log_writer.h"
 #include "db/version_set.h"
 #include "file/file_util.h"
 #include "file/filename.h"
+#include "file/writable_file_writer.h"
 #include "logging/logging.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
@@ -27,6 +29,43 @@
 #include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
+namespace {
+
+class StringWritableFile : public FSWritableFile {
+ public:
+  explicit StringWritableFile(std::string* contents) : contents_(contents) {}
+
+  IOStatus Append(const Slice& data, const IOOptions& /*options*/,
+                  IODebugContext* /*dbg*/) override {
+    contents_->append(data.data(), data.size());
+    return IOStatus::OK();
+  }
+
+  IOStatus Close(const IOOptions& /*options*/,
+                 IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+
+  IOStatus Flush(const IOOptions& /*options*/,
+                 IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+
+  IOStatus Sync(const IOOptions& /*options*/,
+                IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+
+  uint64_t GetFileSize(const IOOptions& /*options*/,
+                       IODebugContext* /*dbg*/) override {
+    return contents_->size();
+  }
+
+ private:
+  std::string* contents_;
+};
+
+}  // namespace
 
 Status DBImpl::FlushForGetLiveFiles(bool force_atomic_flush) {
   FlushOptions flush_opts;
@@ -198,6 +237,21 @@ Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
+  return GetLiveFilesStorageInfoImpl(opts, nullptr, files);
+}
+
+Status DBImpl::GetLiveFilesStorageInfoForColumnFamilies(
+    const std::unordered_set<uint32_t>& column_family_ids,
+    std::vector<LiveFileStorageInfo>* files) {
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  return GetLiveFilesStorageInfoImpl(opts, &column_family_ids, files);
+}
+
+Status DBImpl::GetLiveFilesStorageInfoImpl(
+    const LiveFilesStorageInfoOptions& opts,
+    const std::unordered_set<uint32_t>* column_family_ids,
+    std::vector<LiveFileStorageInfo>* files) {
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
@@ -206,8 +260,8 @@ Status DBImpl::GetLiveFilesStorageInfo(
   // NOTE: This implementation was largely migrated from Checkpoint.
 
   VectorWalPtr live_wal_files;
-  bool flush_memtable = true;
-  if (!immutable_db_options_.allow_2pc) {
+  bool flush_memtable = column_family_ids == nullptr;
+  if (flush_memtable && !immutable_db_options_.allow_2pc) {
     if (opts.wal_size_for_flush == std::numeric_limits<uint64_t>::max()) {
       flush_memtable = false;
     } else if (opts.wal_size_for_flush > 0) {
@@ -242,6 +296,16 @@ Status DBImpl::GetLiveFilesStorageInfo(
   // This is a modified version of GetLiveFiles, to get access to more
   // metadata.
   mutex_.Lock();
+  if (column_family_ids != nullptr) {
+    for (uint32_t column_family_id : *column_family_ids) {
+      ColumnFamilyData* cfd =
+          versions_->GetColumnFamilySet()->GetColumnFamily(column_family_id);
+      if (cfd == nullptr || cfd->IsDropped()) {
+        mutex_.Unlock();
+        return Status::InvalidArgument("Column family is dropped");
+      }
+    }
+  }
   bool wal_locked = false;
   const bool needs_blob_direct_write_flush =
       HasInFlightBlobDirectWriteFilesWithLockHeld();
@@ -280,6 +344,10 @@ Status DBImpl::GetLiveFilesStorageInfo(
   // Make a set of all of the live table and blob files
   for (auto cfd : *versions_->GetColumnFamilySet()) {
     if (cfd->IsDropped()) {
+      continue;
+    }
+    if (column_family_ids != nullptr &&
+        column_family_ids->count(cfd->GetID()) == 0) {
       continue;
     }
     VersionStorageInfo& vsi = *cfd->current()->storage_info();
@@ -343,6 +411,26 @@ Status DBImpl::GetLiveFilesStorageInfo(
     }
   }
 
+  std::string checkpoint_manifest_contents;
+  if (column_family_ids != nullptr) {
+    auto file =
+        std::make_unique<StringWritableFile>(&checkpoint_manifest_contents);
+    auto file_writer = std::make_unique<WritableFileWriter>(
+        std::move(file), "", FileOptions());
+    log::Writer manifest_writer(std::move(file_writer), /*log_number=*/0,
+                                /*recycle_log_files=*/false);
+    IOStatus manifest_io_s;
+    Status manifest_s = versions_->WriteCheckpointManifest(
+        *column_family_ids, &manifest_writer, manifest_io_s);
+    if (manifest_s.ok()) {
+      manifest_s = manifest_writer.Close(WriteOptions());
+    }
+    if (!manifest_s.ok()) {
+      mutex_.Unlock();
+      return manifest_s;
+    }
+  }
+
   // Capture some final info before releasing mutex
   const uint64_t manifest_number = versions_->manifest_file_number();
   const uint64_t manifest_size = versions_->manifest_file_size();
@@ -363,8 +451,13 @@ Status DBImpl::GetLiveFilesStorageInfo(
     info.directory = GetName();
     info.file_number = manifest_number;
     info.file_type = kDescriptorFile;
-    info.size = manifest_size;
-    info.trim_to_size = true;
+    if (column_family_ids != nullptr) {
+      info.replacement_contents = std::move(checkpoint_manifest_contents);
+      info.size = info.replacement_contents.size();
+    } else {
+      info.size = manifest_size;
+      info.trim_to_size = true;
+    }
     if (opts.include_checksum_info) {
       info.file_checksum_func_name = kUnknownFileChecksumFuncName;
       info.file_checksum = kUnknownFileChecksum;

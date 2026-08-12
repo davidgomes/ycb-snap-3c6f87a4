@@ -7095,10 +7095,48 @@ void VersionSet::MarkMinLogNumberToKeep(uint64_t number) {
   }
 }
 
+Status VersionSet::WriteCheckpointManifest(
+    const std::unordered_set<uint32_t>& column_family_ids, log::Writer* log,
+    IOStatus& io_s) {
+  assert(io_s.ok());
+
+  std::unordered_map<uint32_t, MutableCFState> curr_state;
+  VersionEdit wal_additions;
+  for (const auto* cfd : *column_family_set_) {
+    if (column_family_ids.count(cfd->GetID()) != 0) {
+      curr_state.emplace(cfd->GetID(),
+                         MutableCFState(cfd->GetLogNumber(),
+                                        cfd->GetFullHistoryTsLow()));
+    }
+  }
+  for (const auto& wal : wals_.GetWals()) {
+    wal_additions.AddWal(wal.first, wal.second);
+  }
+
+  VersionEdit edit;
+  edit.SetNextFile(next_file_number_.load(std::memory_order_relaxed));
+  if (column_family_set_->GetMaxColumnFamily() > 0) {
+    edit.SetMaxColumnFamily(column_family_set_->GetMaxColumnFamily());
+  }
+  std::string record;
+  if (!edit.EncodeTo(&record)) {
+    return Status::Corruption("Unable to Encode VersionEdit: " +
+                              edit.DebugString(true));
+  }
+  io_s = log->AddRecord(WriteOptions(), record);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+
+  return WriteCurrentStateToManifest(WriteOptions(), curr_state, wal_additions,
+                                     log, io_s, &column_family_ids);
+}
+
 Status VersionSet::WriteCurrentStateToManifest(
     const WriteOptions& write_options,
     const std::unordered_map<uint32_t, MutableCFState>& curr_state,
-    const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s) {
+    const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s,
+    const std::unordered_set<uint32_t>* column_family_ids) {
   // TODO: Break up into multiple records to reduce memory usage on recovery?
 
   // WARNING: This method doesn't hold a mutex!!
@@ -7158,6 +7196,10 @@ Status VersionSet::WriteCurrentStateToManifest(
     assert(cfd);
 
     if (cfd->IsDropped()) {
+      continue;
+    }
+    if (column_family_ids != nullptr &&
+        column_family_ids->count(cfd->GetID()) == 0) {
       continue;
     }
     assert(cfd->initialized());
