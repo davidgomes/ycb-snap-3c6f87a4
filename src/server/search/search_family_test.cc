@@ -27,6 +27,7 @@ using namespace facade;
 
 ABSL_DECLARE_FLAG(bool, search_reject_legacy_field);
 ABSL_DECLARE_FLAG(size_t, search_query_string_bytes);
+ABSL_DECLARE_FLAG(uint32_t, num_shards);
 
 namespace {
 
@@ -48,6 +49,47 @@ auto Vec3ToBytes = [](float x, float y, float z) -> string {
   result.append(reinterpret_cast<const char*>(&z), sizeof(float));
   return result;
 };
+
+// Builds a deterministic, diverse TEXT corpus: varied term frequencies and field lengths (via
+// a simple xorshift PRNG with a fixed seed, so it's identical across repeated calls) so
+// BM25STD/TFIDF/TFIDF.DOCNORM produce a non-trivial score distribution — including ties — for
+// checking that scores/top-K don't depend on shard count.
+vector<tuple<string, string, string>> BuildScoringCorpus(int num_docs) {
+  static const char* kWords[] = {"alpha",  "bravo",    "charlie", "delta",  "echo",    "foxtrot",
+                                 "golf",   "hotel",    "india",   "juliet", "kilo",    "lima",
+                                 "mike",   "november", "oscar",   "papa",   "quebec",  "romeo",
+                                 "sierra", "tango",    "uniform", "victor", "whiskey", "xray",
+                                 "yankee", "zulu",     "dragon",  "fly",    "search",  "score"};
+  constexpr int kNumWords = sizeof(kWords) / sizeof(kWords[0]);
+
+  uint64_t state = 0x9e3779b97f4a7c15ULL;
+  auto next = [&state]() -> uint64_t {
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    return state * 0x2545F4914F6CDD1DULL;
+  };
+
+  vector<tuple<string, string, string>> docs;
+  docs.reserve(num_docs);
+  for (int i = 0; i < num_docs; i++) {
+    string title, body;
+    int title_words = 1 + static_cast<int>(next() % 4);
+    for (int j = 0; j < title_words; j++) {
+      if (j)
+        title += " ";
+      title += kWords[next() % kNumWords];
+    }
+    int body_words = 3 + static_cast<int>(next() % 25);
+    for (int j = 0; j < body_words; j++) {
+      if (j)
+        body += " ";
+      body += kWords[next() % kNumWords];
+    }
+    docs.emplace_back(absl::StrCat("doc:", i), std::move(title), std::move(body));
+  }
+  return docs;
+}
 
 }  // namespace
 
@@ -5840,6 +5882,130 @@ TEST_F(SearchFamilyTest, AggregateAddScoresAutoVisible) {
     }
   }
   EXPECT_TRUE(found_score) << "__score should be visible with ADDSCORES even without LOAD/pipeline";
+}
+
+// Regression test: BM25STD/TFIDF/TFIDF.DOCNORM compute IDF and average field length from
+// corpus-wide statistics. Historically these were computed from each shard's local documents,
+// so the same corpus and query could yield different top-K orderings/scores depending on how
+// many shards the index happened to be split across. Build the same ~200-doc corpus and run the
+// same queries first against a single shard, then against four shards, and verify results match.
+TEST_F(SearchFamilyTest, TextScoringShardInvariant) {
+  constexpr int kNumDocs = 200;
+  constexpr int kTopK = 15;
+  const auto corpus = BuildScoringCorpus(kNumDocs);
+  const string_view kQuery = "@body:(dragon|fly|search)";
+
+  struct Scenario {
+    // scorer name -> ordered (key, score) pairs, as returned by FT.SEARCH WITHSCORES
+    map<string, vector<pair<string, double>>> search_scores;
+    // FT.AGGREGATE SCORER BM25STD ADDSCORES SORTBY @__score DESC — ordered (doc index, score)
+    vector<pair<int, double>> aggregate_scores;
+    // FT.SEARCH SORTBY prio ASC WITHSCORES — ordered (key, score); prio is unique per doc, so
+    // order itself is already deterministic — this checks the *scores* stay in sync.
+    vector<pair<string, double>> sortby_scores;
+    size_t unscored_total_hits = 0;
+  };
+
+  auto run_scenario = [&](unsigned num_shards) {
+    // Explicitly pin the shard count — ResetService() only auto-derives it from num_threads_
+    // when the flag is still at its default (0), so it must be set on every call here.
+    num_threads_ = num_shards + 1;
+    absl::SetFlag(&FLAGS_num_shards, num_shards);
+    ResetService();
+
+    EXPECT_EQ(Run({"ft.create", "idx", "ON", "HASH", "SCHEMA", "title", "TEXT", "body", "TEXT",
+                   "prio", "NUMERIC", "SORTABLE"}),
+              "OK");
+
+    for (size_t i = 0; i < corpus.size(); i++) {
+      const auto& [key, title, body] = corpus[i];
+      Run({"hset", key, "title", title, "body", body, "prio", absl::StrCat(i)});
+    }
+
+    Scenario s;
+    for (const char* scorer : {"BM25STD", "TFIDF", "TFIDF.DOCNORM"}) {
+      auto resp = Run({"ft.search", "idx", kQuery, "WITHSCORES", "SCORER", scorer, "LIMIT", "0",
+                       absl::StrCat(kTopK)});
+      auto vec = resp.GetVec();
+      vector<pair<string, double>> ordered;
+      // [total, key, score, fields, key, score, fields, ...]
+      for (size_t i = 1; i + 1 < vec.size(); i += 3)
+        ordered.emplace_back(vec[i].GetString(), std::stod(vec[i + 1].GetString()));
+      s.search_scores[scorer] = std::move(ordered);
+    }
+
+    {
+      auto resp =
+          Run({"ft.aggregate", "idx", kQuery, "LOAD", "1", "@prio", "SCORER", "BM25STD",
+               "ADDSCORES", "SORTBY", "2", "@__score", "DESC", "LIMIT", "0", absl::StrCat(kTopK)});
+      auto vec = resp.GetVec();
+      for (size_t i = 1; i < vec.size(); i++) {
+        auto row = vec[i].GetVec();
+        int prio = -1;
+        double score = 0;
+        for (size_t j = 0; j + 1 < row.size(); j += 2) {
+          if (row[j].GetString() == "prio")
+            prio = static_cast<int>(std::stod(row[j + 1].GetString()));
+          else if (row[j].GetString() == "__score")
+            score = std::stod(row[j + 1].GetString());
+        }
+        EXPECT_GE(prio, 0) << "prio should always be loaded";
+        s.aggregate_scores.emplace_back(prio, score);
+      }
+    }
+
+    {
+      auto resp = Run({"ft.search", "idx", kQuery, "SORTBY", "prio", "ASC", "WITHSCORES", "LIMIT",
+                       "0", absl::StrCat(kTopK)});
+      auto vec = resp.GetVec();
+      for (size_t i = 1; i + 1 < vec.size(); i += 3)
+        s.sortby_scores.emplace_back(vec[i].GetString(), std::stod(vec[i + 1].GetString()));
+    }
+
+    // Non-scoring path: plain match count must also stay shard-count independent.
+    s.unscored_total_hits =
+        Run({"ft.search", "idx", kQuery, "NOCONTENT"}).GetVec()[0].GetInt().value();
+
+    return s;
+  };
+
+  Scenario single_shard = run_scenario(/*num_shards=*/1);
+  Scenario multi_shard = run_scenario(/*num_shards=*/4);
+
+  constexpr double kTolerance = 1e-4;
+
+  for (const char* scorer : {"BM25STD", "TFIDF", "TFIDF.DOCNORM"}) {
+    const auto& a = single_shard.search_scores[scorer];
+    const auto& b = multi_shard.search_scores[scorer];
+    ASSERT_FALSE(a.empty()) << scorer;
+    ASSERT_EQ(a.size(), b.size()) << scorer;
+    for (size_t i = 0; i < a.size(); i++) {
+      EXPECT_EQ(a[i].first, b[i].first) << scorer << " top-K key mismatch at rank " << i;
+      EXPECT_NEAR(a[i].second, b[i].second, kTolerance)
+          << scorer << " score mismatch for " << a[i].first;
+    }
+  }
+
+  ASSERT_FALSE(single_shard.aggregate_scores.empty());
+  ASSERT_EQ(single_shard.aggregate_scores.size(), multi_shard.aggregate_scores.size());
+  for (size_t i = 0; i < single_shard.aggregate_scores.size(); i++) {
+    EXPECT_EQ(single_shard.aggregate_scores[i].first, multi_shard.aggregate_scores[i].first)
+        << "FT.AGGREGATE top-K doc mismatch at rank " << i;
+    EXPECT_NEAR(single_shard.aggregate_scores[i].second, multi_shard.aggregate_scores[i].second,
+                kTolerance)
+        << "FT.AGGREGATE score mismatch at rank " << i;
+  }
+
+  ASSERT_EQ(single_shard.sortby_scores.size(), multi_shard.sortby_scores.size());
+  for (size_t i = 0; i < single_shard.sortby_scores.size(); i++) {
+    EXPECT_EQ(single_shard.sortby_scores[i].first, multi_shard.sortby_scores[i].first)
+        << "SORTBY+WITHSCORES key/rank mismatch at position " << i;
+    EXPECT_NEAR(single_shard.sortby_scores[i].second, multi_shard.sortby_scores[i].second,
+                kTolerance)
+        << "SORTBY+WITHSCORES score mismatch at position " << i;
+  }
+
+  EXPECT_EQ(single_shard.unscored_total_hits, multi_shard.unscored_total_hits);
 }
 
 // DocKeyIndex: empty-key documents must survive Serialize/Restore and not be
