@@ -11,7 +11,10 @@
 
 #pragma once
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <memory>
+#include <optional>
 #include "common/EasyAssert.h"
 #include "common/JsonCastType.h"
 #include "common/Types.h"
@@ -58,24 +61,30 @@ class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
         if constexpr ((std::is_integral_v<T> && !std::is_same_v<T, bool>) ||
                       std::is_floating_point_v<T>) {
             this->wrapper_->json_range_query(json_path_,
-                                             int64_t{},
-                                             int64_t{},
-                                             true,
-                                             true,
+                                             std::numeric_limits<int64_t>::min(),
+                                             std::numeric_limits<int64_t>::max(),
+                                             false,
+                                             false,
                                              true,
                                              true,
                                              &bitset);
             this->wrapper_->json_range_query(json_path_,
-                                             double{},
-                                             double{},
-                                             true,
-                                             true,
+                                             std::numeric_limits<double>::lowest(),
+                                             std::numeric_limits<double>::max(),
+                                             false,
+                                             false,
                                              true,
                                              true,
                                              &bitset);
+        } else if constexpr (std::is_same_v<T, bool>) {
+            const bool values[] = {false, true};
+            this->wrapper_->json_terms_query(
+                json_path_, values, 2, &bitset);
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            this->wrapper_->json_prefix_query(json_path_, "", &bitset);
         } else {
-            this->wrapper_->json_range_query(
-                json_path_, T{}, T{}, true, true, true, true, &bitset);
+            static_assert(sizeof(T) == 0,
+                          "unsupported JSON flat index value type");
         }
         auto field_valid = InvertedIndexTantivy<T>::IsNotNull();
         bitset &= field_valid;
@@ -128,26 +137,31 @@ class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
         tracer::AutoSpan span("JsonFlatIndexQueryExecutor::Range",
                               tracer::GetRootSpan());
         TargetBitmap bitset(this->Count());
-        switch (op) {
-            case OpType::LessThan: {
-                this->wrapper_->json_range_query(
-                    json_path_, T(), value, true, false, false, false, &bitset);
-            } break;
-            case OpType::LessEqual: {
-                this->wrapper_->json_range_query(
-                    json_path_, T(), value, true, false, true, false, &bitset);
-            } break;
-            case OpType::GreaterThan: {
-                this->wrapper_->json_range_query(
-                    json_path_, value, T(), false, true, false, false, &bitset);
-            } break;
-            case OpType::GreaterEqual: {
-                this->wrapper_->json_range_query(
-                    json_path_, value, T(), false, true, true, false, &bitset);
-            } break;
-            default:
-                ThrowInfo(OpTypeInvalid,
-                          fmt::format("Invalid OperatorType: {}", op));
+        QueryRangeForType(value, op, bitset);
+        if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+            QueryRangeForType(static_cast<double>(value), op, bitset);
+        } else if constexpr (std::is_floating_point_v<T>) {
+            switch (op) {
+                case OpType::LessThan:
+                    QueryIntegerRange(
+                        std::nullopt, false, value, false, bitset);
+                    break;
+                case OpType::LessEqual:
+                    QueryIntegerRange(
+                        std::nullopt, false, value, true, bitset);
+                    break;
+                case OpType::GreaterThan:
+                    QueryIntegerRange(
+                        value, false, std::nullopt, false, bitset);
+                    break;
+                case OpType::GreaterEqual:
+                    QueryIntegerRange(
+                        value, true, std::nullopt, false, bitset);
+                    break;
+                default:
+                    ThrowInfo(OpTypeInvalid,
+                              fmt::format("Invalid OperatorType: {}", op));
+            }
         }
         return bitset;
     }
@@ -173,6 +187,23 @@ class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
                                          lb_inclusive,
                                          ub_inclusive,
                                          &bitset);
+        if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+            this->wrapper_->json_range_query(
+                json_path_,
+                static_cast<double>(lower_bound_value),
+                static_cast<double>(upper_bound_value),
+                false,
+                false,
+                lb_inclusive,
+                ub_inclusive,
+                &bitset);
+        } else if constexpr (std::is_floating_point_v<T>) {
+            QueryIntegerRange(lower_bound_value,
+                              lb_inclusive,
+                              upper_bound_value,
+                              ub_inclusive,
+                              bitset);
+        }
         return bitset;
     }
 
@@ -199,6 +230,125 @@ class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
     }
 
  private:
+    template <typename ValueType>
+    void
+    QueryRangeForType(const ValueType& value,
+                      OpType op,
+                      TargetBitmap& bitset) {
+        switch (op) {
+            case OpType::LessThan:
+                this->wrapper_->json_range_query(
+                    json_path_,
+                    ValueType{},
+                    value,
+                    true,
+                    false,
+                    false,
+                    false,
+                    &bitset);
+                break;
+            case OpType::LessEqual:
+                this->wrapper_->json_range_query(
+                    json_path_,
+                    ValueType{},
+                    value,
+                    true,
+                    false,
+                    true,
+                    false,
+                    &bitset);
+                break;
+            case OpType::GreaterThan:
+                this->wrapper_->json_range_query(json_path_,
+                                                 value,
+                                                 ValueType{},
+                                                 false,
+                                                 true,
+                                                 false,
+                                                 false,
+                                                 &bitset);
+                break;
+            case OpType::GreaterEqual:
+                this->wrapper_->json_range_query(json_path_,
+                                                 value,
+                                                 ValueType{},
+                                                 false,
+                                                 true,
+                                                 true,
+                                                 false,
+                                                 &bitset);
+                break;
+            default:
+                ThrowInfo(OpTypeInvalid,
+                          fmt::format("Invalid OperatorType: {}", op));
+        }
+    }
+
+    void
+    QueryIntegerRange(std::optional<double> lower,
+                      bool lower_inclusive,
+                      std::optional<double> upper,
+                      bool upper_inclusive,
+                      TargetBitmap& bitset) {
+        constexpr auto min = std::numeric_limits<int64_t>::min();
+        constexpr auto max = std::numeric_limits<int64_t>::max();
+        const auto min_ld = static_cast<long double>(min);
+        const auto max_ld = static_cast<long double>(max);
+        int64_t lower_value = min;
+        int64_t upper_value = max;
+        bool lower_unbounded = true;
+        bool upper_unbounded = true;
+
+        if (lower.has_value()) {
+            const auto value = static_cast<long double>(lower.value());
+            if (std::isnan(lower.value()) ||
+                (lower_inclusive ? value > max_ld : value >= max_ld)) {
+                return;
+            }
+            if (lower_inclusive ? value > min_ld : value >= min_ld) {
+                lower_unbounded = false;
+                lower_value = lower_inclusive
+                                  ? static_cast<int64_t>(std::ceil(value))
+                                  : static_cast<int64_t>(std::floor(value));
+            }
+        }
+        if (upper.has_value()) {
+            const auto value = static_cast<long double>(upper.value());
+            if (std::isnan(upper.value()) ||
+                (upper_inclusive ? value < min_ld : value <= min_ld)) {
+                return;
+            }
+            if (upper_inclusive ? value < max_ld : value <= max_ld) {
+                upper_unbounded = false;
+                upper_value = upper_inclusive
+                                  ? static_cast<int64_t>(std::floor(value))
+                                  : static_cast<int64_t>(std::ceil(value));
+            }
+        }
+
+        const auto first =
+            lower_unbounded
+                ? min_ld
+                : static_cast<long double>(lower_value) +
+                      (lower_inclusive ? 0.0L : 1.0L);
+        const auto last =
+            upper_unbounded
+                ? max_ld
+                : static_cast<long double>(upper_value) -
+                      (upper_inclusive ? 0.0L : 1.0L);
+        if (first > last) {
+            return;
+        }
+        this->wrapper_->json_range_query(json_path_,
+                                         lower_value,
+                                         upper_value,
+                                         lower_unbounded,
+                                         upper_unbounded,
+                                         lower_inclusive,
+                                         upper_inclusive,
+                                         &bitset);
+    }
+
     std::string json_path_;
 };
 

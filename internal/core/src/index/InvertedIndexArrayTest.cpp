@@ -48,6 +48,28 @@ using namespace milvus;
 using namespace milvus::query;
 using namespace milvus::segcore;
 
+class NestedIndexValidityTestIndex
+    : public index::InvertedIndexTantivy<int64_t> {
+ public:
+    void
+    SetNullRows(std::vector<size_t> null_rows) {
+        is_nested_index_ = true;
+        null_offset_ = std::move(null_rows);
+    }
+};
+
+TEST(InvertedIndexArrayTest, RowValidityUsesNestedNullOffsets) {
+    NestedIndexValidityTestIndex index;
+    index.SetNullRows({1, 3});
+
+    auto valid = index.IsNotNullForRows(5);
+    EXPECT_TRUE(valid[0]);
+    EXPECT_FALSE(valid[1]);
+    EXPECT_TRUE(valid[2]);
+    EXPECT_FALSE(valid[3]);
+    EXPECT_TRUE(valid[4]);
+}
+
 template <typename T>
 SchemaPtr
 GenTestSchema() {

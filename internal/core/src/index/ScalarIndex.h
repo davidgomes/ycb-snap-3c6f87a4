@@ -129,6 +129,16 @@ class ScalarIndex : public IndexBase {
     virtual TargetBitmap
     IsNotNull() = 0;
 
+    virtual TargetBitmap
+    IsNotNullForRows(size_t row_count) {
+        auto valid = IsNotNull();
+        AssertInfo(valid.size() == row_count,
+                   "index validity size {} does not match row count {}",
+                   valid.size(),
+                   row_count);
+        return valid;
+    }
+
     virtual const TargetBitmap
     InApplyFilter(size_t n,
                   const T* values,

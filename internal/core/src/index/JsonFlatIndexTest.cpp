@@ -240,6 +240,26 @@ TEST_F(JsonFlatIndexTest, TestExistsQuery) {
     ASSERT_FALSE(result[2]);  // not exist
 }
 
+TEST_F(JsonFlatIndexTest, TestTypedValidityQuery) {
+    auto json_flat_index =
+        dynamic_cast<index::JsonFlatIndex*>(json_index_.get());
+    ASSERT_NE(json_flat_index, nullptr);
+
+    std::string preferred_name_path = "/profile/name/preferred_name";
+    auto string_executor =
+        json_flat_index->create_executor<std::string>(preferred_name_path);
+    auto string_valid = string_executor->IsNotNull();
+    ASSERT_EQ(string_valid.size(), json_data_.size());
+    EXPECT_TRUE(string_valid[0]);
+    EXPECT_FALSE(string_valid[1]);  // JSON null
+    EXPECT_FALSE(string_valid[2]);  // missing
+
+    std::string employee_id_path = "/profile/employee_id";
+    auto wrong_type_executor =
+        json_flat_index->create_executor<std::string>(employee_id_path);
+    EXPECT_TRUE(wrong_type_executor->IsNotNull().none());
+}
+
 TEST_F(JsonFlatIndexTest, TestNotInQuery) {
     auto json_flat_index =
         dynamic_cast<index::JsonFlatIndex*>(json_index_.get());
@@ -421,6 +441,25 @@ TEST_F(JsonFlatIndexTest, TestInt64RangeQuery) {
     ASSERT_FALSE(ge_result[0]);  // 1001 < 1002
     ASSERT_TRUE(ge_result[1]);   // 1002 >= 1002
     ASSERT_TRUE(ge_result[2]);   // 1003 >= 1002
+}
+
+TEST_F(JsonFlatIndexTest, TestMixedNumericRangeQuery) {
+    auto json_flat_index =
+        dynamic_cast<index::JsonFlatIndex*>(json_index_.get());
+    ASSERT_NE(json_flat_index, nullptr);
+
+    std::string json_path = "/profile/employee_id";
+    auto executor = json_flat_index->create_executor<double>(json_path);
+    auto result = executor->Range(1001.5, OpType::GreaterEqual);
+    ASSERT_EQ(result.size(), json_data_.size());
+    EXPECT_FALSE(result[0]);
+    EXPECT_TRUE(result[1]);
+    EXPECT_TRUE(result[2]);
+
+    auto bounded = executor->Range(1001.5, true, 1002.5, true);
+    EXPECT_FALSE(bounded[0]);
+    EXPECT_TRUE(bounded[1]);
+    EXPECT_FALSE(bounded[2]);
 }
 
 TEST_F(JsonFlatIndexTest, TestArrayStringInQuery) {

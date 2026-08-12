@@ -571,6 +571,29 @@ TEST_P(ExprTest, JsonPathErrorsRemainUnknownUnderNot) {
         EXPECT_TRUE(result[1]);
         EXPECT_TRUE(result[6]);
     }
+
+    auto empty_contains = std::make_shared<milvus::expr::JsonContainsExpr>(
+        milvus::expr::ColumnInfo(json_fid, DataType::JSON, {"arr"}),
+        proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+        true,
+        std::vector<proto::plan::GenericValue>{});
+    auto empty_contains_all = std::make_shared<milvus::expr::JsonContainsExpr>(
+        milvus::expr::ColumnInfo(json_fid, DataType::JSON, {"arr"}),
+        proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+        true,
+        std::vector<proto::plan::GenericValue>{});
+    std::vector<std::shared_ptr<expr::ITypeFilterExpr>> empty_expressions{
+        logical_not(empty_contains), empty_contains_all};
+    for (const auto& expression : empty_expressions) {
+        auto plan = std::make_shared<plan::FilterBitsNode>(
+            DEFAULT_PLANNODE_ID, expression);
+        auto result = ExecuteQueryExpr(
+            plan, segment.get(), json_strings.size(), MAX_TIMESTAMP);
+        ASSERT_EQ(result.count(), 5);
+        for (auto row : {0, 1, 5, 6, 7}) {
+            EXPECT_TRUE(result[row]);
+        }
+    }
 }
 
 TEST_P(ExprTest, TestUnaryRangeJson) {

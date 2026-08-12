@@ -176,6 +176,9 @@ class InvertedIndexTantivy : public ScalarIndex<T> {
     TargetBitmap
     IsNotNull() override;
 
+    TargetBitmap
+    IsNotNullForRows(size_t row_count) override;
+
     const TargetBitmap
     InApplyFilter(
         size_t n,

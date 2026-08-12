@@ -1795,7 +1795,8 @@ class SegmentExpr : public Expr {
 
                     TargetBitmap valid_res;
                     if (cached_is_nested_index_ && func_returns_row_level) {
-                        valid_res = TargetBitmap(active_count_, true);
+                        valid_res =
+                            index_ptr->IsNotNullForRows(active_count_);
                     } else {
                         valid_res = index_ptr->IsNotNull();
                     }

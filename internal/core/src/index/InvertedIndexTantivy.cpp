@@ -411,6 +411,30 @@ InvertedIndexTantivy<T>::IsNotNull() {
 }
 
 template <typename T>
+TargetBitmap
+InvertedIndexTantivy<T>::IsNotNullForRows(size_t row_count) {
+    if (!is_nested_index_) {
+        return IsNotNull();
+    }
+
+    TargetBitmap bitset(row_count, true);
+    auto fill_bitset = [this, row_count, &bitset]() {
+        auto end =
+            std::lower_bound(null_offset_.begin(), null_offset_.end(), row_count);
+        for (auto iter = null_offset_.begin(); iter != end; ++iter) {
+            bitset.reset(*iter);
+        }
+    };
+    if (is_growing_) {
+        std::shared_lock<folly::SharedMutex> lock(mutex_);
+        fill_bitset();
+    } else {
+        fill_bitset();
+    }
+    return bitset;
+}
+
+template <typename T>
 const TargetBitmap
 InvertedIndexTantivy<T>::InApplyFilter(
     size_t n, const T* values, const std::function<bool(size_t)>& filter) {

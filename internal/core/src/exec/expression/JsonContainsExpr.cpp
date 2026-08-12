@@ -135,26 +135,6 @@ PhyJsonContainsFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
 
     auto input = context.get_offset_input();
     SetHasOffsetInput((input != nullptr));
-    if (expr_->vals_.empty()) {
-        auto real_batch_size = has_offset_input_
-                                   ? context.get_offset_input()->size()
-                                   : GetNextBatchSize();
-        if (real_batch_size == 0) {
-            result = nullptr;
-            return;
-        }
-        if (expr_->op_ == proto::plan::JSONContainsExpr_JSONOp_ContainsAll) {
-            result = std::make_shared<ColumnVector>(
-                TargetBitmap(real_batch_size, true),
-                TargetBitmap(real_batch_size, true));
-        } else {
-            result = std::make_shared<ColumnVector>(
-                TargetBitmap(real_batch_size, false),
-                TargetBitmap(real_batch_size, true));
-        }
-        MoveCursor();
-        return;
-    }
 
     switch (expr_->column_.data_type_) {
         case DataType::ARRAY: {
@@ -167,7 +147,10 @@ PhyJsonContainsFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
             break;
         }
         case DataType::JSON: {
-            if (exec_path_ == ExprExecPath::ScalarIndex && !has_offset_input_) {
+            if (expr_->vals_.empty()) {
+                result = EvalJsonContainsForDataSegment(context);
+            } else if (exec_path_ == ExprExecPath::ScalarIndex &&
+                       !has_offset_input_) {
                 result = EvalArrayContainsForIndexSegment(
                     value_type_ == DataType::INT64 ? DataType::DOUBLE
                                                    : value_type_);
@@ -186,6 +169,13 @@ PhyJsonContainsFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
 VectorPtr
 PhyJsonContainsFilterExpr::EvalJsonContainsForDataSegment(EvalCtx& context) {
     auto data_type = expr_->column_.data_type_;
+    if (expr_->vals_.empty() && data_type == DataType::JSON) {
+        if (expr_->op_ ==
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAll) {
+            return ExecJsonContainsAll<bool>(context);
+        }
+        return ExecJsonContains<bool>(context);
+    }
     switch (expr_->op_) {
         case proto::plan::JSONContainsExpr_JSONOp_Contains:
         case proto::plan::JSONContainsExpr_JSONOp_ContainsAny: {
@@ -587,13 +577,6 @@ PhyJsonContainsFilterExpr::ExecJsonContainsByStats() {
         arg_inited_ = true;
     }
 
-    if (arg_set_->Empty()) {
-        MoveCursor();
-        return std::make_shared<ColumnVector>(
-            TargetBitmap(real_batch_size, false),
-            TargetBitmap(real_batch_size, true));
-    }
-
     if (cached_index_chunk_id_ != 0 && TryCacheGet()) {
         // Cache hit — skip Stats computation.
     } else if (cached_index_chunk_id_ != 0 &&
@@ -835,13 +818,6 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArrayByStats() {
     for (auto const& element : expr_->vals_) {
         elements.emplace_back(GetValueFromProto<proto::plan::Array>(element));
     }
-    if (elements.empty()) {
-        MoveCursor();
-        return std::make_shared<ColumnVector>(
-            TargetBitmap(real_batch_size, false),
-            TargetBitmap(real_batch_size, true));
-    }
-
     if (cached_index_chunk_id_ != 0 && TryCacheGet()) {
         // Cache hit — skip Stats computation.
     } else if (cached_index_chunk_id_ != 0 &&
@@ -1249,13 +1225,6 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
 
     auto elements =
         std::static_pointer_cast<std::set<GetType>>(arg_cached_set_);
-    if (elements->empty()) {
-        MoveCursor();
-        return std::make_shared<ColumnVector>(
-            TargetBitmap(real_batch_size, false),
-            TargetBitmap(real_batch_size, true));
-    }
-
     if (cached_index_chunk_id_ != 0 && TryCacheGet()) {
         // Cache hit — skip Stats computation.
     } else if (cached_index_chunk_id_ != 0 &&
@@ -1603,13 +1572,6 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllWithDiffTypeByStats() {
     for (int i = 0; i < static_cast<int>(elements.size()); i++) {
         elements_index.insert(i);
     }
-    if (elements.empty()) {
-        MoveCursor();
-        return std::make_shared<ColumnVector>(
-            TargetBitmap(real_batch_size, false),
-            TargetBitmap(real_batch_size, true));
-    }
-
     if (cached_index_chunk_id_ != 0 && TryCacheGet()) {
         // Cache hit — skip Stats computation.
     } else if (cached_index_chunk_id_ != 0 &&
@@ -1913,13 +1875,6 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllArrayByStats() {
     for (auto const& element : expr_->vals_) {
         elements.emplace_back(GetValueFromProto<proto::plan::Array>(element));
     }
-    if (elements.empty()) {
-        MoveCursor();
-        return std::make_shared<ColumnVector>(
-            TargetBitmap(real_batch_size, false),
-            TargetBitmap(real_batch_size, true));
-    }
-
     if (cached_index_chunk_id_ != 0 && TryCacheGet()) {
         // Cache hit — skip Stats computation.
     } else if (cached_index_chunk_id_ != 0 &&
@@ -2196,13 +2151,6 @@ PhyJsonContainsFilterExpr::ExecJsonContainsWithDiffTypeByStats() {
     }
     auto pointer = milvus::Json::pointer(expr_->column_.nested_path_);
     const auto& elements = expr_->vals_;
-    if (elements.empty()) {
-        MoveCursor();
-        return std::make_shared<ColumnVector>(
-            TargetBitmap(real_batch_size, false),
-            TargetBitmap(real_batch_size, true));
-    }
-
     if (cached_index_chunk_id_ != 0 && TryCacheGet()) {
         // Cache hit — skip Stats computation.
     } else if (cached_index_chunk_id_ != 0 &&
