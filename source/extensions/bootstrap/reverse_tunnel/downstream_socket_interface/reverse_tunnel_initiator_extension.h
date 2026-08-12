@@ -160,11 +160,10 @@ public:
    *        events for the same connection.
    * @param error_message failure reason for "handshake_failure" events; empty string otherwise.
    */
-  void emitAccessLog(TimeSource& time_source, const std::string& event,
-                     const std::string& node_id, const std::string& cluster_id,
-                     const std::string& tenant_id, const std::string& upstream_cluster,
-                     const std::string& host_address, const std::string& connection_key,
-                     const std::string& error_message);
+  void emitAccessLog(TimeSource& time_source, const std::string& event, const std::string& node_id,
+                     const std::string& cluster_id, const std::string& tenant_id,
+                     const std::string& upstream_cluster, const std::string& host_address,
+                     const std::string& connection_key, const std::string& error_message);
 
   /**
    * Test-only method to set the thread local slot for testing purposes.
