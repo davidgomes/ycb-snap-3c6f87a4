@@ -132,6 +132,7 @@
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/array.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
@@ -9167,6 +9168,9 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
 	int ncols = YbGetNumberOfFunctionOutputColumns(F_YB_GET_TABLET_METADATA);
+	const char *current_db_name = NULL;
+	const char *privilege_placeholder = "<insufficient privilege>";
+	bool		has_cluster_privileges = superuser() || IsYbDbAdminUser(GetUserId());
 
 	/* check to see if caller supports us returning a tuplestore */
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
@@ -9203,15 +9207,36 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 
 	HandleYBStatus(YBCTabletsMetadata(&tablets, &num_tablets));
 
+	if (!has_cluster_privileges)
+		current_db_name = get_database_name(MyDatabaseId);
+
 	for (int i = 0; i < num_tablets; ++i)
 	{
 		YbcPgGlobalTabletsDescriptor *tablet = (YbcPgGlobalTabletsDescriptor *) tablets + i;
 		YbcPgTabletsDescriptor *tablet_descriptor = &tablet->tablet_descriptor;
 		Datum		values[ncols];
 		bool		nulls[ncols];
+		bool		has_table_privileges;
+		bool		is_transactions_table;
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
+
+		is_transactions_table =
+			strcmp(tablet_descriptor->namespace_name, "system") == 0 &&
+			strcmp(tablet_descriptor->table_name, "transactions") == 0;
+		has_table_privileges = has_cluster_privileges || is_transactions_table;
+		if (!has_table_privileges &&
+			OidIsValid(tablet->pg_table_oid) &&
+			strcmp(tablet_descriptor->namespace_name, current_db_name) == 0)
+		{
+			bool		is_missing = false;
+
+			has_table_privileges =
+				pg_class_aclcheck_ext(tablet->pg_table_oid, GetUserId(),
+									  ACL_SELECT, &is_missing) == ACLCHECK_OK &&
+				!is_missing;
+		}
 
 		values[0] = CStringGetTextDatum(tablet_descriptor->tablet_id);
 		values[1] = CStringGetTextDatum(tablet_descriptor->table_id);
@@ -9228,7 +9253,9 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 
 		values[3] = CStringGetTextDatum(tablet_descriptor->namespace_name);
-		values[4] = CStringGetTextDatum(tablet_descriptor->table_name);
+		values[4] = CStringGetTextDatum(has_table_privileges ?
+										tablet_descriptor->table_name :
+										privilege_placeholder);
 		values[5] = CStringGetTextDatum(tablet_descriptor->table_type);
 
 		if (tablet->is_hash_partitioned)
@@ -9274,9 +9301,30 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[9] = true;
 		}
 
-		/* TODO (#28172): start_range, end_range, tablet_attrs are populated in a follow-up change. */
-		nulls[10] = true;
-		nulls[11] = true;
+		if (tablet->is_hash_partitioned)
+		{
+			nulls[10] = true;
+			nulls[11] = true;
+		}
+		else if (!has_table_privileges)
+		{
+			values[10] = CStringGetTextDatum(privilege_placeholder);
+			values[11] = CStringGetTextDatum(privilege_placeholder);
+		}
+		else
+		{
+			if (tablet->start_range)
+				values[10] = CStringGetTextDatum(tablet->start_range);
+			else
+				nulls[10] = true;
+
+			if (tablet->end_range)
+				values[11] = CStringGetTextDatum(tablet->end_range);
+			else
+				nulls[11] = true;
+		}
+
+		/* TODO (#28172): tablet_attrs is populated in a follow-up change. */
 		nulls[12] = true;
 
 		if (tablet->tablet_state)

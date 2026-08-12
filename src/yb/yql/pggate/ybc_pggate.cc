@@ -35,6 +35,7 @@
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
+#include "yb/dockv/doc_key.h"
 #include "yb/dockv/pg_key_decoder.h"
 #include "yb/dockv/pg_row.h"
 #include "yb/dockv/reader_projection.h"
@@ -3162,6 +3163,18 @@ YbcStatus YBCTabletsMetadata(YbcPgGlobalTabletsDescriptor** tablets, size_t* cou
         .replicas = replicas_array,
         .replicas_count = static_cast<size_t>(tablet_metadata.replicas().size()),
         .is_hash_partitioned = tablet_metadata.is_hash_partitioned(),
+        .start_range =
+            !tablet_metadata.is_hash_partitioned() &&
+                    !tablet_metadata.partition().partition_key_start().empty()
+                ? YBCPAllocStdString(dockv::DocKey::DebugSliceToString(
+                      tablet_metadata.partition().partition_key_start()))
+                : nullptr,
+        .end_range =
+            !tablet_metadata.is_hash_partitioned() &&
+                    !tablet_metadata.partition().partition_key_end().empty()
+                ? YBCPAllocStdString(dockv::DocKey::DebugSliceToString(
+                      tablet_metadata.partition().partition_key_end()))
+                : nullptr,
         .tablet_state = tablet_metadata.has_tablet_state()
             ? YBCPAllocStdString(tablet_metadata.tablet_state())
             : nullptr,

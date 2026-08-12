@@ -892,6 +892,8 @@ typedef struct {
   const char** replicas;
   size_t replicas_count;
   bool is_hash_partitioned;
+  const char* start_range;
+  const char* end_range;
   const char* tablet_state;
   YbcPgOid pg_table_oid;
 } YbcPgGlobalTabletsDescriptor;
