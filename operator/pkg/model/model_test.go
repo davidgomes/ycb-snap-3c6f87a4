@@ -426,6 +426,115 @@ func TestNeedsPerPortHTTPSListeners(t *testing.T) {
 	}
 }
 
+func TestNeedsPerPortTLSPassthroughListeners(t *testing.T) {
+	tests := []struct {
+		name  string
+		model Model
+		want  bool
+	}{
+		{
+			name:  "empty model",
+			model: Model{},
+			want:  false,
+		},
+		{
+			name: "one TLS passthrough port",
+			model: Model{
+				TLSPassthrough: []TLSPassthroughListener{
+					{Port: 443, Routes: []TLSPassthroughRoute{{Hostnames: []string{"a.com"}}}},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "two TLS passthrough ports",
+			model: Model{
+				TLSPassthrough: []TLSPassthroughListener{
+					{Port: 6443, Routes: []TLSPassthroughRoute{{Hostnames: []string{"a.com"}}}},
+					{Port: 8443, Routes: []TLSPassthroughRoute{{Hostnames: []string{"a.com"}}}},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "two listeners sharing one port",
+			model: Model{
+				TLSPassthrough: []TLSPassthroughListener{
+					{Port: 443, Routes: []TLSPassthroughRoute{{Hostnames: []string{"a.com"}}}},
+					{Port: 443, Routes: []TLSPassthroughRoute{{Hostnames: []string{"b.com"}}}},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "second port without routes does not count",
+			model: Model{
+				TLSPassthrough: []TLSPassthroughListener{
+					{Port: 6443, Routes: []TLSPassthroughRoute{{Hostnames: []string{"a.com"}}}},
+					{Port: 8443},
+				},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.model.NeedsPerPortTLSPassthroughListeners())
+		})
+	}
+}
+
+func TestNeedsPerPortListeners(t *testing.T) {
+	tests := []struct {
+		name  string
+		model Model
+		want  bool
+	}{
+		{
+			name:  "empty model",
+			model: Model{},
+			want:  false,
+		},
+		{
+			name: "single HTTPS port and single TLS passthrough port",
+			model: Model{
+				HTTP: []HTTPListener{
+					{Port: 443, TLS: []TLSSecret{{Name: "cert", Namespace: "ns"}}},
+				},
+				TLSPassthrough: []TLSPassthroughListener{
+					{Port: 6443, Routes: []TLSPassthroughRoute{{Hostnames: []string{"a.com"}}}},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "multiple HTTPS ports",
+			model: Model{
+				HTTP: []HTTPListener{
+					{Port: 443, TLS: []TLSSecret{{Name: "cert", Namespace: "ns"}}},
+					{Port: 50051, TLS: []TLSSecret{{Name: "cert", Namespace: "ns"}}},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "multiple TLS passthrough ports",
+			model: Model{
+				TLSPassthrough: []TLSPassthroughListener{
+					{Port: 6443, Routes: []TLSPassthroughRoute{{Hostnames: []string{"a.com"}}}},
+					{Port: 8443, Routes: []TLSPassthroughRoute{{Hostnames: []string{"a.com"}}}},
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.model.NeedsPerPortListeners())
+		})
+	}
+}
+
 func TestIsHTTPSPortConfigured(t *testing.T) {
 	m := Model{
 		HTTP: []HTTPListener{

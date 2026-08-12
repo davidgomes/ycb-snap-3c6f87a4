@@ -157,7 +157,7 @@ func (i *cecTranslator) desiredBackendServices(m *model.Model) ([]*ciliumv2.Serv
 }
 
 func (i *cecTranslator) desiredServicesWithPorts(namespace string, name string, m *model.Model) ([]*ciliumv2.ServiceListener, error) {
-	if m.NeedsPerPortHTTPSListeners() {
+	if m.NeedsPerPortListeners() {
 		return i.desiredServicesWithPortsSplit(namespace, name, m)
 	}
 	return i.desiredServicesWithPortsCombined(namespace, name, m)
@@ -191,7 +191,9 @@ func (i *cecTranslator) desiredServicesWithPortsCombined(namespace string, name 
 	}, nil
 }
 
-// desiredServicesWithPortsSplit returns one ServiceListener per distinct HTTPS port.
+// desiredServicesWithPortsSplit returns one ServiceListener per distinct HTTPS
+// port and, when the model has multiple distinct TLS passthrough ports, one
+// ServiceListener per TLS passthrough port.
 func (i *cecTranslator) desiredServicesWithPortsSplit(namespace string, name string, m *model.Model) ([]*ciliumv2.ServiceListener, error) {
 	shortenedName := shortener.ShortenK8sResourceName(name)
 	var result []*ciliumv2.ServiceListener
@@ -226,21 +228,38 @@ func (i *cecTranslator) desiredServicesWithPortsSplit(namespace string, name str
 	}
 
 	// TLS passthrough ports.
-	var ptPorts []uint16
-	for _, tlsl := range m.TLSPassthrough {
-		if len(tlsl.Routes) > 0 {
-			ptPorts = append(ptPorts, uint16(tlsl.Port))
+	if m.NeedsPerPortTLSPassthroughListeners() {
+		// One entry per TLS passthrough port, bound to that port's own listener.
+		for _, port := range m.TLSPassthroughPorts() {
+			if m.IsHTTPSPortConfigured(port) {
+				// Already covered by the HTTPS entry for this port.
+				continue
+			}
+			result = append(result, &ciliumv2.ServiceListener{
+				Namespace: namespace,
+				Name:      shortenedName,
+				Ports:     []uint16{uint16(port)},
+				Listener:  listenerNameForPort(port),
+			})
 		}
-	}
-	goslices.Sort(ptPorts)
-	ptPorts = goslices.Compact(ptPorts)
-	if len(ptPorts) > 0 {
-		result = append(result, &ciliumv2.ServiceListener{
-			Namespace: namespace,
-			Name:      shortenedName,
-			Ports:     ptPorts,
-			Listener:  listenerName,
-		})
+	} else {
+		// A single TLS passthrough port stays on the shared listener.
+		var ptPorts []uint16
+		for _, tlsl := range m.TLSPassthrough {
+			if len(tlsl.Routes) > 0 {
+				ptPorts = append(ptPorts, uint16(tlsl.Port))
+			}
+		}
+		goslices.Sort(ptPorts)
+		ptPorts = goslices.Compact(ptPorts)
+		if len(ptPorts) > 0 {
+			result = append(result, &ciliumv2.ServiceListener{
+				Namespace: namespace,
+				Name:      shortenedName,
+				Ports:     ptPorts,
+				Listener:  listenerName,
+			})
+		}
 	}
 
 	return result, nil

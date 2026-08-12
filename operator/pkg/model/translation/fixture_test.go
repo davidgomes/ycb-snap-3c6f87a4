@@ -1384,6 +1384,83 @@ var multiPortHTTPSModel = &model.Model{
 	},
 }
 
+// multiPortTLSPassthroughModel represents a Gateway with TLS passthrough
+// listeners on two different ports (6443 and 8443) sharing the same hostname,
+// triggering per-port listener splitting.
+var multiPortTLSPassthroughModel = &model.Model{
+	TLSPassthrough: []model.TLSPassthroughListener{
+		{
+			Sources: []model.FullyQualifiedResource{
+				{Name: "my-gateway", Namespace: "default", Version: "v1", Kind: "Gateway"},
+			},
+			Port:     6443,
+			Hostname: "foo.example.com",
+			Routes: []model.TLSPassthroughRoute{
+				{
+					Hostnames: []string{"foo.example.com"},
+					Backends: []model.Backend{
+						{
+							Name:      "backend-one",
+							Namespace: "default",
+							Port:      &model.BackendPort{Port: 6443},
+						},
+					},
+				},
+			},
+		},
+		{
+			Sources: []model.FullyQualifiedResource{
+				{Name: "my-gateway", Namespace: "default", Version: "v1", Kind: "Gateway"},
+			},
+			Port:     8443,
+			Hostname: "foo.example.com",
+			Routes: []model.TLSPassthroughRoute{
+				{
+					Hostnames: []string{"foo.example.com"},
+					Backends: []model.Backend{
+						{
+							Name:      "backend-two",
+							Namespace: "default",
+							Port:      &model.BackendPort{Port: 8443},
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+// catchAllHTTPSWithMultiPortTLSPassthroughModel represents a Gateway with a
+// catch-all HTTPS listener on port 443 alongside TLS passthrough listeners on
+// two different ports (6443 and 8443) sharing the same hostname.
+var catchAllHTTPSWithMultiPortTLSPassthroughModel = &model.Model{
+	HTTP: []model.HTTPListener{
+		{
+			Sources: []model.FullyQualifiedResource{
+				{Name: "my-gateway", Namespace: "default", Version: "v1", Kind: "Gateway"},
+			},
+			Port:     443,
+			Hostname: "*",
+			TLS: []model.TLSSecret{
+				{Name: "example-tls", Namespace: "default"},
+			},
+			Routes: []model.HTTPRoute{
+				{
+					PathMatch: model.StringMatch{Prefix: "/"},
+					Backends: []model.Backend{
+						{
+							Name:      "http-backend",
+							Namespace: "default",
+							Port:      &model.BackendPort{Port: 8080},
+						},
+					},
+				},
+			},
+		},
+	},
+	TLSPassthrough: multiPortTLSPassthroughModel.TLSPassthrough,
+}
+
 // multiPortHTTPSExpectedRouteConfigs is the expected route configuration for
 // multiPortHTTPSModel: one RouteConfiguration per listener.
 var multiPortHTTPSExpectedRouteConfigs = []*envoy_config_route_v3.RouteConfiguration{

@@ -244,14 +244,15 @@ func withSocketOption(tcpKeepAlive, tcpKeepIdleInSeconds, tcpKeepAliveProbeInter
 }
 
 // desiredEnvoyListener returns the desired Envoy listeners for the given model.
-// When the model has multiple distinct HTTPS ports, one Listener is emitted per
-// HTTPS port; otherwise a single combined Listener is returned.
+// When the model has multiple distinct HTTPS ports or multiple distinct TLS
+// passthrough ports, one Listener is emitted per such port; otherwise a single
+// combined Listener is returned.
 func (i *cecTranslator) desiredEnvoyListener(m *model.Model) ([]ciliumv2.XDSResource, error) {
 	if m.IsEmpty() {
 		return nil, nil
 	}
 
-	if m.NeedsPerPortHTTPSListeners() {
+	if m.NeedsPerPortListeners() {
 		return i.desiredEnvoyListenerPerPort(m)
 	}
 	return i.desiredEnvoyListenerCombined(m)
@@ -353,7 +354,9 @@ func (i *cecTranslator) httpsFilterChains(name string, m *model.Model) ([]*envoy
 	return filterChains, nil
 }
 
-// desiredEnvoyListenerPerPort returns one Listener per distinct HTTPS port.
+// desiredEnvoyListenerPerPort returns one Listener per distinct HTTPS port and,
+// when the model has multiple distinct TLS passthrough ports, one Listener per
+// TLS passthrough port.
 func (i *cecTranslator) desiredEnvoyListenerPerPort(m *model.Model) ([]ciliumv2.XDSResource, error) {
 	var allResources []ciliumv2.XDSResource
 
@@ -365,7 +368,13 @@ func (i *cecTranslator) desiredEnvoyListenerPerPort(m *model.Model) ([]ciliumv2.
 		}
 	}
 
-	if hasInsecure || m.IsTLSPassthroughListenerConfigured() {
+	// With a single TLS passthrough port, its filter chains stay on the shared
+	// listener. With multiple distinct ports, each port gets its own listener so
+	// that filter chains sharing the same SNI on different ports do not collide.
+	splitTLSPassthrough := m.NeedsPerPortTLSPassthroughListeners()
+	tlsPassthroughOnBase := m.IsTLSPassthroughListenerConfigured() && !splitTLSPassthrough
+
+	if hasInsecure || tlsPassthroughOnBase {
 		var filterChains []*envoy_config_listener.FilterChain
 
 		if hasInsecure {
@@ -376,7 +385,7 @@ func (i *cecTranslator) desiredEnvoyListenerPerPort(m *model.Model) ([]ciliumv2.
 			filterChains = append(filterChains, httpFC)
 		}
 
-		if m.IsTLSPassthroughListenerConfigured() {
+		if tlsPassthroughOnBase {
 			filterChains = append(filterChains, tlsPassthroughFilterChains(m)...)
 		}
 
@@ -398,7 +407,9 @@ func (i *cecTranslator) desiredEnvoyListenerPerPort(m *model.Model) ([]ciliumv2.
 				basePorts = append(basePorts, hl.Port)
 			}
 		}
-		basePorts = append(basePorts, m.TLSPassthroughPorts()...)
+		if tlsPassthroughOnBase {
+			basePorts = append(basePorts, m.TLSPassthroughPorts()...)
+		}
 		goslices.Sort(basePorts)
 		basePorts = goslices.Compact(basePorts)
 		for _, fn := range i.listenerMutatorsForPorts(m, basePorts) {
@@ -415,37 +426,68 @@ func (i *cecTranslator) desiredEnvoyListenerPerPort(m *model.Model) ([]ciliumv2.
 	for _, port := range m.HTTPSPortsSorted() {
 		lName := listenerNameForPort(port)
 
-		httpsFC, err := i.httpsFilterChainsForPort(lName, port, m)
+		fc, err := i.httpsFilterChainsForPort(lName, port, m)
 		if err != nil {
 			return nil, err
 		}
-		if len(httpsFC) == 0 {
+		if splitTLSPassthrough {
+			// A TLS passthrough port may coincide with an HTTPS port; the
+			// per-port listener then carries both kinds of filter chains.
+			fc = append(fc, tlsPassthroughFilterChainsForPort(m, port)...)
+		}
+		if len(fc) == 0 {
 			continue
 		}
 
-		httpsListener := &envoy_config_listener.Listener{
-			Name:         lName,
-			FilterChains: httpsFC,
-			ListenerFilters: []*envoy_config_listener.ListenerFilter{
-				{
-					Name: tlsInspectorType,
-					ConfigType: &envoy_config_listener.ListenerFilter_TypedConfig{
-						TypedConfig: toAny(&envoy_extensions_listener_tls_inspector_v3.TlsInspector{}),
-					},
-				},
-			},
-		}
-		for _, fn := range i.listenerMutatorsForPorts(m, []uint32{port}) {
-			httpsListener = fn(httpsListener)
-		}
-		res, err := toXdsResource(httpsListener, envoy.ListenerTypeURL)
+		res, err := i.perPortListenerResource(m, lName, port, fc)
 		if err != nil {
 			return nil, err
 		}
 		allResources = append(allResources, res)
 	}
 
+	if splitTLSPassthrough {
+		// one Listener per TLS passthrough port
+		for _, port := range m.TLSPassthroughPorts() {
+			if m.IsHTTPSPortConfigured(port) {
+				// Already emitted together with the HTTPS listener for this port.
+				continue
+			}
+			fc := tlsPassthroughFilterChainsForPort(m, port)
+			if len(fc) == 0 {
+				continue
+			}
+
+			res, err := i.perPortListenerResource(m, listenerNameForPort(port), port, fc)
+			if err != nil {
+				return nil, err
+			}
+			allResources = append(allResources, res)
+		}
+	}
+
 	return allResources, nil
+}
+
+// perPortListenerResource returns the XDS resource for a Listener serving a
+// single port with the given filter chains.
+func (i *cecTranslator) perPortListenerResource(m *model.Model, name string, port uint32, filterChains []*envoy_config_listener.FilterChain) (ciliumv2.XDSResource, error) {
+	listener := &envoy_config_listener.Listener{
+		Name:         name,
+		FilterChains: filterChains,
+		ListenerFilters: []*envoy_config_listener.ListenerFilter{
+			{
+				Name: tlsInspectorType,
+				ConfigType: &envoy_config_listener.ListenerFilter_TypedConfig{
+					TypedConfig: toAny(&envoy_extensions_listener_tls_inspector_v3.TlsInspector{}),
+				},
+			},
+		},
+	}
+	for _, fn := range i.listenerMutatorsForPorts(m, []uint32{port}) {
+		listener = fn(listener)
+	}
+	return toXdsResource(listener, envoy.ListenerTypeURL)
 }
 
 // listenerMutators returns a list of listener mutators to apply to the listener.
@@ -608,9 +650,25 @@ func getHostNetworkListenerAddresses(ports []uint32, ipv4Enabled, ipv6Enabled bo
 }
 
 func tlsPassthroughFilterChains(m *model.Model) []*envoy_config_listener.FilterChain {
+	return tlsPassthroughFilterChainsForListeners(m.TLSPassthrough)
+}
+
+// tlsPassthroughFilterChainsForPort returns the TLS passthrough filter chains
+// for the given port only.
+func tlsPassthroughFilterChainsForPort(m *model.Model, port uint32) []*envoy_config_listener.FilterChain {
+	var listeners []model.TLSPassthroughListener
+	for _, l := range m.TLSPassthrough {
+		if l.Port == port {
+			listeners = append(listeners, l)
+		}
+	}
+	return tlsPassthroughFilterChainsForListeners(listeners)
+}
+
+func tlsPassthroughFilterChainsForListeners(listeners []model.TLSPassthroughListener) []*envoy_config_listener.FilterChain {
 	var filterChains []*envoy_config_listener.FilterChain
 
-	for _, listener := range stableTLSPassthroughListeners(m.TLSPassthrough) {
+	for _, listener := range stableTLSPassthroughListeners(listeners) {
 		for _, route := range stableTLSPassthroughRoutes(listener.Routes) {
 			backends := stableTLSPassthroughBackends(route.Backends)
 			if len(backends) == 0 {

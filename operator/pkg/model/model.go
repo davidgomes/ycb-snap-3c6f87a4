@@ -656,6 +656,19 @@ func (m *Model) NeedsPerPortHTTPSListeners() bool {
 	return len(m.HTTPSPortsSorted()) > 1
 }
 
+// NeedsPerPortTLSPassthroughListeners returns true if the model has more than
+// one distinct TLS passthrough port.
+func (m *Model) NeedsPerPortTLSPassthroughListeners() bool {
+	return len(m.TLSPassthroughPorts()) > 1
+}
+
+// NeedsPerPortListeners returns true if the model requires per-port Envoy
+// listeners, either because of multiple distinct HTTPS ports or multiple
+// distinct TLS passthrough ports.
+func (m *Model) NeedsPerPortListeners() bool {
+	return m.NeedsPerPortHTTPSListeners() || m.NeedsPerPortTLSPassthroughListeners()
+}
+
 // IsTLSPassthroughListenerConfigured returns true if the model has any TLS Passthrough listeners.
 func (m *Model) IsTLSPassthroughListenerConfigured() bool {
 	for _, l := range m.TLSPassthrough {
