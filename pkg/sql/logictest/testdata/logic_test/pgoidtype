@@ -611,26 +611,31 @@ CREATE TABLE other_schema.table_with_indexes (a INT PRIMARY key, b INT)
 statement ok
 CREATE INDEX my_b_index ON other_schema.table_with_indexes(b)
 
+# other_schema is not on the (default) search_path here, and there is
+# already a same-named table_with_indexes (with its own pkey index) in
+# public, so the bare names would not resolve back to these objects: the
+# regclass::string output must be schema-qualified, matching Postgres.
+
 query TTT
 SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
 JOIN pg_namespace n ON c.relnamespace = n.oid
 WHERE c.oid='other_schema.table_with_indexes'::regclass
 ----
-table_with_indexes  table_with_indexes  other_schema
+table_with_indexes  other_schema.table_with_indexes  other_schema
 
 query TTT
 SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
 JOIN pg_namespace n ON c.relnamespace = n.oid
 WHERE c.oid='other_schema.table_with_indexes_pkey'::regclass
 ----
-table_with_indexes_pkey  table_with_indexes_pkey  other_schema
+table_with_indexes_pkey  other_schema.table_with_indexes_pkey  other_schema
 
 query TTT
 SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
 JOIN pg_namespace n ON c.relnamespace = n.oid
 WHERE c.oid='other_schema.my_b_index'::regclass
 ----
-my_b_index  my_b_index  other_schema
+my_b_index  other_schema.my_b_index  other_schema
 
 # Changing the search_path should influence what gets resolved while casting.
 

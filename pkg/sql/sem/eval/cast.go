@@ -1123,25 +1123,40 @@ func performIntToOidCast(
 		// Mapping an dOid to a regtype is easy: we have a hardcoded map.
 		var name string
 		if typ, ok := types.OidToType[o]; ok {
-			name = typ.PGName()
+			// Builtin types always keep their SQL-standard name (e.g.
+			// "integer", not "int4"); they are never schema-qualified.
+			name = typ.SQLStandardName()
 		} else if types.IsOIDUserDefinedType(o) {
 			typ, err := res.ResolveTypeByOID(ctx, o)
 			if err != nil {
 				return nil, err
 			}
-			name = typ.PGName()
+			if typ.TypeMeta.Name != nil {
+				name, err = res.QualifyRegObjectName(
+					ctx, t.Oid(), typ.TypeMeta.Name.Schema, typ.TypeMeta.Name.Basename(),
+				)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				name = typ.PGName()
+			}
 		}
 		return tree.NewDOidWithTypeAndName(o, t, name), nil
 
 	case oid.T_regproc, oid.T_regprocedure:
-		name, _, err := res.ResolveFunctionByOID(ctx, oid.Oid(v))
+		fnName, _, err := res.ResolveFunctionByOID(ctx, oid.Oid(v))
 		if err != nil {
 			if errors.Is(err, tree.ErrRoutineUndefined) {
 				return tree.NewDOidWithType(o, t), nil //nolint:returnerrcheck
 			}
 			return nil, err
 		}
-		return tree.NewDOidWithTypeAndName(o, t, name.Object()), nil
+		name, err := res.QualifyRegObjectName(ctx, t.Oid(), fnName.Schema(), fnName.Object())
+		if err != nil {
+			return nil, err
+		}
+		return tree.NewDOidWithTypeAndName(o, t, name), nil
 
 	default:
 		dOid, errSafeToIgnore, err := res.ResolveOIDFromOID(ctx, t, tree.NewDOid(o))

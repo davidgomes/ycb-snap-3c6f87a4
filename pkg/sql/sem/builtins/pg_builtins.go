@@ -1747,59 +1747,90 @@ FROM defaults_parsed
 	),
 
 	// pg_function_is_visible returns true if the input oid corresponds to a
-	// builtin function that is part of the databases on the search path.
+	// function that is visible under the current search_path -- that is, its
+	// schema is the first schema on the search_path containing any function
+	// (of any overload) with that name. A same-named function in an earlier
+	// schema shadows it, even when both are otherwise on the search path.
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_function_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
-			Body: `SELECT n.nspname = any current_schemas(true)
-             FROM pg_catalog.pg_proc p
-             INNER LOOKUP JOIN pg_catalog.pg_namespace n
-             ON p.pronamespace = n.oid
+			Body: `SELECT COALESCE(n.nspname = (
+               SELECT n2.nspname
+               FROM pg_catalog.pg_proc AS p2
+               INNER LOOKUP JOIN pg_catalog.pg_namespace AS n2 ON p2.pronamespace = n2.oid
+               WHERE p2.proname = p.proname
+                 AND n2.nspname = ANY (current_schemas(true))
+               ORDER BY array_position(current_schemas(true), n2.nspname)
+               LIMIT 1
+             ), false)
+             FROM pg_catalog.pg_proc AS p
+             INNER LOOKUP JOIN pg_catalog.pg_namespace AS n ON p.pronamespace = n.oid
              WHERE p.oid=$1 LIMIT 1`,
 			CalledOnNullInput: true,
-			Info:              "Returns whether the function with the given OID belongs to one of the schemas on the search path.",
+			Info:              "Returns whether the function with the given OID is visible under the current search_path.",
 			Volatility:        volatility.Stable,
 			Language:          tree.RoutineLangSQL,
 		},
 	),
-	// pg_table_is_visible returns true if the input oid corresponds to a table
-	// that is part of the schemas on the search path.
+	// pg_table_is_visible returns true if the input oid corresponds to a
+	// relation that is visible under the current search_path -- that is, its
+	// schema is the first schema on the search_path containing any relation
+	// (table, view, sequence, or index) with that name. A same-named relation
+	// in an earlier schema shadows it, even when both are otherwise on the
+	// search path.
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_table_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
-			Body: `SELECT n.nspname = any current_schemas(true)
-             FROM pg_catalog.pg_class c
-             INNER LOOKUP JOIN pg_catalog.pg_namespace n
-             ON c.relnamespace = n.oid
+			Body: `SELECT COALESCE(n.nspname = (
+               SELECT n2.nspname
+               FROM pg_catalog.pg_class AS c2
+               INNER LOOKUP JOIN pg_catalog.pg_namespace AS n2 ON c2.relnamespace = n2.oid
+               WHERE c2.relname = c.relname
+                 AND n2.nspname = ANY (current_schemas(true))
+               ORDER BY array_position(current_schemas(true), n2.nspname)
+               LIMIT 1
+             ), false)
+             FROM pg_catalog.pg_class AS c
+             INNER LOOKUP JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
              WHERE c.oid=$1 LIMIT 1`,
 			CalledOnNullInput: true,
-			Info:              "Returns whether the table with the given OID belongs to one of the schemas on the search path.",
+			Info:              "Returns whether the table with the given OID is visible under the current search_path.",
 			Volatility:        volatility.Stable,
 			Language:          tree.RoutineLangSQL,
 		},
 	),
 
 	// pg_type_is_visible returns true if the input oid corresponds to a type
-	// that is part of the databases on the search path, or NULL if no such type
-	// exists. CockroachDB doesn't support the notion of type visibility for
-	// builtin types, so we  always return true for those. For user-defined types,
-	// we consult pg_type.
+	// that is visible under the current search_path -- that is, its schema is
+	// the first schema on the search_path containing any type with that name
+	// -- or NULL if no such type exists. A same-named type in an earlier
+	// schema shadows it, even when both are otherwise on the search path.
+	// Builtin types always live in pg_catalog, which is always implicitly on
+	// the search path (first, unless explicitly listed elsewhere), so they
+	// are visible unless shadowed by a same-named user-defined type.
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_type_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
-			Body: `SELECT n.nspname = any current_schemas(true)
-             FROM pg_catalog.pg_type t
-             INNER LOOKUP JOIN pg_catalog.pg_namespace n
-             ON t.typnamespace = n.oid
+			Body: `SELECT COALESCE(n.nspname = (
+               SELECT n2.nspname
+               FROM pg_catalog.pg_type AS t2
+               INNER LOOKUP JOIN pg_catalog.pg_namespace AS n2 ON t2.typnamespace = n2.oid
+               WHERE t2.typname = t.typname
+                 AND n2.nspname = ANY (current_schemas(true))
+               ORDER BY array_position(current_schemas(true), n2.nspname)
+               LIMIT 1
+             ), false)
+             FROM pg_catalog.pg_type AS t
+             INNER LOOKUP JOIN pg_catalog.pg_namespace AS n ON t.typnamespace = n.oid
              WHERE t.oid=$1 LIMIT 1`,
 			CalledOnNullInput: true,
-			Info:              "Returns whether the type with the given OID belongs to one of the schemas on the search path.",
+			Info:              "Returns whether the type with the given OID is visible under the current search_path.",
 			Volatility:        volatility.Stable,
 			Language:          tree.RoutineLangSQL,
 		},

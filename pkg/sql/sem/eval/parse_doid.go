@@ -88,7 +88,14 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 			return nil, funcDef.MakeUnsupportedError()
 		}
 		overload := funcDef.Overloads[0]
-		return tree.NewDOidWithTypeAndName(overload.Oid, t, funcDef.Name), nil
+		// Re-derive the display name from the resolved schema and name so
+		// that string parsing and OID casting agree on whether the name
+		// needs to be schema-qualified (see QualifyRegObjectName).
+		displayName, err := evalCtx.Planner.QualifyRegObjectName(ctx, t.Oid(), overload.Schema, funcDef.Name)
+		if err != nil {
+			return nil, err
+		}
+		return tree.NewDOidWithTypeAndName(overload.Oid, t, displayName), nil
 	case oid.T_regprocedure:
 		// Fake a ALTER FUNCTION statement to extract the function signature.
 		// We're kinda being lazy here to rely on the parser to determine if the
@@ -125,7 +132,11 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 			if !catid.IsOIDUserDefined(ol.Oid) &&
 				ol.Types.Length() == 1 &&
 				ol.Types.GetAt(0).Identical(types.AnyElement) {
-				return tree.NewDOidWithTypeAndName(ol.Oid, t, fd.Name), nil
+				name, err := evalCtx.Planner.QualifyRegObjectName(ctx, t.Oid(), ol.Schema, fd.Name)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDOidWithTypeAndName(ol.Oid, t, name), nil
 			}
 		}
 
@@ -141,13 +152,33 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 		if err != nil {
 			return nil, err
 		}
-		return tree.NewDOidWithTypeAndName(ol.Oid, t, fd.Name), nil
+		// Re-derive the display name from the resolved schema and name so
+		// that string parsing and OID casting agree on whether the name
+		// needs to be schema-qualified (see QualifyRegObjectName).
+		name, err := evalCtx.Planner.QualifyRegObjectName(ctx, t.Oid(), ol.Schema, fd.Name)
+		if err != nil {
+			return nil, err
+		}
+		return tree.NewDOidWithTypeAndName(ol.Oid, t, name), nil
 	case oid.T_regtype:
 		parsedTyp, err := evalCtx.Planner.GetTypeFromValidSQLSyntax(ctx, s)
 		if err == nil {
-			return tree.NewDOidWithTypeAndName(
-				parsedTyp.Oid(), t, parsedTyp.SQLStandardName(),
-			), nil
+			name := parsedTyp.SQLStandardName()
+			if types.IsOIDUserDefinedType(parsedTyp.Oid()) && parsedTyp.TypeMeta.Name != nil {
+				// Re-derive the display name for user-defined types from the
+				// resolved schema and name, so that string parsing and OID
+				// casting agree on whether the name needs to be
+				// schema-qualified (SQLStandardName always fully qualifies
+				// user-defined types, which is not what we want here; see
+				// QualifyRegObjectName).
+				name, err = evalCtx.Planner.QualifyRegObjectName(
+					ctx, t.Oid(), parsedTyp.TypeMeta.Name.Schema, parsedTyp.TypeMeta.Name.Basename(),
+				)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return tree.NewDOidWithTypeAndName(parsedTyp.Oid(), t, name), nil
 		}
 
 		// Fall back to searching pg_type, since we don't provide syntax for
@@ -193,25 +224,38 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 		if err != nil {
 			return nil, err
 		}
+		var resolvedOid oid.Oid
 		if id, err := evalCtx.Planner.ResolveTableName(ctx, &tn); err == nil {
 			// Only remap OIDs for pg_catalog tables so that user tables are
 			// never affected by the remapping.
-			resolvedOid := catconstants.RemapPgCatalogOid(
+			resolvedOid = catconstants.RemapPgCatalogOid(
 				string(tn.SchemaName),
 				uint32(id),
 				sessiondatapb.IsPgDumpCompatibilityEnabled(evalCtx.SessionData().PgDumpCompatibility),
 			)
-			return tree.NewDOidWithTypeAndName(resolvedOid, t, tn.ObjectName.String()), nil
 		} else if pgerror.GetPGCode(err) != pgcode.UndefinedTable {
 			return nil, err
+		} else {
+			// If the above resulted in an UndefinedTable error, then we can
+			// try searching for an index with this name.
+			oidRes, err := indexNameToOID(ctx, evalCtx, tn)
+			if err != nil {
+				return nil, err
+			}
+			resolvedOid = oidRes
 		}
-		// If the above resulted in an UndefinedTable error, then we can try
-		// searching for an index with this name,
-		oidRes, err := indexNameToOID(ctx, evalCtx, tn)
+		// Re-derive the display name from the resolved OID (rather than
+		// echoing the parsed input) so that string parsing and OID casting
+		// agree on whether the name needs to be schema-qualified (see
+		// QualifyRegObjectName).
+		result, errSafeToIgnore, err := evalCtx.Planner.ResolveOIDFromOID(ctx, t, tree.NewDOid(resolvedOid))
 		if err != nil {
+			if errSafeToIgnore {
+				return tree.NewDOidWithTypeAndName(resolvedOid, t, tn.ObjectName.String()), nil
+			}
 			return nil, err
 		}
-		return tree.NewDOidWithTypeAndName(oidRes, t, tn.ObjectName.String()), nil
+		return result, nil
 
 	default:
 		d, _ /* errSafeToIgnore */, err := evalCtx.Planner.ResolveOIDFromString(ctx, t, tree.NewDString(s))

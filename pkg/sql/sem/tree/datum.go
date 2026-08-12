@@ -5588,9 +5588,13 @@ func (d *DOid) Format(ctx *FmtCtx) {
 		lexbase.EncodeSQLStringWithFlags(&ctx.Buffer, d.name, lexbase.EncNoFlags)
 		ctx.WriteByte(')')
 	} else {
-		// This is used to print the name of pseudo-procedures in e.g.
-		// pg_catalog.pg_type.typinput
-		lexbase.EncodeSQLStringWithFlags(&ctx.Buffer, d.name, lexbase.EncBareStrings)
+		// d.name is already the fully resolved display form for the value
+		// (e.g. a bare or schema-qualified, appropriately quoted identifier
+		// for regclass/regproc/regprocedure/regtype -- see QualifyRegObjectName),
+		// so it is written out verbatim rather than escaped as a SQL string
+		// literal. This is also used to print the name of pseudo-procedures
+		// in e.g. pg_catalog.pg_type.typinput.
+		ctx.WriteString(d.name)
 	}
 }
 

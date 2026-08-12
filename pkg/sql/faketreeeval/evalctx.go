@@ -181,6 +181,13 @@ func (ep *DummyEvalPlanner) ResolveOIDFromOID(
 	return nil, false, errors.WithStack(errEvalPlanner)
 }
 
+// QualifyRegObjectName is part of the Planner interface.
+func (ep *DummyEvalPlanner) QualifyRegObjectName(
+	ctx context.Context, regTypeOid oid.Oid, schemaName string, name string,
+) (string, error) {
+	return "", errors.WithStack(errEvalPlanner)
+}
+
 // GenerateTestObjects is part of the Planner interface.
 func (ep *DummyEvalPlanner) GenerateTestObjects(
 	ctx context.Context, params string,

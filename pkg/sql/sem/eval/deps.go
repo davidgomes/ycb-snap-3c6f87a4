@@ -209,6 +209,21 @@ type TypeResolver interface {
 	ResolveOIDFromOID(
 		ctx context.Context, resultType *types.T, toResolve *tree.DOid,
 	) (_ *tree.DOid, errSafeToIgnore bool, _ error)
+
+	// QualifyRegObjectName returns the Postgres-compatible display name for
+	// the object named name that lives in namespace schemaName, for the
+	// reg* family identified by regTypeOid (e.g. oid.T_regclass, oid.T_regproc
+	// or oid.T_regprocedure, or oid.T_regtype). Following Postgres, the bare
+	// (quoted) name is returned unless it would not resolve back to this
+	// object via the current search_path -- i.e. unless schemaName is the
+	// first schema on the search_path containing any entity named name --
+	// in which case the name is schema-qualified instead. Each identifier
+	// component is quoted only when necessary (quote_qualified_identifier
+	// style). reg* families without a notion of schema (e.g. regnamespace,
+	// regrole) always return the bare (quoted) name.
+	QualifyRegObjectName(
+		ctx context.Context, regTypeOid oid.Oid, schemaName string, name string,
+	) (string, error)
 }
 
 // Planner is a limited planner that can be used from EvalContext.
