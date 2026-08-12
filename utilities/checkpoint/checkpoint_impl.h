@@ -6,6 +6,8 @@
 #pragma once
 
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "file/filename.h"
 #include "rocksdb/db.h"
@@ -24,13 +26,22 @@ class CheckpointImpl : public Checkpoint {
                           uint64_t log_size_for_flush,
                           uint64_t* sequence_number_ptr) override;
 
+  Status CreateCheckpoint(const std::string& checkpoint_dir,
+                          const std::vector<ColumnFamilyHandle*>& column_families,
+                          uint64_t log_size_for_flush,
+                          uint64_t* sequence_number_ptr) override;
+
   // Shared by the legacy Checkpoint API and CheckpointEngine. engine == nullptr
   // links/copies serially; otherwise work runs on the pool, awaited before the
-  // staging dir is committed.
-  Status CreateCheckpointImpl(const std::string& checkpoint_dir,
-                              uint64_t log_size_for_flush,
-                              uint64_t* sequence_number_ptr, CopyEngine* engine,
-                              bool use_link, RateLimiter* copy_rate_limiter);
+  // staging dir is committed. included_cf_ids != nullptr restricts the
+  // checkpoint to those column families (must include the default column
+  // family); the others are recorded as dropped in the checkpoint's MANIFEST
+  // and their table/blob files are not linked or copied.
+  Status CreateCheckpointImpl(
+      const std::string& checkpoint_dir, uint64_t log_size_for_flush,
+      uint64_t* sequence_number_ptr, CopyEngine* engine, bool use_link,
+      RateLimiter* copy_rate_limiter,
+      const std::unordered_set<uint32_t>* included_cf_ids = nullptr);
 
   Status ExportColumnFamily(ColumnFamilyHandle* handle,
                             const std::string& export_dir,
@@ -53,10 +64,29 @@ class CheckpointImpl : public Checkpoint {
                            const std::string& contents, FileType type)>
           create_file_cb,
       uint64_t* sequence_number, uint64_t log_size_for_flush,
-      bool get_live_table_checksum = false, bool atomic_flush = false);
+      bool get_live_table_checksum = false, bool atomic_flush = false,
+      const std::unordered_set<uint32_t>* included_cf_ids = nullptr,
+      std::vector<uint32_t>* excluded_cf_ids = nullptr,
+      uint32_t* max_column_family = nullptr);
 
  private:
   Status CleanStagingDirectory(const std::string& path, Logger* info_log);
+
+  // Checks the column family selection of the subset-checkpoint API and
+  // fills *included_cf_ids with the IDs to keep (coalescing duplicates and
+  // always adding the default column family).
+  Status BuildIncludedColumnFamilyIdSet(
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      std::unordered_set<uint32_t>* included_cf_ids) const;
+
+  // Appends a DropColumnFamily VersionEdit record for each ID in
+  // `drop_cf_ids` to the staged checkpoint MANIFEST at `manifest_path`,
+  // whose current size must be `manifest_size`. On replay, the records make
+  // the checkpoint behave as if those column families had been dropped.
+  Status AppendDropColumnFamilyRecordsToManifest(
+      const std::string& manifest_path, uint64_t manifest_size,
+      const std::vector<uint32_t>& drop_cf_ids, uint32_t max_column_family,
+      bool use_fsync) const;
 
   // Export logic customization by providing callbacks for link or copy.
   Status ExportFilesInMetaData(

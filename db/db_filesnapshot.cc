@@ -198,9 +198,24 @@ Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
+  return GetLiveFilesStorageInfoWithColumnFamilyFilter(
+      opts, /*cf_id_filter=*/nullptr, files, /*excluded_cf_ids=*/nullptr,
+      /*max_column_family=*/nullptr);
+}
+
+Status DBImpl::GetLiveFilesStorageInfoWithColumnFamilyFilter(
+    const LiveFilesStorageInfoOptions& opts,
+    const std::unordered_set<uint32_t>* cf_id_filter,
+    std::vector<LiveFileStorageInfo>* files,
+    std::vector<uint32_t>* excluded_cf_ids, uint32_t* max_column_family) {
+  assert((cf_id_filter != nullptr) == (excluded_cf_ids != nullptr));
+  assert((cf_id_filter != nullptr) == (max_column_family != nullptr));
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
+  if (excluded_cf_ids != nullptr) {
+    excluded_cf_ids->clear();
+  }
   std::vector<LiveFileStorageInfo> results;
 
   // NOTE: This implementation was largely migrated from Checkpoint.
@@ -282,6 +297,11 @@ Status DBImpl::GetLiveFilesStorageInfo(
     if (cfd->IsDropped()) {
       continue;
     }
+    if (cf_id_filter != nullptr &&
+        cf_id_filter->find(cfd->GetID()) == cf_id_filter->end()) {
+      excluded_cf_ids->push_back(cfd->GetID());
+      continue;
+    }
     VersionStorageInfo& vsi = *cfd->current()->storage_info();
     auto& cf_paths = cfd->ioptions().cf_paths;
 
@@ -351,8 +371,15 @@ Status DBImpl::GetLiveFilesStorageInfo(
   const uint64_t min_log_num = MinLogNumberToKeep();
   // Ensure consistency with manifest for track_and_verify_wals_in_manifest
   const uint64_t max_log_num = cur_wal_number_;
+  if (max_column_family != nullptr) {
+    *max_column_family = versions_->GetColumnFamilySet()->GetMaxColumnFamily();
+  }
 
   mutex_.Unlock();
+
+  if (excluded_cf_ids != nullptr) {
+    std::sort(excluded_cf_ids->begin(), excluded_cf_ids->end());
+  }
 
   std::string manifest_fname = DescriptorFileName(manifest_number);
   {  // MANIFEST

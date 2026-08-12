@@ -20,6 +20,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -588,6 +589,24 @@ class DBImpl : public DB {
   Status GetLiveFilesStorageInfo(
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override;
+
+  // Extended form of GetLiveFilesStorageInfo() that can restrict the result
+  // to a subset of column families. When `cf_id_filter` is non-null, table
+  // and blob files of live column families whose ID is not in the filter are
+  // left out of `files`, the IDs of those filtered-out column families are
+  // returned in `*excluded_cf_ids` (sorted ascending), and
+  // `*max_column_family` is set to the DB's current maximum column family ID.
+  // All of this is captured atomically with the file enumeration and the
+  // recorded MANIFEST size, so `files` and `*excluded_cf_ids` together cover
+  // exactly the live column families described by the captured MANIFEST
+  // prefix. Files not owned by a single column family (MANIFEST, CURRENT,
+  // OPTIONS, WALs) are unaffected by the filter. `excluded_cf_ids` and
+  // `max_column_family` must be non-null iff `cf_id_filter` is non-null.
+  Status GetLiveFilesStorageInfoWithColumnFamilyFilter(
+      const LiveFilesStorageInfoOptions& opts,
+      const std::unordered_set<uint32_t>* cf_id_filter,
+      std::vector<LiveFileStorageInfo>* files,
+      std::vector<uint32_t>* excluded_cf_ids, uint32_t* max_column_family);
 
   Status GetPreparedFileInfoForExternalSstIngestion(
       const std::string& file_path,
