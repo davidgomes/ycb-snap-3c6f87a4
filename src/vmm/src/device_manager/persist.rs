@@ -154,6 +154,7 @@ pub struct ConnectedLegacyState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MmdsState {
     version: MmdsVersion,
+    imds_compat: bool,
 }
 
 /// Holds the device states.
@@ -328,6 +329,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                     if let (Some(mmds_ns), None) = (net.mmds_ns.as_ref(), states.mmds.as_ref()) {
                         states.mmds = Some(MmdsState {
                             version: mmds_ns.mmds.lock().expect("Poisoned lock").version(),
+                            imds_compat: mmds_ns.mmds.lock().expect("Poisoned lock").imds_compat(),
                         });
                     }
 
@@ -539,7 +541,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         if let Some(mmds) = &state.mmds {
             constructor_args
                 .vm_resources
-                .set_mmds_basic_config(mmds.version, constructor_args.instance_id)?;
+                .set_mmds_basic_config(mmds.version, mmds.imds_compat, constructor_args.instance_id)?;
         }
 
         for net_state in &state.net_devices {
@@ -750,6 +752,7 @@ mod tests {
                 &mut event_manager,
                 network_interface,
                 MmdsVersion::V2,
+                true,
             );
             // Add a vsock device.
             let vsock_dev_id = "vsock";
@@ -823,6 +826,7 @@ mod tests {
   "metrics": null,
   "mmds-config": {{
     "version": "V2",
+    "imds_compat": true,
     "network_interfaces": [
       "netif"
     ],
@@ -858,6 +862,15 @@ mod tests {
                 .unwrap()
                 .version(),
             MmdsVersion::V2
+        );
+        assert!(
+            vm_resources
+                .mmds
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .imds_compat()
         );
         assert_eq!(device_states.mmds.unwrap().version, MmdsVersion::V2.into());
 

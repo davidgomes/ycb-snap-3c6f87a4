@@ -292,6 +292,7 @@ impl VmResources {
         if !net_devs_with_mmds.is_empty() {
             let mut inner_mmds_config = MmdsConfig {
                 version: mmds.lock().expect("Poisoned lock").version(),
+                imds_compat: mmds.lock().expect("Poisoned lock").imds_compat(),
                 network_interfaces: vec![],
                 ipv4_address: None,
             };
@@ -383,7 +384,7 @@ impl VmResources {
         instance_id: &str,
     ) -> Result<(), MmdsConfigError> {
         self.set_mmds_network_stack_config(&config)?;
-        self.set_mmds_basic_config(config.version, instance_id)?;
+        self.set_mmds_basic_config(config.version, config.imds_compat(), instance_id)?;
 
         Ok(())
     }
@@ -392,10 +393,12 @@ impl VmResources {
     pub fn set_mmds_basic_config(
         &mut self,
         version: MmdsVersion,
+        imds_compat: bool,
         instance_id: &str,
     ) -> Result<(), MmdsConfigError> {
         let mut mmds_guard = self.locked_mmds_or_default()?;
         mmds_guard.set_version(version);
+        mmds_guard.set_imds_compat(imds_compat);
         mmds_guard.set_aad(instance_id);
 
         Ok(())

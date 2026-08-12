@@ -1242,6 +1242,7 @@ mod tests {
             MmdsConfig {
                 ipv4_address: None,
                 version: MmdsVersion::default(),
+                imds_compat: false,
                 network_interfaces: Vec::new(),
             },
         )));

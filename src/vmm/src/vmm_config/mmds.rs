@@ -14,6 +14,9 @@ pub struct MmdsConfig {
     /// MMDS version.
     #[serde(default)]
     pub version: MmdsVersion,
+    /// Whether MMDS always responds in IMDS format.
+    #[serde(default)]
+    pub imds_compat: bool,
     /// Network interfaces that allow forwarding packets to MMDS.
     pub network_interfaces: Vec<String>,
     /// MMDS IPv4 configured address.
@@ -26,6 +29,11 @@ impl MmdsConfig {
         self.version
     }
 
+    /// Returns whether MMDS always responds in IMDS format.
+    pub fn imds_compat(&self) -> bool {
+        self.imds_compat
+    }
+
     /// Returns the network interfaces that accept MMDS requests.
     pub fn network_interfaces(&self) -> Vec<String> {
         self.network_interfaces.clone()
@@ -35,6 +43,23 @@ impl MmdsConfig {
     /// Otherwise returns None.
     pub fn ipv4_addr(&self) -> Option<Ipv4Addr> {
         self.ipv4_address
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_imds_compat_defaults_to_false() {
+        let config: MmdsConfig =
+            serde_json::from_str(r#"{"network_interfaces":["eth0"]}"#).unwrap();
+
+        assert!(!config.imds_compat());
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["imds_compat"],
+            false
+        );
     }
 }
 

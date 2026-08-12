@@ -203,7 +203,11 @@ fn respond_to_get_request(mmds: &Mmds, request: Request) -> Response {
     // sanitize the URI.
     let json_path = sanitize_uri(uri.to_string());
 
-    let content_type = request.headers.accept();
+    let content_type = if mmds.imds_compat() {
+        MediaType::PlainText
+    } else {
+        request.headers.accept()
+    };
 
     match mmds.get_value(json_path, content_type.into()) {
         Ok(response_body) => build_response(
@@ -475,6 +479,33 @@ mod tests {
             MediaType::ApplicationJson,
         );
         assert_eq!(convert_to_response(mmds, request), expected_response);
+    }
+
+    #[test]
+    fn test_imds_compat_ignores_accept_header() {
+        let mmds = populate_mmds();
+        mmds.lock().expect("Poisoned lock").set_imds_compat(true);
+
+        let (request, expected_response) = generate_request_and_expected_response(
+            b"GET http://169.254.169.254/ HTTP/1.0\r\n\
+              Accept: application/json\r\n\r\n",
+            MediaType::PlainText,
+        );
+        assert_eq!(convert_to_response(mmds.clone(), request), expected_response);
+
+        let request = Request::try_from(
+            b"GET http://169.254.169.254/age HTTP/1.0\r\n\
+              Accept: application/json\r\n\r\n",
+            None,
+        )
+        .unwrap();
+        let response = convert_to_response(mmds, request);
+        assert_eq!(response.status(), StatusCode::NotImplemented);
+        assert_eq!(response.content_type(), MediaType::PlainText);
+        assert_eq!(
+            response.body().unwrap().body,
+            MmdsError::UnsupportedValueType.to_string().into_bytes()
+        );
     }
 
     // Test the version-independent error paths of `convert_to_response()`.
