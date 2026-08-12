@@ -55,6 +55,7 @@ TEST_MODULES = \
     subcommands.so \
     reply.so \
     cmdintrospection.so \
+    internalsupport.so \
     eventloop.so \
     moduleconfigs.so \
     moduleconfigstwo.so \

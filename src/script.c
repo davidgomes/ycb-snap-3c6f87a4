@@ -582,6 +582,8 @@ void scriptCall(scriptRunCtx *run_ctx, sds *err) {
     moduleCallCommandFilters(c);
 
     struct redisCommand *cmd = lookupCommand(c->argv, c->argc);
+    if (cmd && !commandAllowedForClient(c, cmd))
+        cmd = NULL;
     c->cmd = c->lastcmd = c->realcmd = cmd;
     if (scriptVerifyCommandArity(cmd, c->argc, err) != C_OK) {
         goto error;

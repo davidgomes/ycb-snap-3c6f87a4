@@ -1123,7 +1123,9 @@ static int luaRedisAclCheckCmdPermissionsCommand(lua_State *lua) {
 
     /* Find command */
     struct redisCommand *cmd;
-    if ((cmd = lookupCommand(argv, argc)) == NULL) {
+    if ((cmd = lookupCommand(argv, argc)) == NULL ||
+        !commandAllowedForClient(rctx->c, cmd))
+    {
         luaPushError(lua, "Invalid command passed to redis.acl_check_cmd()");
         raise_error = 1;
     } else {

@@ -1489,6 +1489,7 @@ void addAuthErrReply(client *c, robj *err) {
  * The return value is AUTH_OK on success (valid username / password pair) & AUTH_ERR otherwise. */
 int checkPasswordBasedAuth(client *c, robj *username, robj *password) {
     if (ACLCheckUserCredentials(username,password) == C_OK) {
+        c->flags &= ~CLIENT_INTERNAL;
         c->authenticated = 1;
         c->user = ACLGetUserByName(username->ptr,sdslen(username->ptr));
         moduleNotifyUserChanged(c);
@@ -3227,6 +3228,25 @@ void authCommand(client *c) {
         username = c->argv[1];
         password = c->argv[2];
         redactClientCommandArgument(c, 2);
+    }
+
+    if (c->argc == 3 &&
+        sdslen(username->ptr) == sizeof("internal connection")-1 &&
+        !memcmp(username->ptr, "internal connection", sizeof("internal connection")-1))
+    {
+        size_t secret_len;
+        const char *secret = server.cluster_enabled ? clusterGetSecret(&secret_len) : NULL;
+        if (!secret) {
+            addReplyError(c, "Internal connection authentication is only supported in cluster mode.");
+        } else if (sdslen(password->ptr) != secret_len ||
+                   memcmp(password->ptr, secret, secret_len) != 0)
+        {
+            addAuthErrReply(c, NULL);
+        } else {
+            markClientAsInternal(c);
+            addReply(c, shared.ok);
+        }
+        return;
     }
 
     robj *err = NULL;

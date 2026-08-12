@@ -1151,6 +1151,7 @@ int64_t commandFlagsFromString(char *s) {
         else if (!strcasecmp(t,"no-cluster")) flags |= CMD_MODULE_NO_CLUSTER;
         else if (!strcasecmp(t,"no-mandatory-keys")) flags |= CMD_NO_MANDATORY_KEYS;
         else if (!strcasecmp(t,"allow-busy")) flags |= CMD_ALLOW_BUSY;
+        else if (!strcasecmp(t,"internal")) flags |= CMD_INTERNAL;
         else break;
     }
     sdsfreesplitres(tokens,count);
@@ -1235,6 +1236,9 @@ RedisModuleCommand *moduleCreateCommandProxy(struct RedisModule *module, sds dec
  *                     RM_Yield.
  * * **"getchannels-api"**: The command implements the interface to return
  *                          the arguments that are channels.
+ * * **"internal"**: The command is only available to internal connections,
+ *                   AOF loading, replication from a master, and unrestricted
+ *                   module calls.
  *
  * The last three parameters specify which arguments of the new command are
  * Redis keys. See https://redis.io/commands/command for more information.
@@ -6403,8 +6407,17 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     }
     if (ctx->module) ctx->module->in_call++;
 
+    int internal_client = (ctx->client->flags & CLIENT_INTERNAL) != 0;
+    int script_mode = (ctx->client->flags & CLIENT_SCRIPT) ||
+                      (flags & REDISMODULE_ARGV_SCRIPT_MODE);
+    if (!(flags & REDISMODULE_ARGV_RUN_AS_USER) && !script_mode) {
+        c->flags |= CLIENT_INTERNAL;
+    } else if (internal_client && !script_mode) {
+        c->flags |= CLIENT_INTERNAL;
+    }
+
     user *user = NULL;
-    if (flags & REDISMODULE_ARGV_RUN_AS_USER) {
+    if ((flags & REDISMODULE_ARGV_RUN_AS_USER) && !internal_client) {
         user = ctx->user ? ctx->user->user : ctx->client->user;
         if (!user) {
             errno = ENOTSUP;
@@ -9083,6 +9096,16 @@ const char *RM_GetMyClusterID(void) {
 size_t RM_GetClusterSize(void) {
     if (!server.cluster_enabled) return 0;
     return getClusterSize();
+}
+
+/* Return the cluster internal secret and store its length in `*len`, or NULL
+ * if this instance is not running in cluster mode. The returned pointer is
+ * owned by Redis and remains valid while the cluster is active. */
+const char *RM_GetInternalSecret(RedisModuleCtx *ctx, size_t *len) {
+    UNUSED(ctx);
+    if (!server.cluster_enabled) return NULL;
+    size_t ignored_len;
+    return clusterGetSecret(len ? len : &ignored_len);
 }
 
 /* Populate the specified info for the node having as ID the specified 'id',
@@ -14195,6 +14218,7 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(GetTimerInfo);
     REGISTER_API(GetMyClusterID);
     REGISTER_API(GetClusterSize);
+    REGISTER_API(GetInternalSecret);
     REGISTER_API(GetRandomBytes);
     REGISTER_API(GetRandomHexChars);
     REGISTER_API(BlockedClientDisconnected);

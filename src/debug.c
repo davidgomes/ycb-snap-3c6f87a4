@@ -399,6 +399,8 @@ void debugCommand(client *c) {
 "    Output a hex signature representing the current DB content.",
 "INTERNAL_SECRET",
 "    Return the cluster internal secret (hashed with crc16) or error if not in cluster mode.",
+"MARK-INTERNAL-CLIENT [UNMARK]",
+"    Mark or unmark the current client as an internal connection.",
 "DIGEST-VALUE <key> [<key> ...]",
 "    Output a hex signature of the values of all the specified keys.",
 "ERROR <string>",
@@ -770,6 +772,15 @@ NULL
             uint16_t hash = crc16(internal_secret, len);
             addReplyLongLong(c, hash);
         }
+    } else if (!strcasecmp(c->argv[1]->ptr,"mark-internal-client") &&
+               (c->argc == 2 ||
+                (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"unmark"))))
+    {
+        if (c->argc == 3)
+            unmarkClientAsInternal(c);
+        else
+            markClientAsInternal(c);
+        addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"digest-value") && c->argc >= 2) {
         /* DEBUG DIGEST-VALUE key key key ... key. */
         addReplyArrayLen(c,c->argc-2);

@@ -178,6 +178,12 @@ void execCommand(client *c) {
         c->argv_len = c->mstate.commands[j].argv_len;
         c->cmd = c->realcmd = c->mstate.commands[j].cmd;
 
+        sds err;
+        if (!commandCheckExistence(c, &err)) {
+            addReplyErrorSds(c, err);
+            continue;
+        }
+
         /* ACL permissions are also checked at the time of execution in case
          * they were changed after the commands were queued. */
         int acl_errpos;

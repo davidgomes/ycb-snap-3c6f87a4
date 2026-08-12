@@ -116,6 +116,19 @@ int authRequired(client *c) {
     return auth_required;
 }
 
+void markClientAsInternal(client *c) {
+    c->flags |= CLIENT_INTERNAL;
+    c->user = NULL; /* Internal connections are unrestricted. */
+    c->authenticated = 1;
+    moduleNotifyUserChanged(c);
+}
+
+void unmarkClientAsInternal(client *c) {
+    c->flags &= ~CLIENT_INTERNAL;
+    clientSetDefaultAuth(c);
+    moduleNotifyUserChanged(c);
+}
+
 client *createClient(connection *conn) {
     client *c = zmalloc(sizeof(client));
 
@@ -3064,7 +3077,7 @@ char *getClientSockname(client *c) {
 /* Concatenate a string representing the state of a client in a human
  * readable format, into the sds string 's'. */
 sds catClientInfoString(sds s, client *client) {
-    char flags[17], events[3], conninfo[CONN_INFO_LEN], *p;
+    char flags[19], events[3], conninfo[CONN_INFO_LEN], *p;
 
     /* Pause IO thread to access data of the client safely. */
     int paused = 0;
@@ -3099,6 +3112,7 @@ sds catClientInfoString(sds s, client *client) {
     if (client->flags & CLIENT_NO_EVICT) *p++ = 'e';
     if (client->flags & CLIENT_NO_TOUCH) *p++ = 'T';
     if (client->flags & CLIENT_REPL_RDB_CHANNEL) *p++ = 'C';
+    if (client->flags & CLIENT_INTERNAL) *p++ = 'I';
     if (p == flags) *p++ = 'N';
     *p++ = '\0';
 
