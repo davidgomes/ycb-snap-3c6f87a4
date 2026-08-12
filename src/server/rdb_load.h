@@ -1,0 +1,478 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+#pragma once
+
+#include <system_error>
+
+extern "C" {
+#include "redis/rdb.h"
+}
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
+
+#include "base/mpsc_intrusive_queue.h"
+#include "base/pod_array.h"
+#include "core/search/base.h"
+#include "core/search/hnsw_index.h"
+#include "io/io.h"
+#include "io/io_buf.h"
+#include "server/detail/decompress.h"
+#include "server/execution_state.h"
+#include "server/rdb_load_context.h"
+#include "server/table.h"
+#include "server/tx_base.h"
+
+struct streamID;
+
+namespace dfly {
+
+class EngineShardSet;
+class ScriptMgr;
+class CompactObj;
+class Service;
+class JournalExecutor;
+struct JournalReader;
+
+using RdbVersion = std::uint16_t;
+
+class RdbLoaderBase {
+ protected:
+  RdbLoaderBase();
+  ~RdbLoaderBase();
+
+  struct LoadTrace;
+  using MutableBytes = ::io::MutableBytes;
+
+  struct LzfString {
+    base::PODArray<uint8_t> compressed_blob;
+    uint64_t uncompressed_len;
+  };
+
+  struct RdbSBF {
+    double grow_factor = 0, fp_prob = 0;
+    size_t prev_size = 0, current_size = 0;
+    size_t max_capacity = 0;
+
+    struct Filter {
+      unsigned hash_cnt;
+      std::string blob;
+      Filter(unsigned h, std::string b) : hash_cnt(h), blob(std::move(b)) {
+      }
+    };
+    std::vector<Filter> filters;
+  };
+
+  struct RdbCMS {
+    uint32_t width, depth;
+    int64_t total_incr_count;
+    std::vector<int64_t> counters;
+  };
+
+  struct RdbTOPK {
+    uint32_t k, width, depth;
+    double decay;
+    std::vector<std::pair<std::string, uint32_t>> heap_items;  // parsed one by one
+    std::string counters_buffer;  // Unstructured: raw bytes dumped from memory
+  };
+  using RdbVariant = std::variant<long long, base::PODArray<char>, LzfString,
+                                  std::unique_ptr<LoadTrace>, RdbSBF, RdbCMS, RdbTOPK>;
+
+  struct OpaqueObj {
+    RdbVariant obj;
+    int rdb_type{0};
+  };
+
+  struct LoadBlob {
+    RdbVariant rdb_var;
+    union {
+      unsigned encoding;
+      double score;
+    };
+  };
+
+  struct StreamPelTrace {
+    std::array<uint8_t, 16> rawid;
+    int64_t delivery_time;
+    uint64_t delivery_count;
+  };
+
+  struct StreamConsumerTrace {
+    RdbVariant name;
+    int64_t seen_time;
+    int64_t active_time;
+    std::vector<std::array<uint8_t, 16>> nack_arr;
+  };
+
+  struct StreamID {
+    uint64_t ms = 0;
+    uint64_t seq = 0;
+  };
+
+  struct StreamCGTrace {
+    RdbVariant name;
+    uint64_t ms;
+    uint64_t seq;
+    uint64_t entries_read;
+    std::vector<StreamPelTrace> pel_arr;
+    std::vector<StreamConsumerTrace> cons_arr;
+  };
+
+  struct StreamTrace {
+    size_t lp_len;
+    size_t stream_len;
+    StreamID last_id;
+    StreamID first_id;             /* The first non-tombstone entry, zero if empty. */
+    StreamID max_deleted_entry_id; /* The maximal ID that was deleted. */
+    uint64_t entries_added = 0;    /* All time count of elements added. */
+    std::vector<StreamCGTrace> cgroup;
+  };
+
+  struct LoadTrace {
+    std::vector<LoadBlob> arr;
+    std::unique_ptr<StreamTrace> stream_trace;
+  };
+
+  // Contains the state of a pending partial read.
+  //
+  // This us used to load huge objects in parts (only loading a subset of
+  // elements at a time) (see LoadKeyValPair).
+  struct PendingRead {
+    // Number of elements in the object to reserve.
+    //
+    // Used to reserve the elements in a huge object up front, then append
+    // in next loads.
+    size_t reserve = 0;
+
+    // Number of elements remaining in the object.
+    // For SBF2 object, this means the number of filters remaining.
+    // If the sbf_filter field is set, then this number also includes the partially read filter.
+    size_t remaining = 0;
+
+    // partial state for single filter in an SBF
+    // when chunk size runs out mid-filter, saves the partially filled buffer and resumes on the
+    // next chunk.
+    struct SbfFilterState {
+      // Pre-allocated to total_size, partially filled
+      std::string filter_data;
+      // Bytes read so far, the point to which we will write next
+      size_t offset = 0;
+      // Only read on first chunk of a filter
+      unsigned hash_cnt = 0;
+    };
+    std::optional<SbfFilterState> sbf_filter;
+  };
+
+  struct LoadConfig {
+    bool chunked = false;   // Big value streamed incrementally
+    size_t reserve = 0;     // Number of elements to reserve to optimize big value load
+    bool append = false;    // Append chunk to existing object
+    bool finalize = false;  // Last portion of chunked stream, finalize object
+  };
+
+  class OpaqueObjLoader;
+
+  io::Result<uint8_t> FetchType();
+
+  template <typename T> io::Result<T> FetchInt();
+
+  static std::error_code FromOpaque(const OpaqueObj& opaque, LoadConfig config, PrimeValue* pv);
+
+  io::Result<uint64_t> LoadLen(bool* is_encoded);
+  std::error_code FetchBuf(size_t size, void* dest);
+
+  io::Result<std::string> FetchGenericString();
+  io::Result<std::string> FetchLzfStringObject();
+  io::Result<std::string> FetchIntegerObject(int enctype);
+
+  io::Result<double> FetchBinaryDouble();
+  io::Result<double> FetchDouble();
+
+  ::io::Result<std::string> ReadKey();
+
+  std::error_code ReadObj(int rdbtype, OpaqueObj* dest);
+  std::error_code ReadStringObj(RdbVariant* rdb_variant, bool big_string_split = false);
+  std::error_code ReadRemainingString(RdbVariant* dest);
+  ::io::Result<long long> ReadIntObj(int encoding);
+  ::io::Result<LzfString> ReadLzf();
+
+  ::io::Result<OpaqueObj> ReadSet(int rdbtype);
+  ::io::Result<OpaqueObj> ReadIntSet();
+  ::io::Result<OpaqueObj> ReadGeneric(int rdbtype);
+  ::io::Result<OpaqueObj> ReadHMap(int rdbtype);
+  ::io::Result<OpaqueObj> ReadZSet(int rdbtype);
+  ::io::Result<OpaqueObj> ReadListQuicklist(int rdbtype);
+  ::io::Result<OpaqueObj> ReadStreams(int rdbtype);
+  ::io::Result<OpaqueObj> ReadRedisJson();
+  ::io::Result<OpaqueObj> ReadSBFImpl(bool filter_is_chunked);
+  ::io::Result<OpaqueObj> ReadSBF();
+  ::io::Result<OpaqueObj> ReadSBF2();
+  ::io::Result<OpaqueObj> ReadCMS();
+  ::io::Result<OpaqueObj> ReadTOPK();
+
+  std::error_code SkipModuleData();
+  std::error_code HandleCompressedBlob(int op_type);
+  std::error_code HandleCompressedBlobFinish();
+  std::error_code AllocateDecompressOnce(int op_type);
+
+  std::error_code HandleJournalBlob(Service* service);
+
+  static size_t StrLen(const RdbVariant& tset);
+
+  std::error_code EnsureRead(size_t min_sz);
+
+  std::error_code EnsureReadInternal(size_t min_to_read);
+
+  // Wrapper to consume n bytes from mem buf, and also decrement remaining_payload_bytes if a chunk
+  // read is in progress
+  std::error_code ConsumeInput(size_t n);
+
+  // If reading a chunk, deducts n bytes from size with error checking. No op if chunk is not being
+  // read such as journal data etc
+  std::error_code ConsumeChunkBudget(size_t n);
+
+  bool ChunkBudgetExhausted() const {
+    return current_chunk_state_ && current_chunk_state_->remaining_payload_bytes == 0;
+  }
+
+  // Called to validate that the current chunk is fully consumed, after validation resets current
+  // chunk state.
+  std::error_code FinishCurrentChunk();
+
+  static void CopyStreamId(const StreamID& src, struct streamID* dest);
+
+  base::IoBuf* mem_buf_ = nullptr;
+  base::IoBuf origin_mem_buf_;
+  ::io::Source* src_ = nullptr;
+
+  size_t bytes_read_ = 0;
+  size_t source_limit_ = SIZE_MAX;
+  base::PODArray<uint8_t> compr_buf_;
+  std::unique_ptr<detail::DecompressImpl> decompress_impl_;
+  std::optional<uint64_t> journal_offset_ = std::nullopt;
+  RdbVersion rdb_version_ = RDB_VERSION;
+  PendingRead pending_read_;
+
+  std::unique_ptr<JournalReader> journal_reader_;
+  std::unique_ptr<JournalExecutor> journal_executor_;
+
+  // State for the tagged chunk currently being parsed
+  struct ActiveTaggedChunk {
+    // Identifies which interleaved object stream this chunk belongs to
+    uint32_t stream_id;
+    // Number of payload bytes still unread in this tagged chunk
+    uint32_t remaining_payload_bytes;
+  };
+
+  // Set while parsing a tagged chunk. nullopt means the current input is a regular top-level RDB
+  // entry or opcode, not tagged chunk payload
+  std::optional<ActiveTaggedChunk> current_chunk_state_ = std::nullopt;
+};
+
+class RdbLoader : protected RdbLoaderBase {
+ public:
+  // load_context is shared across all RdbLoader instances in a load session.
+  explicit RdbLoader(Service* service, RdbLoadContext* load_context, std::string snapshot_id = {});
+
+  ~RdbLoader();
+
+  void SetOverrideExistingKeys(bool override) {
+    override_existing_keys_ = override;
+  }
+
+  void SetLoadUnownedSlots(bool load_unowned) {
+    load_unowned_slots_ = load_unowned;
+  }
+
+  // Sets shard count of the snapshot being loaded.
+  // Does not necessarily match the shard count of the current instance.
+  void SetShardCount(uint32_t shard_cnt) {
+    shard_count_ = shard_cnt;
+  }
+
+  std::error_code Load(::io::Source* src);
+
+  void set_source_limit(size_t n) {
+    source_limit_ = n;
+  }
+
+  ::io::Bytes Leftover() const {
+    return mem_buf_->InputBuffer();
+  }
+
+  size_t bytes_read() const {
+    return bytes_read_;
+  }
+
+  size_t keys_loaded() const {
+    return keys_loaded_;
+  }
+
+  // returns time in seconds.
+  double load_time() const {
+    return load_time_;
+  }
+
+  void stop() {
+    stop_early_.store(true);
+  }
+
+  void Pause(bool pause) {
+    pause_ = pause;
+  }
+
+  const std::string& GetSnapshotId() const {
+    return snapshot_id_;
+  }
+
+  // Return the offset that was received with a RDB_OPCODE_JOURNAL_OFFSET command,
+  // or 0 if no offset was received.
+  std::optional<uint64_t> journal_offset() const {
+    return journal_offset_;
+  }
+
+  // Set callback for receiving RDB_OPCODE_FULLSYNC_END.
+  // This opcode is used by a master instance to notify it finished streaming static data
+  // and is ready to switch to stable state sync.
+  void SetFullSyncCutCb(std::function<void()> cb) {
+    full_sync_cut_cb = std::move(cb);
+  }
+
+  uint32_t shard_id() const {
+    return shard_id_;
+  }
+
+  uint32_t shard_count() const {
+    return shard_count_;
+  }
+
+ private:
+  struct Item {
+    std::string key;
+    OpaqueObj val;
+    uint64_t expire_ms;
+    std::atomic<Item*> next;
+    DbIndex db_index = 0;
+    bool is_sticky = false;
+    bool has_mc_flags = false;
+    uint32_t mc_flags = 0;
+
+    LoadConfig load_config;
+
+    friend void MPSC_intrusive_store_next(Item* dest, Item* nxt) {
+      dest->next.store(nxt, std::memory_order_release);
+    }
+
+    friend Item* MPSC_intrusive_load_next(const Item& src) {
+      return src.next.load(std::memory_order_acquire);
+    }
+  };
+
+  using ItemsBuf = std::vector<Item*>;
+
+  struct ObjSettings;
+
+  struct StreamState;
+
+  std::error_code LoadKeyValPair(int type, ObjSettings* settings);
+
+  // Loads a continuation tagged chunk. The first chunk has already loaded the key and object type.
+  // This restores the saved stream state and continues loading only the remaining payload.
+  std::error_code LoadValueChunk();
+
+  io::Result<bool> ReadAndDispatchObject(int object_type, std::string& key,
+                                         const ObjSettings& obj_settings, DbIndex db_index);
+
+  // Returns whether to discard the read key pair.
+  bool ShouldDiscardKey(std::string_view key, const ObjSettings& settings) const;
+
+  std::error_code HandleAux();
+
+  std::error_code VerifyChecksum();
+
+  void FinishLoad(absl::Time start_time, size_t* keys_loaded);
+
+  void FlushShardAsync(ShardId sid);
+  void FlushAllShards();
+
+  void LoadItemsBuffer(const ItemsBuf& ib);
+
+  void CreateObjectOnShard(const DbContext& db_cntx, const Item* item, DbSlice* db_slice);
+
+  void LoadScriptFromAux(std::string&& value);
+
+  // Load index definition from RESP string describing it in FT.CREATE format,
+  // issues an FT.CREATE call, but does not start indexing
+  void LoadSearchIndexDefFromAux(std::string&& value);
+
+  // Load synonyms from RESP string and issue FT.SYNUPDATE call
+  void LoadSearchSynonymsFromAux(std::string&& value);
+
+  // Restore HNSW vector index graph from serialized node data.
+  std::error_code RestoreVectorIndex(std::string_view index_key, std::string_view index_name,
+                                     std::string_view field_name, uint64_t elements_number,
+                                     const search::HnswIndexMetadata& metadata);
+
+  // Load HNSW vector index nodes into a vector for deferred restoration.
+  std::error_code LoadVectorIndexNodes(uint64_t elements_number,
+                                       std::vector<search::HnswNodeData>* nodes);
+
+  // Skip over serialized HNSW vector index node data without restoring.
+  std::error_code SkipVectorIndex(std::string_view index_key, uint64_t elements_number);
+
+  // Extracted opcode handlers — kept out of RdbLoader::Load() so their
+  // locals don't accumulate in Load()'s stack frame.
+  std::error_code HandleVectorIndex();
+  std::error_code HandleShardDocIndex();
+
+  // validates if the current chunk is fully read, resets the state. returns early if stop_early_ is
+  // requested.
+  std::error_code FinalizeCurrentChunkIfNeeded();
+
+  Service* service_;
+  RdbLoadContext* load_context_;
+
+  std::string snapshot_id_;
+  bool override_existing_keys_ = false;
+  bool load_unowned_slots_ = false;
+  bool rdb_ignore_expiry_;
+  const bool deserialize_hnsw_index_;
+  uint32_t shard_id_ = UINT32_MAX;
+  uint32_t shard_count_ = 0;
+  size_t table_used_memory_ = 0;
+  ScriptMgr* script_mgr_;
+  std::vector<ItemsBuf> shard_buf_;
+
+  size_t keys_loaded_ = 0;
+  double load_time_ = 0;
+
+  DbIndex cur_db_index_ = 0;
+  bool pause_ = false;
+  bool is_tiered_enabled_ = false;
+  AggregateError ec_;
+
+  // We use atomics here because shard threads can notify RdbLoader fiber from another thread
+  // that it should stop early.
+  std::atomic_bool stop_early_{false};
+
+  // Callback when receiving RDB_OPCODE_FULLSYNC_END
+  std::function<void()> full_sync_cut_cb;
+
+  // A free pool of allocated unused items.
+  base::MPSCIntrusiveQueue<Item> item_queue_;
+
+  // Map of currently chunked big values, keyed by (db index, key) to avoid
+  // collisions when the same key name exists in different databases, and we
+  // receive chunked data from >1 db with the same key name
+  using ChunkedKey = std::pair<DbIndex, std::string>;
+  std::unordered_map<ChunkedKey, std::unique_ptr<PrimeValue>, absl::Hash<ChunkedKey>> now_chunked_;
+  base::SpinLock now_chunked_mu_;  // guards now_chunked_
+
+  std::string last_key_loaded_;
+
+  // Maps tagged stream id to the loader state needed to resume a partially read object
+  absl::flat_hash_map<uint32_t, StreamState> stream_states_;
+};
+
+}  // namespace dfly

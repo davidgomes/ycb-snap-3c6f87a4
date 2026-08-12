@@ -1,0 +1,895 @@
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+
+#include "server/detail/snapshot_storage.h"
+
+#include <absl/base/optimization.h>
+#include <absl/flags/flag.h>
+#include <absl/strings/str_replace.h>
+#include <absl/strings/strip.h>
+
+#ifdef WITH_AWS
+#include <aws/core/auth/AWSCredentialsProvider.h>
+#include <aws/s3/S3Client.h>
+#include <aws/s3/model/ListObjectsV2Request.h>
+#include <aws/s3/model/PutObjectRequest.h>
+
+#include "util/aws/aws.h"
+#include "util/aws/credentials_provider_chain.h"
+#include "util/aws/s3_endpoint_provider.h"
+#include "util/aws/s3_read_file.h"
+#include "util/aws/s3_write_file.h"
+#endif
+
+#include "util/cloud/aws/s3_storage.h"
+
+#ifdef WITH_GCP
+#include "util/cloud/gcp/gcs_file.h"
+#endif
+
+#include <regex>
+
+#include "base/logging.h"
+#include "io/file_util.h"
+#include "server/engine_shard_set.h"
+#include "util/cloud/azure/creds_provider.h"
+#include "util/cloud/azure/storage.h"
+#include "util/fibers/fiber_file.h"
+
+// Selects between the helio-native S3 client (util::cloud::aws) and aws-sdk-cpp.
+// Only meaningful when WITH_AWS is compiled in; otherwise the helio client is used.
+ABSL_FLAG(bool, s3_use_helio_client, true,
+          "If true, use helio's native S3 client; if false, use aws-sdk-cpp");
+
+namespace rng = std::ranges;
+namespace dfly {
+namespace detail {
+
+using namespace util;
+using namespace std;
+
+namespace {
+
+constexpr string_view kSummarySuffix = "summary.dfs"sv;
+
+pair<string, string> GetBucketPath(string_view path) {
+  string_view clean = path;
+  string_view prefix = kGCSPrefix;
+  if (absl::StartsWith(clean, kS3Prefix)) {
+    prefix = kS3Prefix;
+  } else if (absl::StartsWith(clean, kAzurePrefix)) {
+    prefix = kAzurePrefix;
+  }
+  clean = absl::StripPrefix(clean, prefix);
+
+  size_t pos = clean.find('/');
+  if (pos == string_view::npos) {
+    return make_pair(string(clean), "");
+  }
+
+  string bucket_name{clean.substr(0, pos)};
+  string obj_path{clean.substr(pos + 1)};
+
+  return make_pair(std::move(bucket_name), std::move(obj_path));
+}
+
+#ifdef __linux__
+const int kRdbWriteFlags = O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC | O_DIRECT;
+#endif
+
+std::string EscapeRegex(string_view input) {
+  // List of regex special characters that need escaping
+  // We don't escape "{}" since we use them for our own placeholders.
+  constexpr std::string_view chars{"\\.^$|?*+()[]"};
+  std::string escaped;
+
+  // Reserve space to avoid multiple reallocations
+  escaped.reserve(input.size() * 1.1);
+
+  for (char c : input) {
+    // If the character is in our specialChars list, prepend a backslash
+    if (chars.find(c) != std::string::npos) {
+      escaped += '\\';
+    }
+    escaped += c;
+  }
+
+  return escaped;
+}
+
+}  // namespace
+
+string SnapshotStorage::FindMatchingFile(string_view prefix, string_view dbfilename,
+                                         vector<SnapStat> keys) {
+  rng::sort(keys,
+            [](const SnapStat& l, const SnapStat& r) { return l.last_modified > r.last_modified; });
+
+  // Create a regex to match the object keys, substituting the timestamp
+  // and adding an extension if needed.
+  fs::path fl_path{prefix};
+  fl_path.append(dbfilename);
+  fl_path = EscapeRegex(fl_path.string());
+
+  SubstituteFilenamePlaceholders(&fl_path,
+                                 {.ts = "([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})",
+                                  .year = "([0-9]{4})",
+                                  .month = "([0-9]{2})",
+                                  .day = "([0-9]{2})"});
+  if (!fl_path.has_extension()) {
+    fl_path += "(-summary.dfs|.rdb)";
+  }
+  const std::regex re(fl_path.string());
+
+  for (const SnapStat& key : keys) {
+    DVLOG(1) << "Checking object key: " << key.name << " against regex: " << fl_path.string();
+    std::smatch m;
+    if (std::regex_match(key.name, m, re)) {
+      return key.name;
+    }
+  }
+  return {};
+}
+
+io::Result<SnapshotStorage::ExpandResult, GenericError> SnapshotStorage::ExpandSnapshot(
+    const string& load_path) {
+  if (!(absl::EndsWith(load_path, ".rdb") || absl::EndsWith(load_path, "summary.dfs"))) {
+    return nonstd::make_unexpected(
+        GenericError(std::make_error_code(std::errc::invalid_argument), "Bad filename extension"));
+  }
+
+  error_code ec = CheckPath(load_path);
+  if (ec) {
+    return nonstd::make_unexpected(GenericError(ec, "File not found"));
+  }
+
+  ExpandResult result;
+
+  // Collect all other files in case we're loading dfs.
+  if (absl::EndsWith(load_path, "summary.dfs")) {
+    auto res = ExpandFromPath(load_path);
+    if (!res) {
+      return nonstd::make_unexpected(res.error());
+    }
+    result = std::move(*res);
+    result.push_back(load_path);
+  } else {
+    result.push_back(load_path);
+  }
+  return result;
+}
+
+FileSnapshotStorage::FileSnapshotStorage(fb2::FiberQueueThreadPool* fq_threadpool)
+    : fq_threadpool_{fq_threadpool} {
+}
+
+io::Result<std::pair<io::Sink*, uint8_t>, GenericError> FileSnapshotStorage::OpenWriteFile(
+    const std::string& path) {
+  if (fq_threadpool_) {  // EPOLL
+    FiberWriteOptions opts;
+    opts.direct = true;
+
+    auto res = OpenFiberWriteFile(path, fq_threadpool_, opts);
+    if (!res) {
+      return nonstd::make_unexpected(GenericError(res.error(), "Couldn't open file for writing"));
+    }
+
+    return std::pair(*res, FileType::FILE | FileType::DIRECT);
+  } else {
+#ifdef __linux__
+    auto res = fb2::OpenLinux(path, kRdbWriteFlags, 0666);
+    if (!res) {
+      return nonstd::make_unexpected(GenericError(
+          res.error(),
+          "Couldn't open file for writing (is direct I/O supported by the file system?)"));
+    }
+
+    uint8_t file_type = FileType::FILE | FileType::IO_URING;
+    if (kRdbWriteFlags & O_DIRECT) {
+      file_type |= FileType::DIRECT;
+    }
+    return std::pair(new LinuxWriteWrapper(res->release()), file_type);
+#else
+    LOG(FATAL) << "Linux I/O is not supported on this platform";
+#endif
+  }
+}
+
+io::ReadonlyFileOrError FileSnapshotStorage::OpenReadFile(const std::string& path) {
+#ifdef __linux__
+  if (fq_threadpool_) {
+    return OpenFiberReadFile(path, fq_threadpool_);
+  } else {
+    return fb2::OpenRead(path);
+  }
+#else
+  return OpenFiberReadFile(path, fq_threadpool_);
+#endif
+}
+
+io::Result<std::string, GenericError> FileSnapshotStorage::LoadPath(std::string_view dir,
+                                                                    std::string_view dbfilename) {
+  if (dbfilename.empty())
+    return {};
+
+  fs::path data_folder;
+  if (dir.empty()) {
+    data_folder = fs::current_path();
+  } else {
+    std::error_code file_ec;
+    data_folder = fs::canonical(dir, file_ec);
+    if (file_ec) {
+      return nonstd::make_unexpected(GenericError{file_ec, "Data directory error"});
+    }
+  }
+
+  LOG(INFO) << "Load snapshot: Searching for snapshot in directory: " << data_folder;
+
+  fs::path fl_path = data_folder.append(dbfilename);
+  // If we've found an exact match we're done.
+  if (fs::exists(fl_path))
+    return fl_path.generic_string();
+
+  SubstituteFilenamePlaceholders(&fl_path, {"*", "*", "*", "*"});
+  if (!fl_path.has_extension()) {
+    fl_path += "*";
+  }
+  io::Result<io::StatShortVec> short_vec = io::StatFiles(fl_path.generic_string());
+  if (short_vec) {
+    rng::sort(*short_vec, [](const io::StatShort& l, const io::StatShort& r) {
+      return std::difftime(l.last_modified, r.last_modified) < 0;
+    });
+    auto it = std::find_if(short_vec->rbegin(), short_vec->rend(), [](const auto& stat) {
+      return absl::EndsWith(stat.name, ".rdb") || absl::EndsWith(stat.name, kSummarySuffix);
+    });
+    if (it != short_vec->rend())
+      return it->name;
+  } else {
+    return nonstd::make_unexpected(
+        GenericError(short_vec.error(), "Could not stat snapshot directory"));
+  }
+
+  return nonstd::make_unexpected(GenericError(
+      std::make_error_code(std::errc::no_such_file_or_directory), "Snapshot not found"));
+}
+
+io::Result<vector<string>, GenericError> FileSnapshotStorage::ExpandFromPath(const string& path) {
+  string glob = absl::StrReplaceAll(path, {{"summary", "????"}});
+  io::Result<io::StatShortVec> files = io::StatFiles(glob);
+
+  if (!files || files->size() == 0) {
+    return nonstd::make_unexpected(GenericError(make_error_code(errc::no_such_file_or_directory),
+                                                "Cound not find DFS shard files"));
+  }
+
+  vector<string> paths;
+  for (auto& fstat : *files) {
+    paths.push_back(std::move(fstat.name));
+  }
+
+  return paths;
+}
+
+error_code FileSnapshotStorage::CheckPath(const string& path) {
+  error_code ec;
+  std::ignore = fs::canonical(path, ec);
+  return ec;
+}
+
+#ifdef WITH_GCP
+GcsSnapshotStorage::~GcsSnapshotStorage() {
+  util::http::TlsClient::FreeContext(ctx_);
+}
+
+error_code GcsSnapshotStorage::Init(unsigned connect_ms) {
+  error_code ec = creds_provider_.Init(connect_ms);
+  if (ec)
+    return ec;
+
+  ctx_ = util::http::TlsClient::CreateSslContext();
+  return ec;
+}
+
+io::Result<std::pair<io::Sink*, uint8_t>, GenericError> GcsSnapshotStorage::OpenWriteFile(
+    const std::string& path) {
+  CHECK(ctx_);
+
+  pair<string, string> bucket_path = GetBucketPath(path);
+  fb2::ProactorBase* proactor = fb2::ProactorBase::me();
+  unique_ptr<http::ClientPool> conn_pool = cloud::GCS::CreateApiConnectionPool(ctx_, proactor);
+  cloud::GcsWriteFileOptions opts;
+  opts.creds_provider = &creds_provider_;
+  opts.pool = conn_pool.release();
+  opts.pool_owned = true;
+
+  io::Result<io::WriteFile*> dest_res =
+      cloud::OpenWriteGcsFile(bucket_path.first, bucket_path.second, opts);
+  if (!dest_res) {
+    return nonstd::make_unexpected(GenericError(dest_res.error(), "Could not open file"));
+  }
+
+  return std::pair(*dest_res, FileType::CLOUD);
+}
+
+io::ReadonlyFileOrError GcsSnapshotStorage::OpenReadFile(const std::string& path) {
+  if (!IsGCSPath(path))
+    return nonstd::make_unexpected(GenericError("Invalid GCS path"));
+
+  auto [bucket, key] = GetBucketPath(path);
+  fb2::ProactorBase* proactor = fb2::ProactorBase::me();
+  unique_ptr<http::ClientPool> conn_pool = cloud::GCS::CreateApiConnectionPool(ctx_, proactor);
+  cloud::GcsReadFileOptions opts;
+  opts.creds_provider = &creds_provider_;
+  opts.pool = conn_pool.release();
+  opts.pool_owned = true;
+
+  return cloud::OpenReadGcsFile(bucket, key, opts);
+}
+
+io::Result<std::string, GenericError> GcsSnapshotStorage::LoadPath(string_view dir,
+                                                                   string_view dbfilename) {
+  if (dbfilename.empty())
+    return "";
+
+  auto [bucket_name, prefix] = GetBucketPath(dir);
+
+  // GCS needs trailing slash to match prefix sub path
+  if (!prefix.empty() && prefix.back() != '/') {
+    prefix += '/';
+  }
+
+  fb2::ProactorBase* proactor = shard_set->pool()->GetNextProactor();
+
+  io::Result<vector<SnapStat>, GenericError> keys =
+      proactor->Await([this, proactor, bucket_name = bucket_name,
+                       prefix = prefix]() -> io::Result<vector<SnapStat>, GenericError> {
+        cloud::GCS gcs(&creds_provider_, ctx_, proactor);
+        vector<SnapStat> res;
+        string cursor;
+        do {
+          error_code ec = gcs.List(
+              bucket_name, prefix, false, 500,
+              [&res](const cloud::StorageListItem& item) {
+                res.emplace_back(string(item.key), item.mtime_ns);
+              },
+              &cursor);
+          if (ec)
+            return nonstd::make_unexpected(GenericError(ec, "Failed to list objects"));
+        } while (!cursor.empty());
+        return res;
+      });
+
+  if (!keys) {
+    return nonstd::make_unexpected(keys.error());
+  }
+
+  auto match_key = FindMatchingFile(prefix, dbfilename, *keys);
+  if (!match_key.empty()) {
+    return absl::StrCat(kGCSPrefix, bucket_name, "/", match_key);
+  }
+  return nonstd::make_unexpected(GenericError(
+      std::make_error_code(std::errc::no_such_file_or_directory), "Snapshot not found"));
+}
+
+io::Result<vector<string>, GenericError> GcsSnapshotStorage::ExpandFromPath(
+    const string& load_path) {
+  if (!IsGCSPath(load_path))
+    return nonstd::make_unexpected(
+        GenericError(make_error_code(errc::invalid_argument), "Invalid GCS path"));
+
+  if (!absl::EndsWith(load_path, kSummarySuffix))
+    return vector<string>{};
+
+  const auto [bucket_name, obj_path] = GetBucketPath(load_path);
+  regex re(absl::StrReplaceAll(obj_path, {{"summary", "[0-9]{4}"}}));
+  string_view prefix = absl::StripSuffix(obj_path, kSummarySuffix);
+
+  // Find snapshot shard files if we're loading DFS.
+  fb2::ProactorBase* proactor = shard_set->pool()->GetNextProactor();
+  auto paths = proactor->Await(
+      [&, &bucket_name = bucket_name]() -> io::Result<vector<string>, GenericError> {
+        vector<string> res;
+        cloud::GCS gcs(&creds_provider_, ctx_, proactor);
+        string cursor;
+
+        do {
+          error_code ec = gcs.List(
+              bucket_name, prefix, false, 500,
+              [&](const cloud::StorageListItem& item) {
+                std::smatch m;
+                string key{item.key};
+                if (std::regex_match(key, m, re)) {
+                  res.push_back(absl::StrCat(kGCSPrefix, bucket_name, "/", item.key));
+                }
+              },
+              &cursor);
+
+          if (ec) {
+            return nonstd::make_unexpected(ec);
+          }
+        } while (!cursor.empty());
+        return res;
+      });
+
+  if (!paths || paths->empty()) {
+    return nonstd::make_unexpected(
+        GenericError{std::make_error_code(std::errc::no_such_file_or_directory),
+                     "Cound not find DFS snapshot shard files"});
+  }
+
+  return *paths;
+}
+
+error_code GcsSnapshotStorage::CheckPath(const std::string& path) {
+  return {};
+}
+#endif
+
+// AZURE
+
+AzureSnapshotStorage::AzureSnapshotStorage() {
+  creds_provider_ = make_unique<util::cloud::azure::Credentials>();
+}
+
+AzureSnapshotStorage::~AzureSnapshotStorage() {
+  if (ctx_)
+    util::http::TlsClient::FreeContext(ctx_);
+}
+
+error_code AzureSnapshotStorage::Init(unsigned connect_ms) {
+  RETURN_ERROR(creds_provider_->Init(connect_ms));
+  if (creds_provider_->IsHttps()) {
+    ctx_ = util::http::TlsClient::CreateSslContext();
+  }
+
+  return {};
+}
+
+io::Result<std::pair<io::Sink*, uint8_t>, GenericError> AzureSnapshotStorage::OpenWriteFile(
+    const std::string& path) {
+  auto [container, key] = GetBucketPath(path);
+  cloud::azure::WriteFileOptions opts;
+  opts.creds_provider = creds_provider_.get();
+  opts.ssl_cntx = ctx_;
+
+  io::Result<io::WriteFile*> dest_res = cloud::azure::OpenWriteFile(container, key, opts);
+  if (!dest_res) {
+    return nonstd::make_unexpected(GenericError(dest_res.error(), "Could not open file"));
+  }
+
+  return std::pair(*dest_res, FileType::CLOUD);
+}
+
+io::ReadonlyFileOrError AzureSnapshotStorage::OpenReadFile(const std::string& path) {
+  if (!IsAzurePath(path))
+    return nonstd::make_unexpected(GenericError("Invalid azure path"));
+
+  auto [container, key] = GetBucketPath(path);
+  cloud::azure::ReadFileOptions opts;
+  opts.creds_provider = creds_provider_.get();
+  opts.ssl_cntx = ctx_;
+
+  return cloud::azure::OpenReadFile(container, key, opts);
+}
+
+io::Result<std::string, GenericError> AzureSnapshotStorage::LoadPath(string_view dir,
+                                                                     string_view dbfilename) {
+  if (dbfilename.empty())
+    return "";
+
+  auto [bucket_name, prefix] = GetBucketPath(dir);
+
+  // TODO: check if needed
+  if (!prefix.empty() && prefix.back() != '/') {
+    prefix += '/';
+  }
+
+  fb2::ProactorBase* proactor = shard_set->pool()->GetNextProactor();
+
+  io::Result<vector<SnapStat>, GenericError> keys =
+      proactor->Await([this, bucket_name = bucket_name,
+                       prefix = prefix]() -> io::Result<vector<SnapStat>, GenericError> {
+        cloud::azure::Storage azure(creds_provider_.get());
+        vector<SnapStat> res;
+        string cursor;
+        do {
+          error_code ec = azure.List(
+              bucket_name, prefix, false, 500,
+              [&res](const cloud::StorageListItem& item) {
+                res.emplace_back(string(item.key), item.mtime_ns);
+              },
+              &cursor);
+          if (ec)
+            return nonstd::make_unexpected(GenericError(ec, "Failed to list objects"));
+        } while (!cursor.empty());
+
+        return res;
+      });
+
+  if (!keys) {
+    return nonstd::make_unexpected(keys.error());
+  }
+
+  auto match_key = FindMatchingFile(prefix, dbfilename, *keys);
+  if (!match_key.empty()) {
+    return absl::StrCat(kAzurePrefix, bucket_name, "/", match_key);
+  }
+  return nonstd::make_unexpected(GenericError(
+      std::make_error_code(std::errc::no_such_file_or_directory), "Snapshot not found"));
+}
+
+io::Result<vector<string>, GenericError> AzureSnapshotStorage::ExpandFromPath(
+    const string& load_path) {
+  if (!IsAzurePath(load_path))
+    return nonstd::make_unexpected(
+        GenericError(make_error_code(errc::invalid_argument), "Invalid Azure path"));
+
+  if (!absl::EndsWith(load_path, kSummarySuffix))
+    return vector<string>{};
+
+  const auto [bucket_name, obj_path] = GetBucketPath(load_path);
+  regex re(absl::StrReplaceAll(obj_path, {{"summary", "[0-9]{4}"}}));
+  string_view prefix = absl::StripSuffix(obj_path, kSummarySuffix);
+
+  // Find snapshot shard files if we're loading DFS.
+  fb2::ProactorBase* proactor = shard_set->pool()->GetNextProactor();
+  auto paths = proactor->Await(
+      [&, &bucket_name = bucket_name]() -> io::Result<vector<string>, GenericError> {
+        vector<string> res;
+        cloud::azure::Storage azure(static_cast<cloud::azure::Credentials*>(creds_provider_.get()));
+        string cursor;
+        do {
+          error_code ec = azure.List(
+              bucket_name, prefix, false, 500,
+              [&](const cloud::StorageListItem& item) {
+                std::smatch m;
+                string key{item.key};
+                if (std::regex_match(key, m, re)) {
+                  res.push_back(absl::StrCat(kAzurePrefix, bucket_name, "/", item.key));
+                }
+              },
+              &cursor);
+
+          if (ec) {
+            return nonstd::make_unexpected(ec);
+          }
+        } while (!cursor.empty());
+
+        return res;
+      });
+
+  if (!paths || paths->empty()) {
+    return nonstd::make_unexpected(
+        GenericError{std::make_error_code(std::errc::no_such_file_or_directory),
+                     "Cound not find DFS snapshot shard files"});
+  }
+
+  return *paths;
+}
+
+error_code AzureSnapshotStorage::CheckPath(const std::string& path) {
+  return {};
+}
+
+AwsS3SnapshotStorage::AwsS3SnapshotStorage(const std::string& endpoint, bool https,
+                                           bool ec2_metadata, bool sign_payload) {
+#ifdef WITH_AWS
+  use_helio_ = absl::GetFlag(FLAGS_s3_use_helio_client);
+#else
+  use_helio_ = true;
+#endif
+
+  if (use_helio_) {
+    https_ = https;
+    if (!ec2_metadata) {
+      setenv("AWS_EC2_METADATA_DISABLED", "true", 0);
+    }
+    // AwsCredsProvider reads AWS_S3_ENDPOINT at ServiceEndpoint() time; setting it here lets
+    // callers override the default S3 endpoint (e.g. for MinIO tests).
+    if (!endpoint.empty()) {
+      string endpoint_url = absl::StrCat(https ? "https://" : "http://", endpoint);
+      setenv("AWS_S3_ENDPOINT", endpoint_url.c_str(), 1);
+    }
+    (void)sign_payload;  // Uploads in cloud::aws always use UNSIGNED-PAYLOAD.
+    LOG(INFO) << "Creating AWS S3 client (helio); https=" << std::boolalpha << https
+              << "; endpoint=" << endpoint;
+    return;
+  }
+
+#ifdef WITH_AWS
+  shard_set->pool()->GetNextProactor()->Await([&] {
+    util::aws::Init();
+    if (!ec2_metadata) {
+      setenv("AWS_EC2_METADATA_DISABLED", "true", 0);
+    }
+    // S3ClientConfiguration may request configuration and credentials from
+    // EC2 metadata so must be run in a proactor thread.
+    Aws::S3::S3ClientConfiguration s3_conf;
+    s3_conf.checksumConfig.responseChecksumValidation =
+        Aws::Client::ResponseChecksumValidation::WHEN_REQUIRED;
+
+    LOG(INFO) << "Creating AWS S3 client (sdk); region=" << s3_conf.region
+              << "; https=" << std::boolalpha << https << "; endpoint=" << endpoint;
+    if (!sign_payload) {
+      s3_conf.payloadSigningPolicy = Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never;
+    }
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_provider =
+        std::make_shared<aws::CredentialsProviderChain>();
+    // Pass a custom endpoint. If empty uses the S3 endpoint.
+    std::shared_ptr<Aws::S3::S3EndpointProviderBase> endpoint_provider =
+        std::make_shared<aws::S3EndpointProvider>(endpoint, https);
+    s3_ = std::make_shared<Aws::S3::S3Client>(credentials_provider, endpoint_provider, s3_conf);
+  });
+#endif
+}
+
+AwsS3SnapshotStorage::~AwsS3SnapshotStorage() {
+  if (ctx_) {
+    util::http::TlsClient::FreeContext(ctx_);
+  }
+}
+
+error_code AwsS3SnapshotStorage::Init(unsigned connect_ms) {
+  if (!use_helio_) {
+    return {};
+  }
+
+  RETURN_ERROR(creds_provider_.Init(connect_ms));
+
+  if (https_) {
+    ctx_ = util::http::TlsClient::CreateSslContext();
+    if (!ctx_) {
+      return make_error_code(std::errc::operation_not_permitted);
+    }
+  }
+  return {};
+}
+
+io::Result<std::pair<io::Sink*, uint8_t>, GenericError> AwsS3SnapshotStorage::OpenWriteFile(
+    const std::string& path) {
+  if (use_helio_) {
+    auto [bucket, key] = GetBucketPath(path);
+    cloud::aws::WriteFileOptions opts;
+    opts.creds_provider = &creds_provider_;
+    opts.ssl_cntx = ctx_;
+
+    io::Result<io::WriteFile*> dest_res = cloud::aws::OpenWriteFile(bucket, key, opts);
+    if (!dest_res) {
+      return nonstd::make_unexpected(GenericError(dest_res.error(), "Could not open file"));
+    }
+
+    return std::pair<io::Sink*, uint8_t>(*dest_res, FileType::CLOUD);
+  }
+
+#ifdef WITH_AWS
+  auto [bucket, key] = GetBucketPath(path);
+  fb2::ProactorBase* proactor = ProactorBase::me();
+
+  // We run S3 operations via a temporary fiber to avoid agressive stack consumption.
+  io::Result<std::pair<io::Sink*, uint8_t>, GenericError> result;
+  auto fb = proactor->LaunchFiber(
+      fb2::Launch::post, boost::context::fixedsize_stack{40 * 1024}, "open_s3_write", [&] {
+        io::Result<aws::S3WriteFile> file = aws::S3WriteFile::Open(bucket, key, s3_);
+        if (!file) {
+          result = nonstd::make_unexpected(GenericError(file.error(), "Failed to open write file"));
+          return;
+        }
+
+        aws::S3WriteFile* f = new aws::S3WriteFile(std::move(*file));
+        result = std::pair<io::Sink*, uint8_t>(f, FileType::CLOUD);
+      });
+  fb.Join();
+
+  return result;
+#else
+  ABSL_UNREACHABLE();
+#endif
+}
+
+io::ReadonlyFileOrError AwsS3SnapshotStorage::OpenReadFile(const std::string& path) {
+  VLOG(1) << "Opening S3 read file: " << path;
+  if (!IsS3Path(path))
+    return nonstd::make_unexpected(GenericError("Invalid S3 path"));
+
+  auto [bucket, key] = GetBucketPath(path);
+  if (use_helio_) {
+    cloud::aws::ReadFileOptions opts;
+    opts.creds_provider = &creds_provider_;
+    opts.ssl_cntx = ctx_;
+    return cloud::aws::OpenReadFile(bucket, key, opts);
+  }
+
+#ifdef WITH_AWS
+  return new aws::S3ReadFile(bucket, key, s3_);
+#else
+  ABSL_UNREACHABLE();
+#endif
+}
+
+io::Result<std::string, GenericError> AwsS3SnapshotStorage::LoadPath(std::string_view dir,
+                                                                     std::string_view dbfilename) {
+  if (dbfilename.empty())
+    return "";
+
+  auto [bucket_name, prefix] = GetBucketPath(dir);
+
+  LOG(INFO) << "Load snapshot: Searching for snapshot in S3 path: " << kS3Prefix << bucket_name
+            << "/" << prefix;
+  io::Result<std::vector<SnapStat>, GenericError> keys = ListObjects(bucket_name, prefix);
+  if (!keys) {
+    return nonstd::make_unexpected(keys.error());
+  }
+
+  auto match_key = FindMatchingFile(prefix, dbfilename, *keys);
+  if (!match_key.empty()) {
+    return absl::StrCat(kS3Prefix, bucket_name, "/", match_key);
+  }
+  return nonstd::make_unexpected(GenericError(
+      std::make_error_code(std::errc::no_such_file_or_directory), "Snapshot not found"));
+}
+
+io::Result<vector<string>, GenericError> AwsS3SnapshotStorage::ExpandFromPath(
+    const string& load_path) {
+  VLOG(1) << "Expanding S3 path: " << load_path;
+
+  optional<pair<string, string>> bucket_path = GetBucketPath(load_path);
+  if (!bucket_path) {
+    return nonstd::make_unexpected(
+        GenericError{std::make_error_code(std::errc::invalid_argument), "Invalid S3 path"});
+  }
+
+  auto& [bucket_name, obj_path] = *bucket_path;
+
+  // Limit prefix to objects in the same 'directory' as load_path.
+  const size_t pos = obj_path.find_last_of('/');
+  const std::string prefix = (pos == std::string_view::npos) ? "" : obj_path.substr(0, pos + 1);
+
+  io::Result<std::vector<SnapStat>, GenericError> list_res = ListObjects(bucket_name, prefix);
+  if (!list_res) {
+    return nonstd::make_unexpected(list_res.error());
+  }
+
+  vector<string> paths;
+  obj_path = EscapeRegex(obj_path);
+  const std::regex re(absl::StrReplaceAll(obj_path, {{"summary", "[0-9]{4}"}}));
+
+  for (const SnapStat& key : *list_res) {
+    std::smatch m;
+    DVLOG(1) << "Checking object key: " << key.name << " against regex: " << obj_path;
+
+    if (std::regex_match(key.name, m, re)) {
+      paths.push_back(std::string(kS3Prefix) + bucket_name + "/" + key.name);
+    }
+  }
+
+  if (paths.empty()) {
+    return nonstd::make_unexpected(
+        GenericError{std::make_error_code(std::errc::no_such_file_or_directory),
+                     "Cound not find DFS snapshot shard files"});
+  }
+
+  return paths;
+}
+
+error_code AwsS3SnapshotStorage::CheckPath(const std::string& path) {
+  return {};
+}
+
+io::Result<std::vector<AwsS3SnapshotStorage::SnapStat>, GenericError>
+AwsS3SnapshotStorage::ListObjects(std::string_view bucket_name, std::string_view prefix) {
+  VLOG(1) << "Listing S3 objects in bucket: " << bucket_name << " with prefix: " << prefix;
+
+  // Each list objects request has a 1000 object limit, so page through the
+  // objects if needed.
+  std::string continuation_token;
+  std::vector<SnapStat> keys;
+
+  // We use a random proactor because this function might be called from the main thread.
+  fb2::ProactorBase* proactor = shard_set->pool()->GetNextProactor();
+
+  if (use_helio_) {
+    string adjusted_prefix(prefix);
+    if (!prefix.empty() && prefix.back() != '/') {
+      adjusted_prefix.push_back('/');
+    }
+    string cursor;
+
+    do {
+      error_code ec = proactor->Await([&]() -> error_code {
+        cloud::aws::S3Storage s3(&creds_provider_, ctx_, proactor);
+        return s3.List(
+            bucket_name, adjusted_prefix, false, 1000,
+            [&keys](const cloud::StorageListItem& item) {
+              keys.emplace_back(string(item.key), item.mtime_ns);
+            },
+            &cursor);
+      });
+
+      if (ec) {
+        return nonstd::make_unexpected(GenericError(ec, "Failed list objects in S3 bucket"));
+      }
+    } while (!cursor.empty());
+
+    return keys;
+  }
+
+#ifdef WITH_AWS
+  do {
+    Aws::S3::Model::ListObjectsV2Request request;
+    request.SetBucket(std::string(bucket_name));
+    if (!prefix.empty()) {
+      // Ensure prefix ends with '/' to treat it as a directory-like namespace and avoid
+      // matching objects with similar prefix names.
+      if (prefix.back() == '/') {
+        request.SetPrefix(std::string(prefix));
+      } else {
+        request.SetPrefix(std::string(prefix) + '/');
+      }
+    }
+    request.SetDelimiter("/");
+
+    if (!continuation_token.empty()) {
+      request.SetContinuationToken(continuation_token);
+    }
+
+    Aws::S3::Model::ListObjectsV2Outcome outcome;
+
+    // We use fibers to wrap the s3 call to avoid stack exhaustion.
+    auto fb = proactor->LaunchFiber(
+        fb2::Launch::post, boost::context::fixedsize_stack{40 * 1024}, "list_s3",
+        [&, &bucket_name = bucket_name] { outcome = s3_->ListObjectsV2(request); });
+
+    fb.Join();
+
+    if (outcome.IsSuccess()) {
+      continuation_token = outcome.GetResult().GetNextContinuationToken();
+      for (const auto& object : outcome.GetResult().GetContents()) {
+        keys.emplace_back(object.GetKey(), object.GetLastModified().Millis());
+      }
+    } else if (outcome.GetError().GetExceptionName() == "PermanentRedirect") {
+      return nonstd::make_unexpected(
+          GenericError{"Failed list objects in S3 bucket: Permanent redirect; Ensure your "
+                       "configured AWS region matches the S3 bucket region"});
+    } else if (outcome.GetError().GetErrorType() == Aws::S3::S3Errors::NO_SUCH_BUCKET) {
+      return nonstd::make_unexpected(GenericError{
+          "Failed list objects in S3 bucket: Bucket not found: " + std::string(bucket_name)});
+    } else if (outcome.GetError().GetErrorType() == Aws::S3::S3Errors::INVALID_ACCESS_KEY_ID) {
+      return nonstd::make_unexpected(
+          GenericError{"Failed list objects in S3 bucket: Invalid access key ID"});
+    } else if (outcome.GetError().GetErrorType() == Aws::S3::S3Errors::SIGNATURE_DOES_NOT_MATCH) {
+      return nonstd::make_unexpected(
+          GenericError{"Failed list objects in S3 bucket: Invalid signature; Check your AWS "
+                       "credentials are correct"});
+    } else if (outcome.GetError().GetExceptionName() == "InvalidToken") {
+      return nonstd::make_unexpected(
+          GenericError{"Failed list objects in S3 bucket: Invalid token; Check your AWS "
+                       "credentials are correct"});
+    } else {
+      return nonstd::make_unexpected(GenericError{"Failed list objects in S3 bucket: " +
+                                                  outcome.GetError().GetExceptionName()});
+    }
+  } while (!continuation_token.empty());
+  return keys;
+#else
+  ABSL_UNREACHABLE();
+#endif
+}
+
+#ifdef __linux__
+io::Result<size_t> LinuxWriteWrapper::WriteSome(const iovec* v, uint32_t len) {
+  io::Result<size_t> res = lf_->WriteSome(v, len, offset_, 0);
+  if (res) {
+    offset_ += *res;
+  }
+
+  return res;
+}
+#endif
+
+void SubstituteFilenamePlaceholders(fs::path* filename, const FilenameSubstitutions& fns) {
+  *filename = absl::StrReplaceAll(
+      filename->string(),
+      {{"{Y}", fns.year}, {"{m}", fns.month}, {"{d}", fns.day}, {"{timestamp}", fns.ts}});
+}
+
+}  // namespace detail
+}  // namespace dfly

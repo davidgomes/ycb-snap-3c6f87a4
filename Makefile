@@ -1,0 +1,69 @@
+BUILD_ARCH := $(shell uname -m)
+RELEASE_NAME := "dragonfly-${BUILD_ARCH}"
+HELIO_RELEASE_FLAGS = -DHELIO_RELEASE_FLAGS="-g"
+HELIO_USE_STATIC_LIBS = ON
+HELIO_OPENSSL_USE_STATIC_LIBS = ON
+HELIO_ENABLE_GIT_VERSION = ON
+HELIO_WITH_UNWIND ?= OFF
+RELEASE_DIR=build-release
+WITH_SIMSIMD ?= ON
+
+# Some distributions (old fedora) have incorrect dependencies for crypto
+# so we add -lz for them.
+LINKER_FLAGS=-lz
+
+# equivalent to: if $(uname_m) == x86_64 || $(uname_m) == amd64
+# Override HELIO_MARCH_OPT via environment: make HELIO_MARCH_OPT="-march=native"
+ifneq (, $(filter $(BUILD_ARCH),x86_64 amd64))
+HELIO_MARCH_OPT ?= -march=core2 -msse4.1 -mpopcnt -mtune=skylake
+endif
+
+# For release builds we link statically libstdc++ and libgcc. Currently,
+# all the release builds are performed by gcc.
+LINKER_FLAGS += -static-libstdc++ -static-libgcc
+
+# Optional ASAN support: make ASAN=1 release
+ifdef ASAN
+SANITIZE_COMPILE_FLAGS = -fsanitize=address -Wno-maybe-uninitialized
+SANITIZE_LINK_FLAGS = -fsanitize=address
+endif
+
+HELIO_FLAGS = -DHELIO_RELEASE_FLAGS="-g" \
+			  -DCMAKE_CXX_FLAGS="$(SANITIZE_COMPILE_FLAGS)" \
+			  -DCMAKE_EXE_LINKER_FLAGS="$(LINKER_FLAGS) $(SANITIZE_LINK_FLAGS)" \
+              -DBoost_USE_STATIC_LIBS=$(HELIO_USE_STATIC_LIBS) \
+              -DOPENSSL_USE_STATIC_LIBS=$(HELIO_OPENSSL_USE_STATIC_LIBS) \
+              -DENABLE_GIT_VERSION=$(HELIO_ENABLE_GIT_VERSION) \
+              -DWITH_SIMSIMD=$(WITH_SIMSIMD) \
+              -DWITH_UNWIND=$(HELIO_WITH_UNWIND) -DMARCH_OPT="$(HELIO_MARCH_OPT)"
+
+.PHONY: default
+
+configure:
+	cmake -L -B $(RELEASE_DIR) -DCMAKE_BUILD_TYPE=Release -GNinja $(HELIO_FLAGS)
+
+build:
+	cd $(RELEASE_DIR); \
+	ninja dfly_bench dragonfly && ldd dragonfly
+
+package:
+	cd $(RELEASE_DIR); \
+	tar cvfz $(RELEASE_NAME)-dbgsym.tar.gz dragonfly ../LICENSE.md; \
+	objcopy \
+		--remove-section=".debug_*" \
+		--remove-section="!.debug_line" \
+		--compress-debug-sections \
+		dragonfly \
+		$(RELEASE_NAME); \
+	tar cvfz $(RELEASE_NAME).tar.gz $(RELEASE_NAME) ../LICENSE.md; \
+	objcopy \
+		--remove-section=".debug_*" \
+		--remove-section="!.debug_line" \
+		--compress-debug-sections \
+		dfly_bench \
+		dfly_bench-$(BUILD_ARCH); \
+	tar cvfz dfly_bench-$(BUILD_ARCH).tar.gz dfly_bench-$(BUILD_ARCH)
+
+release: configure build
+
+default: release

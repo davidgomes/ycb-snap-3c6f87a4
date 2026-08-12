@@ -1,0 +1,1301 @@
+"""
+Test compatibility with the redis-py client search module.
+Search correctness should be ensured with unit tests.
+"""
+
+import copy
+
+import numpy as np
+from redis.commands.search.field import TextField, NumericField, TagField, VectorField, GeoField
+
+try:
+    from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+except ModuleNotFoundError:
+    from redis.commands.search.index_definition import IndexDefinition, IndexType
+from redis.commands.search.query import Query
+
+from . import dfly_args
+from .instance import DflyInstanceFactory
+from .seeder import HnswSearchSeeder
+from .utility import *
+
+TEST_DATA = [
+    {
+        "title": "First article",
+        "content": "Long description",
+        "views": 100,
+        "topic": "world, science",
+    },
+    {
+        "title": "Second article",
+        "content": "Small text",
+        "views": 200,
+        "topic": "national, policits",
+    },
+    {
+        "title": "Third piece",
+        "content": "Brief description",
+        "views": 300,
+        "topic": "health, lifestyle",
+    },
+    {
+        "title": "Last piece",
+        "content": "Interesting text",
+        "views": 400,
+        "topic": "world, business",
+    },
+]
+
+BASIC_TEST_SCHEMA = [
+    TextField("title"),
+    TextField("content"),
+    NumericField("views"),
+    TagField("topic"),
+]
+
+
+def fix_schema_naming(itype: IndexType, idx_list: list):
+    """Copy all schema fields and for json types, change name to json $.path and add alias"""
+    if itype == IndexType.HASH:
+        return idx_list
+    copies = [copy.copy(idx) for idx in idx_list]
+    for idx in copies:
+        idx.as_name = idx.name
+        idx.name = "$." + idx.name
+    return copies
+
+
+async def index_test_data(async_client: aioredis.Redis, itype: IndexType, prefix=""):
+    for i, e in enumerate(TEST_DATA):
+        if itype == IndexType.HASH:
+            await async_client.hset(prefix + str(i), mapping=e)
+        else:
+            await async_client.json().set(prefix + str(i), "$", e)
+
+
+def doc_to_str(index_type, doc):
+    if not type(doc) is dict:
+        doc = doc.__dict__
+
+    if "json" in doc:
+        return json.dumps(json.loads(doc["json"]), sort_keys=True)
+
+    if index_type == IndexType.JSON:
+        return json.dumps(doc, sort_keys=True)
+
+    doc = dict(doc)  # copy to remove fields
+    doc.pop("id", None)
+    doc.pop("payload", None)
+
+    return "//".join(sorted(doc))
+
+
+def contains_test_data(itype, res, td_indices):
+    if res.total != len(td_indices):
+        return False
+
+    docset = {doc_to_str(itype, doc) for doc in res.docs}
+
+    for td_entry in (TEST_DATA[tdi] for tdi in td_indices):
+        if not doc_to_str(itype, td_entry) in docset:
+            return False
+
+    return True
+
+
+@dfly_args({"proactor_threads": 4})
+async def test_management(async_client: aioredis.Redis):
+    SCHEMA_1 = [TextField("f1"), NumericField("f2", sortable=True)]
+    SCHEMA_2 = [
+        NumericField("f3", no_index=True, sortable=True),
+        TagField("f4"),
+        VectorField(
+            "f5",
+            algorithm="HNSW",
+            attributes={"TYPE": "FLOAT32", "DIM": 1, "DISTANCE_METRIC": "L2", "INITIAL_CAP": 100},
+        ),
+    ]
+
+    i1 = async_client.ft("i1")
+    i2 = async_client.ft("i2")
+
+    await i1.create_index(SCHEMA_1, definition=IndexDefinition(prefix=["p1"]))
+    await i2.create_index(SCHEMA_2, definition=IndexDefinition(prefix=["p2"]))
+
+    # Fill indices with 10 and 15 docs respectively
+    for i in range(10):
+        await async_client.hset(f"p1-{i}", mapping={"f1": "ok", "f2": 11})
+    for i in range(15):
+        await async_client.hset(
+            f"p2-{i}",
+            mapping={"f3": 12, "f4": "hmm", "f5": np.array(0).astype(np.float32).tobytes()},
+        )
+
+    assert sorted(await async_client.execute_command("FT._LIST")) == ["i1", "i2"]
+
+    i1info = await i1.info()
+    assert i1info["index_definition"] == [
+        "key_type",
+        "HASH",
+        "prefixes",
+        ["p1"],
+        "default_language",
+        "english",
+        "default_score",
+        1,
+    ]
+    assert i1info["num_docs"] == 10
+    assert sorted(i1info["attributes"]) == [
+        ["identifier", "f1", "attribute", "f1", "type", "TEXT"],
+        [
+            "identifier",
+            "f2",
+            "attribute",
+            "f2",
+            "type",
+            "NUMERIC",
+            "SORTABLE",
+            "blocksize",
+            "10000",
+        ],
+    ]
+
+    i2info = await i2.info()
+    assert i2info["index_definition"] == [
+        "key_type",
+        "HASH",
+        "prefixes",
+        ["p2"],
+        "default_language",
+        "english",
+        "default_score",
+        1,
+    ]
+    assert i2info["num_docs"] == 15
+    assert sorted(i2info["attributes"]) == [
+        [
+            "identifier",
+            "f3",
+            "attribute",
+            "f3",
+            "type",
+            "NUMERIC",
+            "NOINDEX",
+            "SORTABLE",
+            "blocksize",
+            "10000",
+        ],
+        ["identifier", "f4", "attribute", "f4", "type", "TAG", "SEPARATOR", ","],
+        [
+            "identifier",
+            "f5",
+            "attribute",
+            "f5",
+            "type",
+            "VECTOR",
+            "algorithm",
+            "HNSW",
+            "data_type",
+            "FLOAT32",
+            "dim",
+            "1",
+            "distance_metric",
+            "L2",
+            "M",
+            "16",
+            "ef_construction",
+            "200",
+        ],
+    ]
+
+    await i1.dropindex()
+    await i2.dropindex()
+
+    assert await async_client.execute_command("FT._LIST") == []
+
+
+@dfly_args({"proactor_threads": 4})
+@pytest.mark.parametrize("index_type", [IndexType.HASH, IndexType.JSON])
+async def test_basic(async_client: aioredis.Redis, index_type):
+    i1 = async_client.ft("i1-" + str(index_type))
+
+    await i1.create_index(
+        fix_schema_naming(index_type, BASIC_TEST_SCHEMA),
+        definition=IndexDefinition(index_type=index_type),
+    )
+    await index_test_data(async_client, index_type)
+
+    res = await i1.search("article")
+    assert contains_test_data(index_type, res, [0, 1])
+
+    res = await i1.search("text")
+    assert contains_test_data(index_type, res, [1, 3])
+
+    res = await i1.search("brief piece")
+    assert contains_test_data(index_type, res, [2])
+
+    res = await i1.search("@title:(article|last) @content:text")
+    assert contains_test_data(index_type, res, [1, 3])
+
+    res = await i1.search("@views:[200 300]")
+    assert contains_test_data(index_type, res, [1, 2])
+
+    res = await i1.search("@views:[0 150] | @views:[350 500]")
+    assert contains_test_data(index_type, res, [0, 3])
+
+    res = await i1.search("@topic:{world}")
+    assert contains_test_data(index_type, res, [0, 3])
+
+    res = await i1.search("@topic:{business}")
+    assert contains_test_data(index_type, res, [3])
+
+    res = await i1.search("@topic:{world | national}")
+    assert contains_test_data(index_type, res, [0, 1, 3])
+
+    res = await i1.search("@topic:{science | health}")
+    assert contains_test_data(index_type, res, [0, 2])
+
+    await i1.dropindex()
+
+
+@dfly_args({"proactor_threads": 4})
+async def test_big_json(async_client: aioredis.Redis):
+    i1 = async_client.ft("i1")
+    gen_arr = lambda base: {"blob": [base + str(i) for i in range(100)]}
+
+    await i1.create_index(
+        [TextField(name="$.blob", as_name="items")],
+        definition=IndexDefinition(index_type=IndexType.JSON),
+    )
+
+    await async_client.json().set("k1", "$", gen_arr("alex"))
+    await async_client.json().set("k2", "$", gen_arr("bob"))
+
+    res = await i1.search("alex55")
+    assert res.docs[0].id == "k1"
+
+    res = await i1.search("bob77")
+    assert res.docs[0].id == "k2"
+
+    res = await i1.search("alex11 | bob22")
+    assert res.total == 2
+
+    await i1.dropindex()
+
+
+async def knn_query(idx, query, vector):
+    params = {"vec": np.array(vector, dtype=np.float32).tobytes()}
+    result = await idx.search(query, params)
+    return {doc["id"] for doc in result.docs}
+
+
+async def knn_query_with_limit(idx, query, vector, limit):
+    params = {"vec": np.array(vector, dtype=np.float32).tobytes()}
+    result = await idx.search(Query(query).paging(0, limit), params)
+    return {doc["id"] for doc in result.docs}
+
+
+@dfly_args({"proactor_threads": 4})
+@pytest.mark.parametrize("index_type", [IndexType.HASH, IndexType.JSON])
+@pytest.mark.parametrize("algo_type", ["FLAT", "HNSW"])
+async def test_knn(async_client: aioredis.Redis, index_type, algo_type):
+    i2 = async_client.ft("i2-" + str(index_type))
+
+    vector_field = VectorField(
+        "pos",
+        algorithm=algo_type,
+        attributes={
+            "TYPE": "FLOAT32",
+            "DIM": 1,
+            "DISTANCE_METRIC": "L2",
+            "INITIAL_CAP": 100,
+        },
+    )
+
+    await i2.create_index(
+        fix_schema_naming(index_type, [TagField("even"), vector_field]),
+        definition=IndexDefinition(index_type=index_type),
+    )
+
+    pipe = async_client.pipeline()
+    for i in range(100):
+        even = "yes" if i % 2 == 0 else "no"
+        if index_type == IndexType.HASH:
+            pos = np.array(i, dtype=np.float32).tobytes()
+            pipe.hset(f"k{i}", mapping={"even": even, "pos": pos})
+        else:
+            pipe.json().set(f"k{i}", "$", {"even": even, "pos": [float(i)]})
+    await pipe.execute()
+
+    assert await knn_query(i2, "* => [KNN 3 @pos $vec]", [50.0]) == {"k49", "k50", "k51"}
+
+    assert await knn_query(i2, "@even:{yes} => [KNN 3 @pos $vec]", [20.0]) == {"k18", "k20", "k22"}
+
+    assert await knn_query(i2, "@even:{no} => [KNN 4 @pos $vec]", [30.0]) == {
+        "k27",
+        "k29",
+        "k31",
+        "k33",
+    }
+
+    assert await knn_query(i2, "@even:{yes} => [KNN 3 @pos $vec]", [10.0] == {"k8", "k10", "k12"})
+    await i2.dropindex()
+
+
+NUM_DIMS = 10
+NUM_POINTS = 100
+
+
+@dfly_args({"proactor_threads": 4})
+@pytest.mark.parametrize("index_type", [IndexType.HASH, IndexType.JSON])
+@pytest.mark.parametrize("algo_type", ["HNSW", "FLAT"])
+async def test_multidim_knn(async_client: aioredis.Redis, index_type, algo_type):
+    vector_field = VectorField(
+        "pos",
+        algorithm=algo_type,
+        attributes={
+            "TYPE": "FLOAT32",
+            "DIM": NUM_DIMS,
+            "DISTANCE_METRIC": "L2",
+        },
+    )
+
+    i3 = async_client.ft("i3-" + str(index_type))
+    await i3.create_index(
+        fix_schema_naming(index_type, [vector_field]),
+        definition=IndexDefinition(index_type=index_type),
+    )
+
+    # Use fixed seed for deterministic results
+    np.random.seed(42)
+
+    def rand_point():
+        return np.random.uniform(0, 10, NUM_DIMS).astype(np.float32)
+
+    # Generate points and send to DF
+    points = [rand_point() for _ in range(NUM_POINTS)]
+    points = list(enumerate(points))
+
+    pipe = async_client.pipeline(transaction=False)
+    for i, point in points:
+        if index_type == IndexType.HASH:
+            pipe.hset(f"k{i}", mapping={"pos": point.tobytes()})
+        else:
+            pipe.json().set(f"k{i}", "$", {"pos": point.tolist()})
+    await pipe.execute()
+
+    # Run 10 random queries
+    for _ in range(10):
+        center = rand_point()
+        limit = np.random.randint(
+            1, NUM_POINTS // 10 + 1
+        )  # +1 because numpy's randint is exclusive
+
+        expected_ids = [
+            f"k{i}"
+            for i, point in sorted(points, key=lambda p: np.linalg.norm(center - p[1]))[:limit]
+        ]
+
+        if algo_type == "HNSW":
+            # We need to search all points because results can be different between expected_ids that
+            # distance is  calculated on all points and hnsw which is approximate greedy search
+            knn_limit = NUM_POINTS
+            got_ids = await knn_query_with_limit(
+                i3, f"* => [KNN {knn_limit} @pos $vec]", center, limit
+            )
+        else:
+            got_ids = await knn_query(i3, f"* => [KNN {limit} @pos $vec]", center)
+
+        assert set(expected_ids) == set(got_ids)
+
+    await i3.dropindex()
+
+
+@dfly_args({"proactor_threads": 4})
+@pytest.mark.parametrize("index_type", [IndexType.HASH, IndexType.JSON])
+@pytest.mark.parametrize("algo_type", ["HNSW", "FLAT"])
+async def test_vector_empty_and_update(async_client: aioredis.Redis, index_type, algo_type):
+    """KNN on an empty index returns no results; overwriting a vector moves the doc."""
+    idx = async_client.ft("vec_ops_" + str(index_type))
+    vector_field = VectorField(
+        "pos",
+        algorithm=algo_type,
+        attributes={"TYPE": "FLOAT32", "DIM": 1, "DISTANCE_METRIC": "L2"},
+    )
+    await idx.create_index(
+        fix_schema_naming(index_type, [vector_field]),
+        definition=IndexDefinition(index_type=index_type),
+    )
+
+    async def set_pos(key, val):
+        if index_type == IndexType.HASH:
+            await async_client.hset(
+                key, mapping={"pos": np.array([val], dtype=np.float32).tobytes()}
+            )
+        else:
+            await async_client.json().set(key, "$", {"pos": [val]})
+
+    # Empty index: KNN must return no results, not crash.
+    assert await knn_query(idx, "* => [KNN 5 @pos $vec]", [0.0]) == set()
+
+    # Populate docs on the axis; k_target sits at 0.0.
+    await set_pos("k_target", 0.0)
+    for i in range(1, 10):
+        await set_pos(f"k{i}", float(i * 100))
+
+    # Before update: k_target is nearest to 0.0.
+    assert "k_target" in await knn_query(idx, "* => [KNN 1 @pos $vec]", [0.0])
+
+    # Overwrite k_target's vector to 1000.0 — it must move in the index.
+    await set_pos("k_target", 1000.0)
+    assert "k_target" in await knn_query(idx, "* => [KNN 1 @pos $vec]", [1000.0])
+    assert "k_target" not in await knn_query(idx, "* => [KNN 1 @pos $vec]", [0.0])
+
+    await idx.dropindex()
+
+
+@pytest.mark.parametrize("document_type", ["HASH", "JSON"])
+@pytest.mark.parametrize("start_threads, reload_threads", [(4, 4), (4, 2), (2, 4)])
+async def test_hnsw_reload_different_threads(
+    df_factory: DflyInstanceFactory, document_type, start_threads, reload_threads
+):
+    """HNSW KNN must still work after SAVE + restart with a different thread count."""
+    dbfilename = f"hnsw_threads_{tmp_file_name()}"
+    inst = df_factory.create(proactor_threads=start_threads, dbfilename=dbfilename)
+    inst.start()
+    client = inst.client()
+
+    seeder = HnswSearchSeeder(num_initial_docs=50, num_dims=8, document_type=document_type)
+    await seeder.create_index(client)
+    await seeder.seed_initial_docs(client)
+
+    query_vec = seeder._make_embedding().tobytes()
+    k = 10
+    _, before_ids = await seeder._search_knn(client, query_vec, k)
+
+    await client.execute_command("SAVE")
+    inst.stop()
+
+    inst2 = df_factory.create(proactor_threads=reload_threads, dbfilename=dbfilename)
+    inst2.start()
+    client2 = inst2.client()
+    await wait_available_async(client2)
+
+    assert await client2.dbsize() == seeder.num_initial_docs
+    _, after_ids = await seeder._search_knn(client2, query_vec, k)
+
+    # HNSW is approximate, so the top-k may shift across restarts. Docs that
+    # appear only post-reload are approximation noise — what matters for
+    # correctness is that every doc previously in top-k is still indexed. For
+    # each one missing from the reloaded top-k, confirm it with a TAG-filtered
+    # KNN (bypasses approximation).
+    for key in before_ids - after_ids:
+        assert await seeder._search_knn_filtered(
+            client2, query_vec, key, k=1
+        ), f"doc {key} lost from index after reload"
+
+
+@dfly_args({"proactor_threads": 4})
+async def test_knn_score_return(async_client: aioredis.Redis):
+    i1 = async_client.ft("i1")
+    vector_field = VectorField(
+        "pos",
+        algorithm="FLAT",
+        attributes={
+            "DIM": 1,
+            "DISTANCE_METRIC": "L2",
+            "INITIAL_CAP": 100,
+        },
+    )
+
+    await i1.create_index(
+        [vector_field],
+        definition=IndexDefinition(index_type=IndexType.HASH),
+    )
+
+    pipe = async_client.pipeline()
+    for i in range(100):
+        pipe.hset(f"k{i}", mapping={"pos": np.array(i, dtype=np.float32).tobytes()})
+    await pipe.execute()
+
+    params = {"vec": np.array([1.0], dtype=np.float32).tobytes()}
+    result = await i1.search("* => [KNN 3 @pos $vec AS distance]", params)
+
+    assert result.total == 3
+    assert [d["distance"] for d in result.docs] == ["0", "1", "1"]
+
+    result = await i1.search(
+        Query("* => [KNN 3 @pos $vec AS distance]").return_fields("pos"), params
+    )
+    assert not any(hasattr(d, "distance") for d in result.docs)
+
+    await i1.dropindex()
+
+
+@dfly_args({"proactor_threads": 4, "dbfilename": "search-data"})
+async def test_index_persistence(df_server):
+    client = aioredis.Redis(port=df_server.port)
+
+    # Build two indices and fill them with data
+
+    SCHEMA_1 = [TextField("title"), NumericField("views", sortable=True), TagField("topic")]
+    SCHEMA_2 = [
+        TextField("name"),
+        NumericField("age", sortable=True),
+        TagField("job", separator=":", case_sensitive=True),
+        VectorField(
+            "pos",
+            algorithm="HNSW",
+            attributes={"TYPE": "FLOAT32", "DIM": 1, "DISTANCE_METRIC": "L2", "INITIAL_CAP": 100},
+        ),
+    ]
+
+    i1 = client.ft("i1")
+    await i1.create_index(
+        fix_schema_naming(IndexType.JSON, SCHEMA_1),
+        stopwords=["interesting", "stopwords"],
+        definition=IndexDefinition(index_type=IndexType.JSON, prefix=["blog-"]),
+    )
+
+    i2 = client.ft("i2")
+    await i2.create_index(
+        fix_schema_naming(IndexType.HASH, SCHEMA_2),
+        definition=IndexDefinition(index_type=IndexType.HASH, prefix=["people-"]),
+    )
+
+    for i in range(150):
+        await client.json().set(
+            f"blog-{i}",
+            ".",
+            {"title": f"Post {i}", "views": i * 10, "topic": "even" if i % 2 == 0 else "odd"},
+        )
+
+    for i in range(200):
+        await client.hset(
+            f"people-{i}",
+            mapping={
+                "name": f"Name {i}",
+                "age": i,
+                "job": "newsagent" if i % 2 == 0 else "writer",
+                "pos": np.array(i / 200.0).astype(np.float32).tobytes(),
+            },
+        )
+
+    info_1 = await i1.info()
+    info_2 = await i2.info()
+    assert info_1["num_docs"] == 150
+    assert info_2["num_docs"] == 200
+
+    # stop & start server
+
+    df_server.stop()
+    df_server.start()
+
+    client = aioredis.Redis(port=df_server.port)
+    await wait_available_async(client)
+
+    # Check indices were loaded
+
+    assert {i.decode() for i in await client.execute_command("FT._LIST")} == {"i1", "i2"}
+
+    i1 = client.ft("i1")
+    i2 = client.ft("i2")
+
+    info_1_new = await i1.info()
+    info_2_new = await i2.info()
+
+    def build_fields_set(info):
+        fields = set()
+        for field in info["attributes"]:
+            fields.add(tuple(field))
+        return fields
+
+    assert build_fields_set(info_1) == build_fields_set(info_1_new)
+    assert build_fields_set(info_2) == build_fields_set(info_2_new)
+
+    assert info_1["index_definition"] == info_1_new["index_definition"]
+    assert info_2["index_definition"] == info_2_new["index_definition"]
+
+    assert info_1["num_docs"] == info_1_new["num_docs"]
+    assert info_2["num_docs"] == info_2_new["num_docs"]
+
+    # Check basic queries run correctly
+
+    assert (await i1.search("@views:[0 90]")).total == 10
+    assert (await i1.search("@views:[100 190] @topic:{even}")).total == 5
+
+    assert (await i2.search("@job:{writer}")).total == 100
+    assert (await i2.search("@job:{writer} @age:[100 200]")).total == 50
+    assert (await i2.search("@job:{wRiTeR}")).total == 0
+
+    # Check fields are sortable
+    assert (await i1.search(Query("*").sort_by("views", asc=True).paging(0, 1))).docs[0][
+        "id"
+    ] == "blog-0"
+    assert (await i2.search(Query("*").sort_by("age", asc=False).paging(0, 1))).docs[0][
+        "age"
+    ] == "199"
+
+    # Check stopwords were loaded
+    await client.json().set("blog-sw1", ".", {"title": "some stopwords"})
+    assert (await i1.search("some")).total == 1
+    assert (await i1.search("stopwords")).total == 0
+
+    await i1.dropindex()
+    await i2.dropindex()
+
+
+@dfly_args({"proactor_threads": 4})
+def test_redis_om(df_server):
+    try:
+        import redis_om
+    except ModuleNotFoundError:
+        skip_if_not_in_github("redis-om python library not installed")
+        raise
+
+    client = redis.Redis(port=df_server.port, decode_responses=True)
+
+    class TestCar(redis_om.HashModel, index=True):
+        producer: str = redis_om.Field(index=True)
+        description: str = redis_om.Field(index=True, full_text_search=True)
+        speed: int = redis_om.Field(index=True, sortable=True)
+
+        class Meta:
+            database = client
+
+    def extract_producers(testset):
+        return sorted([car.producer for car in testset])
+
+    def make_car(producer, description, speed):
+        return TestCar(producer=producer, description=description, speed=speed)
+
+    CARS = [
+        make_car("BMW", "Very fast and elegant", 200),
+        make_car("Audi", "Fast & stylish", 170),
+        make_car("Mercedes", "High class but expensive!", 150),
+        make_car("Honda", "Good allrounder with flashy looks", 120),
+        make_car("Peugeot", "Good allrounder for the whole family", 100),
+        make_car("Mini", "Fashinable cooper for the big city", 80),
+        make_car("John Deere", "It's not a car, it's a tractor in fact!", 50),
+    ]
+
+    for car in CARS:
+        car.save()
+
+    redis_om.Migrator().run()
+
+    # Wait for async indexing of existing documents to complete
+    for index_name in client.execute_command("FT._LIST"):
+        timeout = time.time() + 10
+        while int(client.ft(index_name).info()["indexing"]) == 1:
+            if time.time() > timeout:
+                raise TimeoutError(f"Indexing {index_name} did not complete within 10 seconds")
+            time.sleep(0.05)
+
+    # Get all cars
+    assert extract_producers(TestCar.find().all()) == extract_producers(CARS)
+
+    # Get all cars of a specific producer
+    assert extract_producers(
+        TestCar.find((TestCar.producer == "Peugeot") | (TestCar.producer == "Mini"))
+    ) == ["Mini", "Peugeot"]
+
+    # Get only fast cars
+    assert extract_producers(TestCar.find(TestCar.speed >= 150).all()) == extract_producers(
+        [c for c in CARS if c.speed >= 150]
+    )
+
+    # Get only slow cars
+    assert extract_producers(TestCar.find(TestCar.speed < 100).all()) == extract_producers(
+        [c for c in CARS if c.speed < 100]
+    )
+
+    # Get all cars which are fast based on description
+    assert extract_producers(TestCar.find(TestCar.description % "fast")) == ["Audi", "BMW"]
+
+    # Get all cars which are not marked as extensive by descriptions
+    assert extract_producers(
+        TestCar.find(~(TestCar.description % "expensive")).all()
+    ) == extract_producers([c for c in CARS if c.producer != "Mercedes"])
+
+    # Get a fast allrounder
+    assert extract_producers(
+        TestCar.find((TestCar.speed >= 110) & (TestCar.description % "allrounder"))
+    ) == ["Honda"]
+
+    # What's the slowest car
+    assert extract_producers([TestCar.find().sort_by("speed").first()]) == ["John Deere"]
+
+    # What's the fastest car
+    assert extract_producers([TestCar.find().sort_by("-speed").first()]) == ["BMW"]
+
+    for index_name in client.execute_command("FT._LIST"):
+        client.ft(index_name).dropindex()
+
+
+@dfly_args({"proactor_threads": 4, "dbfilename": "synonym-persistence"})
+async def test_synonym_persistence(df_server):
+    """Test that synonyms are persisted across server restarts"""
+    client = aioredis.Redis(port=df_server.port)
+
+    # Create index and add documents
+    idx = client.ft("idx")
+    await idx.create_index([TextField("txt")], definition=IndexDefinition(prefix=["d:"]))
+    await client.hset("d:1", mapping={"txt": "car"})
+    await client.hset("d:2", mapping={"txt": "automobile"})
+
+    # Add synonyms and verify they work
+    await client.execute_command("FT.SYNUPDATE", "idx", "grp", "car", "automobile")
+    assert (await idx.search(Query("car"))).total == 2
+
+    # Restart server
+    df_server.stop()
+    df_server.start()
+    client = aioredis.Redis(port=df_server.port)
+    await wait_available_async(client)
+
+    idx = client.ft("idx")
+
+    # Verify synonyms still work after restart
+    assert (await idx.search(Query("car"))).total == 2
+
+
+@dfly_args({"proactor_threads": 4})
+async def test_ft_info_concurrent_create_drop(df_server):
+    """
+    Test that FT.INFO doesn't crash when called concurrently with FT.CREATE/FT.DROPINDEX.
+    The bug was a DCHECK failure when some shards have the index while others don't.
+    """
+    ITERATIONS = 500
+
+    async def create_drop_worker(port):
+        client = aioredis.Redis(port=port)
+        for _ in range(ITERATIONS):
+            try:
+                await client.execute_command(
+                    "FT.CREATE", "idx", "ON", "HASH", "SCHEMA", "f", "TEXT"
+                )
+            except Exception:
+                pass  # Index might already exist
+            try:
+                await client.execute_command("FT.DROPINDEX", "idx")
+            except Exception:
+                pass  # Index might not exist
+        await client.close()
+
+    async def info_worker(port):
+        client = aioredis.Redis(port=port)
+        for _ in range(ITERATIONS):
+            try:
+                await client.execute_command("FT.INFO", "idx")
+            except Exception:
+                pass  # Index might not exist - that's OK
+        await client.close()
+
+    # Run multiple workers concurrently with separate connections
+    port = df_server.port
+    tasks = [
+        create_drop_worker(port),
+        create_drop_worker(port),
+        create_drop_worker(port),
+        create_drop_worker(port),
+        create_drop_worker(port),
+        info_worker(port),
+        info_worker(port),
+        info_worker(port),
+        info_worker(port),
+        info_worker(port),
+    ]
+
+    # If there's a crash, this will fail
+    await asyncio.gather(*tasks)
+
+    # Verify server is still alive
+    client = aioredis.Redis(port=port)
+    assert await client.ping()
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    "master_threads,replica_threads",
+    [
+        (4, 4),  # Same thread count
+        (4, 3),  # Master has more threads
+        (3, 4),  # Replica has more threads
+    ],
+)
+async def test_replicate_all_index_types(df_factory, master_threads, replica_threads):
+    """
+    Test that all index types (text, numeric, tag, geo, and vector) can be replicated
+    via full sync rebuild on the replica side. Uses 10000 elements for stress testing.
+    Tests with different thread counts between master and replica to ensure proper
+    shard handling during replication.
+    """
+    from .instance import DflyInstanceFactory
+
+    master = df_factory.create(proactor_threads=master_threads)
+    # logbuflevel=-1 forces glog to flush every log line immediately, so INFO messages
+    # are visible in the log file when we read it (before the process exits).
+    replica = df_factory.create(proactor_threads=replica_threads, logbuflevel=-1)
+
+    df_factory.start_all([master, replica])
+
+    c_master = master.client()
+    c_replica = replica.client()
+
+    # Create an index with all field types on master
+    await c_master.execute_command(
+        "FT.CREATE",
+        "all_types_idx",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "item:",
+        "SCHEMA",
+        "name",
+        "TEXT",
+        "price",
+        "NUMERIC",
+        "SORTABLE",
+        "category",
+        "TAG",
+        "location",
+        "GEO",
+        "embedding",
+        "VECTOR",
+        "HNSW",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "2",
+        "DISTANCE_METRIC",
+        "L2",
+    )
+
+    # Insert 10000 test documents
+    NUM_DOCS = 10000
+    pipe = c_master.pipeline(transaction=False)
+    for i in range(NUM_DOCS):
+        lat = 37.0 + (i % 100) * 0.01  # Varying latitudes
+        lon = -122.0 + (i // 100) * 0.01  # Varying longitudes
+        category = "electronics" if i % 3 == 0 else ("clothing" if i % 3 == 1 else "food")
+        embedding = np.array([float(i % 100), float(i // 100)], dtype=np.float32).tobytes()
+        pipe.hset(
+            f"item:{i}",
+            mapping={
+                "name": f"Product {i}",
+                "price": i,
+                "category": category,
+                "location": f"{lon},{lat}",
+                "embedding": embedding,
+            },
+        )
+        # Execute in batches to avoid memory issues
+        if i % 1000 == 999:
+            await pipe.execute()
+            pipe = c_master.pipeline(transaction=False)
+    await pipe.execute()
+
+    # Verify searches work on master
+    master_idx = c_master.ft("all_types_idx")
+
+    # Text search
+    text_result = await master_idx.search("Product 100")
+    assert text_result.total >= 1
+
+    # Numeric search
+    numeric_result = await master_idx.search("@price:[1000 2000]")
+    assert numeric_result.total == 1001  # prices 1000-2000
+
+    # Tag search - every 3rd item is electronics (0, 3, 6, ...)
+    tag_result = await master_idx.search(Query("@category:{electronics}").paging(0, 0))
+    expected_electronics = (NUM_DOCS + 2) // 3  # ceil(10000/3)
+    assert tag_result.total == expected_electronics
+
+    # Geo search - search around (-122.0, 37.0) with 10km radius
+    geo_result = await master_idx.search("@location:[-122.0 37.0 10 km]")
+    assert geo_result.total > 0
+
+    # Vector search (KNN)
+    query_vec = np.array([50.0, 50.0], dtype=np.float32).tobytes()
+    knn_result = await c_master.execute_command(
+        "FT.SEARCH",
+        "all_types_idx",
+        "*=>[KNN 10 @embedding $vec]",
+        "PARAMS",
+        "2",
+        "vec",
+        query_vec,
+    )
+    assert knn_result[0] == 10  # Exactly 10 results for KNN 10
+
+    # Start replication
+    await c_replica.execute_command("REPLICAOF", "localhost", master.port)
+    await wait_available_async(c_replica)
+
+    # Verify index exists on replica
+    indices = await c_replica.execute_command("FT._LIST")
+    assert b"all_types_idx" in indices or "all_types_idx" in indices
+
+    replica_idx = c_replica.ft("all_types_idx")
+
+    # Verify all search types work on replica
+
+    # Text search
+    replica_text = await replica_idx.search("Product 100")
+    assert replica_text.total >= 1
+
+    # Numeric search
+    replica_numeric = await replica_idx.search("@price:[1000 2000]")
+    assert replica_numeric.total == 1001
+
+    # Tag search
+    replica_tag = await replica_idx.search(Query("@category:{electronics}").paging(0, 0))
+    assert replica_tag.total == expected_electronics
+
+    # Geo search
+    replica_geo = await replica_idx.search("@location:[-122.0 37.0 10 km]")
+    assert replica_geo.total == geo_result.total
+
+    # Vector search (KNN) - verify same results as master
+    replica_knn = await c_replica.execute_command(
+        "FT.SEARCH",
+        "all_types_idx",
+        "*=>[KNN 10 @embedding $vec]",
+        "PARAMS",
+        "2",
+        "vec",
+        query_vec,
+    )
+    assert replica_knn[0] == 10
+
+    # Extract and compare document keys from KNN results (sorted because order may vary
+    # slightly due to floating-point distance ties).
+    # Format: [count, key1, fields1, key2, fields2, ...]
+    master_knn_keys = sorted([knn_result[i] for i in range(1, len(knn_result), 2)])
+    replica_knn_keys = sorted([replica_knn[i] for i in range(1, len(replica_knn), 2)])
+    assert master_knn_keys == replica_knn_keys, (
+        f"KNN results differ between master and replica: "
+        f"master={master_knn_keys}, replica={replica_knn_keys}"
+    )
+
+    # Verify the HNSW index was actually restored from the serialized graph (not rebuilt
+    # from scratch). Check replica's INFO log for the restoration message.
+    info_logs = [f for f in replica.log_files if "INFO" in f]
+    assert info_logs, "Could not find replica INFO log file"
+    with open(info_logs[0], "r") as f:
+        log_content = f.read()
+    if master_threads == replica_threads:
+        assert (
+            "Restored HNSW index" in log_content
+        ), "Expected HNSW index to be restored from serialized graph (same shard count)"
+    else:
+        assert (
+            "global_ids remapped" in log_content
+        ), "Expected HNSW index to be restored with global_id remapping (different shard count)"
+    rebuild_lines = [
+        l.strip()
+        for l in log_content.splitlines()
+        if "Will rebuild from scratch" in l and "HNSW" in l
+    ]
+    assert (
+        not rebuild_lines
+    ), "HNSW index fell back to rebuild from scratch unexpectedly:\n" + "\n".join(rebuild_lines)
+
+
+@dfly_args({"proactor_threads": 4})
+async def test_vector_search_with_geo_and_tags(async_client: aioredis.Redis):
+    """
+    Test combining vector search (KNN) with geo radius filter and category tags.
+    This tests complex queries that use multiple index types together with 10000 elements.
+    """
+    idx = async_client.ft("combined_idx")
+
+    # Create index with vector, geo, and tag fields
+    await idx.create_index(
+        [
+            TextField("name"),
+            TagField("category"),
+            GeoField("location"),
+            VectorField(
+                "embedding",
+                algorithm="HNSW",
+                attributes={
+                    "TYPE": "FLOAT32",
+                    "DIM": 3,
+                    "DISTANCE_METRIC": "L2",
+                    "INITIAL_CAP": 10000,
+                },
+            ),
+        ],
+        definition=IndexDefinition(index_type=IndexType.HASH, prefix=["place:"]),
+    )
+
+    # Insert 10000 places with varying locations and categories
+    NUM_PLACES = 10000
+    categories = ["restaurant", "cafe", "bar", "shop", "hotel"]
+
+    pipe = async_client.pipeline(transaction=False)
+    for i in range(NUM_PLACES):
+        # Distribute locations across a grid
+        lat = 37.0 + (i % 100) * 0.01  # 100 different latitudes
+        lon = -122.5 + (i // 100) * 0.01  # 100 different longitudes
+        category = categories[i % len(categories)]
+        # Create embeddings that form clusters based on category
+        cat_offset = (i % len(categories)) * 10
+        embedding = np.array(
+            [float(i % 100) + cat_offset, float(i // 100), float(i % 10)], dtype=np.float32
+        )
+        pipe.hset(
+            f"place:{i}",
+            mapping={
+                "name": f"Place {i}",
+                "category": category,
+                "location": f"{lon},{lat}",
+                "embedding": embedding.tobytes(),
+            },
+        )
+        # Execute in batches
+        if i % 1000 == 999:
+            await pipe.execute()
+            pipe = async_client.pipeline(transaction=False)
+    await pipe.execute()
+
+    # Test 1: Vector search only - find places with embeddings closest to a point
+    query_vec = np.array([50.0, 50.0, 5.0], dtype=np.float32).tobytes()
+    result = await async_client.execute_command(
+        "FT.SEARCH",
+        "combined_idx",
+        "*=>[KNN 10 @embedding $vec]",
+        "PARAMS",
+        "2",
+        "vec",
+        query_vec,
+        "RETURN",
+        "1",
+        "name",
+    )
+    assert result[0] == 10
+
+    # Test 2: Vector search filtered by tag - only restaurants (every 5th item starting from 0)
+    result = await async_client.execute_command(
+        "FT.SEARCH",
+        "combined_idx",
+        "@category:{restaurant}=>[KNN 10 @embedding $vec]",
+        "PARAMS",
+        "2",
+        "vec",
+        query_vec,
+        "RETURN",
+        "2",
+        "name",
+        "category",
+    )
+    assert result[0] == 10
+    # Verify all results are restaurants
+    result_str = str(result)
+    for cat in ["cafe", "bar", "shop", "hotel"]:
+        # The category field should not contain other categories
+        assert (
+            f"'category', '{cat}'" not in result_str and f"b'category', b'{cat}'" not in result_str
+        )
+
+    # COMMENTED OUT: Test 3 - Triggers DCHECK failure due to unsorted geo results
+    # See: src/core/search/indices.cc:622 - GeoIndex::RadiusSearch doesn't sort results
+    # This causes DCHECK failure at src/core/search/search.cc:402 when combining filters
+    # TODO: Uncomment after fixing GeoIndex::RadiusSearch to sort results
+    #
+    # # Test 3: Vector search filtered by geo - only places near center (within 5km)
+    # result = await async_client.execute_command(
+    #     "FT.SEARCH",
+    #     "combined_idx",
+    #     "@location:[-122.0 37.5 5 km]=>[KNN 20 @embedding $vec]",
+    #     "PARAMS",
+    #     "2",
+    #     "vec",
+    #     query_vec,
+    #     "RETURN",
+    #     "2",
+    #     "name",
+    #     "location",
+    # )
+    # # Should find places within the geo radius
+    # assert result[0] >= 1
+    # assert result[0] <= 20
+
+    # COMMENTED OUT: Test 4 - Triggers DCHECK failure due to unsorted geo results
+    # See: src/core/search/indices.cc:622 - GeoIndex::RadiusSearch doesn't sort results
+    # This causes DCHECK failure at src/core/search/search.cc:402 when combining geo + tag filters
+    # TODO: Uncomment after fixing GeoIndex::RadiusSearch to sort results
+    #
+    # # Test 4: Combined - vector search with both geo AND tag filters
+    # # Find cafes (category index 1) near a specific location
+    # query_vec_cafe = np.array([60.0, 50.0, 5.0], dtype=np.float32).tobytes()  # Near cafe cluster
+    # result = await async_client.execute_command(
+    #     "FT.SEARCH",
+    #     "combined_idx",
+    #     "@category:{cafe} @location:[-122.0 37.5 20 km]=>[KNN 10 @embedding $vec]",
+    #     "PARAMS",
+    #     "2",
+    #     "vec",
+    #     query_vec_cafe,
+    #     "RETURN",
+    #     "2",
+    #     "name",
+    #     "category",
+    # )
+    # # Should find cafes within the geo and vector constraints
+    # assert result[0] >= 1
+    # result_str = str(result)
+    # # Should not contain other categories
+    # assert "restaurant" not in result_str.lower() or "category" not in result_str
+
+    # COMMENTED OUT: Test 5 - Triggers DCHECK failure due to unsorted geo results
+    # See: src/core/search/indices.cc:622 - GeoIndex::RadiusSearch doesn't sort results
+    # This causes DCHECK failure at src/core/search/search.cc:402 when combining geo + tag filters
+    # TODO: Uncomment after fixing GeoIndex::RadiusSearch to sort results
+    #
+    # # Test 5: Tag search with geo filter (no vector)
+    # result = await idx.search(
+    #     Query("@category:{restaurant} @location:[-122.0 37.5 50 km]").paging(0, 0)
+    # )
+    # # Should find restaurants within 50km radius
+    # assert result.total >= 1
+
+    # Test 6: Count documents per category
+    for cat in categories:
+        result = await idx.search(Query(f"@category:{{{cat}}}").paging(0, 0))
+        expected_count = NUM_PLACES // len(categories)
+        assert (
+            result.total == expected_count
+        ), f"Expected {expected_count} {cat}s, got {result.total}"
+
+    await idx.dropindex()
+
+
+@dfly_args({"proactor_threads": 4})
+async def test_ft_search_scorer_bm25std(async_client: aioredis.Redis):
+    """Test FT.SEARCH with SCORER BM25STD and WITHSCORES."""
+    idx = async_client.ft("scorer_idx")
+
+    await idx.create_index(
+        [TextField("content")],
+        definition=IndexDefinition(index_type=IndexType.HASH),
+    )
+
+    # Doc with "hello" appearing multiple times should score higher
+    await async_client.hset("doc:1", mapping={"content": "hello world hello hello"})
+    await async_client.hset("doc:2", mapping={"content": "hello there"})
+    await async_client.hset("doc:3", mapping={"content": "goodbye world"})
+
+    # Raw command: FT.SEARCH scorer_idx "hello" WITHSCORES SCORER BM25STD
+    res = await async_client.execute_command(
+        "FT.SEARCH", "scorer_idx", "hello", "WITHSCORES", "SCORER", "BM25STD"
+    )
+
+    # Response format: [total, key1, score1, fields1, key2, score2, fields2, ...]
+    total = res[0]
+    assert total == 2, f"Expected 2 matches, got {total}"
+
+    # Parse results: each doc is (key, score, fields)
+    docs = {}
+    i = 1
+    while i < len(res):
+        key = str(res[i]) if isinstance(res[i], bytes) else res[i]
+        score = float(res[i + 1])
+        i += 3  # skip key, score, fields
+        docs[key] = score
+
+    assert "doc:1" in docs, f"doc:1 should match, got {docs}"
+    assert "doc:2" in docs, f"doc:2 should match, got {docs}"
+    assert "doc:3" not in docs, f"doc:3 should not match, got {docs}"
+
+    # doc:1 has higher TF for "hello" -> higher score
+    assert docs["doc:1"] > docs["doc:2"], (
+        f"doc:1 (TF=3) should score higher than doc:2 (TF=1), "
+        f"got {docs['doc:1']} vs {docs['doc:2']}"
+    )
+
+    # Scores should be positive
+    assert docs["doc:1"] > 0
+    assert docs["doc:2"] > 0
+
+    await idx.dropindex()
+
+
+@dfly_args({"proactor_threads": 4})
+async def test_ft_search_scorer_invalid(async_client: aioredis.Redis):
+    """Test that invalid scorer name returns error."""
+    idx = async_client.ft("scorer_err_idx")
+
+    await idx.create_index(
+        [TextField("content")],
+        definition=IndexDefinition(index_type=IndexType.HASH),
+    )
+
+    await async_client.hset("doc:1", mapping={"content": "hello"})
+
+    try:
+        await async_client.execute_command(
+            "FT.SEARCH", "scorer_err_idx", "hello", "SCORER", "INVALID_SCORER"
+        )
+        assert False, "Should have raised error for invalid scorer"
+    except Exception as e:
+        assert "scorer" in str(e).lower() or "syntax" in str(e).lower()
+
+    await idx.dropindex()
+
+
+@dfly_args({"proactor_threads": 4})
+async def test_ft_aggregate_addscores(async_client: aioredis.Redis):
+    """Test FT.AGGREGATE with SCORER BM25STD and ADDSCORES."""
+    await async_client.execute_command(
+        "FT.CREATE", "agg_score_idx", "ON", "HASH", "SCHEMA", "content", "TEXT"
+    )
+
+    await async_client.hset("doc:1", mapping={"content": "science science science"})
+    await async_client.hset("doc:2", mapping={"content": "science fiction"})
+    await async_client.hset("doc:3", mapping={"content": "hello world"})
+
+    # FT.AGGREGATE with LOAD first, then SCORER + ADDSCORES + SORTBY @__score DESC
+    res = await async_client.execute_command(
+        "FT.AGGREGATE",
+        "agg_score_idx",
+        "@content:(science)",
+        "LOAD",
+        "1",
+        "@content",
+        "SCORER",
+        "BM25STD",
+        "ADDSCORES",
+        "SORTBY",
+        "2",
+        "@__score",
+        "DESC",
+    )
+
+    total = res[0]
+    assert total == 2, f"Expected 2 matches, got {total}"
+
+    # Parse aggregate results -- each result is a list of field-value pairs
+    results = []
+    for row in res[1:]:
+        entry = {}
+        for j in range(0, len(row), 2):
+            entry[row[j].decode() if isinstance(row[j], bytes) else row[j]] = (
+                row[j + 1].decode() if isinstance(row[j + 1], bytes) else row[j + 1]
+            )
+        results.append(entry)
+
+    # Both results should have __score field
+    for r in results:
+        assert "__score" in r, f"Expected __score field in result: {r}"
+        assert float(r["__score"]) > 0, f"Expected positive score, got {r['__score']}"
+
+    # First result (sorted DESC) should have higher score
+    if len(results) >= 2:
+        assert float(results[0]["__score"]) >= float(results[1]["__score"])
+
+    await async_client.execute_command("FT.DROPINDEX", "agg_score_idx")

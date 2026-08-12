@@ -1,0 +1,57 @@
+// Copyright 2025, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
+
+#include <memory>
+#include <shared_mutex>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "core/search/base.h"
+#include "core/search/hnsw_index.h"
+#include "core/search/search.h"
+#include "server/search/doc_index.h"
+
+namespace dfly {
+class GlobalHnswIndexRegistry {
+ public:
+  static GlobalHnswIndexRegistry& Instance();
+
+  bool Create(std::string_view index_name, std::string_view field_name,
+              const search::SchemaField::VectorParams& params, DocIndex::DataType data_type);
+
+  bool Remove(std::string_view index_name, std::string_view field_name);
+
+  std::shared_ptr<search::HnswVectorIndex> Get(std::string_view index_name,
+                                               std::string_view field_name) const;
+
+  bool Exist(std::string_view index_name, std::string_view field_name) const;
+
+  absl::flat_hash_map<std::string, std::shared_ptr<search::HnswVectorIndex>> GetAll() const {
+    std::shared_lock<std::shared_mutex> lock(registry_mutex_);
+    return indices_;
+  }
+
+  // Returns unique index names from all registered HNSW indices
+  absl::flat_hash_set<std::string> GetIndexNames() const;
+
+  // Aggregate in-memory footprint of all registered HNSW indices, in bytes.
+  size_t GetTotalMemoryUsage() const;
+
+  void Reset();
+
+ private:
+  GlobalHnswIndexRegistry() = default;
+  std::string MakeKey(std::string_view index_name, std::string_view field_name) const;
+
+  mutable std::shared_mutex registry_mutex_;
+  absl::flat_hash_map<std::string, std::shared_ptr<search::HnswVectorIndex>> indices_;
+};
+
+}  // namespace dfly

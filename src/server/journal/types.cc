@@ -1,0 +1,46 @@
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "server/journal/types.h"
+
+#include <absl/strings/str_join.h>
+
+namespace dfly::journal {
+
+using namespace std;
+
+void AppendPrefix(string_view cmd, string* dest) {
+  absl::StrAppend(dest, ", cmd='");
+  absl::StrAppend(dest, cmd);
+  absl::StrAppend(dest, "', args=[");
+}
+
+void AppendSuffix(string* dest) {
+  if (dest->back() == ',')
+    dest->pop_back();
+  absl::StrAppend(dest, "]");
+}
+
+string Entry::ToString() const {
+  string rv = absl::StrCat("{op=", opcode, ", dbid=", dbid);
+
+  if (HasPayload()) {
+    AppendPrefix(payload.cmd, &rv);
+    for (string_view arg : base::it::Wrap(cmn::kToSV, payload.args))
+      absl::StrAppend(&rv, "'", cmn::ToSV(arg), "',");
+    AppendSuffix(&rv);
+  } else {
+    absl::StrAppend(&rv, ", empty");
+  }
+
+  rv += "}";
+  return rv;
+}
+
+string ParsedEntry::ToString() const {
+  return absl::StrCat("{op=", opcode, ", dbid=", dbid, ", cmd='")  //
+         + absl::StrJoin(cmd.view(), " ") + "'}";
+}
+
+}  // namespace dfly::journal

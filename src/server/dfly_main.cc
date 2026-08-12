@@ -1,0 +1,1252 @@
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include <absl/flags/parse.h>
+#include <absl/flags/usage.h>
+#include <absl/flags/usage_config.h>
+#include <absl/strings/match.h>
+#include <absl/strings/str_cat.h>
+#include <absl/strings/str_split.h>
+#include <absl/strings/strip.h>
+
+#include "absl/cleanup/cleanup.h"
+#include "absl/container/inlined_vector.h"
+#include "absl/strings/numbers.h"
+
+#ifdef DFLY_ENABLE_MEMORY_TRACKING
+#define INJECT_ALLOCATION_TRACKER
+#include "core/allocation_tracker.h"
+#else
+#include <mimalloc-new-delete.h>
+#endif
+
+#include <unistd.h>
+
+#ifdef __linux__
+#include <grp.h>
+#include <pwd.h>
+
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
+
+#include "util/fibers/uring_proactor.h"
+
+ABSL_DECLARE_FLAG(std::string, dir);
+#endif
+
+#include <mimalloc.h>
+#include <signal.h>
+
+#include <iostream>
+#include <memory>
+
+#ifdef USE_AFL
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#include <thread>
+#endif
+
+#include "base/init.h"
+#include "base/proc_util.h"  // for GetKernelVersion
+#include "facade/dragonfly_listener.h"
+#include "io/file.h"
+#include "io/file_util.h"
+#include "io/proc_reader.h"
+#include "server/common.h"
+#include "server/generic_family.h"
+#include "server/main_service.h"
+#include "server/server_family.h"
+#include "server/version.h"
+#include "server/version_monitor.h"
+#include "strings/human_readable.h"
+#include "util/accept_server.h"
+#include "util/fibers/pool.h"
+#include "util/varz.h"
+
+#ifdef __APPLE__
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#else
+extern char** environ;
+#endif
+
+using namespace std;
+
+ABSL_DECLARE_FLAG(int32_t, port);
+ABSL_DECLARE_FLAG(uint32_t, memcached_port);
+ABSL_DECLARE_FLAG(uint16_t, admin_port);
+ABSL_DECLARE_FLAG(std::string, admin_bind);
+ABSL_DECLARE_FLAG(strings::MemoryBytesFlag, maxmemory);
+ABSL_DECLARE_FLAG(uint32_t, proactor_threads);
+ABSL_DECLARE_FLAG(std::string, dbfilename);
+
+#ifdef USE_ABSL_LOG
+ABSL_FLAG(bool, alsologtostderr, false, "also log messages to stderr in addition to logfiles");
+#endif
+
+ABSL_FLAG(string, bind, "",
+          "Bind address. If empty - binds on all interfaces. "
+          "It's not advised due to security implications.");
+ABSL_FLAG(string, pidfile, "", "If not empty - server writes its pid into the file");
+ABSL_FLAG(string, unixsocket, "",
+          "If not empty - specifies path for the Unix socket that will "
+          "be used for listening for incoming connections.");
+ABSL_FLAG(string, unixsocketperm, "", "Set permissions for unixsocket, in octal value.");
+ABSL_FLAG(bool, force_epoll, false,
+          "If true - uses linux epoll engine underneath. "
+          "Can fit for kernels older than 5.10.");
+ABSL_FLAG(
+    string, allocation_tracker, "",
+    "Logs stack trace of memory allocation within these ranges. Format is min:max,min:max,....");
+
+ABSL_FLAG(bool, version_check, true,
+          "If true, Will monitor for new releases on Dragonfly servers once a day.");
+
+ABSL_FLAG(uint16_t, tcp_backlog, 256, "TCP listen(2) backlog parameter.");
+#ifdef __linux__
+ABSL_FLAG(string, user, "",
+          "If not empty - drop privileges to this user (and their primary group) after binding "
+          "ports. Accepts username or numeric uid. "
+          "If --dir is set, chowns the data directory to this user.");
+#endif
+ABSL_FLAG(uint16_t, uring_recv_buffer_cnt, 0,
+          "How many buffer ring entries to allocate per thread for io_uring receive operations. "
+          "Relevant only for modern kernels with io_uring enabled");
+
+ABSL_FLAG(bool, omit_basic_usage, false, "Omit printing basic usage info.");
+
+#ifdef USE_AFL
+ABSL_FLAG(uint32_t, afl_loop_limit, UINT_MAX,
+          "AFL++ persistent mode loop limit. Specifies how many fuzzing iterations "
+          "to run before restarting the process. Higher values improve performance but "
+          "may accumulate state.");
+ABSL_FLAG(uint16_t, afl_target_port, 0,
+          "Port to send fuzz input to. Defaults to --port (RESP). "
+          "Set to --memcached_port to fuzz the memcache protocol.");
+#endif
+
+using namespace util;
+using namespace facade;
+using namespace io;
+using absl::GetFlag;
+using absl::StrCat;
+using strings::HumanReadableNumBytes;
+
+namespace dfly {
+
+namespace {
+
+#if ABSL_HAVE_ADDRESS_SANITIZER
+// Increase stack size for all debug builds; tools like ASAN can require more than 50 KB.
+constexpr size_t kAsanFactor = 2;
+#else
+constexpr size_t kAsanFactor = 1;
+#endif
+
+#ifdef NDEBUG
+constexpr size_t kFiberStackBase = 40_KB;
+#else
+constexpr size_t kFiberStackBase = 56_KB;
+#endif
+
+// Default stack size for fibers. We decrease it by 16 bytes because some allocators
+// need additional 8-16 bytes for their internal structures, thus over reserving additional
+// memory pages if using round sizes.
+constexpr size_t kFiberDefaultStackSize = kFiberStackBase * kAsanFactor - 16;
+
+enum class TermColor : uint8_t { kDefault, kRed, kGreen, kYellow };
+
+// Returns the ANSI color code for the given color. TermColor::kDefault is
+// an invalid input.
+const char* GetAnsiColorCode(TermColor color) {
+  switch (color) {
+    case TermColor::kRed:
+      return "1";
+    case TermColor::kGreen:
+      return "2";
+    case TermColor::kYellow:
+      return "3";
+    default:
+      return nullptr;
+  }
+}
+
+string ColorStart(TermColor color) {
+  return StrCat("\033[0;3", GetAnsiColorCode(color), "m");
+}
+
+// Resets the terminal to default.
+const char kColorEnd[] = "\033[m";
+
+string ColoredStr(TermColor color, string_view str) {
+  return StrCat(ColorStart(color), str, kColorEnd);
+}
+
+bool HelpshortFlags(std::string_view f) {
+  return absl::StartsWith(f, "\033[0;32");
+}
+
+bool HelpFlags(std::string_view f) {
+  return absl::StartsWith(f, "\033[0;3");
+}
+
+#define STRING_PP_NX(A) #A
+#define STRING_MAKE_PP(A) STRING_PP_NX(A)
+
+// This would create a string value from a "defined" location of the source code
+// Note that SOURCE_PATH_FROM_BUILD_ENV is taken from the build system
+#define BUILD_LOCATION_PATH STRING_MAKE_PP(SOURCE_PATH_FROM_BUILD_ENV)
+
+string NormalizePaths(std::string_view path) {
+  const std::string FULL_PATH = BUILD_LOCATION_PATH;
+  const std::string FULL_PATH_SRC = FULL_PATH + "/src";
+  const std::string FULL_PATH_HELIO = FULL_PATH + "/helio";
+
+  if (absl::ConsumePrefix(&path, "../src/") || absl::ConsumePrefix(&path, FULL_PATH_SRC))
+    return ColoredStr(TermColor::kGreen, path);
+
+  if (absl::ConsumePrefix(&path, "../") || absl::ConsumePrefix(&path, FULL_PATH_HELIO))
+    return ColoredStr(TermColor::kYellow, path);
+
+  if (absl::ConsumePrefix(&path, "_deps/"))
+    return string(path);
+
+  return string(path);
+}
+
+template <typename... Args> unique_ptr<Listener> MakeListener(Args&&... args) {
+  auto res = make_unique<Listener>(std::forward<Args>(args)...);
+  res->SetConnFiberStackSize(kFiberDefaultStackSize);
+  return res;
+}
+
+#ifdef __linux__
+// Drops privileges to the specified user (username or numeric uid).
+// Must be called after ports are bound (so we can bind privileged ports first)
+// and BEFORE service.Init() to avoid racing with background snapshot loading.
+// Returns false on failure.
+bool DropPrivilegesToUser(const string& user_spec, const string& data_dir) {
+  // Resolve user — accept username or numeric uid.
+  // For numeric UIDs not in /etc/passwd (common in distroless containers),
+  // fall back to using the raw UID with gid=uid and no supplementary groups.
+  uid_t uid;
+  gid_t gid;
+  struct passwd* pw = nullptr;
+  if (absl::SimpleAtoi(user_spec, &uid)) {
+    pw = getpwuid(uid);  // may be NULL for UIDs not in /etc/passwd
+  } else {
+    pw = getpwnam(user_spec.c_str());
+    if (!pw) {
+      LOG(ERROR) << "--user: unknown user '" << user_spec << "'";
+      return false;
+    }
+  }
+
+  if (pw) {
+    uid = pw->pw_uid;
+    gid = pw->pw_gid;
+  } else {
+    // Numeric UID without passwd entry — use uid as gid.
+    gid = uid;
+    LOG(INFO) << "--user: uid " << uid << " not in /etc/passwd, using gid=" << gid;
+  }
+
+  // Recursively chown the data directory so the new user can access existing snapshots.
+  // Only when --dir is explicitly set. Uses lchown to avoid following symlinks.
+  if (!data_dir.empty()) {
+    namespace fs = std::filesystem;
+    auto do_chown = [&](const fs::path& p) {
+      if (lchown(p.c_str(), uid, gid) != 0) {
+        LOG(WARNING) << "lchown(" << p << ") failed: " << strerror(errno);
+      }
+    };
+    do_chown(data_dir);
+    std::error_code ec;
+    fs::recursive_directory_iterator it(data_dir, ec);
+    for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+      do_chown(it->path());
+    }
+    if (ec) {
+      LOG(WARNING) << "Error iterating " << data_dir << ": " << ec.message();
+    }
+  }
+
+  // Drop supplementary groups first, then gid, then uid.
+  // Order is critical: after setuid we no longer have permission to call setgid.
+  if (pw) {
+    if (initgroups(pw->pw_name, gid) != 0) {
+      LOG(ERROR) << "initgroups failed: " << strerror(errno);
+      return false;
+    }
+  } else {
+    if (setgroups(0, nullptr) != 0) {
+      LOG(ERROR) << "setgroups failed: " << strerror(errno);
+      return false;
+    }
+  }
+
+  if (setgid(gid) != 0) {
+    LOG(ERROR) << "setgid(" << gid << ") failed: " << strerror(errno);
+    return false;
+  }
+
+  if (setuid(uid) != 0) {
+    LOG(ERROR) << "setuid(" << uid << ") failed: " << strerror(errno);
+    return false;
+  }
+
+  LOG(INFO) << "Dropped privileges to uid=" << uid << " gid=" << gid;
+  return true;
+}
+#endif  // __linux__
+
+void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
+  uint64_t maxmemory = absl::GetFlag(FLAGS_maxmemory);
+  if (maxmemory > 0 && maxmemory < pool->size() * 256_MB) {
+    LOG(ERROR) << "There are " << pool->size() << " threads, so "
+               << HumanReadableNumBytes(pool->size() * 256_MB) << " are required. Exiting...";
+    exit(1);
+  }
+
+  Service service(pool);
+
+  auto tcp_disabled = GetFlag(FLAGS_port) == 0u;
+  Listener* main_listener = nullptr;
+
+  std::vector<facade::Listener*> listeners;
+
+  // If we ever add a new listener, plz don't change this,
+  // we depend on tcp listener to be at the front since we later
+  // need to pass it to the AclFamily::Init
+  if (!tcp_disabled) {
+    auto listener = MakeListener(Protocol::REDIS, &service, Listener::Role::MAIN);
+    main_listener = listener.get();
+    listeners.push_back(listener.release());
+  }
+
+  const auto& bind = GetFlag(FLAGS_bind);
+
+  // Protected mode: if no bind address is specified and no password is set,
+  // bind only to localhost to prevent unauthorized remote access.
+  // Only enabled when running under systemd (INVOCATION_ID is set) to avoid
+  // breaking containerized deployments where binding to localhost would make
+  // the service unreachable from the host.
+  // GetPassword() checks both --requirepass flag and DFLY_PASSWORD env var.
+  bool running_under_systemd = getenv("INVOCATION_ID") != nullptr;
+  bool protected_mode = running_under_systemd && bind.empty() && GetPassword().empty();
+  const char* bind_addr = nullptr;
+  if (protected_mode) {
+    bind_addr = "127.0.0.1";
+    LOG(WARNING) << "Protected mode enabled. Binding to localhost only because no password is set. "
+                 << "To accept remote connections, set a password with --requirepass or "
+                 << "specify a bind address with --bind.";
+  } else if (!bind.empty()) {
+    bind_addr = bind.c_str();
+  }
+
+  int32_t port = GetFlag(FLAGS_port);
+  // The reason for this code is a bit silly. We want to provide a way to
+  // bind any 'random' available port. The way to do that is to call
+  // bind with the argument port 0. However we can't expose this functionality
+  // as is to our users: Since giving --port=0 to redis DISABLES the network
+  // interface that would break users' existing configurations in potentionally
+  // unsafe ways. For that reason the user's --port=-1 means to us 'bind port 0'.
+  if (port == -1) {
+    port = 0;
+  } else if (port < 0 || port > 65535) {
+    LOG(ERROR) << "Bad port number " << port;
+    exit(1);
+  }
+
+  auto mc_port = GetFlag(FLAGS_memcached_port);
+  string unix_sock = GetFlag(FLAGS_unixsocket);
+  bool unlink_uds = false;
+  absl::Cleanup maybe_unlink_uds([&unlink_uds, &unix_sock]() {
+    if (unlink_uds) {
+      unlink(unix_sock.c_str());
+    }
+  });
+
+  if (!unix_sock.empty()) {
+    string perm_str = GetFlag(FLAGS_unixsocketperm);
+    uint32_t unix_socket_perm;
+    if (perm_str.empty()) {
+      // get umask of running process, indicates the permission bits that are turned off
+      mode_t umask_val = umask(0);
+      umask(umask_val);
+      unix_socket_perm = 0777 & ~umask_val;
+    } else {
+      if (!absl::numbers_internal::safe_strtoi_base(perm_str, &unix_socket_perm, 8) ||
+          unix_socket_perm > 0777) {
+        LOG(ERROR) << "Invalid unixsocketperm: " << perm_str;
+        exit(1);
+      }
+    }
+    unlink(unix_sock.c_str());
+
+    auto uds_listener = MakeListener(Protocol::REDIS, &service);
+    error_code ec =
+        acceptor->AddUDSListener(unix_sock.c_str(), unix_socket_perm, uds_listener.get());
+    if (ec) {
+      if (tcp_disabled) {
+        LOG(ERROR) << "Could not open unix socket " << unix_sock
+                   << ", and TCP listening is disabled (error: " << ec << "). Exiting.";
+        exit(1);
+      } else {
+        LOG(WARNING) << "Could not open unix socket " << unix_sock << ", error " << ec;
+      }
+    } else {
+      LOG(INFO) << "Listening on unix socket " << unix_sock;
+      listeners.push_back(uds_listener.release());
+      unlink_uds = true;
+    }
+  } else if (tcp_disabled) {
+    LOG(ERROR)
+        << "Did not receive a unix socket to listen to, yet TCP listening is disabled. Exiting.";
+    exit(1);
+  }
+
+  std::uint16_t admin_port = GetFlag(FLAGS_admin_port);
+  if (admin_port != 0) {
+    const std::string& admin_bind = GetFlag(FLAGS_admin_bind);
+    // Note passing the result of c_str() for empty string in optimized mode don't work, we must
+    // explicitly set this to null in this case
+    const char* interface_addr = admin_bind.empty() ? nullptr : admin_bind.c_str();
+    const std::string printable_addr =
+        absl::StrCat("admin socket ", interface_addr ? interface_addr : "any", ":", admin_port);
+    auto admin_listener = MakeListener(Protocol::REDIS, &service, Listener::Role::PRIVILEGED);
+
+    error_code ec = acceptor->AddListener(interface_addr, admin_port, admin_listener.get());
+
+    if (ec) {
+      LOG(ERROR) << "Failed to open " << printable_addr << ", error: " << ec.message();
+    } else {
+      LOG(INFO) << "Listening on " << printable_addr;
+      listeners.push_back(admin_listener.release());
+    }
+  }
+
+  if (main_listener) {
+    error_code ec = acceptor->AddListener(bind_addr, port, main_listener);
+
+    if (ec) {
+      LOG(ERROR) << "Could not open port " << port << ", error: " << ec.message();
+      exit(1);
+    }
+
+    if (port == 0) {
+      absl::SetFlag(&FLAGS_port, main_listener->socket()->LocalEndpoint().port());
+    }
+  }
+
+  if (mc_port > 0 && !tcp_disabled) {
+    auto listener = MakeListener(Protocol::MEMCACHE, &service);
+    error_code ec = acceptor->AddListener(bind_addr, mc_port, listener.get());
+    if (ec) {
+      LOG(ERROR) << "Could not open memcached port " << mc_port << ", error: " << ec.message();
+      exit(1);
+    }
+    listeners.push_back(listener.release());
+  }
+
+#ifdef __linux__
+  // Drop privileges after ports are bound but BEFORE service.Init() to avoid
+  // racing with background snapshot loading that starts inside service.Init().
+  const string user_flag = GetFlag(FLAGS_user);
+  if (!user_flag.empty() && !DropPrivilegesToUser(user_flag, GetFlag(FLAGS_dir))) {
+    exit(1);
+  }
+#endif
+
+  service.Init(acceptor, listeners);
+
+  VersionMonitor version_monitor;
+
+  // check if it's a production release tag.
+  if (GetFlag(FLAGS_version_check) && kGitTag[0] == 'v' && strchr(kGitTag, '-') == nullptr) {
+    version_monitor.Run(pool);
+  }
+
+  // Start the acceptor loop and wait for the server to shutdown.
+  acceptor->Run();
+  base::FlushLogs();
+
+  acceptor->Wait();
+
+  version_monitor.Shutdown();
+  service.Shutdown();
+}
+
+bool CreatePidFile(const string& path) {
+  Result<WriteFile*> res = OpenWrite(path);
+  if (!res) {
+    LOG(ERROR) << "Failed to open pidfile with error: " << res.error().message() << ". Exiting...";
+    return false;
+  }
+
+  unique_ptr<WriteFile> wf(res.value());
+  auto ec = wf->Write(to_string(getpid()));
+  if (ec) {
+    LOG(ERROR) << "Failed to write pid into pidfile with error: " << ec.message() << ". Exiting...";
+    return false;
+  }
+
+  ec = wf->Close();
+  if (ec) {
+    LOG(WARNING) << "Failed to close pidfile file descriptor with error: " << ec.message() << ".";
+  }
+
+  return true;
+}
+
+#ifdef __linux__
+bool ShouldUseEpollAPI(const base::sys::KernelVersion& kver) {
+  if (GetFlag(FLAGS_force_epoll))
+    return true;
+
+  if (kver.kernel < 5 || (kver.kernel == 5 && kver.major < 10)) {
+    LOG(WARNING) << "Kernel is older than 5.10, switching to epoll engine.";
+    return true;
+  }
+
+  struct io_uring ring;
+  io_uring_params params;
+  memset(&params, 0, sizeof(params));
+
+  int iouring_res = io_uring_queue_init_params(1024, &ring, &params);
+
+  if (iouring_res == 0) {
+    io_uring_queue_exit(&ring);
+    return false;
+  }
+
+  iouring_res = -iouring_res;
+
+  if (iouring_res == ENOSYS) {
+    LOG(WARNING) << "iouring API is not supported. switching to epoll.";
+  } else if (iouring_res == ENOMEM) {
+    LOG(WARNING) << "io_uring does not have enough memory. That can happen when your "
+                    "max locked memory is too limited. If you run via docker, "
+                    "try adding '--ulimit memlock=-1' to \"docker run\" command."
+                    "Meanwhile, switching to epoll";
+  } else {
+    LOG(WARNING) << "Weird error " << iouring_res << " switching to epoll";
+  }
+
+  return true;
+}
+
+void GetCGroupPath(string* memory_path, string* cpu_path) {
+  CHECK(memory_path != nullptr) << "memory_path is null! (this shouldn't happen!)";
+  CHECK(cpu_path != nullptr) << "cpu_path is null! (this shouldn't happen!)";
+
+  // Begin by reading /proc/self/cgroup
+
+  auto cg = io::ReadFileToString("/proc/self/cgroup");
+  CHECK(cg.has_value()) << "Failed to read /proc/self/cgroup";
+
+  string cgv = std::move(cg).value();
+
+  // Next, depending on cgroup version we either read:
+  // N:<cgroup name>:<path> -- in case of v1, in many lines
+  // 0::<cgroup name> -- in case of v2, in a single line
+
+  auto stripped = absl::StripAsciiWhitespace(cgv);
+
+  vector<string_view> groups = absl::StrSplit(stripped, '\n');
+
+  if (groups.size() == 1) {
+    // for v2 we only read 0::<name>
+    size_t pos = cgv.rfind(':');
+    if (pos == string::npos) {
+      LOG(ERROR) << "Failed to parse cgroupv2 format, got: " << cgv;
+      exit(1);
+    }
+
+    auto cgroup = string_view(cgv.c_str() + pos + 1);
+    string_view cgroup_stripped = absl::StripTrailingAsciiWhitespace(cgroup);
+
+    *memory_path = absl::StrCat("/sys/fs/cgroup/", cgroup_stripped);
+    *cpu_path = *memory_path;  // in v2 the path to the cgroup is singular
+  } else {
+    for (const auto& sv : groups) {
+      // in v1 the format is
+      // N:s1:2 where N is an integer, s1, s2 strings with s1 maybe empty.
+      vector<string_view> entry = absl::StrSplit(sv, ':');
+      if (entry.size() != 3u) {
+        LOG(ERROR) << "Unsupported group " << sv;
+        continue;
+      }
+
+      // in v1 there are several 'canonical' cgroups
+      // we are interested in the 'memory' and the 'cpu,cpuacct' ones
+      // which specify memory and cpu limits, respectively.
+      if (entry[1] == "memory")
+        *memory_path = absl::StrCat("/sys/fs/cgroup/memory/", entry[2]);
+
+      if (entry[1] == "cpu,cpuacct")
+        *cpu_path = absl::StrCat("/sys/fs/cgroup/cpu,cpuacct/", entry[2]);
+    }
+  }
+}
+
+// returns true on success.
+bool UpdateResourceLimitsIfInsideContainer(io::MemInfoData* mdata, size_t* max_threads) {
+  using absl::StrCat;
+
+  // did we succeed in reading *something*? if not, exit.
+  // note that all processes in Linux are in some cgroup, so at the very
+  // least we should read something.
+  bool read_something = false;
+
+  auto read_mem = [&read_something](string_view path, size_t* output) {
+    auto file = io::ReadFileToString(path);
+    DVLOG(1) << "container limits: read " << path << ": " << file.value_or("N/A");
+
+    size_t temp = numeric_limits<size_t>::max();
+
+    if (file.has_value()) {
+      if (!absl::StartsWith(*file, "max"))
+        CHECK(absl::SimpleAtoi(*file, &temp))
+            << "Failed in parsing cgroup limits, path: " << path << " (read: " << *file << ")";
+      read_something = true;
+    }
+
+    *output = min(*output, temp);
+  };
+
+  string mem_path, cpu_path;
+  GetCGroupPath(&mem_path, &cpu_path);
+
+  if (mem_path.empty() || cpu_path.empty()) {
+    return true;  // not a container
+  }
+
+  VLOG(1) << "mem_path = " << mem_path;
+  VLOG(1) << "cpu_path = " << cpu_path;
+
+  /* Update memory limits */
+
+  // Start by reading global memory limits
+  auto parse_limits = [&](std::string_view base_mem) {
+    read_mem(StrCat(base_mem, "/memory.limit_in_bytes"), &mdata->mem_total);
+    read_mem(StrCat(base_mem, "/memory.max"), &mdata->mem_total);
+  };
+
+  // For v1
+  constexpr auto base_mem_v1 = "/sys/fs/cgroup/memory"sv;
+  parse_limits(base_mem_v1);
+  // For v2 if the previous failed
+  constexpr auto base_mem_v2 = "/sys/fs/cgroup"sv;
+  parse_limits(base_mem_v2);
+  // For v2 under /user.slice
+  constexpr auto base_mem_v2_slice = "/sys/fs/cgroup/user.slice"sv;
+  parse_limits(base_mem_v2_slice);
+
+  // Read cgroup-specific limits
+  read_mem(StrCat(mem_path, "/memory.limit_in_bytes"), &mdata->mem_total);
+  read_mem(StrCat(mem_path, "/memory.max"), &mdata->mem_total);
+  read_mem(StrCat(mem_path, "/memory.high"), &mdata->mem_avail);
+  mdata->mem_avail = min(mdata->mem_avail, mdata->mem_total);
+
+  /* Update thread limits */
+
+  auto read_cpu = [&read_something](string_view path, size_t* output) {
+    double count{0}, timeshare{1};
+
+    /**
+     * Summarized: the function does one of the following:
+     *
+     * 1. read path/cpu.max -- for v2. The format of this file is:
+     *  $COUNT $PERIOD
+     * which indicates that we can use upto $COUNT shares in a $PERIOD of time.
+     * If $COUNT is max, then we can use as much CPU as the system has. Otherwise,
+     * this translates to $COUNT/$PERIOD threads.
+     *
+     * 2. read path/cpu.cfs_quota_us & path/cpu.cfs_period_us -- same idea, but for v1.
+     */
+
+    if (auto cpu = ReadFileToString(StrCat(path, "/cpu.max")); cpu.has_value()) {
+      vector<string_view> res = absl::StrSplit(*cpu, ' ');
+
+      // Some linux distributions do not have anything there.
+      if (res.size() == 2u) {
+        if (res[0] == "max")
+          *output = 0u;
+        else {
+          CHECK(absl::SimpleAtod(res[0], &count))
+              << "Failed in parsing cgroupv2 cpu count, path = " << path << " (read: " << *cpu
+              << ")";
+          CHECK(absl::SimpleAtod(res[1], &timeshare))
+              << "Failed in parsing cgroupv2 cpu timeshare, path = " << path << " (read: " << *cpu
+              << ")";
+
+          *output = static_cast<size_t>(ceil(count / timeshare));
+        }
+
+        read_something = true;
+      }
+    } else if (auto quota = ReadFileToString(StrCat(path, "/cpu.cfs_quota_us"));
+               quota.has_value()) {
+      auto period = ReadFileToString(StrCat(path, "/cpu.cfs_period_us"));
+
+      CHECK(period.has_value()) << "Failed to read cgroup cpu.cfs_period_us, but read "
+                                   "cpu.cfs_quota_us (this shouldn't happen!)";
+
+      CHECK(absl::SimpleAtod(quota.value(), &count))
+          << "Failed in parsing cgroupv1 cpu timeshare, quota = " << path << " (read: " << *quota
+          << ")";
+
+      if (count == -1)  // on -1 there is no limit.
+        count = 0;
+
+      CHECK(absl::SimpleAtod(period.value(), &timeshare))
+          << "Failed in parsing cgroupv1 cpu timeshare, path = " << path << " (read: " << *period
+          << ")";
+
+      *output = static_cast<size_t>(count / timeshare);
+      read_something = true;
+    }
+  };
+
+  constexpr auto base_cpu = "/sys/fs/cgroup/cpu"sv;
+  read_cpu(base_cpu, max_threads);  // global cpu limits
+  constexpr auto base_cpu_v2 = "/sys/fs/cgroup"sv;
+  read_cpu(base_cpu_v2, max_threads);  // global cpu limits
+  constexpr auto base_cpu_v2_slice = "/sys/fs/cgroup/user.slice"sv;
+  read_cpu(base_cpu_v2_slice, max_threads);  // global cpu limits
+  read_cpu(cpu_path, max_threads);           // cgroup-specific limits
+
+  if (!read_something) {
+    LOG(ERROR) << "Failed in deducing any cgroup limits with paths " << mem_path << " and "
+               << cpu_path;
+    return false;
+  }
+  return true;
+}
+
+#endif
+
+void SetupAllocationTracker(ProactorPool* pool) {
+#ifdef DFLY_ENABLE_MEMORY_TRACKING
+  string flag = absl::GetFlag(FLAGS_allocation_tracker);
+  vector<pair<size_t, size_t>> track_ranges;
+  for (string_view entry : absl::StrSplit(flag, ",", absl::SkipEmpty())) {
+    auto separator = entry.find(":");
+    if (separator == entry.npos) {
+      LOG(ERROR) << "Can't find ':' in element";
+      exit(-1);
+    }
+
+    pair<size_t, size_t> p;
+    if (!absl::SimpleAtoi(entry.substr(0, separator), &p.first)) {
+      LOG(ERROR) << "Can't parse first number in pair";
+      exit(-1);
+    }
+    if (!absl::SimpleAtoi(entry.substr(separator + 1), &p.second)) {
+      LOG(ERROR) << "Can't parse second number in pair";
+      exit(-1);
+    }
+
+    track_ranges.push_back(p);
+  }
+
+  pool->AwaitBrief([&](unsigned, ProactorBase*) {
+    for (auto range : track_ranges) {
+      if (!AllocationTracker::Get().Add(
+              {.lower_bound = range.first, .upper_bound = range.second, .sample_odds = 1.0})) {
+        LOG(ERROR) << "Unable to track allocation range";
+        exit(-1);
+      }
+    }
+  });
+#endif
+}
+
+void RegisterBufRings(ProactorPool* pool) {
+#ifdef __linux__
+  auto bufcnt = absl::GetFlag(FLAGS_uring_recv_buffer_cnt);
+  if (bufcnt == 0) {
+    return;
+  }
+
+  if (dfly::kernel_version < 602 || pool->at(0)->GetKind() != ProactorBase::IOURING) {
+    LOG(WARNING) << "uring_recv_buffer_cnt is only supported on kernels >= 6.2 and with "
+                    "io_uring proactor";
+    return;
+  }
+
+  // We need a power of 2 length.
+  bufcnt = absl::bit_ceil(bufcnt);
+  pool->AwaitBrief([&](unsigned, ProactorBase* pb) {
+    auto up = static_cast<fb2::UringProactor*>(pb);
+    int res = up->RegisterBufferRing(facade::kRecvSockGid, bufcnt, facade::kRecvBufSize);
+    if (res != 0) {
+      LOG(ERROR) << "Failed to register buf ring for proactor "
+                 << util::detail::SafeErrorMessage(res);
+      exit(1);
+    }
+  });
+  LOG(INFO) << "Registered a bufring with " << bufcnt << " buffers of size " << facade::kRecvBufSize
+            << " per thread ";
+#endif
+}
+
+class MiMallocResource : public PMR_NS::memory_resource {
+ private:
+  void* do_allocate(std::size_t size, std::size_t align) final {
+    return mi_malloc_aligned(size, align);
+  }
+
+  void do_deallocate(void* ptr, std::size_t size, std::size_t align) final {
+    mi_free_size_aligned(ptr, size, align);
+  }
+
+  bool do_is_equal(const PMR_NS::memory_resource& o) const noexcept final {
+    return this == &o;
+  }
+};
+
+MiMallocResource g_mi_resource;
+
+#ifdef USE_AFL
+// AFL++ fuzzing helper functions
+// These functions support AFL++ persistent mode fuzzing by handling server readiness checks,
+// input reading, and test case execution. The __AFL_LOOP macro itself must remain in main()
+// due to AFL++ instrumentation requirements.
+
+// Waits for the Dragonfly server to become ready by attempting TCP connections.
+// Returns true if server is ready, false otherwise.
+// This is necessary because the server starts in a separate thread and we need to
+// wait for it to be fully initialized before starting the fuzzing loop.
+bool WaitForServerReady(uint16_t port, int max_attempts = 100) {
+  for (int i = 0; i < max_attempts; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s >= 0) {
+      struct sockaddr_in a = {};
+      a.sin_family = AF_INET;
+      a.sin_port = htons(port);
+      inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+      if (connect(s, (struct sockaddr*)&a, sizeof(a)) == 0) {
+        close(s);
+        return true;
+      }
+      close(s);
+    }
+  }
+  return false;
+}
+
+// Configures stdin to non-blocking mode for AFL++ fuzzing.
+// Non-blocking mode is required because AFL++ feeds input through stdin,
+// and we need to handle cases where input might not be immediately available.
+void ConfigureStdinNonBlocking() {
+  fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
+}
+
+// Reads fuzzing input from stdin with retry logic.
+// AFL++ provides test cases through stdin, and this function handles reading them
+// with appropriate retry logic for non-blocking I/O.
+// Returns the number of bytes read, or -1 on error, or 0 if no data available after retries.
+ssize_t ReadFuzzInput(char* buffer, size_t buffer_size) {
+  ssize_t len = 0;
+  for (int attempt = 0; attempt < 100 && len == 0; attempt++) {
+    len = read(STDIN_FILENO, buffer, buffer_size);
+    if (len < 0 && errno == EAGAIN) {
+      usleep(10000);  // Wait 10ms and retry
+      continue;
+    }
+    if (len < 0)
+      break;
+  }
+  return len;
+}
+
+// Sends fuzzing input to the Dragonfly server and reads the response.
+// This executes one fuzzing iteration by:
+// 1. Creating a TCP socket connection to the server
+// 2. Sending the fuzzed data
+// 3. Reading a response (with timeout to prevent hangs)
+// The function uses short timeouts to keep fuzzing fast and prevent AFL++ from stalling.
+void SendFuzzInputToServer(uint16_t port, const char* data, ssize_t len) {
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  if (s >= 0) {
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in a = {};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+    if (connect(s, (struct sockaddr*)&a, sizeof(a)) == 0) {
+      send(s, data, len, MSG_NOSIGNAL);
+      char r[4096];
+      recv(s, r, sizeof(r), 0);
+    }
+    close(s);
+  }
+}
+
+// Clears the --dir directory so the server starts with a clean state.
+// Without this, dumps from a previous AFL++ loop cycle would be loaded on restart,
+// making RECORD files insufficient to reproduce crashes.
+void ClearDumpDirectory() {
+  string dbfilename = GetFlag(FLAGS_dbfilename);
+  if (dbfilename.empty())
+    return;
+
+  string dir = GetFlag(FLAGS_dir);
+  if (dir.empty())
+    return;
+
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  for (const auto& entry : fs::directory_iterator(dir, ec)) {
+    std::error_code remove_ec;
+    fs::remove_all(entry.path(), remove_ec);
+    if (remove_ec) {
+      LOG(WARNING) << "AFL++: Failed to remove " << entry.path() << ": " << remove_ec.message();
+    }
+  }
+  if (ec) {
+    LOG(WARNING) << "AFL++: Failed to iterate " << dir << ": " << ec.message();
+  }
+}
+
+// Initializes AFL++ fuzzing by starting the server in a separate thread,
+// waiting for it to become ready, and preparing stdin for fuzzing input.
+// Returns the server thread handle. The caller is responsible for the fuzzing loop.
+std::thread InitAflFuzzing(ProactorPool* pool, AcceptServer* acceptor) {
+  ClearDumpDirectory();
+
+  // Start server in a separate thread
+  std::thread server_thread([pool, acceptor]() {
+    dfly::RunEngine(pool, acceptor);
+    pool->Stop();
+  });
+
+  uint16_t target_port = GetFlag(FLAGS_afl_target_port);
+  uint16_t port = target_port ? target_port : GetFlag(FLAGS_port);
+
+  // Wait for server to become ready
+  if (!WaitForServerReady(port)) {
+    LOG(ERROR) << "AFL++: Server not ready after 100 attempts, exiting...";
+    exit(1);
+  }
+
+  uint32_t afl_loop_limit = GetFlag(FLAGS_afl_loop_limit);
+  LOG(INFO) << "AFL++: Server ready, starting fuzzing loop with limit " << afl_loop_limit
+            << " iterations...";
+
+  // Configure stdin for AFL++ input
+  ConfigureStdinNonBlocking();
+
+  return server_thread;
+}
+
+// Executes one AFL++ fuzzing iteration: reads input from stdin and sends it to the server.
+// Returns true if the iteration was successful, false if stdin EOF or error occurred.
+bool RunAflFuzzingIteration(uint16_t port) {
+  char buf[64 * 1024];
+
+  // Read fuzzing input from stdin
+  ssize_t len = ReadFuzzInput(buf, sizeof(buf));
+
+  if (len <= 0)
+    return false;  // stdin EOF or error
+
+  // Send fuzzed input to the server
+  SendFuzzInputToServer(port, buf, len);
+  return true;
+}
+#endif  // USE_AFL
+
+}  // namespace
+}  // namespace dfly
+
+extern "C" void _mi_options_init();
+
+using namespace dfly;
+
+void sigill_hdlr(int signo) {
+  LOG(ERROR) << "An attempt to execute an instruction failed."
+             << "The root cause might be an old hardware. Exiting...";
+  exit(1);
+}
+
+void PrintBasicUsageInfo() {
+  std::string output =
+      "                   .--::--.                   \n"
+      "   :+*=:          =@@@@@@@@=          :+*+:   \n"
+      "  %@@@@@@%*=.     =@@@@@@@@-     .=*%@@@@@@#  \n"
+      "  @@@@@@@@@@@@#+-. .%@@@@#. .-+#@@@@@@@@@@@%  \n"
+      "  -@@@@@@@@@@@@@@@@*:#@@#:*@@@@@@@@@@@@@@@@-  \n"
+      "    :+*********####-%@%%@%-####********++.    \n"
+      "   .%@@@@@@@@@@@@@%:@@@@@@:@@@@@@@@@@@@@@%    \n"
+      "   .@@@@@@@@%*+-:   =@@@@=  .:-+*%@@@@@@@%.   \n"
+      "     =*+-:           ###*          .:-+*=     \n"
+      "                     %@@%                     \n"
+      "                     *@@*                     \n"
+      "                     +@@=                     \n"
+      "                     :##:                     \n"
+      "                     :@@:                     \n"
+      "                      @@                      \n"
+      "                      ..                      \n"
+      "* Logs will be written to the first available of the following paths:\n";
+
+  for (const auto& dir : base::GetLoggingDirectories()) {
+    const string_view maybe_slash = absl::EndsWith(dir, "/") ? "" : "/";
+    absl::StrAppend(&output, dir, maybe_slash, "dragonfly.*\n");
+  }
+
+  absl::StrAppend(&output,
+                  "* For the available flags type dragonfly [--help | --helpfull]\n"
+                  "* Documentation can be found at: https://www.dragonflydb.io/docs\n");
+
+  std::cout << output;
+  std::cout.flush();
+}
+
+void ParseFlagsFromEnv() {
+  const auto& flags = absl::GetAllFlags();
+  for (char** env = environ; *env != nullptr; env++) {
+    constexpr string_view kPrefix = "DFLY_";
+    string_view environ_var = *env;
+    if (absl::StartsWith(environ_var, kPrefix)) {
+      // Per 'man environ', environment variables are included with their values
+      // in the format "name=value". Need to strip them apart, in order to work with flags object
+      pair<string_view, string_view> environ_pair =
+          absl::StrSplit(absl::StripPrefix(environ_var, kPrefix), absl::MaxSplits('=', 1));
+      const auto& [flag_name, flag_value] = environ_pair;
+      if (flag_name == "DEV_ENV") {
+        continue;  // DFLY_DEV_ENV is used to skip version check.
+      }
+
+      auto entry = flags.find(flag_name);
+      if (entry != flags.end()) {
+        if (absl::flags_internal::WasPresentOnCommandLine(flag_name)) {
+          continue;
+        }
+        string error;
+        auto& flag = entry->second;
+        bool success = flag->ParseFrom(flag_value, &error);
+        if (!success) {
+          LOG(FATAL) << "could not parse flag " << flag->Name()
+                     << " from environment variable. Error: " << error;
+        }
+      } else {
+        LOG(FATAL) << "unknown environment variable DFLY_" << flag_name;
+      }
+    }
+  }
+}
+
+int main(int argc, char* argv[]) {
+  absl::SetProgramUsageMessage(
+      R"(a modern in-memory store.
+
+Usage: dragonfly [FLAGS]
+)");
+
+  absl::FlagsUsageConfig config;
+  config.contains_help_flags = dfly::HelpFlags;
+  config.contains_helpshort_flags = dfly::HelpshortFlags;
+  config.normalize_filename = dfly::NormalizePaths;
+  config.version_string = [] {
+    string version = StrCat(dfly::kGitTag, "-", dfly::kGitSha);
+    return StrCat("dragonfly ", ColoredStr(TermColor::kGreen, version),
+                  "\nbuild time: ", ColoredStr(TermColor::kYellow, dfly::kBuildTime), "\n");
+  };
+
+  absl::SetFlagsUsageConfig(config);
+
+#ifndef USE_ABSL_LOG
+  google::InitGoogleLogging(argv[0]);
+  google::SetLogFilenameExtension(".log");
+#endif
+
+  MainInitGuard guard(&argc, &argv);
+
+  ParseFlagsFromEnv();
+
+#ifdef USE_ABSL_LOG
+  // alsologtostderr: route all logs to stderr in addition to files.
+  // logtostderr is handled by FileLogSink::Init() in helio.
+  if (GetFlag(FLAGS_alsologtostderr)) {
+    absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfo);
+  }
+#endif
+
+  if (!GetFlag(FLAGS_omit_basic_usage)) {
+    PrintBasicUsageInfo();
+  }
+
+  LOG(INFO) << "Starting dragonfly " << GetVersion() << "-" << kGitSha;
+
+  struct sigaction act;
+  act.sa_handler = sigill_hdlr;
+  sigemptyset(&act.sa_mask);
+  sigaction(SIGILL, &act, nullptr);
+
+  // Ignore SIGHUP to prevent termination when the parent shell exits
+  signal(SIGHUP, SIG_IGN);
+
+  if (GetFlag(FLAGS_port) == 0u) {
+    string usock = GetFlag(FLAGS_unixsocket);
+    if (usock.length() == 0u) {
+      LOG(ERROR) << "received --port 0, yet no unix socket to listen to. Exiting.";
+      exit(1);
+    }
+    LOG(INFO) << "received --port 0, disabling TCP listening.";
+    LOG(INFO) << "listening on unix socket " << usock << ".";
+  }
+
+  if (GetFlag(FLAGS_dbnum) > dfly::kMaxDbId) {
+    LOG(ERROR) << "dbnum is too big. Exiting...";
+    return 1;
+  }
+
+  string pidfile_path = GetFlag(FLAGS_pidfile);
+  if (!pidfile_path.empty()) {
+    if (!CreatePidFile(pidfile_path)) {
+      return 1;
+    }
+  }
+
+  io::MemInfoData mem_info = ReadMemInfo().value_or(io::MemInfoData{});
+  size_t max_available_threads = 0u;
+
+#ifdef __linux__
+  UpdateResourceLimitsIfInsideContainer(&mem_info, &max_available_threads);
+  // If --proactor_threads (or DFLY_proactor_threads env var) was explicitly set by the user,
+  // honor it over the cgroup-derived CPU limit. The flag defaults to 0, so any non-zero value
+  // means the user explicitly requested a specific thread count.
+  if (absl::GetFlag(FLAGS_proactor_threads) > 0) {
+    LOG(INFO) << "Using proactor_threads=" << absl::GetFlag(FLAGS_proactor_threads)
+              << " (overriding cgroup-derived " << max_available_threads << ")";
+    max_available_threads = 0;  // causes ProactorPool to use FLAGS_proactor_threads
+  }
+#endif
+
+  if (mem_info.swap_total != 0)
+    LOG(WARNING) << "SWAP is enabled. Consider disabling it when running Dragonfly.";
+
+  dfly::max_memory_limit = absl::GetFlag(FLAGS_maxmemory);
+
+  if (dfly::max_memory_limit == 0) {
+    LOG(INFO) << "maxmemory has not been specified. Deciding myself....";
+
+    size_t available = mem_info.mem_avail;
+    size_t maxmemory = size_t(0.8 * available);
+    if (maxmemory == 0) {
+      LOG(ERROR) << "Could not deduce how much memory available. "
+                 << "Use --maxmemory=... to specify explicitly";
+      return 1;
+    }
+    LOG(INFO) << "Found " << HumanReadableNumBytes(available)
+              << " available memory. Setting maxmemory to " << HumanReadableNumBytes(maxmemory);
+
+    absl::SetFlag(&FLAGS_maxmemory, maxmemory);
+    dfly::max_memory_limit = maxmemory;
+  } else {
+    string hr_limit = HumanReadableNumBytes(dfly::max_memory_limit);
+    if (dfly::max_memory_limit > mem_info.mem_avail)
+      LOG(WARNING) << "Got memory limit " << hr_limit << ", however only "
+                   << HumanReadableNumBytes(mem_info.mem_avail) << " was found.";
+    LOG(INFO) << "Max memory limit is: " << hr_limit;
+  }
+
+  // Initialize mi_malloc options
+  // export MIMALLOC_VERBOSE=1 to see the options before the override.
+  // _default functions override the default options vaues but if the options were set
+  // via the environment variables, they will not be overridden.
+  mi_option_set_enabled_default(mi_option_show_errors, true);
+  mi_option_set_default(mi_option_purge_delay, 0);
+
+  // To see the options after the override, use:
+  // mi_options_print();
+
+  fb2::SetDefaultStackResource(&g_mi_resource, kFiberDefaultStackSize);
+
+  {
+    unique_ptr<util::ProactorPool> pool;
+
+#ifdef __linux__
+    base::sys::KernelVersion kver;
+    base::sys::GetKernelVersion(&kver);
+
+    CHECK_LT(kver.major, 99u);
+    dfly::kernel_version = kver.kernel * 100 + kver.major;
+
+    bool use_epoll = ShouldUseEpollAPI(kver);
+
+    if (use_epoll) {
+      pool.reset(fb2::Pool::Epoll(max_available_threads));
+    } else {
+      pool.reset(fb2::Pool::IOUring(1024, max_available_threads));  // 1024 - iouring queue size.
+    }
+#else
+    pool.reset(fb2::Pool::Epoll(max_available_threads));
+#endif
+
+    pool->Run();
+
+    SetupAllocationTracker(pool.get());
+    RegisterBufRings(pool.get());
+
+    AcceptServer acceptor(pool.get(), &g_mi_resource, true);
+    acceptor.set_back_log(absl::GetFlag(FLAGS_tcp_backlog));
+
+#ifdef USE_AFL
+    //  Persistent mode fuzzing integration:
+    // - AFL++ generates test cases and feeds them through stdin
+    // - This code reads from stdin and forwards the data to a real TCP connection to the Dragonfly
+    //   server
+    // - The server runs in a separate thread and processes the fuzzed input as if it came from a
+    //   normal client
+    // - Each fuzzing iteration: read stdin -> send to server via TCP -> read response -> repeat
+    //
+    // Process lifecycle:
+    // - When stdin closes (EOF), the fuzzing process exits - this is expected behavior
+    // - When the fuzzing session completes (__AFL_LOOP finishes), the process exits with code 0
+    // - Exiting with code 0 is REQUIRED for AFL++ to work correctly
+    // - This also enables "dry run" mode where AFL++ tests that the target can be fuzzed before
+    //   starting the actual fuzzing campaign
+
+    std::thread server_thread = dfly::InitAflFuzzing(pool.get(), &acceptor);
+
+    uint16_t target_port = GetFlag(FLAGS_afl_target_port);
+    uint16_t port = target_port ? target_port : GetFlag(FLAGS_port);
+    uint32_t afl_loop_limit = GetFlag(FLAGS_afl_loop_limit);
+    unsigned int loop_iteration = 0;
+
+    // AFL++ persistent mode loop - this macro MUST stay in main() for proper instrumentation
+    while (__AFL_LOOP(afl_loop_limit)) {
+      loop_iteration++;
+      if (!dfly::RunAflFuzzingIteration(port))
+        break;  // stdin EOF or error
+    }
+
+    // AFL++ fuzzing session completed successfully
+    LOG(INFO) << "AFL++: Loop finished after " << loop_iteration << " iterations, exiting...";
+    // Use _exit(0) to skip cleanup - required by AFL++ persistent mode
+    _exit(0);
+#else
+    dfly::RunEngine(pool.get(), &acceptor);
+    pool->Stop();
+#endif
+
+    if (!pidfile_path.empty()) {
+      unlink(pidfile_path.c_str());
+    }
+  }
+
+  return 0;
+}

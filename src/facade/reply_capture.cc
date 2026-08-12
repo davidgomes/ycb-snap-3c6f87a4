@@ -1,0 +1,175 @@
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+#include "facade/reply_capture.h"
+
+#include "absl/types/span.h"
+#include "base/logging.h"
+#include "reply_capture.h"
+
+#define SKIP_LESS(needed)     \
+  replies_recorded_++;        \
+  if (reply_mode_ < needed) { \
+    current_ = monostate{};   \
+    return;                   \
+  }
+namespace facade {
+
+using namespace std;
+using namespace payload;
+
+void CapturingReplyBuilder::SendError(std::string_view str, std::string_view type) {
+  last_error_ = str;
+  SKIP_LESS(ReplyMode::ONLY_ERR);
+  Capture(make_error(str, type));
+}
+
+void CapturingReplyBuilder::SendNullArray() {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(unique_ptr<CollectionPayload>{nullptr});
+}
+
+void CapturingReplyBuilder::SendNull() {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(nullptr_t{});
+}
+
+void CapturingReplyBuilder::SendLong(long val) {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(val);
+}
+
+void CapturingReplyBuilder::SendDouble(double val) {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(val);
+}
+
+void CapturingReplyBuilder::SendSimpleString(std::string_view str) {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(SimpleString{string{str}});
+}
+
+void CapturingReplyBuilder::SendBulkString(std::string_view str) {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(BulkString{string{str}});
+}
+
+void CapturingReplyBuilder::StartCollection(unsigned len, CollectionType type) {
+  SKIP_LESS(ReplyMode::FULL);
+  stack_.emplace(make_unique<CollectionPayload>(len, type),
+                 type == CollectionType::MAP ? len * 2 : len);
+
+  // If we added an empty collection, it must be collapsed immediately.
+  CollapseFilledCollections();
+}
+
+CapturingReplyBuilder::Payload CapturingReplyBuilder::Take() {
+  CHECK(stack_.empty());
+  Payload pl = std::move(current_);
+  current_ = monostate{};
+  return pl;
+}
+
+void CapturingReplyBuilder::SendDirect(Payload&& val) {
+  replies_recorded_ += !holds_alternative<monostate>(val);
+  bool is_err = holds_alternative<Error>(val);
+  ReplyMode min_mode = is_err ? ReplyMode::ONLY_ERR : ReplyMode::FULL;
+  if (reply_mode_ >= min_mode) {
+    DCHECK_EQ(current_.index(), 0u);
+    current_ = std::move(val);
+  } else {
+    current_ = monostate{};
+  }
+}
+
+void CapturingReplyBuilder::Capture(Payload val, bool collapse_if_needed) {
+  if (!stack_.empty()) {
+    auto& last = stack_.top();
+    last.first->arr.push_back(std::move(val));
+    if (last.second-- == 1 && collapse_if_needed) {
+      CollapseFilledCollections();
+    }
+  } else {
+    DCHECK_EQ(current_.index(), 0u);
+    current_ = std::move(val);
+  }
+}
+
+void CapturingReplyBuilder::CollapseFilledCollections() {
+  while (!stack_.empty() && stack_.top().second == 0) {
+    auto pl = std::move(stack_.top());
+    stack_.pop();
+    Capture(std::move(pl.first), false);
+  }
+}
+
+struct CaptureVisitor {
+  void operator()(monostate) {
+  }
+
+  void operator()(long v) {
+    rb->SendLong(v);
+  }
+
+  void operator()(double v) {
+    static_cast<RedisReplyBuilder*>(rb)->SendDouble(v);
+  }
+
+  void operator()(const payload::SimpleString& ss) {
+    rb->SendSimpleString(ss);
+  }
+
+  void operator()(const payload::BulkString& bs) {
+    static_cast<RedisReplyBuilder*>(rb)->SendBulkString(bs);
+  }
+
+  void operator()(payload::Null) {
+    static_cast<RedisReplyBuilder*>(rb)->SendNull();
+  }
+
+  void operator()(const payload::Error& err) {
+    rb->SendError(err->first, err->second);
+  }
+
+  void operator()(const unique_ptr<payload::CollectionPayload>& cp) {
+    auto* builder = static_cast<RedisReplyBuilder*>(rb);
+    if (!cp) {
+      builder->SendNullArray();
+      return;
+    }
+    if (cp->len == 0 && cp->type == CollectionType::ARRAY) {
+      builder->SendEmptyArray();
+      return;
+    }
+    builder->StartCollection(cp->len, cp->type);
+    for (auto& pl : cp->arr)
+      visit(*this, std::move(pl));
+  }
+
+  SinkReplyBuilder* rb;
+};
+
+void CapturingReplyBuilder::Apply(Payload&& pl, SinkReplyBuilder* rb) {
+  if (auto* crb = dynamic_cast<CapturingReplyBuilder*>(rb); crb != nullptr) {
+    crb->SendDirect(std::move(pl));
+    return;
+  }
+
+  CaptureVisitor cv{rb};
+  visit(cv, std::move(pl));
+}
+
+void CapturingReplyBuilder::SetReplyMode(ReplyMode mode) {
+  reply_mode_ = mode;
+  current_ = monostate{};
+}
+
+optional<CapturingReplyBuilder::ErrorRef> CapturingReplyBuilder::TryExtractError(
+    const Payload& pl) {
+  if (auto* err = get_if<Error>(&pl); err != nullptr) {
+    return ErrorRef{(*err)->first, (*err)->second};
+  }
+  return nullopt;
+}
+
+}  // namespace facade

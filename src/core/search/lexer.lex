@@ -1,0 +1,183 @@
+%top{
+  // Our lexer need to know about Parser::symbol_type
+  #include "core/search/parser.hh"
+  #include "core/search/tag_types.h" // Include TagType enum
+}
+
+%{
+  #include <absl/strings/escaping.h>
+  #include <absl/strings/numbers.h>
+
+  #include "base/logging.h"
+
+  #define DFLY_LEXER_CC 1
+     #include "core/search/scanner.h"
+  #undef DFLY_LEXER_CC
+%}
+
+%o bison-cc-namespace="dfly.search" bison-cc-parser="Parser"
+%o namespace="dfly.search"
+%o class="Scanner" lex="Lex"
+%o nodefault batch case-insensitive
+/* %o debug */
+
+/* Declarations before lexer implementation.  */
+%{
+  // A number symbol corresponding to the value in S.
+  using dfly::search::Parser;
+  using namespace std;
+  using dfly::search::TagType;
+
+  Parser::symbol_type make_PhraseTok(string_view src, const Parser::location_type& loc);
+  Parser::symbol_type make_Tag(string_view src, TagType type, const Parser::location_type& loc);
+  // Strip backslashes from \X sequences in a term.
+  string UnescapeTerm(string_view src);
+%}
+
+dq         \"
+sq         \'
+esc_chars  ['"\?\\abfnrtv]
+esc_seq    \\{esc_chars}
+term_ch    \w
+/* term_part: word char OR any backslash-escaped char.
+ * This deliberately overlaps with tag_val_ch — both can match the same input
+ * inside `{...}`. The grammar treats TERM and TAG_VAL interchangeably as
+ * `tag_list_element`, so identical-length matches resolve to TERM (rule order)
+ * and the unescaped text is the same. UnescapeTerm produces the literal text. */
+term_part  (\w|\\.)
+tag_val_base_ch [^,.<>{}\[\]\\\"\?':;!@#$%^&*()\-+=~\/| ]|\\.
+tag_val_ch {tag_val_base_ch}+(:+{tag_val_base_ch}*)*
+astrsk_ch  \*
+
+
+%{
+  // Code run each time a pattern is matched.
+%}
+
+%%
+
+%{
+  // Code run each time lex() is called.
+%}
+
+[[:space:]]+   // skip white space
+
+"("                  return Parser::make_LPAREN (loc());
+")"                  return Parser::make_RPAREN (loc());
+"*"                  return Parser::make_STAR (loc());
+"-"                  return Parser::make_NOT_OP (loc());
+"~"                  return Parser::make_TILDE (loc());
+":"                  return Parser::make_COLON (loc());
+"=>"                 return Parser::make_ARROW (loc());
+"["                  return Parser::make_LBRACKET (loc());
+"]"                  return Parser::make_RBRACKET (loc());
+"{"                  return Parser::make_LCURLBR (loc());
+"}"                  return Parser::make_RCURLBR (loc());
+"|"                  return Parser::make_OR_OP (loc());
+","                  return Parser::make_COMMA (loc());
+"KNN"                return Parser::make_KNN (loc());
+"AS"                 return Parser::make_AS (loc());
+"EF_RUNTIME"         return Parser::make_EF_RUNTIME (loc());
+"VECTOR_RANGE"       return Parser::make_VECTOR_RANGE (loc());
+"$YIELD_DISTANCE_AS" return Parser::make_YIELD_DISTANCE_AS (loc());
+
+[0-9]{1,9}                          return Parser::make_UINT32(str(), loc());
+[+-]?(([0-9]*[.])?[0-9]+|inf)       return Parser::make_DOUBLE(str(), loc());
+
+  /* Quoted phrase, optionally followed by `~N` slop (no whitespace before `~`). With whitespace
+     before `~`, the tilde tokenizes separately as the optional-term operator. */
+{dq}([^"]|{esc_seq})*{dq}(~[0-9]+)?   return make_PhraseTok(str(), loc());
+{sq}([^']|{esc_seq})*{sq}(~[0-9]+)?   return make_PhraseTok(str(), loc());
+
+"$"{term_ch}+                       return ParseParam(str(), loc());
+"@"{term_ch}+                       return Parser::make_FIELD(str(), loc());
+{astrsk_ch}{term_part}+{astrsk_ch}    return Parser::make_INFIX(UnescapeTerm(matched_view(1, 1)), loc());
+{term_part}+{astrsk_ch}               return Parser::make_PREFIX(UnescapeTerm(matched_view(0, 1)), loc());
+{astrsk_ch}{term_part}+               return Parser::make_SUFFIX(UnescapeTerm(matched_view(1, 0)), loc());
+
+{term_part}+                          return Parser::make_TERM(UnescapeTerm(str()), loc());
+{tag_val_ch}+{astrsk_ch}            return make_Tag(str(), TagType::PREFIX, loc());
+{astrsk_ch}{tag_val_ch}+            return make_Tag(str(), TagType::SUFFIX, loc());
+{astrsk_ch}{tag_val_ch}+{astrsk_ch} return make_Tag(str(), TagType::INFIX, loc());
+{tag_val_ch}+                       return make_Tag(str(), TagType::REGULAR, loc());
+
+<<EOF>> return Parser::make_YYEOF(loc());
+%%
+
+Parser::symbol_type make_PhraseTok(string_view src, const Parser::location_type& loc) {
+  // src is the full match: opening quote, content, closing quote, optionally `~N`.
+  uint32_t slop = 0;
+  char quote = src.front();
+  // Locate closing quote (last char matching the opener, skipping escaped pairs).
+  size_t close_idx = src.size() - 1;
+  while (close_idx > 0 && src[close_idx] != quote)
+    --close_idx;
+  string_view inner = src.substr(1, close_idx - 1);
+  string_view after = src.substr(close_idx + 1);
+  if (!after.empty() && after.front() == '~') {
+    if (!absl::SimpleAtoi(after.substr(1), &slop))
+      throw Parser::syntax_error(loc, "bad phrase slop: " + string(after));
+  }
+  string res;
+  if (!absl::CUnescape(inner, &res))
+    throw Parser::syntax_error(loc, "bad escaped string: " + string(inner));
+
+  return Parser::make_PHRASE(dfly::search::PhraseTok{std::move(res), slop}, loc);
+}
+
+string UnescapeTerm(string_view src) {
+  string res;
+  res.reserve(src.size());
+  bool escaped = false;
+  for (char c : src) {
+    if (escaped) {
+      res.push_back(c);
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else {
+      res.push_back(c);
+    }
+  }
+  // The {term_part}+ pattern always pairs `\\` with a following char, so a
+  // trailing lone backslash is unreachable.
+  DCHECK(!escaped);
+  return res;
+}
+
+Parser::symbol_type make_Tag(string_view src, TagType type, const Parser::location_type& loc) {
+  string res;
+  res.reserve(src.size());
+
+  // Determine processing boundaries
+  size_t start = (type == TagType::SUFFIX || type == TagType::INFIX) ? 1 : 0;
+  size_t end = src.size();
+  if (type == TagType::PREFIX || type == TagType::INFIX) {
+    end--; // Skip the last '*' character
+  }
+
+    // Handle escaping
+  bool escaped = false;
+  for (size_t i = start; i < end; ++i) {
+    if (escaped) {
+      escaped = false;
+    } else if (src[i] == '\\') {
+      escaped = true;
+      continue;
+    }
+    res.push_back(src[i]);
+  }
+
+  // Return the appropriate token type
+  switch (type) {
+    case TagType::PREFIX:
+      return Parser::make_PREFIX(res, loc);
+    case TagType::SUFFIX:
+      return Parser::make_SUFFIX(res, loc);
+    case TagType::INFIX:
+      return Parser::make_INFIX(res, loc);
+    case TagType::REGULAR:
+    default:
+      return Parser::make_TAG_VAL(res, loc);
+  }
+}

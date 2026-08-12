@@ -1,0 +1,1198 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+#pragma once
+
+#include <array>
+#include <ranges>
+#include <vector>
+
+#include "absl/random/random.h"
+#include "base/pmr/memory_resource.h"
+#include "core/dash_internal.h"
+
+namespace dfly {
+
+// DASH: Dynamic And Scalable Hashing.
+
+template <typename _Key, typename _Value, typename Policy>
+class DashTable : public detail::DashTableBase {
+  DashTable(const DashTable&) = delete;
+  DashTable& operator=(const DashTable&) = delete;
+
+  using Base = detail::DashTableBase;
+  using SegmentType = detail::Segment<_Key, _Value, Policy>;
+  using SegmentIterator = typename SegmentType::Iterator;
+
+ public:
+  using Key_t = _Key;
+  using Value_t = _Value;
+  using Segment_t = SegmentType;
+
+  //! Total number of buckets in a segment (including stash).
+  static constexpr double kTaxAmount = SegmentType::kTaxSize;
+  static constexpr size_t kSegBytes = sizeof(SegmentType);
+
+  // How many bytes the non-stash part is taking.
+  static constexpr size_t kSegRegularBytes =
+      kSegBytes - (SegmentType::kStashBucketNum * SegmentType::kBucketSz);
+
+  static constexpr size_t kSegCapacity = SegmentType::capacity();
+  static constexpr size_t kSlotNum = SegmentType::kSlotNum;
+  static constexpr size_t kBucketNum = SegmentType::kBucketNum;
+
+  // if IsSingleBucket is true - iterates only over a single bucket.
+  template <bool IsConst, bool IsSingleBucket = false> class Iterator;
+  struct BucketSet;
+
+  using const_iterator = Iterator<true>;
+  using iterator = Iterator<false>;
+
+  using const_bucket_iterator = Iterator<true, true>;
+  using bucket_iterator = Iterator<false, true>;
+  using Cursor = detail::DashCursor;
+
+  struct HotBuckets {
+    static constexpr size_t kRegularBuckets = 4;
+    static constexpr size_t kNumBuckets = kRegularBuckets + SegmentType::kStashBucketNum;
+
+    struct ByType {
+      bucket_iterator regular_buckets[kRegularBuckets];
+      bucket_iterator stash_buckets[SegmentType::kStashBucketNum];
+    };
+
+    union Probes {
+      ByType by_type;
+      bucket_iterator arr[kNumBuckets];
+
+      Probes() : arr() {
+      }
+    } probes;
+
+    // id must be in the range [0, kNumBuckets).
+    bucket_iterator at(unsigned id) const {
+      return probes.arr[id];
+    }
+
+    unsigned num_buckets;
+    // key_hash of a key that we try to insert.
+    // I use it as pseudo-random number in my gc/eviction heuristics.
+    uint64_t key_hash;
+  };
+
+  struct DefaultEvictionPolicy {
+    static constexpr bool can_gc = false;
+    static constexpr bool can_evict = false;
+
+    bool CanGrow(const DashTable&) {
+      return true;
+    }
+
+    void OnMove(Cursor source, Cursor dest) {
+    }
+
+    void RecordSplit(SegmentType* segment) {
+    }
+    /*
+       /// Required interface in case can_gc is true
+       // Returns number of garbage collected items deleted. 0 - means nothing has been
+       // deleted.
+       unsigned GarbageCollect(const EvictionBuckets& eb, DashTable* me) const {
+         return 0;
+       }
+
+       // Required interface in case can_gc is true
+       // returns number of items evicted from the table.
+       // 0 means - nothing has been evicted.
+       unsigned Evict(const EvictionBuckets& eb, DashTable* me) {
+         return 0;
+       }
+   */
+  };
+
+  DashTable(size_t capacity_log = 1, const Policy& policy = Policy{},
+            PMR_NS::memory_resource* mr = PMR_NS::get_default_resource());
+  ~DashTable();
+
+  void Reserve(size_t size);
+
+  // false for duplicate, true if inserted.
+  template <typename U, typename V> std::pair<iterator, bool> Insert(U&& key, V&& value) {
+    DefaultEvictionPolicy policy;
+    return InsertInternal(std::forward<U>(key), std::forward<V>(value), policy,
+                          InsertMode::kInsertIfNotFound);
+  }
+
+  template <typename U, typename V, typename EvictionPolicy>
+  std::pair<iterator, bool> Insert(U&& key, V&& value, EvictionPolicy& ev) {
+    return InsertInternal(std::forward<U>(key), std::forward<V>(value), ev,
+                          InsertMode::kInsertIfNotFound);
+  }
+
+  template <typename U, typename V> iterator InsertNew(U&& key, V&& value) {
+    DefaultEvictionPolicy policy;
+    return InsertNew(std::forward<U>(key), std::forward<V>(value), policy);
+  }
+
+  template <typename U, typename V, typename EvictionPolicy>
+  iterator InsertNew(U&& key, V&& value, EvictionPolicy& ev) {
+    return InsertInternal(std::forward<U>(key), std::forward<V>(value), ev,
+                          InsertMode::kForceInsert)
+        .first;
+  }
+
+  template <typename U> const_iterator Find(U&& key) const;
+  template <typename U> iterator Find(U&& key);
+
+  // Prefetches the memory where the key would resize into the cache.
+  template <typename U> void Prefetch(U&& key) const;
+
+  // Find first entry with given key hash that evaulates to true on pred.
+  // Pred accepts either (const key&) or (const key&, const value&)
+  template <typename Pred> iterator FindFirst(uint64_t key_hash, Pred&& pred);
+
+  // it must be valid.
+  void Erase(iterator it);
+
+  size_t Erase(const Key_t& k);
+
+  iterator begin() {
+    iterator it{this, 0, 0, 0};
+    it.Seek2Occupied();
+    return it;
+  }
+
+  const_iterator cbegin() const {
+    const_iterator it{this, 0, 0, 0};
+    it.Seek2Occupied();
+    return it;
+  }
+
+  iterator end() const {
+    return iterator{};
+  }
+  const_iterator cend() const {
+    return const_iterator{};
+  }
+
+  using Base::depth;
+  using Base::Empty;
+  using Base::size;
+  using Base::unique_segments;
+
+  // Direct access to the segment for debugging purposes.
+  Segment_t* GetSegment(unsigned segment_id) {
+    return segment_[segment_id];
+  }
+
+  // - If there is no buddy for segment_id return segment_id.
+  //   Otherwise, return buddy_id.
+  // - A buddy is a sibling segment that was created from the
+  //   same parent during split and can be merged back together.
+  //   It's the adjacent subtree of the same depth.
+  unsigned FindBuddyId(unsigned segment_id) {
+    auto* seg = GetSegment(segment_id);
+    uint8_t depth = seg->local_depth();
+
+    if (depth <= 1) {
+      return segment_id;
+    }
+
+    const size_t bit_pos = global_depth_ - depth;
+    const size_t buddy_idx = segment_id ^ (1u << bit_pos);
+    assert(buddy_idx < segment_.size());
+
+    auto* buddy = GetSegment(buddy_idx);
+    // There is no adjacent subtree of the same depth
+    if (buddy->local_depth() != depth) {
+      return segment_id;
+    }
+
+    return buddy_idx;
+  }
+
+  // - Moves all items from `buddy_id` to `keep_id` (merges the two segments).
+  //   After merge completes, `buddy_id` segment is deleted.
+  // - Return true if the two segments merged successfully.
+  // - If an insertion fails we rollback and abort the merge (return false).
+  // - Merge can run only if there are no active snapshots.
+  // - Prefer calling this function only when the combined size of both segments
+  //   than x * segment_capacity. With x: 0 < x < 0.25 as statistically this won't
+  //   trigger rollbacks.
+  bool Merge(unsigned keep_id, unsigned buddy_id) {
+    auto* keep = GetSegment(keep_id);
+    auto* buddy = GetSegment(buddy_id);
+
+    assert((keep->local_depth() == buddy->local_depth()));
+    // assert((keep->SlowSize() + buddy->SlowSize() < (0.25 * buddy->capacity())));
+    assert(keep->local_depth() != 1);
+    assert(keep != buddy);
+    assert(keep_id < buddy_id);  // Callers must iterate low to high to ensure correct orientation
+
+    // Don't merge below initial_depth to maintain Clear() invariant
+    // After merge, keep will have depth-1, which determines unique_segments
+    uint8_t depth_after_merge = keep->local_depth() - 1;
+    if (depth_after_merge < initial_depth_) {
+      return false;
+    }
+
+    bool should_rollback = false;
+
+    // Decrease depth (merge back to parent)
+    keep->set_local_depth(keep->local_depth() - 1);
+
+    // Move all items from buddy to keep
+    buddy->TraverseAll([&](const auto& it) {
+      if (should_rollback) {
+        return;
+      }
+
+      uint64_t hash = DoHash(buddy->Key(it.index, it.slot));
+
+      auto& src_bucket = buddy->GetBucket(it.index);
+      auto res =
+          keep->InsertUniq(std::move(src_bucket.key[it.slot]), std::move(src_bucket.value[it.slot]),
+                           hash, false, [](auto&&...) {});
+
+      if (!res.found()) {
+        should_rollback = true;
+        return;
+      }
+
+      // Clear the slot in buddy so rollback can reuse the space
+      src_bucket.Delete(it.slot);
+    });
+
+    if (should_rollback) {
+      auto hash_fn = [this](const auto& k) { return policy_.HashFn(k); };
+      keep->Split(hash_fn, buddy, [](auto&&...) {});
+
+      return false;
+    }
+
+    // Same as Split()
+    uint32_t buddy_chunk_size = 1u << (global_depth_ - buddy->local_depth());
+    uint32_t buddy_start = buddy_id & ~(buddy_chunk_size - 1u);
+    for (size_t i = buddy_start; i < buddy_start + buddy_chunk_size; ++i) {
+      segment_[i] = keep;
+    }
+
+    // Free buddy segment
+    PMR_NS::polymorphic_allocator<SegmentType> pa(segment_.get_allocator());
+    using alloc_traits = std::allocator_traits<decltype(pa)>;
+    alloc_traits::destroy(pa, buddy);
+    alloc_traits::deallocate(pa, buddy, 1);
+
+    // Decrement unique segment counter
+    --unique_segments_;
+    bucket_count_ -= keep->num_buckets();
+
+    return true;
+  }
+
+  size_t GetSegmentCount() const {
+    return segment_.size();
+  }
+
+  size_t NextSeg(size_t sid) const {
+    size_t delta = (1u << (global_depth_ - segment_[sid]->local_depth()));
+    return sid + delta;
+  }
+
+  template <typename U> uint64_t DoHash(const U& k) const {
+    return policy_.HashFn(k);
+  }
+
+  // Flat memory usage (allocated) of the table, not including the the memory allocated
+  // by the hosted objects.
+  size_t mem_usage() const {
+    return segment_.capacity() * sizeof(void*) + sizeof(SegmentType) * unique_segments_;
+  }
+
+  // Returns the total number of buckets in the table, in contrast to capacity() which
+  // returns the total number of slots.
+  size_t bucket_count() const {
+    return bucket_count_;
+  }
+
+  // Overall capacity of the table (including stash buckets) in number of keys.
+  size_t capacity() const {
+    return bucket_count() * kSlotNum;
+  }
+
+  double load_factor() const {
+    return double(size()) / capacity();
+  }
+
+  static constexpr unsigned LargestBucketId() {
+    return SegmentType::kBucketNum + SegmentType::kStashBucketNum - 1;
+  }
+
+  // Gets a random cursor based on the available segments and buckets.
+  // Returns: cursor with a random position
+  Cursor GetRandomCursor(absl::BitGen* bitgen);
+
+  // Traverses over a single logical bucket in table and calls cb(iterator) 0 or more
+  // times. if cursor=0 starts traversing from the beginning, otherwise continues from where it
+  // stopped. returns 0 if the supplied cursor reached end of traversal. Traverse iterates at bucket
+  // logical granularity, which means for each non-empty bucket it calls cb per each entry in the
+  // logical bucket before returning. Unlike begin/end interface, traverse is stable during table
+  // mutations. It guarantees that if key exists (1)at the beginning of traversal, (2) stays in the
+  // table during the traversal, then Traverse() will eventually reach it even when the table
+  // shrinks or grows. Returns: cursor that is guaranteed to be less than 2^40.
+  template <typename Cb> Cursor Traverse(Cursor curs, Cb&& cb);
+
+  // Traverses over physical buckets. It calls cb once for each bucket by passing a bucket iterator.
+  // if cursor=0 starts traversing from the beginning, otherwise continues from where
+  // it stopped. returns 0 if the supplied cursor reached end of traversal.
+  // Unlike Traverse, TraverseBuckets calls cb once on bucket iterator and not on each entry in
+  // bucket. TraverseBuckets is stable during table mutations. It guarantees traversing all buckets
+  // that existed at the beginning of traversal.
+  template <typename Cb> Cursor TraverseBuckets(Cursor curs, Cb&& cb, bool visit_empty = false);
+
+  // Traverses over a single bucket in table and calls cb(iterator). The traverse order will be
+  // segment by segment over physical backets.
+  // traverse by segment order does not guarantees coverage if the table grows/shrinks, it is useful
+  // when formal full coverage is not critically important.
+  template <typename Cb> Cursor TraverseBySegmentOrder(Cursor curs, Cb&& cb);
+
+  // Discards slots information.
+  static const_bucket_iterator BucketIt(const_iterator it) {
+    return const_bucket_iterator{it.owner_, it.seg_id_, it.bucket_id_, 0};
+  }
+
+  // Seeks to the first occupied slot if exists in the bucket.
+  const_bucket_iterator BucketIt(unsigned segment_id, unsigned bucket_id) const {
+    return const_bucket_iterator{this, segment_id, uint8_t(bucket_id)};
+  }
+
+  bucket_iterator BucketIt(unsigned segment_id, unsigned bucket_id) {
+    return bucket_iterator{this, segment_id, uint8_t(bucket_id)};
+  }
+
+  iterator GetIterator(unsigned segment_id, unsigned bucket_id, unsigned slot_id) {
+    return iterator{this, segment_id, uint8_t(bucket_id), uint8_t(slot_id)};
+  }
+
+  const_bucket_iterator CursorToBucketIt(Cursor c) const {
+    return const_bucket_iterator{this, c.segment_id(global_depth_), c.bucket_id(), 0};
+  }
+  bucket_iterator CursorToBucketIt(Cursor c) {
+    return bucket_iterator{this, c.segment_id(global_depth_), c.bucket_id(), 0};
+  }
+
+  // Capture Version Change. Determine buckets that can potentially be modified when inserting key.
+  // These are not const functions because they send non-const iterators that allow
+  // updating contents/versions of the passed iterators.
+  template <typename U> BucketSet CVCUponInsert(const U& key);
+
+  template <typename Cb> void CVCUponBump(const_iterator it, Cb&& cb);
+
+  void Clear();
+
+  // Returns true if an element was deleted i.e the rightmost slot was busy.
+  bool ShiftRight(bucket_iterator it);
+
+  template <typename BumpPolicy> iterator BumpUp(iterator it, BumpPolicy& bp) {
+    SegmentIterator seg_it = segment_[it.seg_id_]->BumpUp(
+        it.bucket_id_, it.slot_id_, DoHash(it->first), bp,
+        [&](uint32_t segment_id, detail::PhysicalBid from, detail::PhysicalBid to) {
+          // OnMove is used to notify policy about the items moves across buckets.
+          bp.OnMove(Cursor{global_depth_, segment_id, from}, Cursor{global_depth_, segment_id, to});
+        });
+
+    return iterator{this, it.seg_id_, seg_it.index, seg_it.slot};
+  }
+
+  uint64_t garbage_collected() const {
+    return garbage_collected_;
+  }
+
+  uint64_t stash_unloaded() const {
+    return stash_unloaded_;
+  }
+
+ private:
+  enum class InsertMode {
+    kInsertIfNotFound,
+    kForceInsert,
+  };
+
+  Cursor AdvanceCursorBucketOrder(Cursor cursor);
+
+  template <typename U, typename V, typename EvictionPolicy>
+  std::pair<iterator, bool> InsertInternal(U&& key, V&& value, EvictionPolicy& policy,
+                                           InsertMode mode);
+
+  void IncreaseDepth(unsigned new_depth);
+  template <typename EvictionPolicy> void Split(uint32_t seg_id, EvictionPolicy& ev);
+
+  // Segment directory contains multiple segment pointers, some of them pointing to
+  // the same object. IterateDistinct goes over all distinct segments in the table.
+  template <typename Cb> void IterateDistinct(Cb&& cb);
+
+  template <typename K> auto EqPred(const K& key) const {
+    return [p = &policy_, &key](const auto& probe) -> bool { return p->Equal(probe, key); };
+  }
+
+  SegmentType* ConstructSegment(uint8_t depth, uint32_t id) {
+    auto* mr = segment_.get_allocator().resource();
+    PMR_NS::polymorphic_allocator<SegmentType> pa(mr);
+    SegmentType* res = pa.allocate(1);
+    pa.construct(res, depth, id, mr);  //   new SegmentType(depth);
+    bucket_count_ += res->num_buckets();
+    return res;
+  }
+
+  Policy policy_;
+  std::vector<SegmentType*, PMR_NS::polymorphic_allocator<SegmentType*>> segment_;
+
+  uint64_t garbage_collected_ = 0;
+  uint64_t stash_unloaded_ = 0;
+};  // DashTable
+
+template <typename _Key, typename _Value, typename Policy>
+template <bool IsConst, bool IsSingleBucket>
+class DashTable<_Key, _Value, Policy>::Iterator {
+  using Owner = std::conditional_t<IsConst, const DashTable, DashTable>;
+
+  Owner* owner_;
+  uint32_t seg_id_;
+  detail::PhysicalBid bucket_id_;
+  uint8_t slot_id_;
+  bool done_;
+
+  friend class DashTable;
+
+  Iterator(Owner* me, uint32_t seg_id, detail::PhysicalBid bid, uint8_t sid)
+      : owner_(me), seg_id_(seg_id), bucket_id_(bid), slot_id_(sid), done_(false) {
+  }
+
+  Iterator(Owner* me, uint32_t seg_id, detail::PhysicalBid bid)
+      : owner_(me), seg_id_(seg_id), bucket_id_(bid), slot_id_(0), done_(false) {
+    Seek2Occupied();
+  }
+
+ public:
+  using iterator_category = std::forward_iterator_tag;
+  using difference_type = std::ptrdiff_t;
+  using IteratorPairType =
+      std::conditional_t<IsConst, detail::IteratorPair<const Key_t, const Value_t>,
+                         detail::IteratorPair<Key_t, Value_t>>;
+
+  // Copy constructor from iterator to const_iterator.
+  template <bool TIsConst = IsConst, bool TIsSingleB>
+  requires TIsConst Iterator(const Iterator<!TIsConst, TIsSingleB>& other)
+  noexcept
+      : owner_(other.owner_),
+        seg_id_(other.seg_id_),
+        bucket_id_(other.bucket_id_),
+        slot_id_(other.slot_id_),
+        done_(other.done_) {
+  }
+
+  // Copy constructor from iterator to bucket_iterator and vice versa.
+  template <bool TIsSingle>
+  Iterator(const Iterator<IsConst, TIsSingle>& other) noexcept
+      : owner_(other.owner_),
+        seg_id_(other.seg_id_),
+        bucket_id_(other.bucket_id_),
+        slot_id_(IsSingleBucket ? 0 : other.slot_id_),
+        done_(other.done_) {
+    // if this - is a bucket_iterator - we reset slot_id to the first occupied space.
+    if constexpr (IsSingleBucket) {
+      Seek2Occupied();
+    }
+  }
+
+  Iterator() : owner_(nullptr), seg_id_(0), bucket_id_(0), slot_id_(0), done_(true) {
+  }
+
+  Iterator(const Iterator& other) = default;
+
+  Iterator(Iterator&& other) = default;
+
+  Iterator& operator=(const Iterator& other) = default;
+  Iterator& operator=(Iterator&& other) = default;
+
+  // pre
+  Iterator& operator++() {
+    ++slot_id_;
+    Seek2Occupied();
+    return *this;
+  }
+
+  Iterator& operator+=(int delta) {
+    slot_id_ += delta;
+    Seek2Occupied();
+    return *this;
+  }
+
+  Iterator& AdvanceIfNotOccupied() {
+    if (!IsOccupied()) {
+      this->operator++();
+    }
+    return *this;
+  }
+
+  IteratorPairType operator->() const {
+    auto* seg = owner_->segment_[seg_id_];
+    return {seg->Key(bucket_id_, slot_id_), seg->Value(bucket_id_, slot_id_)};
+  }
+
+  // Make it self-contained. Does not need container::end().
+  bool is_done() const {
+    return done_;
+  }
+
+  bool IsOccupied() const {
+    return (seg_id_ < owner_->segment_.size()) &&
+           ((owner_->segment_[seg_id_]->IsBusy(bucket_id_, slot_id_)));
+  }
+
+  Owner& owner() const {
+    return *owner_;
+  }
+
+  template <bool B = Policy::kUseVersion>
+  requires B uint64_t GetVersion()
+  const {
+    assert(owner_ && seg_id_ < owner_->segment_.size());
+    return owner_->segment_[seg_id_]->GetVersion(bucket_id_);
+  }
+
+  template <bool B = Policy::kUseVersion>
+  requires B void SetVersion(uint64_t v) {
+    return owner_->segment_[seg_id_]->SetVersion(bucket_id_, v);
+  }
+
+  friend bool operator==(const Iterator& lhs, const Iterator& rhs) {
+    if (lhs.done_ && rhs.done_)
+      return true;
+    return lhs.owner_ == rhs.owner_ && lhs.seg_id_ == rhs.seg_id_ &&
+           lhs.bucket_id_ == rhs.bucket_id_ && lhs.slot_id_ == rhs.slot_id_ &&
+           lhs.done_ == rhs.done_;
+  }
+
+  friend bool operator!=(const Iterator& lhs, const Iterator& rhs) {
+    return !(lhs == rhs);
+  }
+
+  // Bucket resolution cursor that is safe to use with insertions/removals.
+  // Serves as a hint really to the placement of the original item, i.e. the item
+  // could have moved.
+  detail::DashCursor bucket_cursor() const {
+    return detail::DashCursor(owner_->global_depth_, seg_id_, bucket_id_);
+  }
+
+  detail::PhysicalBid bucket_id() const {
+    return bucket_id_;
+  }
+
+  // Returns the unique address of the physical bucket as an integer.
+  // Stable for the lifetime of a serialization (mutations that could trigger
+  // segment splits are blocked while a snapshot version is registered).
+  uintptr_t bucket_address() const {
+    assert(owner_ && seg_id_ < owner_->segment_.size());
+    return reinterpret_cast<uintptr_t>(&owner_->segment_[seg_id_]->GetBucket(bucket_id_));
+  }
+
+  unsigned slot_id() const {
+    return slot_id_;
+  }
+
+  unsigned segment_id() const {
+    return seg_id_;
+  }
+
+ private:
+  void Seek2Occupied();
+};  // Iterator
+
+// Limited set of buckets on a single segment that can be turned into a iterator view
+template <typename _Key, typename _Value, typename Policy>
+struct DashTable<_Key, _Value, Policy>::BucketSet {
+  auto buckets() const {
+    bool is_all = limit_ > ids_.size();
+    return std::views::iota(0u, limit_) | std::views::transform([*this, is_all](uint8_t i) {
+             uint8_t index = is_all ? i : ids_[i];
+             return bucket_iterator{owner_, seg_id_, index};
+           });
+  }
+
+  bool operator==(const BucketSet& other) const {
+    return owner_ == other.owner_ && seg_id_ == other.seg_id_ && limit_ == other.limit_ &&
+           ids_[0] == other.ids_[0] && ids_[1] == other.ids_[1];
+  }
+
+ private:
+  friend class DashTable;
+
+  BucketSet(DashTable* owner, uint32_t seg_id, uint8_t limit, uint8_t ids[2])
+      : owner_{owner}, seg_id_{seg_id}, limit_{limit}, ids_{ids[0], ids[1]} {
+  }
+
+  DashTable* owner_;
+  uint32_t seg_id_;
+  uint8_t limit_;
+  std::array<uint8_t, 2> ids_;
+};
+
+/**
+  _____                 _                           _        _   _
+ |_   _|               | |                         | |      | | (_)
+   | |  _ __ ___  _ __ | | ___ _ __ ___   ___ _ __ | |_ __ _| |_ _  ___  _ __
+   | | | '_ ` _ \| '_ \| |/ _ \ '_ ` _ \ / _ \ '_ \| __/ _` | __| |/ _ \| '_ \
+  _| |_| | | | | | |_) | |  __/ | | | | |  __/ | | | || (_| | |_| | (_) | | | |
+ |_____|_| |_| |_| .__/|_|\___|_| |_| |_|\___|_| |_|\__\__,_|\__|_|\___/|_| |_|
+                 | |
+                 |_|
+
+**/
+
+template <typename _Key, typename _Value, typename Policy>
+template <bool IsConst, bool IsSingleBucket>
+void DashTable<_Key, _Value, Policy>::Iterator<IsConst, IsSingleBucket>::Seek2Occupied() {
+  if (done_)
+    return;
+  assert(seg_id_ < owner_->segment_.size());
+
+  if constexpr (IsSingleBucket) {
+    const auto& b = owner_->segment_[seg_id_]->GetBucket(bucket_id_);
+    uint32_t mask = b.GetBusy() >> slot_id_;
+    if (mask) {
+      int slot = __builtin_ctz(mask);
+      slot_id_ += slot;
+      return;
+    }
+  } else {
+    while (seg_id_ < owner_->segment_.size()) {
+      auto seg_it = owner_->segment_[seg_id_]->FindValidStartingFrom(bucket_id_, slot_id_);
+      if (seg_it.found()) {
+        bucket_id_ = seg_it.index;
+        slot_id_ = seg_it.slot;
+        return;
+      }
+      seg_id_ = owner_->NextSeg(seg_id_);
+      bucket_id_ = slot_id_ = 0;
+    }
+  }
+  done_ = true;
+}
+
+template <typename _Key, typename _Value, typename Policy>
+DashTable<_Key, _Value, Policy>::DashTable(size_t capacity_log, const Policy& policy,
+                                           PMR_NS::memory_resource* mr)
+    : Base(capacity_log), policy_(policy), segment_(mr) {
+  segment_.resize(unique_segments_);
+
+  // I assume we have enough memory to create the initial table and do not check allocations.
+  for (uint32_t i = 0; i < segment_.size(); ++i) {
+    segment_[i] = ConstructSegment(global_depth_, i);  //   new SegmentType(global_depth_);
+  }
+}
+
+template <typename _Key, typename _Value, typename Policy>
+DashTable<_Key, _Value, Policy>::~DashTable() {
+  Clear();
+  auto* resource = segment_.get_allocator().resource();
+  PMR_NS::polymorphic_allocator<SegmentType> pa(resource);
+  using alloc_traits = std::allocator_traits<decltype(pa)>;
+
+  IterateDistinct([&](SegmentType* seg) {
+    alloc_traits::destroy(pa, seg);
+    alloc_traits::deallocate(pa, seg, 1);
+    return false;
+  });
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename U>
+auto DashTable<_Key, _Value, Policy>::CVCUponInsert(const U& key) -> BucketSet {
+  uint64_t key_hash = DoHash(key);
+  uint32_t seg_id = SegmentId(key_hash);
+  assert(seg_id < segment_.size());
+  const SegmentType* target = segment_[seg_id];
+
+  uint8_t bids[2] = {0, 0};
+  uint8_t num_touched = target->CVCOnInsert(key_hash, bids);
+  return BucketSet{this, seg_id, num_touched, bids};
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename Cb>
+void DashTable<_Key, _Value, Policy>::CVCUponBump(const_iterator it, Cb&& cb) {
+  uint64_t key_hash = DoHash(it->first);
+  uint32_t seg_id = it.segment_id();
+  assert(seg_id < segment_.size());
+  const SegmentType* target = segment_[seg_id];
+
+  uint8_t bids[3];
+  unsigned num_touched = target->CVCOnBump(it.bucket_id(), it.slot_id(), key_hash, bids);
+
+  for (unsigned i = 0; i < num_touched; ++i) {
+    cb(bucket_iterator{this, seg_id, bids[i]});
+  }
+}
+
+template <typename _Key, typename _Value, typename Policy>
+void DashTable<_Key, _Value, Policy>::Clear() {
+  auto cb = [this](SegmentType* seg) {
+    seg->TraverseAll([this, seg](const SegmentIterator& it) {
+      policy_.DestroyKey(seg->Key(it.index, it.slot));
+      policy_.DestroyValue(seg->Value(it.index, it.slot));
+    });
+    seg->Clear();
+    return false;
+  };
+
+  IterateDistinct(cb);
+  size_ = 0;
+
+  // Consider the following case: table with 8 segments overall, 4 distinct.
+  // S1, S1, S1, S1, S2, S3, S4, S4
+  /* This corresponds to the tree:
+            R
+          /  \
+        S1   /\
+            /\ S4
+           S2 S3
+     We want to collapse this tree into, say, 2 segment directory.
+     That means we need to keep S1, S2 but delete S3, S4.
+     That means, we need to move representative segments until we reached the desired size
+     and then erase all other distinct segments.
+  **********/
+  if (global_depth_ > initial_depth_) {
+    PMR_NS::polymorphic_allocator<SegmentType> pa(segment_.get_allocator());
+    using alloc_traits = std::allocator_traits<decltype(pa)>;
+
+    size_t dest = 0, src = 0;
+    size_t new_size = (1 << initial_depth_);
+    bucket_count_ = 0;
+    while (src < segment_.size()) {
+      auto* seg = segment_[src];
+      size_t next_src = NextSeg(src);  // must do before because NextSeg is dependent on seg.
+      if (dest < new_size) {
+        seg->set_local_depth(initial_depth_);
+        bucket_count_ += seg->num_buckets();
+        segment_[dest++] = seg;
+      } else {
+        alloc_traits::destroy(pa, seg);
+        alloc_traits::deallocate(pa, seg, 1);
+      }
+
+      src = next_src;
+    }
+
+    global_depth_ = initial_depth_;
+    unique_segments_ = new_size;
+    segment_.resize(new_size);
+  }
+}
+
+template <typename _Key, typename _Value, typename Policy>
+bool DashTable<_Key, _Value, Policy>::ShiftRight(bucket_iterator it) {
+  auto* seg = segment_[it.seg_id_];
+
+  typename Segment_t::Hash_t hash_val = 0;
+  auto& bucket = seg->GetBucket(it.bucket_id_);
+
+  if (bucket.GetBusy() & (1 << (kSlotNum - 1))) {
+    it.slot_id_ = kSlotNum - 1;
+    hash_val = DoHash(it->first);
+    policy_.DestroyKey(it->first);
+    policy_.DestroyValue(it->second);
+  }
+
+  bool deleted = seg->ShiftRight(it.bucket_id_, hash_val);
+  size_ -= unsigned(deleted);
+
+  return deleted;
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename Cb>
+void DashTable<_Key, _Value, Policy>::IterateDistinct(Cb&& cb) {
+  size_t i = 0;
+  while (i < segment_.size()) {
+    auto* seg = segment_[i];
+    size_t next_id = NextSeg(i);
+    if (cb(seg))
+      break;
+    i = next_id;
+  }
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename U>
+auto DashTable<_Key, _Value, Policy>::Find(U&& key) const -> const_iterator {
+  uint64_t key_hash = DoHash(key);
+  uint32_t seg_id = SegmentId(key_hash);  // seg_id takes up global_depth_ high bits.
+
+  // Hash structure is like this: [SSUUUUBF], where S is segment id, U - unused,
+  // B - bucket id and F is a fingerprint. Segment id is needed to identify the correct segment.
+  // Once identified, the segment instance uses the lower part of hash to locate the key.
+  // It uses 8 least significant bits for a fingerprint and few more bits for bucket id.
+  if (auto seg_it = segment_[seg_id]->FindIt(key_hash, EqPred(key)); seg_it.found()) {
+    return {this, seg_id, seg_it.index, seg_it.slot};
+  }
+  return {};
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename U>
+auto DashTable<_Key, _Value, Policy>::Find(U&& key) -> iterator {
+  return FindFirst(DoHash(key), EqPred(key));
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename U>
+void DashTable<_Key, _Value, Policy>::Prefetch(U&& key) const {
+  uint64_t key_hash = DoHash(key);
+  uint32_t seg_id = SegmentId(key_hash);
+  segment_[seg_id]->Prefetch(key_hash);
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename Pred>
+auto DashTable<_Key, _Value, Policy>::FindFirst(uint64_t key_hash, Pred&& pred) -> iterator {
+  uint32_t seg_id = SegmentId(key_hash);
+  if (auto seg_it = segment_[seg_id]->FindIt(key_hash, pred); seg_it.found()) {
+    return {this, seg_id, seg_it.index, seg_it.slot};
+  }
+  return {};
+}
+
+template <typename _Key, typename _Value, typename Policy>
+size_t DashTable<_Key, _Value, Policy>::Erase(const Key_t& key) {
+  uint64_t key_hash = DoHash(key);
+  size_t x = SegmentId(key_hash);
+  auto* target = segment_[x];
+  auto it = target->FindIt(key_hash, EqPred(key));
+  if (!it.found())
+    return 0;
+
+  policy_.DestroyKey(target->Key(it.index, it.slot));
+  policy_.DestroyValue(target->Value(it.index, it.slot));
+  target->Delete(it, key_hash);
+  --size_;
+
+  return 1;
+}
+
+template <typename _Key, typename _Value, typename Policy>
+void DashTable<_Key, _Value, Policy>::Erase(iterator it) {
+  auto* target = segment_[it.seg_id_];
+  uint64_t key_hash = DoHash(it->first);
+  SegmentIterator sit{it.bucket_id_, it.slot_id_};
+
+  policy_.DestroyKey(it->first);
+  policy_.DestroyValue(it->second);
+
+  target->Delete(sit, key_hash);
+  --size_;
+}
+
+template <typename _Key, typename _Value, typename Policy>
+void DashTable<_Key, _Value, Policy>::Reserve(size_t size) {
+  if (size <= capacity())
+    return;
+
+  size_t sg_floor = (size - 1) / SegmentType::capacity();
+  if (sg_floor < segment_.size()) {
+    return;
+  }
+  assert(sg_floor > 1u);
+  unsigned new_depth = 1 + (63 ^ __builtin_clzll(sg_floor));
+
+  IncreaseDepth(new_depth);
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename U, typename V, typename EvictionPolicy>
+auto DashTable<_Key, _Value, Policy>::InsertInternal(U&& key, V&& value, EvictionPolicy& ev,
+                                                     InsertMode mode) -> std::pair<iterator, bool> {
+  uint64_t key_hash = DoHash(key);
+  uint32_t target_seg_id = SegmentId(key_hash);
+
+  while (true) {
+    // Keep last global_depth_ msb bits of the hash.
+    assert(target_seg_id < segment_.size());
+    SegmentType* target = segment_[target_seg_id];
+
+    // Load heap allocated segment data - to avoid TLB miss when accessing the bucket.
+    __builtin_prefetch(target, 0, 1);
+
+    typename SegmentType::Iterator it;
+    bool res = true;
+    unsigned num_buckets = target->num_buckets();
+
+    auto move_cb = [&](uint32_t segment_id, detail::PhysicalBid from, detail::PhysicalBid to) {
+      // OnMove is used to notify policy about the move of items across buckets.
+      ev.OnMove(Cursor{global_depth_, segment_id, from}, Cursor{global_depth_, segment_id, to});
+    };
+
+    if (mode == InsertMode::kForceInsert) {
+      it =
+          target->InsertUniq(std::forward<U>(key), std::forward<V>(value), key_hash, true, move_cb);
+      res = it.found();
+    } else {
+      std::tie(it, res) = target->Insert(std::forward<U>(key), std::forward<V>(value), key_hash,
+                                         EqPred(key), move_cb);
+    }
+
+    if (res) {  // success
+      // in case segment bucket count changed, we need to update total bucket count.
+      bucket_count_ += (target->num_buckets() - num_buckets);
+      ++size_;
+      return std::make_pair(iterator{this, target_seg_id, it.index, it.slot}, true);
+    }
+
+    /*duplicate insert, insertion failure*/
+    if (it.found()) {
+      return std::make_pair(iterator{this, target_seg_id, it.index, it.slot}, false);
+    }
+
+    bool consider_throw = true;
+
+    // At this point we must split the segment.
+    // try garbage collect or evict.
+    if constexpr (EvictionPolicy::can_evict || EvictionPolicy::can_gc) {
+      // Try gc.
+      uint8_t bid[HotBuckets::kRegularBuckets];
+      SegmentType::FillProbeArray(key_hash, bid);
+      HotBuckets hotspot;
+      hotspot.key_hash = key_hash;
+
+      for (unsigned j = 0; j < HotBuckets::kRegularBuckets; ++j) {
+        hotspot.probes.by_type.regular_buckets[j] = bucket_iterator{this, target_seg_id, bid[j]};
+      }
+
+      for (unsigned i = 0; i < SegmentType::kStashBucketNum; ++i) {
+        hotspot.probes.by_type.stash_buckets[i] =
+            bucket_iterator{this, target_seg_id, uint8_t(Policy::kBucketNum + i), 0};
+      }
+      hotspot.num_buckets = HotBuckets::kNumBuckets;
+
+      // The difference between gc and eviction is that gc can be applied even if
+      // the table can grow since we throw away logically deleted items.
+      // For eviction to be applied we should reach the growth limit.
+      if constexpr (EvictionPolicy::can_gc) {
+        unsigned res = ev.GarbageCollect(hotspot, this);
+        garbage_collected_ += res;
+        if (res) {
+          // We succeeded to gc. Lets continue with the momentum.
+          // In terms of API abuse it's an awful hack, just to see if it works.
+          /*unsigned start = (bid[HotBuckets::kNumBuckets - 1] + 1) % kLogicalBucketNum;
+          for (unsigned i = 0; i < HotBuckets::kNumBuckets; ++i) {
+            uint8_t id = (start + i) % kLogicalBucketNum;
+            buckets.probes.arr[i] = bucket_iterator{this, target_seg_id, id};
+          }
+          garbage_collected_ += ev.GarbageCollect(buckets, this);
+          */
+          continue;
+        }
+      }
+
+      auto hash_fn = [this](const auto& k) { return policy_.HashFn(k); };
+      unsigned moved = target->UnloadStash(hash_fn, move_cb);
+      if (moved > 0) {
+        stash_unloaded_ += moved;
+        continue;
+      }
+
+      // We evict only if our policy says we can not grow
+      if constexpr (EvictionPolicy::can_evict) {
+        bool can_grow = ev.CanGrow(*this);
+        if (can_grow) {
+          consider_throw = false;
+        } else {
+          unsigned res = ev.Evict(hotspot, this);
+          if (res)
+            continue;
+        }
+      }
+    }
+
+    if (consider_throw && !ev.CanGrow(*this)) {
+      throw std::bad_alloc{};
+    }
+
+    // Split the segment.
+    if (target->local_depth() == global_depth_) {
+      IncreaseDepth(global_depth_ + 1);
+
+      target_seg_id = SegmentId(key_hash);
+      assert(target_seg_id < segment_.size() && segment_[target_seg_id] == target);
+    }
+
+    ev.RecordSplit(target);
+    Split(target_seg_id, ev);
+  }
+
+  return std::make_pair(iterator{}, false);
+}
+
+template <typename _Key, typename _Value, typename Policy>
+void DashTable<_Key, _Value, Policy>::IncreaseDepth(unsigned new_depth) {
+  assert(!segment_.empty());
+  assert(new_depth > global_depth_);
+  size_t prev_sz = segment_.size();
+  size_t repl_cnt = 1ul << (new_depth - global_depth_);
+  segment_.resize(1ul << new_depth);
+
+  for (int i = prev_sz - 1; i >= 0; --i) {
+    size_t offs = i * repl_cnt;
+    std::fill(segment_.begin() + offs, segment_.begin() + offs + repl_cnt, segment_[i]);
+    segment_[i]->set_segment_id(offs);  // update segment id.
+  }
+  global_depth_ = new_depth;
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename EvictionPolicy>
+void DashTable<_Key, _Value, Policy>::Split(uint32_t seg_id, EvictionPolicy& ev) {
+  SegmentType* source = segment_[seg_id];
+
+  uint32_t chunk_size = 1u << (global_depth_ - source->local_depth());
+  uint32_t start_idx = seg_id & (~(chunk_size - 1));
+  assert(segment_[start_idx] == source && segment_[start_idx + chunk_size - 1] == source);
+  uint32_t target_id = start_idx + chunk_size / 2;
+  SegmentType* target = ConstructSegment(source->local_depth() + 1, target_id);
+
+  auto hash_fn = [this](const auto& k) { return policy_.HashFn(k); };
+
+  // remove current segment bucket count.
+  bucket_count_ -= (source->num_buckets() + target->num_buckets());
+
+  source->Split(
+      std::move(hash_fn), target,
+      [&](uint32_t segment_from, detail::PhysicalBid from, uint32_t segment_to,
+          detail::PhysicalBid to) {
+        // OnMove is used to notify eviction policy about the moves across
+        // buckets/segments during the split.
+        ev.OnMove(Cursor{global_depth_, segment_from, from}, Cursor{global_depth_, segment_to, to});
+      });
+
+  // add back the updated bucket count.
+  bucket_count_ += (target->num_buckets() + source->num_buckets());
+  ++unique_segments_;
+
+  for (size_t i = target_id; i < start_idx + chunk_size; ++i) {
+    segment_[i] = target;
+  }
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename Cb>
+auto DashTable<_Key, _Value, Policy>::TraverseBySegmentOrder(Cursor curs, Cb&& cb) -> Cursor {
+  uint32_t sid = curs.segment_id(global_depth_);
+  assert(sid < segment_.size());
+  SegmentType* s = segment_[sid];
+  assert(s);
+  uint8_t bid = curs.bucket_id();
+
+  auto dt_cb = [&](const SegmentIterator& it) { cb(iterator{this, sid, it.index, it.slot}); };
+  s->TraverseBucket(bid, std::move(dt_cb));
+
+  ++bid;
+  if (SegmentType::OutOfRange(bid)) {
+    sid = NextSeg(sid);
+    if (sid >= segment_.size()) {
+      return Cursor::end();
+    }
+    bid = 0;
+  }
+
+  return Cursor{global_depth_, sid, bid};
+}
+
+template <typename _Key, typename _Value, typename Policy>
+auto DashTable<_Key, _Value, Policy>::GetRandomCursor(absl::BitGen* bitgen) -> Cursor {
+  uint32_t sid = absl::Uniform<uint32_t>(*bitgen, 0, segment_.size());
+  uint8_t bid = absl::Uniform<uint8_t>(*bitgen, 0, Policy::kBucketNum);
+
+  return Cursor{global_depth_, sid, bid};
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename Cb>
+auto DashTable<_Key, _Value, Policy>::Traverse(Cursor curs, Cb&& cb) -> Cursor {
+  uint32_t sid = curs.segment_id(global_depth_);
+  uint8_t bid = curs.bucket_id();
+
+  // Test validity of the cursor.
+  if (bid >= Policy::kBucketNum || sid >= segment_.size())
+    return Cursor::end();
+
+  auto hash_fun = [this](const auto& k) { return policy_.HashFn(k); };
+
+  bool fetched = false;
+
+  // We fix bid and go over all segments. Once we reach the end we increase bid and repeat.
+  do {
+    SegmentType* s = segment_[sid];
+    assert(s);
+
+    auto dt_cb = [&](const SegmentIterator& it) { cb(iterator{this, sid, it.index, it.slot}); };
+
+    fetched = s->TraverseLogicalBucket(bid, hash_fun, std::move(dt_cb));
+    sid = NextSeg(sid);
+    if (sid >= segment_.size()) {
+      sid = 0;
+      ++bid;
+
+      if (bid >= Policy::kBucketNum)
+        return Cursor::end();
+    }
+  } while (!fetched);
+
+  return Cursor{global_depth_, sid, bid};
+}
+
+template <typename _Key, typename _Value, typename Policy>
+auto DashTable<_Key, _Value, Policy>::AdvanceCursorBucketOrder(Cursor cursor) -> Cursor {
+  // We fix bid and go over all segments. Once we reach the end we increase bid and repeat.
+  uint32_t sid = cursor.segment_id(global_depth_);
+  uint8_t bid = cursor.bucket_id();
+  sid = NextSeg(sid);
+  if (sid >= segment_.size()) {
+    sid = 0;
+    ++bid;
+
+    if (SegmentType::OutOfRange(bid))
+      return Cursor::end();
+  }
+  return Cursor{global_depth_, sid, bid};
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename Cb>
+auto DashTable<_Key, _Value, Policy>::TraverseBuckets(Cursor cursor, Cb&& cb, bool visit_empty)
+    -> Cursor {
+  if (SegmentType::OutOfRange(cursor.bucket_id()))  // sanity.
+    return Cursor::end();
+
+  constexpr uint32_t kMaxIterations = 8;
+  bool invoked = false;
+
+  for (uint32_t i = 0; i < kMaxIterations; ++i) {
+    uint32_t sid = cursor.segment_id(global_depth_);
+    uint8_t bid = cursor.bucket_id();
+    SegmentType* s = segment_[sid];
+    assert(s);
+    if (bid < s->num_buckets()) {
+      const auto& bucket = s->GetBucket(bid);
+      if (visit_empty || bucket.GetBusy()) {
+        cb(BucketIt(sid, bid));
+        invoked = true;
+      }
+    }
+    cursor = AdvanceCursorBucketOrder(cursor);
+    if (invoked || !cursor)  // Break end of traversal or callback invoked.
+      return cursor;
+  }
+  return cursor;
+}
+
+}  // namespace dfly

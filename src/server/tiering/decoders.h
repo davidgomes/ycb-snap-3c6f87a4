@@ -1,0 +1,117 @@
+// Copyright 2025, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <variant>
+
+#include "core/compact_object.h"
+#include "core/qlist.h"
+
+namespace dfly::detail {
+struct ListpackWrap;
+}
+
+namespace dfly::tiering {
+
+struct SerializedMap;
+
+// Decodes serialized value and provides it to callbacks.
+// Acts as generic interface to callback driver (OpManager)
+struct Decoder {
+  struct UploadMetrics {
+    bool modified;               // whether the value as modified
+    size_t estimated_mem_usage;  // Estimated memory usage if uploaded
+  };
+
+  virtual ~Decoder() = default;
+
+  // Poor man's type-erasure copy
+  virtual std::unique_ptr<Decoder> Clone() const = 0;
+
+  // Initialize decoder from slice
+  virtual void Initialize(std::string_view slice) = 0;
+
+  // Compute upload metrics to determine if its worth
+  virtual UploadMetrics GetMetrics() const = 0;
+
+  // Store value. It's up to implementation to ensure that
+  // pointer is cast to correct object type.
+  virtual void Upload(void* obj) = 0;
+};
+
+// Basic "bare" decoder that just stores the provided slice
+struct BareDecoder : public Decoder {
+  std::unique_ptr<Decoder> Clone() const override;
+  void Initialize(std::string_view slice) override;
+  UploadMetrics GetMetrics() const override;
+  void Upload(void* obj) override;
+
+  std::string_view slice;
+};
+
+// Decodes string value with objects StrEncoding
+struct StringDecoder : public Decoder {
+  explicit StringDecoder(const CompactObj& obj);
+
+  std::unique_ptr<Decoder> Clone() const override;
+  void Initialize(std::string_view slice) override;
+  UploadMetrics GetMetrics() const override;
+  void Upload(void* obj) override;
+
+  std::string_view GetView() const {
+    return value_.view();
+  }
+
+  std::string* Write();
+
+ private:
+  explicit StringDecoder(CompactObj::StrEncoding encoding);
+
+  bool modified_ = false;
+  std::string_view slice_;
+  CompactObj::StrEncoding encoding_;
+  dfly::StringOrView value_;
+};
+
+// Decodes SerializedMaps
+struct SerializedMapDecoder : public Decoder {
+  ~SerializedMapDecoder();  // because of forward declared types
+
+  std::unique_ptr<Decoder> Clone() const override;
+  void Initialize(std::string_view slice) override;
+  UploadMetrics GetMetrics() const override;
+  void Upload(void* obj) override;
+
+  // Access internal object for read, returns currently stored variant
+  std::variant<SerializedMap*, dfly::detail::ListpackWrap*> Get() const;
+
+  // Access internal object for writes
+  dfly::detail::ListpackWrap* GetMutable();
+
+ private:
+  void MakeOwned();  // Convert to listpack
+
+  bool modified_ = false;
+  std::variant<std::unique_ptr<SerializedMap>, std::unique_ptr<dfly::detail::ListpackWrap>> map_;
+};
+
+// Decodes QList::Node
+struct ListNodeDecoder : public Decoder {
+  explicit ListNodeDecoder(QList* ql);
+  std::unique_ptr<Decoder> Clone() const override;
+  void Initialize(std::string_view slice) override;
+  UploadMetrics GetMetrics() const override;
+  void Upload(void* obj) override;
+
+ private:
+  QList* ql_;
+  std::string_view slice_;
+};
+
+}  // namespace dfly::tiering

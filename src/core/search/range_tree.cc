@@ -1,0 +1,370 @@
+// Copyright 2025, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "core/search/range_tree.h"
+
+namespace rng = std::ranges;
+
+namespace dfly::search {
+
+namespace {
+
+std::vector<DocId> MergeAllResults(absl::Span<const RangeTree::RangeBlock*> blocks, double l,
+                                   double r) {
+  DCHECK(blocks.size() != 1 && blocks.size() != 2);
+
+  // After the benchmarking, it is better to use inlined vector
+  // than std::priority_queue
+  absl::InlinedVector<RangeFilterIterator, 10> heap;
+  heap.reserve(blocks.size());
+
+  size_t doc_ids_count = 0;
+  for (const auto* block : blocks) {
+    auto it = MakeBegin(*block, l, r);
+    if (!it.HasReachedEnd()) {
+      heap.emplace_back(it);
+      doc_ids_count += block->Size();
+    }
+  }
+
+  std::vector<DocId> result;
+  result.reserve(doc_ids_count);
+
+  size_t size = heap.size();
+  while (size) {
+    DCHECK(!heap[0].HasReachedEnd());
+
+    size_t min_doc_id_index = 0;
+    for (size_t i = 1; i < size; ++i) {
+      DCHECK(!heap[i].HasReachedEnd());
+
+      if (*heap[i] < *heap[min_doc_id_index]) {
+        min_doc_id_index = i;
+      }
+    }
+
+    auto& it = heap[min_doc_id_index];
+    result.push_back(*it);
+    ++it;
+
+    if (it.HasReachedEnd()) {
+      // If we reached the end of the current block, remove it from the heap
+      std::swap(heap[min_doc_id_index], heap[size - 1]);
+      --size;
+    }
+  }
+
+  DCHECK(std::is_sorted(result.begin(), result.end()));
+  return result;
+}
+
+template <typename MapT> auto FindRangeBlockImpl(MapT& entries, double value) {
+  DCHECK(!entries.empty());
+
+  auto it = entries.lower_bound(value);
+  if (it != entries.begin() && (it == entries.end() || it->first > value)) {
+    // TODO: remove this, we do log N here
+    // we can use negative left bouding to find the block
+    --it;  // Move to the block that contains the value
+  }
+
+  DCHECK(it != entries.end() && it->first <= value);
+  return it;
+}
+
+}  // namespace
+
+RangeTree::RangeTree(PMR_NS::memory_resource* mr, size_t max_range_block_size)
+    : max_range_block_size_(max_range_block_size), entries_(mr) {
+  // The tree has at least always a block with a negative infinity bound, so that any new insertion
+  // goes at least somewhere
+  CreateEmptyBlock(-std::numeric_limits<double>::infinity());
+}
+
+void RangeTree::Add(DocId id, double value) {
+  DCHECK(std::isfinite(value));
+
+  auto it = FindRangeBlock(value);
+  auto& [lower_bound, block] = *it;
+
+  // Don't disrupt large monovalue blocks, instead create new nextafter block
+  if (block.Size() >= max_range_block_size_ && lower_bound == block.max_seen /* monovalue */ &&
+      value != lower_bound /* but new value is different*/
+  ) {
+    // We use nextafter as the lower bound to "catch" all other possible inserts into the block,
+    // as a decreasing `value` sequence would otherwise create lots of single-value blocks
+    double lb2 = std::nextafter(lower_bound, std::numeric_limits<double>::infinity());
+    CreateEmptyBlock(lb2)->second.Insert({id, value});
+    return;
+  }
+
+  auto insert_result = block.Insert({id, value});
+  LOG_IF(ERROR, !insert_result) << "RangeTree: Failed to insert id: " << id << ", value: " << value;
+
+  // Small block or large monovalue block, not reducable by splitting
+  if (block.Size() <= max_range_block_size_ || lower_bound == block.max_seen)
+    return;
+
+  SplitBlock(it);
+}
+
+void RangeTree::Remove(DocId id, double value) {
+  DCHECK(std::isfinite(value));
+
+  auto it = FindRangeBlock(value);
+  RangeBlock& block = it->second;
+
+  auto remove_result = block.Remove({id, value});
+  LOG_IF(ERROR, !remove_result) << "RangeTree: Failed to remove id: " << id << ", value: " << value;
+
+  // Merge with left block if both are relatively small and won't be forced to split soon
+  if (block.size() < max_range_block_size_ / 4 && it != entries_.begin()) {
+    auto lit = it;
+    --lit;
+
+    auto& lblock = lit->second;
+    if (block.Size() + lblock.Size() < max_range_block_size_ / 2) {
+      for (auto e : block)
+        lblock.Insert(e);
+      entries_.erase(it);
+      stats_.merges++;
+    }
+  }
+}
+
+RangeResult RangeTree::Range(double l, double r) const {
+  return {RangeBlocks(l, r), l, r};
+}
+
+absl::InlinedVector<const RangeTree::RangeBlock*, 5> RangeTree::RangeBlocks(double l,
+                                                                            double r) const {
+  DCHECK(l <= r);
+
+  auto it_l = FindRangeBlock(l);
+  auto it_r = FindRangeBlock(r);
+
+  absl::InlinedVector<const RangeBlock*, 5> blocks;
+  for (auto it = it_l;; ++it) {
+    blocks.push_back(&it->second);
+    if (it == it_r) {
+      break;
+    }
+  }
+
+  DCHECK(!blocks.empty());
+  return blocks;
+}
+
+RangeResult RangeTree::GetAllDocIds() const {
+  return RangeResult{GetAllBlocks()};
+}
+
+absl::InlinedVector<const RangeTree::RangeBlock*, 5> RangeTree::GetAllBlocks() const {
+  absl::InlinedVector<const RangeBlock*, 5> blocks;
+  blocks.reserve(entries_.size());
+
+  for (const auto& entry : entries_) {
+    blocks.push_back(&entry.second);
+  }
+
+  return blocks;
+}
+
+RangeTree::Map::iterator RangeTree::FindRangeBlock(double value) {
+  return FindRangeBlockImpl(entries_, value);
+}
+
+RangeTree::Map::const_iterator RangeTree::FindRangeBlock(double value) const {
+  return FindRangeBlockImpl(entries_, value);
+}
+
+RangeTree::Map::iterator RangeTree::CreateEmptyBlock(double lb) {
+  return entries_
+      .emplace(std::piecewise_construct, std::forward_as_tuple(lb),
+               std::forward_as_tuple(entries_.get_allocator().resource(), max_range_block_size_))
+      .first;
+}
+
+/*
+There is an edge case in the SplitBlock method:
+If split_result.left.Size() == 0, it means that all values in the block
+were equal to the median value.
+Because split works like this:
+  - at the beginning it does not insert median values into the left or right block,
+  - then it checks if left block is smaller than right block, if so, it adds
+    median values to the left block, otherwise it adds it to the right block.
+So if left block is empty, it means that left.Size() < right.Size() was false,
+what means that right.Size() was also zero.
+After that all median entries were added to the right block.
+
+That means that we have equal values in the whole block,
+and their count is greater than max_range_block_size_.
+So we will do cascade splits of the right block.
+TODO: we can optimize this case by splitting to three blocks:
+ - empty left block with range [l, m),
+ - middle block with range [m, std::nextafter(m, +inf)),
+ - empty right block with range [std::nextafter(m, +inf), r)
+*/
+void RangeTree::SplitBlock(Map::iterator it) {
+  double lower_bound = it->first;
+
+  auto split_result = Split(std::move(it->second));
+
+  const double m = split_result.median;
+  DCHECK(!split_result.right.Empty());
+
+  entries_.erase(it);
+  stats_.splits++;
+
+  // Insert left block if it's not empty or if its the first one (negative inf bound)
+  if (!split_result.left.Empty() || std::isinf(lower_bound)) {
+    if (!std::isinf(lower_bound))  // keep negative inf bound
+      lower_bound = split_result.lmin;
+
+    entries_.emplace(std::piecewise_construct, std::forward_as_tuple(lower_bound),
+                     std::forward_as_tuple(std::move(split_result.left), split_result.lmax));
+  }
+
+  entries_.emplace(std::piecewise_construct, std::forward_as_tuple(m),
+                   std::forward_as_tuple(std::move(split_result.right), split_result.rmax));
+
+  DCHECK(TreeIsInCorrectState());
+}
+
+RangeTree::Stats RangeTree::GetStats() const {
+  return Stats{.splits = stats_.splits, .merges = stats_.merges, .block_count = entries_.size()};
+}
+
+// Used for DCHECKs to check that the tree is in a correct state.
+[[maybe_unused]] bool RangeTree::TreeIsInCorrectState() const {
+  if (entries_.empty()) {
+    return false;
+  }
+
+  double prev_range = entries_.begin()->first;
+  for (auto it = std::next(entries_.begin()); it != entries_.end(); ++it) {
+    const double& current_range = it->first;
+
+    // Check that ranges are non-overlapping and sorted
+    // Also there can not be gaps between ranges
+    if (prev_range >= current_range) {
+      return false;
+    }
+
+    prev_range = current_range;
+  }
+
+  return true;
+}
+
+RangeResult::RangeResult(std::vector<DocId> doc_ids) : result_(std::move(doc_ids)) {
+}
+
+RangeResult::RangeResult(absl::InlinedVector<RangeBlockPointer, 5> blocks)
+    : RangeResult(std::move(blocks), -std::numeric_limits<double>::infinity(),
+                  std::numeric_limits<double>::infinity()) {
+}
+
+RangeResult::RangeResult(absl::InlinedVector<RangeBlockPointer, 5> blocks, double l, double r) {
+  if (blocks.size() == 1) {
+    result_ = SingleBlockRangeResult(blocks[0], l, r);
+  } else if (blocks.size() == 2) {
+    result_ = TwoBlocksRangeResult(blocks[0], blocks[1], l, r);
+  } else {
+    result_ = MergeAllResults(absl::MakeSpan(blocks), l, r);
+  }
+}
+
+std::vector<DocId> RangeResult::Take() {
+  if (std::holds_alternative<DocsList>(result_)) {
+    DCHECK(std::is_sorted(std::get<DocsList>(result_).begin(), std::get<DocsList>(result_).end()));
+    return std::get<DocsList>(std::move(result_));
+  }
+
+  auto cb = [](const auto& v) {
+    std::vector<DocId> result;
+    result.reserve(v.size());
+    std::copy(v.begin(), v.end(), std::back_inserter(result));
+    DCHECK(std::is_sorted(result.begin(), result.end()));
+    return result;
+  };
+
+  return std::visit(cb, result_);
+}
+
+void RangeTree::Builder::Add(DocId id, double value) {
+  bool inserted = updates_.emplace(id, value).second;
+  DCHECK(inserted);
+}
+
+void RangeTree::Builder::Remove(DocId id, double value) {
+  if (!updates_.erase({id, value}))
+    delayed_erased_.emplace(id, value);
+}
+
+void RangeTree::Builder::Populate(RangeTree* tree, const RenewableQuota& quota) {
+  // Sort all elements by value
+  std::vector<Entry> sorted_entries(updates_.begin(), updates_.end());
+  rng::sort(sorted_entries, {}, &Entry::second);
+  updates_.clear();
+
+  quota.Check();  // TODO: sort might take a long time
+
+  // Add sorted elements in batches
+  size_t max_size = tree->max_range_block_size_;
+  RangeBlock* block = &tree->entries_.begin()->second;
+  for (size_t idx = 0; idx < sorted_entries.size();) {
+    // Create new block for each insertion batch (first goes into only first block)
+    if (idx)
+      block = &tree->CreateEmptyBlock(sorted_entries[idx].second)->second;
+
+    // Insert until we filled a block and a new value started (equal value must be in same block)
+    while (idx < sorted_entries.size()) {
+      if (block->Size() >= max_size && sorted_entries[idx - 1].second != sorted_entries[idx].second)
+        break;
+
+      block->Insert(sorted_entries[idx]);
+      idx++;
+
+      // If we filled a new multiple of the block size due to equal entries, check quota
+      if ((block->Size() - 1) / max_size != block->Size() / max_size)
+        quota.Check();
+    }
+
+    quota.Check();  // Yield if needed
+  }
+
+  // Update entries accumulated during yields in batches while respecting quota.
+  // Last loop is atomic (without quota checks) to ensure consistency
+  size_t iterations = 3;
+  while (iterations--) {
+    // Take updates to allow new ones during suspensions
+    auto stolen_erased = std::move(delayed_erased_);
+    auto stolen_updates = std::move(updates_);
+    delayed_erased_.clear();
+    updates_.clear();
+
+    auto check_quota = [&, ops = size_t(0)]() mutable {
+      ops++;
+      if (iterations && ops / max_size != (ops + 1) / max_size)
+        quota.Check();
+    };
+
+    for (auto [id, v] : stolen_erased) {
+      tree->Remove(id, v);
+      check_quota();
+    }
+
+    for (auto [id, v] : stolen_updates) {
+      tree->Add(id, v);
+      check_quota();
+    }
+  }
+
+  // Because last iteration was atomic
+  DCHECK(updates_.empty());
+  DCHECK(delayed_erased_.empty());
+}
+
+}  // namespace dfly::search
