@@ -15,6 +15,7 @@ AggCmdShapeComponents::AggCmdShapeComponents(
     std::vector<BSONObj> pipeline,
     LetShapeComponent let)
     : allowDiskUse(aggRequest.getAllowDiskUse()),
+      rawData(bool(aggRequest.getRawData()) ? OptionalBool(true) : OptionalBool()),
       involvedNamespaces(std::move(involvedNamespaces_)),
       representativePipeline(std::move(pipeline)),
       // Copying LetShapeComponent is safe, since the 'shapifiedLet' BSONObj is owned.
@@ -22,17 +23,19 @@ AggCmdShapeComponents::AggCmdShapeComponents(
 
 AggCmdShapeComponents::AggCmdShapeComponents(
     OptionalBool allowDiskUse,
+    OptionalBool rawData,
     stdx::unordered_set<NamespaceString> involvedNamespaces_,
     std::vector<BSONObj> pipeline,
     LetShapeComponent let)
     : allowDiskUse(allowDiskUse),
+      rawData(rawData),
       involvedNamespaces(std::move(involvedNamespaces_)),
       representativePipeline(std::move(pipeline)),
       // Copying LetShapeComponent is safe, since the 'shapifiedLet' BSONObj is owned.
       let(let) {}
 
 void AggCmdShapeComponents::HashValue(absl::HashState state) const {
-    state = absl::HashState::combine(std::move(state), allowDiskUse, let);
+    state = absl::HashState::combine(std::move(state), allowDiskUse, rawData, let);
     for (auto&& shapifiedStage : representativePipeline) {
         state = absl::HashState::combine(std::move(state), simpleHash(shapifiedStage));
     }
@@ -62,6 +65,7 @@ void AggCmdShape::appendCmdSpecificShapeComponents(
         _components.representativePipeline, expCtx, pipeline_factory::kOptionsMinimal);
     auto serializedPipeline = reparsed->serializeToBson(opts);
     AggCmdShapeComponents{_components.allowDiskUse,
+                          _components.rawData,
                           _components.involvedNamespaces,
                           serializedPipeline,
                           _components.let}
@@ -81,6 +85,11 @@ void AggCmdShapeComponents::appendTo(BSONObjBuilder& bob,
     // allowDiskUse
     if (allowDiskUse.has_value()) {
         bob.append(AggregateCommandRequest::kAllowDiskUseFieldName, bool(allowDiskUse));
+    }
+
+    // rawData
+    if (rawData.has_value()) {
+        bob.append(AggregateCommandRequest::kRawDataFieldName, bool(rawData));
     }
 }
 

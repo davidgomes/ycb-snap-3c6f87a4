@@ -197,6 +197,34 @@ TEST_F(AggCmdShapeTest, IncludesLet) {
                       SerializationContext::stateDefault()));
 }
 
+// Verifies that a 'rawData: true' aggregate command produces a different query shape hash from
+// the same command without 'rawData' (or with 'rawData: false'), and that 'rawData: false' is
+// normalized to hash identically to an absent 'rawData'.
+TEST_F(AggCmdShapeTest, RawDataAffectsShapeHash) {
+    auto makeHash = [&](boost::optional<bool> rawData) {
+        auto aggRequest = makeAggregateCommandRequest({R"({$match: {x: 3}})"sv});
+        if (rawData.has_value()) {
+            aggRequest->setRawData(*rawData);
+        }
+        auto parsedPipeline = pipeline_factory::makePipeline(
+            aggRequest->getPipeline(), _expCtx, pipeline_factory::kOptionsMinimal);
+        auto shape = std::make_unique<AggCmdShape>(*aggRequest,
+                                                    kDefaultTestNss,
+                                                    stdx::unordered_set<NamespaceString>{
+                                                        kDefaultTestNss},
+                                                    *parsedPipeline,
+                                                    _expCtx);
+        return shape->sha256Hash(_operationContext.get(), SerializationContext::stateDefault());
+    };
+
+    auto hashNoRawData = makeHash(boost::none);
+    auto hashRawDataFalse = makeHash(false);
+    auto hashRawDataTrue = makeHash(true);
+
+    ASSERT_EQ(hashNoRawData.toHexString(), hashRawDataFalse.toHexString());
+    ASSERT_NE(hashNoRawData.toHexString(), hashRawDataTrue.toHexString());
+}
+
 // Verifies that "aggregate" command shape hash value is stable (does not change between the
 // versions of the server).
 TEST_F(AggCmdShapeTest, StableQueryShapeHashValue) {

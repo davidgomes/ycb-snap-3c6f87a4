@@ -30,6 +30,7 @@ struct AggCmdShapeComponents : public query_shape::CmdSpecificShapeComponents {
                           LetShapeComponent let);
 
     AggCmdShapeComponents(OptionalBool allowDiskUse,
+                          OptionalBool rawData,
                           stdx::unordered_set<NamespaceString> involvedNamespaces,
                           std::vector<BSONObj> shapifiedPipeline,
                           LetShapeComponent let);
@@ -43,6 +44,12 @@ struct AggCmdShapeComponents : public query_shape::CmdSpecificShapeComponents {
     void HashValue(absl::HashState state) const final;
 
     OptionalBool allowDiskUse;
+
+    // Normalized so that only an explicit value of 'true' is tracked as part of the shape - both
+    // an absent 'rawData' and an explicit 'false' are treated identically (i.e. not present), so
+    // that they continue to share a query shape (and hash) with commands that never mention
+    // 'rawData' at all.
+    OptionalBool rawData;
 
     stdx::unordered_set<NamespaceString> involvedNamespaces;
 
