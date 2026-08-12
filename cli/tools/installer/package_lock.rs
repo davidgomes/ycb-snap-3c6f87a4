@@ -462,12 +462,18 @@ mod test {
     .unwrap();
 
     assert!(
-      lockfile.contains(r#""npm:@scope/outer@^1.0.0": "1.0.0_peer@1.0.0""#)
+      lockfile.contains(r#""npm:@scope/outer@1": "1.0.0_peer@1.0.0""#),
+      "{lockfile}"
     );
-    assert!(lockfile.contains(r#""npm:dev@^1.0.0": "1.0.0""#));
+    assert!(lockfile.contains(r#""npm:dev@1": "1.0.0""#));
     assert!(lockfile.contains(r#""@scope/outer@1.0.0_peer@1.0.0""#));
-    assert!(lockfile.contains(r#""dependencies": ["inner", "peer"]"#));
-    assert!(lockfile.contains(r#""optionalDependencies": ["optional"]"#));
+    assert!(lockfile.contains(
+      "\"dependencies\": [\n        \"inner\",\n        \"peer\"\n      ]"
+    ));
+    assert!(
+      lockfile
+        .contains("\"optionalDependencies\": [\n        \"optional\"\n      ]")
+    );
     assert!(lockfile.contains(r#""os": ["linux"]"#));
     assert!(lockfile.contains(r#""cpu": ["x64"]"#));
     assert!(!lockfile.contains("skipped"));
