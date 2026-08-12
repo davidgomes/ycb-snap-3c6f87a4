@@ -415,10 +415,44 @@ func (c *CustomFuncs) foldOIDFamilyCast(
 			)
 			displayName := tree.MakeUnqualifiedTableName(resName.ObjectName)
 			unqualifiedName := displayName
-			visibleDS, _, visibleErr := c.f.catalog.ResolveDataSource(
+			visibleDS, visibleName, visibleErr := c.f.catalog.ResolveDataSource(
 				c.f.ctx, flags, &unqualifiedName,
 			)
-			if visibleErr != nil || visibleDS.ID() != ds.ID() {
+			firstSchema := ""
+			if visibleErr == nil {
+				firstSchema = visibleName.Schema()
+				c.mem.Metadata().AddDependency(
+					opt.DepByName(&unqualifiedName),
+					visibleDS,
+					privilege.SELECT,
+					username.SQLUsername{},
+				)
+			}
+
+			indexName := tree.TableIndexName{Index: tree.UnrestrictedName(resName.ObjectName)}
+			visibleIndex, indexTableName, indexErr := c.f.catalog.ResolveIndex(
+				c.f.ctx, flags, &indexName,
+			)
+			if indexErr == nil {
+				c.mem.Metadata().AddDependency(
+					opt.DepByID(visibleIndex.Table().ID()),
+					visibleIndex.Table(),
+					privilege.SELECT,
+					username.SQLUsername{},
+				)
+				indexSchema := indexTableName.Schema()
+				iter := c.f.evalCtx.SessionData().SearchPath.Iter()
+				for sc, ok := iter.Next(); ok; sc, ok = iter.Next() {
+					if sc == indexSchema {
+						firstSchema = indexSchema
+						break
+					}
+					if sc == firstSchema {
+						break
+					}
+				}
+			}
+			if firstSchema != resName.Schema() {
 				displayName = tree.MakeTableNameFromPrefix(
 					tree.ObjectNamePrefix{
 						SchemaName:     resName.SchemaName,

@@ -1755,7 +1755,7 @@ FROM defaults_parsed
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT coalesce(n.nspname = (
                SELECT sp.schema_name
-               FROM unnest(current_schemas(true)) WITH ORDINALITY
+               FROM pg_catalog.unnest(pg_catalog.current_schemas(true)) WITH ORDINALITY
                     AS sp(schema_name, path_position)
                WHERE EXISTS (
                  SELECT 1
@@ -1788,7 +1788,7 @@ FROM defaults_parsed
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT coalesce(n.nspname = (
                SELECT sp.schema_name
-               FROM unnest(current_schemas(true)) WITH ORDINALITY
+               FROM pg_catalog.unnest(pg_catalog.current_schemas(true)) WITH ORDINALITY
                     AS sp(schema_name, path_position)
                WHERE EXISTS (
                  SELECT 1
@@ -1822,7 +1822,7 @@ FROM defaults_parsed
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT coalesce(n.nspname = (
                SELECT sp.schema_name
-               FROM unnest(current_schemas(true)) WITH ORDINALITY
+               FROM pg_catalog.unnest(pg_catalog.current_schemas(true)) WITH ORDINALITY
                     AS sp(schema_name, path_position)
                WHERE EXISTS (
                  SELECT 1

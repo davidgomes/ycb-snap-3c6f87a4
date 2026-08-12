@@ -36,6 +36,23 @@ func (p *planner) ResolveOIDFromString(
 func (p *planner) ResolveOIDFromOID(
 	ctx context.Context, resultType *types.T, toResolve *tree.DOid,
 ) (_ *tree.DOid, errSafeToIgnore bool, _ error) {
+	if resultType.Oid() == oid.T_regtype && types.IsOIDUserDefinedType(toResolve.Oid) {
+		typ, err := p.ResolveTypeByOID(ctx, toResolve.Oid)
+		if err != nil {
+			return nil, false, err
+		}
+		if typ.TypeMeta.Name != nil {
+			typeName := typ.TypeMeta.Name
+			displayName := tree.NameString(typeName.Name)
+			resolved, err := p.GetTypeFromValidSQLSyntax(ctx, displayName)
+			if err != nil || resolved.Oid() != toResolve.Oid {
+				displayName = tree.NameString(typeName.Schema) + "." + displayName
+			}
+			return tree.NewDOidWithTypeAndName(
+				toResolve.Oid, resultType, displayName,
+			), true, nil
+		}
+	}
 	return resolveOID(
 		ctx, p.Txn(),
 		p.InternalSQLTxn(),
@@ -69,8 +86,9 @@ func resolveOID(
 		q = fmt.Sprintf(
 			`SELECT obj.oid,
 			        CASE WHEN pg_catalog.%[1]s(obj.oid)
-			             THEN quote_ident(obj.%[2]s)
-			             ELSE quote_ident(n.nspname) || '.' || quote_ident(obj.%[2]s)
+			             THEN pg_catalog.quote_ident(obj.%[2]s)
+			             ELSE pg_catalog.quote_ident(n.nspname) || '.' ||
+			                  pg_catalog.quote_ident(obj.%[2]s)
 			        END
 			   FROM pg_catalog.%[3]s AS obj
 			   JOIN pg_catalog.pg_namespace AS n ON obj.%[4]s = n.oid
@@ -100,7 +118,7 @@ func resolveOID(
 	return tree.NewDOidWithTypeAndName(
 		results[0].(*tree.DOid).Oid,
 		resultType,
-		tree.AsStringWithFlags(results[1], tree.FmtBareStrings),
+		string(tree.MustBeDString(results[1])),
 	), true, nil
 }
 

@@ -824,6 +824,9 @@ CREATE SCHEMA reg_second;
 CREATE SCHEMA "Odd Schema";
 CREATE TABLE reg_first.shadowed (id INT PRIMARY KEY);
 CREATE TABLE reg_second.shadowed (id INT PRIMARY KEY);
+CREATE TABLE reg_first.index_holder (id INT PRIMARY KEY, INDEX index_shadow (id));
+CREATE TABLE reg_second.index_shadow (id INT PRIMARY KEY);
+CREATE TABLE reg_second.plan_shadow (id INT PRIMARY KEY);
 CREATE TABLE "Odd Schema"."select" (id INT PRIMARY KEY);
 CREATE TABLE reg_second.serial_reflection (id SERIAL PRIMARY KEY);
 CREATE TYPE reg_first.shadowed_type AS ENUM ('first');
@@ -832,6 +835,12 @@ CREATE TYPE reg_first.int4 AS ENUM ('shadow');
 CREATE FUNCTION reg_first.shadowed_fn() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 CREATE FUNCTION reg_second.shadowed_fn() RETURNS INT LANGUAGE SQL AS $$ SELECT 2 $$;
 CREATE FUNCTION reg_first.length() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE FUNCTION reg_first.quote_ident(STRING) RETURNS STRING LANGUAGE SQL
+  AS $$ SELECT 'hijacked' $$;
+CREATE FUNCTION reg_first.current_schemas(BOOL) RETURNS STRING[] LANGUAGE SQL
+  AS $$ SELECT ARRAY['reg_second'] $$;
+CREATE FUNCTION reg_first.unnest(STRING[]) RETURNS SETOF STRING LANGUAGE SQL
+  AS $$ SELECT 'reg_second' $$;
 SET search_path = reg_first, reg_second, pg_catalog
 
 # Name-based and OID-based casts use the same visible or qualified spelling.
@@ -842,6 +851,34 @@ SELECT 'reg_first.shadowed'::regclass,
        'reg_second.shadowed'::regclass::oid::regclass::text
 ----
 shadowed  shadowed  reg_second.shadowed  reg_second.shadowed
+
+# Indexes participate in the same pg_class namespace as other relations.
+query TTB
+SELECT 'reg_second.index_shadow'::regclass::text,
+       'reg_second.index_shadow'::regclass::oid::regclass::text,
+       pg_table_is_visible('reg_second.index_shadow'::regclass)
+----
+reg_second.index_shadow  reg_second.index_shadow  false
+
+# A prepared folded cast is invalidated when its unqualified binding changes.
+statement ok
+PREPARE regclass_display AS SELECT 'reg_second.plan_shadow'::regclass::text
+
+query T
+EXECUTE regclass_display
+----
+plan_shadow
+
+statement ok
+CREATE TABLE reg_first.plan_shadow (id INT PRIMARY KEY)
+
+query T
+EXECUTE regclass_display
+----
+reg_second.plan_shadow
+
+statement ok
+DEALLOCATE regclass_display
 
 query OTOT
 SELECT 'reg_first.shadowed_type'::regtype,
@@ -874,11 +911,12 @@ SELECT 'int4'::regtype, '23'::regtype, 23::oid::regtype::text
 integer  integer  integer
 
 # Pgwire writes the resolved identifier directly, including identifier quotes.
-query OT
+query OTT
 SELECT '"Odd Schema"."select"'::regclass,
-       '"Odd Schema"."select"'::regclass::text
+       '"Odd Schema"."select"'::regclass::text,
+       '"Odd Schema"."select"'::regclass::oid::regclass::text
 ----
-"Odd Schema"."select"  "Odd Schema"."select"
+"Odd Schema"."select"  "Odd Schema"."select"  "Odd Schema"."select"
 
 statement ok
 SET search_path = "Odd Schema", reg_first, reg_second, pg_catalog
@@ -931,12 +969,14 @@ true  true
 
 # Built-in type visibility follows pg_type names, while regtype output keeps
 # the SQL-standard spelling.
-query BBT
+query BBTTT
 SELECT pg_type_is_visible('reg_first.int4'::regtype),
        pg_type_is_visible(23),
-       23::oid::regtype::text
+       23::oid::regtype::text,
+       'reg_first.int4'::regtype::text,
+       'reg_first.int4'::regtype::oid::regtype::text
 ----
-true  false  integer
+true  false  integer  reg_first.int4  reg_first.int4
 
 # This is the cast shape used by SQLAlchemy column reflection.
 statement ok
