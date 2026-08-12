@@ -221,15 +221,17 @@ func (i *cecTranslator) desiredServicesWithPortsSplit(namespace string, name str
 		})
 	}
 
-	// One entry per HTTPS port.
-	for _, port := range m.HTTPSPortsSorted() {
-		envoyListenerName := listenerNameForPort(port)
-		result = append(result, &ciliumv2.ServiceListener{
-			Namespace: namespace,
-			Name:      shortenedName,
-			Ports:     []uint16{uint16(port)},
-			Listener:  envoyListenerName,
-		})
+	if m.NeedsPerPortHTTPSListeners() {
+		// One entry per HTTPS port.
+		for _, port := range m.HTTPSPortsSorted() {
+			envoyListenerName := listenerNameForPort(port)
+			result = append(result, &ciliumv2.ServiceListener{
+				Namespace: namespace,
+				Name:      shortenedName,
+				Ports:     []uint16{uint16(port)},
+				Listener:  envoyListenerName,
+			})
+		}
 	}
 
 	// One entry per TLS passthrough port.
