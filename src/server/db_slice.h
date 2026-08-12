@@ -1,0 +1,717 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
+
+#include <atomic>
+#include <limits>
+
+#include "common/string_or_view.h"
+#include "core/mi_memory_resource.h"
+#include "facade/connection_ref.h"
+#include "facade/op_status.h"
+#include "server/common.h"
+#include "server/common_types.h"
+#include "server/synchronization.h"
+#include "server/table.h"
+#include "server/tx_base.h"
+#include "util/fibers/fibers.h"
+#include "util/fibers/synchronization.h"
+
+namespace dfly {
+
+namespace cluster {
+class SlotRanges;
+class SlotSet;
+}  // namespace cluster
+
+using facade::OpResult;
+
+struct DbStats : public DbTableStats {
+  // number of active keys.
+  size_t key_count = 0;
+
+  // total number of slots in prime dictionary (key capacity).
+  size_t prime_capacity = 0;
+
+  // Memory used by dictionaries.
+  size_t table_mem_usage = 0;
+
+  // We override additional DbStats fields explicitly in DbSlice::GetStats().
+  using DbTableStats::operator=;
+
+  DbStats& operator+=(const DbStats& o);
+};
+
+struct SliceEvents {
+  // Number of eviction events.
+  size_t evicted_keys = 0;
+
+  // evictions that were performed when we have a negative memory budget.
+  size_t hard_evictions = 0;
+  size_t expired_keys = 0;
+  size_t garbage_checked = 0;
+  size_t garbage_collected = 0;
+  size_t stash_unloaded = 0;
+  size_t bumpups = 0;  // how many bump-upds we did.
+
+  // hits/misses on keys
+  size_t hits = 0;
+  size_t misses = 0;
+  size_t mutations = 0;
+
+  // ram hit/miss when tiering is enabled
+  size_t ram_hits = 0;
+  size_t ram_cool_hits = 0;
+  size_t ram_misses = 0;
+
+  // how many insertions were rejected due to OOM.
+  size_t insertion_rejections = 0;
+
+  // how many updates and insertions of keys between snapshot intervals
+  size_t update = 0;
+
+  // how many journal omit optimizations were performed
+  size_t journal_omit = 0;
+
+  uint64_t huff_encode_total = 0, huff_encode_success = 0;
+
+  SliceEvents& operator+=(const SliceEvents& o);
+};
+
+class DbSlice {
+  DbSlice(const DbSlice&) = delete;
+  void operator=(const DbSlice&) = delete;
+
+ public:
+  // Consumer of bucket change events than can be registered inside the slice.
+  // It also includes additional methods for interfacing with snapshots and migrations.
+  struct ChangeConsumerInterface {
+    // Called before a specific bucket (or set of buckets) will be mutated
+    virtual void OnChange(DbIndex, const ChangeReq&) = 0;
+
+    // Should return true if any bucket is mid-serialization
+    virtual bool IsAnyBucketBlocked() const {
+      return false;
+    }
+
+    // Should wait for IsAnyBucketBlocked to return false
+    virtual void WaitForNoBucketBlocked() const {
+    }
+
+    bool eventually_consistent_ = false;
+    uint64_t snapshot_version_ = 0;
+  };
+
+  // Auto-laundering iterator wrapper. Laundering means re-finding keys if they moved between
+  // buckets.
+  template <typename T> class IteratorT {
+   public:
+    IteratorT() = default;
+
+    IteratorT(T it, StringOrView key)
+        : it_(it), fiber_epoch_(util::fb2::FiberSwitchEpoch()), key_(std::move(key)) {
+    }
+
+    static IteratorT FromPrime(T it) {
+      if (!IsValid(it)) {
+        return IteratorT();
+      }
+
+      std::string key;
+      it->first.GetString(&key);
+      return IteratorT(it, StringOrView::FromString(std::move(key)));
+    }
+
+    IteratorT(const IteratorT& o) = default;
+    IteratorT(IteratorT&& o) = default;
+    IteratorT& operator=(const IteratorT& o) = default;
+    IteratorT& operator=(IteratorT&& o) = default;
+
+    // Do NOT store this iterator in a variable, as it will not be laundered automatically.
+    const T& GetInnerIt() const {
+      LaunderIfNeeded();
+      return it_;
+    }
+
+    auto operator->() const {
+      return GetInnerIt().operator->();
+    }
+
+    auto is_done() const {
+      return GetInnerIt().is_done();
+    }
+
+    std::string_view key() const {
+      return key_.view();
+    }
+
+    auto IsOccupied() const {
+      return GetInnerIt().IsOccupied();
+    }
+
+    auto GetVersion() const {
+      return GetInnerIt().GetVersion();
+    }
+
+   private:
+    void LaunderIfNeeded() const;  // const is a lie
+
+    mutable T it_;
+    mutable uint64_t fiber_epoch_ = 0;
+    StringOrView key_;
+  };
+
+  using Iterator = IteratorT<PrimeIterator>;
+  using ConstIterator = IteratorT<PrimeConstIterator>;
+
+  class AutoUpdater {
+   public:
+    AutoUpdater();
+    AutoUpdater(const AutoUpdater& o) = delete;
+    AutoUpdater& operator=(const AutoUpdater& o) = delete;
+    AutoUpdater(AutoUpdater&& o) noexcept;
+    AutoUpdater& operator=(AutoUpdater&& o) noexcept;
+    ~AutoUpdater();
+
+    // Removes the memory usage attributed to the iterator and resets orig_heap_size.
+    // Used when the existing object is overridden by a new one.
+    void ReduceHeapUsage();
+
+    void Run();
+    void Cancel();
+
+   private:
+    // Wrap members in a struct to auto generate operator=
+    struct Fields {
+      DbSlice* db_slice = nullptr;
+      DbIndex db_ind = 0;
+
+      // TODO: remove `it` from ItAndUpdater as it's redundant with respect to this iterator.
+      Iterator it;
+      std::string_view key;
+
+      // The following fields are calculated at init time
+      size_t orig_value_heap_size = 0;
+      CompactObjType orig_obj_type = 0;
+    };
+
+    AutoUpdater(DbIndex db_ind, std::string_view key, const Iterator& it, DbSlice* db_slice);
+
+    friend class DbSlice;
+
+    Fields fields_ = {};
+  };
+
+  struct Stats {
+    // DbStats db;
+    std::vector<DbStats> db_stats;
+    SliceEvents events;
+    size_t small_string_bytes = 0;
+  };
+
+  using Context = DbContext;
+  using ChangeReq = dfly::ChangeReq;
+
+  // Called before deleting an element to notify the search indices.
+  // pv is non-const: HNSW external vector preservation may swap sds entries.
+  using DocDeletionCallback = std::function<void(std::string_view, const Context&, PrimeValue& pv)>;
+
+  struct ExpireParams {
+    ExpireParams() = default;
+
+    // if now_ms = 0 the value is absolute; cap applies to relative dispatch only;
+    // cap=true silently clamps to kMaxExpireDeadlineMs;
+    ExpireParams(TimeUnit unit, int64_t value, uint64_t now_ms = 0, bool cap = false);
+    ExpireParams(ExpT type, int64_t value, uint64_t now_ms = 0, bool cap = false);
+
+    bool IsDefined() const {
+      return persist || ms_timestamp >= 0;
+    }
+
+    // Returns (relative_ms, absolute_ms). On overflow returns {0, -1}.
+    std::pair<int64_t, int64_t> Calculate(uint64_t now_msec, bool cap) const;
+
+    // INT64_MAX is the year 292M AD — never a real expiration.
+    static constexpr int64_t kOverflow = std::numeric_limits<int64_t>::max();
+
+    int64_t ms_timestamp = -1;  // -1 = undefined; 0 = expire now; kOverflow = overflow.
+    bool persist = false;
+    int32_t expire_options = 0;  // ExpireFlags
+  };
+
+  DbSlice(uint32_t index, bool cache_mode, EngineShard* owner);
+  ~DbSlice();
+
+  // Returns statistics for the whole db slice. A bit heavy operation.
+  Stats GetStats() const;
+
+  // Returns slot statistics for db 0.
+  SlotStats GetSlotStats(SlotId sid) const;
+
+  void UpdateMemoryParams(int64_t budget, size_t bytes_per_object) {
+    memory_budget_ = budget;
+    bytes_per_object_ = bytes_per_object;
+  }
+
+  ssize_t memory_budget() const {
+    return memory_budget_;
+  }
+
+  size_t bytes_per_object() const {
+    return bytes_per_object_;
+  }
+
+  struct ItAndUpdater {
+    Iterator it;
+    AutoUpdater post_updater;
+    bool is_new = false;
+
+    // Set if DbContext::is_omittable_operation was set and the conditions were met.
+    // Means that the journal write should NOT be performed.
+    bool omitted_journal = false;
+  };
+
+  ItAndUpdater FindMutable(const Context& cntx, std::string_view key);
+  OpResult<ItAndUpdater> FindMutable(const Context& cntx, std::string_view key,
+                                     unsigned req_obj_type);
+
+  ConstIterator FindReadOnly(const Context& cntx, std::string_view key) const;
+  OpResult<ConstIterator> FindReadOnly(const Context& cntx, std::string_view key,
+                                       unsigned req_obj_type) const;
+
+  // Consider using req_obj_type to specify the type of object you expect.
+  // Because it can evaluate to bugs like this:
+  // - We already have a key but with another type you expect.
+  // - During FindMutable we will not use req_obj_type, so the object type will not be checked.
+  // - AddOrFind will return the object with this key but with a different type.
+  // - Then you will update this object with a different type, which will lead to an error.
+  // If you proved the key type on your own, please add a comment there why don't specify
+  // req_obj_type
+  OpResult<ItAndUpdater> AddOrFind(const Context& cntx, std::string_view key,
+                                   std::optional<unsigned> req_obj_type);
+
+  // Same as AddOrSkip, but overwrites in case entry exists.
+  OpResult<ItAndUpdater> AddOrUpdate(const Context& cntx, std::string_view key, PrimeValue obj,
+                                     uint64_t expire_at_ms);
+
+  // Adds a new entry. Requires: key does not exist in this slice.
+  // Returns the iterator to the newly added entry.
+  // Returns OpStatus::OUT_OF_MEMORY if bad_alloc is thrown
+  OpResult<ItAndUpdater> AddNew(const Context& cntx, std::string_view key, PrimeValue obj,
+                                uint64_t expire_at_ms);
+
+  // Update entry expiration. Return expiration timepoint in abs milliseconds, or -1 if the entry
+  // already expired and was deleted;
+  facade::OpResult<int64_t> UpdateExpire(const Context& cntx, Iterator prime_it,
+                                         const ExpireParams& params);
+
+  // Adds expiry on a key. If the key already has expiry, updates it.
+  void AddExpire(DbIndex db_ind, const Iterator& main_it, uint64_t at);
+
+  // Removes expiry from a key. Returns true if expiry existed and was removed.
+  bool RemoveExpire(DbIndex db_ind, const Iterator& main_it);
+
+  // Returns false if no action was taken, true if the mc flag was set or removed.
+  bool SetMCFlag(DbIndex db_ind, const PrimeKey& key, uint32_t flag);
+
+  uint32_t GetMCFlag(DbIndex db_ind, const PrimeKey& key) const;
+
+  // Creates a database with index `db_ind`. If such database exists does nothing.
+  void ActivateDb(DbIndex db_ind);
+
+  // Deletes the iterator. The iterator must be valid.
+  // Context argument is used only for document removal and it just needs
+  // timestamp field. Last argument, db_table, is optional and is used only in FlushSlotsCb.
+  // If async is set, AsyncDeleter will enqueue deletion of the object
+  void Del(Context cntx, Iterator it, DbTable* db_table = nullptr, bool async = false);
+
+  // Deletes a key after FindMutable(). Runs post_updater before deletion
+  // to update memory accounting while the key is still valid.
+  // Takes ownership of it_updater (pass by value with move semantics).
+  void DelMutable(Context cntx, ItAndUpdater it_updater);
+
+  constexpr static DbIndex kDbAll = 0xFFFF;
+
+  // Flushes db_ind or all databases if kDbAll is passed
+  util::fb2::Fiber FlushDb(DbIndex db_ind);
+
+  // Flushes the data of given slot ranges.
+  void FlushSlots(const cluster::SlotRanges& slot_ranges);
+
+  EngineShard* shard_owner() const {
+    return owner_;
+  }
+
+  ShardId shard_id() const {
+    return shard_id_;
+  }
+
+  void OnCbFinishBlocking();
+
+  bool Acquire(IntentLock::Mode m, const KeyLockArgs& lock_args);
+  void Release(IntentLock::Mode m, const KeyLockArgs& lock_args);
+
+  // Returns true if the key can be locked under m. Does not lock.
+  bool CheckLock(IntentLock::Mode mode, DbIndex dbid, uint64_t fp) const;
+  bool CheckLock(IntentLock::Mode mode, DbIndex dbid, std::string_view key) const {
+    return CheckLock(mode, dbid, LockTag(key).Fingerprint());
+  }
+
+  // Returns true if none of lock_args' keys are locked in a conflicting mode. Unlike Acquire(),
+  // this does not register anything in the lock table.
+  bool IsLockFree(IntentLock::Mode mode, const KeyLockArgs& lock_args) const;
+
+  size_t db_array_size() const {
+    return db_arr_.size();
+  }
+
+  bool IsDbValid(DbIndex id) const {
+    return id < db_arr_.size() && bool(db_arr_[id]);
+  }
+
+  auto CopyDBTablePtr(DbIndex id) {
+    return db_arr_[id];
+  }
+
+  DbTable* GetDBTable(DbIndex id) {
+    return db_arr_[id].get();
+  }
+
+  const DbTable* GetDBTable(DbIndex id) const {
+    return db_arr_[id].get();
+  }
+
+  PrimeTable* GetTables(DbIndex id) {
+    return &db_arr_[id]->prime;
+  }
+
+  // Returns existing keys count in the db.
+  size_t DbSize(DbIndex db_ind) const;
+
+  DbTableStats* MutableStats(DbIndex db_ind) {
+    return &db_arr_[db_ind]->stats;
+  }
+
+  // Check whether 'it' has not expired. Returns it if it's still valid. Otherwise, erases it
+  // and returns Iterator{}.
+  Iterator ExpireIfNeeded(const Context& cntx, Iterator it) const;
+
+  // Iterate over all expire table entries and delete expired.
+  void ExpireAllIfNeeded();
+
+  // Current version of this slice.
+  // We maintain a shared versioning scheme for all databases in the slice.
+  uint64_t version() const {
+    return version_;
+  }
+
+  size_t table_memory() const {
+    return table_memory_;
+  }
+
+  size_t entries_count() const {
+    return entries_count_;
+  }
+
+  void RegisterOnChange(ChangeConsumerInterface* consumer);
+
+  // Not allowed to be called from the consumer callback. Idempotent: returns true only for the
+  // caller that actually removed the consumer, false if it was not registered. This makes it safe
+  // for racing fibers to unregister the same consumer without double-erasing.
+  bool UnregisterOnChange(ChangeConsumerInterface* consumer);
+
+  bool HasRegisteredCallbacks() const {
+    return !change_cb_.empty();
+  }
+
+  // Call registered callbacks with version less than upper_bound.
+  void FlushChangeToEarlierCallbacks(DbIndex db_ind, Iterator it, uint64_t upper_bound);
+
+  struct DeleteExpiredStats {
+    uint32_t deleted = 0;                 // number of deleted items due to expiry.
+    uint32_t deleted_bytes = 0;           // total bytes of deleted items.
+    uint32_t traversed = 0;               // total number of traversed entries in the prime table.
+    std::vector<std::string> key_events;  // expired key names for keyspace notifications.
+  };
+
+  // Deletes some amount of possible expired items.
+  DeleteExpiredStats DeleteExpiredStep(const Context& cntx, unsigned count);
+
+  // Evicts items with dynamically allocated data from the primary table.
+  // Does not shrink tables.
+  // Returns number of (elements,bytes) freed due to evictions.
+  // key_events: if non-null, evicted key names are appended for keyspace notifications.
+  std::pair<uint64_t, size_t> FreeMemWithEvictionStepAtomic(DbIndex db_indx, const Context& cntx,
+                                                            size_t starting_segment_id,
+                                                            size_t increase_goal_bytes,
+                                                            std::vector<std::string>* key_events);
+
+  int32_t GetNextSegmentForEviction(int32_t segment_id, DbIndex db_ind) const;
+
+  const DbTableArray& databases() const {
+    return db_arr_;
+  }
+
+  void TEST_EnableCacheMode() {
+    cache_mode_ = 1;
+  }
+
+  bool IsCacheMode() const {
+    // During loading time we never bump elements.
+    return cache_mode_ && (load_ref_count_ == 0);
+  }
+
+  void IncrLoadInProgress() {
+    ++load_ref_count_;
+  }
+
+  void DecrLoadInProgress() {
+    --load_ref_count_;
+  }
+
+  bool IsLoadRefCountZero() const {
+    return load_ref_count_ == 0;
+  }
+
+  // Test hook to inspect last locked keys.
+  const auto& TEST_GetLastLockedFps() const {
+    return uniq_fps_;
+  }
+
+  // Register key to be watched - when touched, set dirty_ptr to true
+  void RegisterWatchedKey(DbIndex db_indx, std::string_view key, std::atomic_bool* dirty_ptr);
+
+  // Unregisted all watched key for given dirty_ptr
+  void UnregisterConnectionWatches(absl::Span<const std::pair<DbIndex, std::string>> keys,
+                                   const std::atomic_bool* dirty_ptr);
+
+  void SetDocDeletionCallback(DocDeletionCallback ddcb);
+
+  // Resets the event counter for updates/insertions
+  void ResetUpdateEvents();
+
+  // Resets events_ member. Used by CONFIG RESETSTAT
+  void ResetEvents();
+
+  // Controls the expiry/eviction state. The server may enter states where
+  // Both evictions and expiries will be stopped for a short period of time.
+  void SetExpireAllowed(bool is_allowed) {
+    expire_allowed_ = is_allowed;
+  }
+
+  // Track keys for the client represented by the the weak reference to its connection.
+  void TrackKey(const facade::ConnectionRef& conn_ref, std::string_view key) {
+    client_tracking_map_[key].insert(conn_ref);
+  }
+
+  // Does not check for non supported events. Callers must parse the string and reject it
+  // if it's not empty and not EX.
+  void SetNotifyKeyspaceEvents(std::string_view notify_keyspace_events);
+
+  // Returns true if any registered snapshot is blocked on bucket serialiazion (big value, delayed)
+  // and thus might reject the journal change
+  bool WillBlockOnJournalWrite() const;
+
+  // Block and wait for WillBlockOnJournalWrite to become false
+  void WaitForUnblockedJournalWrites() const;
+
+  void StartSampleTopK(DbIndex db_ind, uint32_t min_freq);
+
+  struct SamplingResult {
+    std::vector<std::pair<std::string, uint64_t>> top_keys;  // key -> frequency pairs.
+    uint64_t total_samples = 0;                              // Total number of keys sampled.
+  };
+  SamplingResult StopSampleTopK(DbIndex db_ind);
+
+  void StartSampleKeys(DbIndex db_ind);
+
+  // Returns number of unique keys sampled.
+  struct UniqueSampleResult {
+    uint64_t unique_keys_count = 0;  // Number of unique keys sampled.
+    uint64_t total_samples = 0;      // Total number of keys sampled.
+  };
+  UniqueSampleResult StopSampleKeys(DbIndex db_ind);
+
+  void StartSampleValues(DbIndex db_ind);
+
+  // Returns a histogram of sampled values.
+  std::unique_ptr<base::Histogram> StopSampleValues(DbIndex db_ind);
+
+ private:
+  void PreUpdateBlocking(DbIndex db_ind, const Iterator& it);
+  void PostUpdate(DbIndex db_ind, std::string_view key);
+
+  OpResult<ItAndUpdater> AddOrUpdateInternal(const Context& cntx, std::string_view key,
+                                             PrimeValue obj, uint64_t expire_at_ms,
+                                             bool force_update);
+
+  void FlushSlotsFb(const cluster::SlotSet& slot_ids, uint64_t next_version,
+                    ChangeConsumerInterface* consumer);
+  util::fb2::Fiber FlushDbIndexes(const std::vector<DbIndex>& indexes);
+
+  // Invalidate all watched keys in database. Used on FLUSH.
+  void InvalidateDbWatches(DbIndex db_indx);
+
+  // Invalidate all watched keys for given slots. Used on FlushSlots.
+  void InvalidateSlotWatches(const cluster::SlotSet& slot_ids);
+
+  // Clear tiered storage entries for the specified indices. Called during flushing some indices.
+  void RemoveOffloadedEntriesFromTieredStorage(absl::Span<const DbIndex> indices,
+                                               const DbTableArray& db_arr) const;
+
+  void PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async = false);
+
+  // Queues invalidation message to the clients that are tracking the change to a key.
+  void QueueInvalidationTrackingMessageAtomic(std::string_view key);
+  void SendQueuedInvalidationMessages();
+  void SendQueuedInvalidationMessagesAsync();
+
+  void CreateDb(DbIndex index);
+
+  // Returns true if this write could be ignored during replication without losing consistency
+  bool IsOmittableWrite(const Context& cntx, const ChangeReq& req);
+
+  enum class UpdateStatsMode : uint8_t {
+    kReadStats,
+    kMutableStats,
+  };
+
+  // events: if non-null, the expired key is appended to it (caller is in an atomic section and
+  // will send notifications later). If null, the notification is sent immediately (read path).
+  PrimeIterator ExpireIfNeeded(const Context& cntx, PrimeIterator it,
+                               std::vector<std::string>* events = nullptr) const;
+
+  OpResult<ItAndUpdater> AddOrFindInternal(const Context& cntx, std::string_view key,
+                                           std::optional<unsigned> req_obj_type);
+
+  OpResult<PrimeIterator> FindInternal(const Context& cntx, std::string_view key,
+                                       std::optional<unsigned> req_obj_type,
+                                       UpdateStatsMode stats_mode) const;
+  OpResult<ItAndUpdater> FindMutableInternal(const Context& cntx, std::string_view key,
+                                             std::optional<unsigned> req_obj_type);
+
+  uint64_t NextVersion() {
+    return version_++;
+  }
+
+  void CallChangeCallbacks(DbIndex id, const ChangeReq& cr) const;
+
+  ShardId shard_id_;
+  uint8_t cache_mode_ : 1;
+
+  EngineShard* owner_;
+
+  bool expire_allowed_ = true;
+
+  uint64_t version_ = 1;  // Used to version entries in the PrimeTable.
+
+  // Estimation of available memory dedicated to this shard.
+  // Recalculated periodically by dividing free memory left among all shards equally
+  ssize_t memory_budget_ = SSIZE_MAX / 2;
+  size_t bytes_per_object_ = 0;
+
+  size_t table_memory_ = 0;
+  uint64_t entries_count_ = 0;
+  unsigned load_ref_count_ = 0;
+
+  mutable SliceEvents events_;  // we may change this even for const operations.
+
+  DbTableArray db_arr_;
+
+  // key for bump up items pair contains <key hash, db_index>
+  using FetchedItemKey = std::pair<uint64_t, DbIndex>;
+
+  struct FpHasher {
+    size_t operator()(uint64_t val) const {
+      return val;
+    }
+    size_t operator()(const FetchedItemKey& val) const {
+      return val.first;
+    }
+  };
+
+  // Used in temporary computations in Acquire/Release.
+  mutable absl::flat_hash_set<uint64_t, FpHasher> uniq_fps_;
+
+  // ordered from the smallest to largest version.
+  std::list<ChangeConsumerInterface*> change_cb_;
+  mutable LocalLatch change_cb_latch_;  // to avoid deletion during traversal
+
+  // Used in temporary computations in Find item and CbFinish
+  // This set is used to hold fingerprints of key accessed during the run of
+  // a transaction callback (not the whole transaction).
+  // We track them to avoid bumping them again (in any direction) so that the iterators to
+  // the fetched keys will not be invalidated. We must do it for atomic operations,
+  // for operations that preempt in the middle we have another mechanism -
+  // auto laundering iterators, so in case of preemption we do not mind that fetched_items are
+  // cleared or changed.
+  mutable absl::flat_hash_set<FetchedItemKey, FpHasher> fetched_items_;
+
+  // Registered by shard indices on when first document index is created.
+  DocDeletionCallback doc_del_cb_;
+
+  bool expired_keys_events_recording_ = true;
+
+  bool journal_omit_redundant_writes_ = true;
+
+  struct Hash {
+    size_t operator()(const facade::ConnectionRef& c) const {
+      return std::hash<uint32_t>()(c.GetClientId());
+    }
+  };
+
+  // the following type definitions are confusing, and they are for achieving memory
+  // usage tracking for client_tracking_map_ data structure through C++'s memory resource and
+  // and polymorphic allocator (new C++ features)
+  // the declarations below meant to say:
+  // absl::flat_hash_map<std::string,
+  //                    absl::flat_hash_set<facade::Connection::WeakRef, Hash>>
+  //                    client_tracking_map_
+  using HashSetAllocator = PMR_NS::polymorphic_allocator<facade::ConnectionRef>;
+
+  using ConnectionHashSet =
+      absl::flat_hash_set<facade::ConnectionRef, Hash,
+                          absl::container_internal::hash_default_eq<facade::ConnectionRef>,
+                          HashSetAllocator>;
+
+  using AllocatorType = PMR_NS::polymorphic_allocator<std::pair<std::string, ConnectionHashSet>>;
+
+  using TrackingMap =
+      absl::flat_hash_map<std::string, ConnectionHashSet,
+                          absl::container_internal::hash_default_hash<std::string>,
+                          absl::container_internal::hash_default_eq<std::string>, AllocatorType>;
+  TrackingMap client_tracking_map_, pending_send_map_;
+
+  void SendQueuedInvalidationMessagesCb(const TrackingMap& track_map, unsigned idx) const;
+
+  class PrimeBumpPolicy;
+};
+
+inline bool IsValid(const DbSlice::Iterator& it) {
+  return dfly::IsValid(it.GetInnerIt());
+}
+
+inline bool IsValid(const DbSlice::ConstIterator& it) {
+  return dfly::IsValid(it.GetInnerIt());
+}
+
+template <typename T> void DbSlice::IteratorT<T>::LaunderIfNeeded() const {
+  if (!dfly::IsValid(it_)) {
+    return;
+  }
+
+  uint64_t current_epoch = util::fb2::FiberSwitchEpoch();
+  if (current_epoch != fiber_epoch_) {
+    if (!it_.IsOccupied() || it_->first != key_.view()) {
+      it_ = it_.owner().Find(key_.view());
+    }
+    fiber_epoch_ = current_epoch;
+  }
+}
+
+}  // namespace dfly

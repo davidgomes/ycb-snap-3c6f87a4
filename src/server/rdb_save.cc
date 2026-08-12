@@ -1,0 +1,2055 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "server/rdb_save.h"
+
+#include <absl/cleanup/cleanup.h>
+#include <absl/strings/str_cat.h>
+#include <absl/strings/str_format.h>
+
+#include <bit>
+#include <queue>
+
+#include "core/stream_node.h"
+
+extern "C" {
+#include "redis/crc64.h"
+#include "redis/intset.h"
+#include "redis/listpack.h"
+#include "redis/rdb.h"
+#include "redis/stream.h"
+#include "redis/util.h"
+#include "redis/zmalloc.h"
+}
+
+#include "base/flags.h"
+#include "base/logging.h"
+#include "core/bloom.h"
+#include "core/cms.h"
+#include "core/cuckoo.h"
+#include "core/json/json_object.h"
+#include "core/oah_set.h"
+#include "core/qlist.h"
+#include "core/size_tracking_channel.h"
+#include "core/sorted_map.h"
+#include "core/string_map.h"
+#include "core/string_set.h"
+#include "core/topk.h"
+#include "server/engine_shard_set.h"
+#include "server/error.h"
+#include "server/main_service.h"
+#include "server/namespaces.h"
+#include "server/rdb_extensions.h"
+#include "server/search/doc_index.h"
+#include "server/serializer_commons.h"
+#include "server/snapshot.h"
+#include "server/tiered_storage.h"
+#include "server/tiering/common.h"
+#include "util/fibers/simple_channel.h"
+
+ABSL_FLAG(dfly::CompressionMode, compression_mode, dfly::CompressionMode::MULTI_ENTRY_LZ4,
+          "set 0 for no compression,"
+          "set 1 for single entry lzf compression,"
+          "set 2 for multi entry zstd compression on df snapshot and single entry on rdb snapshot,"
+          "set 3 for multi entry lz4 compression on df snapshot and single entry on rdb snapshot");
+
+ABSL_FLAG(bool, rdb_sbf_chunked, true, "Enable new save format for saving SBFs in chunks.");
+
+namespace dfly {
+
+using namespace std;
+using base::IoBuf;
+using io::Bytes;
+
+using namespace tiering::literals;
+
+namespace {
+
+/* Encodes the "value" argument as integer when it fits in the supported ranges
+ * for encoded types. If the function successfully encodes the integer, the
+ * representation is stored in the buffer pointer to by "enc" and the string
+ * length is returned. Otherwise 0 is returned. */
+unsigned EncodeInteger(long long value, uint8_t* enc) {
+  if (value >= -(1 << 7) && value <= (1 << 7) - 1) {
+    enc[0] = (RDB_ENCVAL << 6) | RDB_ENC_INT8;
+    enc[1] = value & 0xFF;
+    return 2;
+  }
+
+  if (value >= -(1 << 15) && value <= (1 << 15) - 1) {
+    enc[0] = (RDB_ENCVAL << 6) | RDB_ENC_INT16;
+    enc[1] = value & 0xFF;
+    enc[2] = (value >> 8) & 0xFF;
+    return 3;
+  }
+
+  constexpr long long k31 = (1LL << 31);
+  if (value >= -k31 && value <= k31 - 1) {
+    enc[0] = (RDB_ENCVAL << 6) | RDB_ENC_INT32;
+    enc[1] = value & 0xFF;
+    enc[2] = (value >> 8) & 0xFF;
+    enc[3] = (value >> 16) & 0xFF;
+    enc[4] = (value >> 24) & 0xFF;
+    return 5;
+  }
+
+  return 0;
+}
+
+/* String objects in the form "2391" "-100" without any space and with a
+ * range of values that can fit in an 8, 16 or 32 bit signed value can be
+ * encoded as integers to save space */
+unsigned TryIntegerEncoding(string_view input, uint8_t* dest) {
+  long long value;
+
+  /* Check if it's possible to encode this value as a number */
+  if (!absl::SimpleAtoi(input, &value))
+    return 0;
+  absl::AlphaNum alpha(value);
+
+  /* If the number converted back into a string is not identical
+   * then it's not possible to encode the string as integer */
+  if (alpha.size() != input.size() || alpha.Piece() != input)
+    return 0;
+
+  return EncodeInteger(value, dest);
+}
+
+constexpr size_t kBufLen = 64_KB;
+constexpr size_t kAmask = 4_KB - 1;
+constexpr uint32_t kChannelLen = 2;
+
+}  // namespace
+
+bool AbslParseFlag(std::string_view in, dfly::CompressionMode* flag, std::string* err) {
+  if (in == "0" || in == "NONE") {
+    *flag = dfly::CompressionMode::NONE;
+    return true;
+  }
+  if (in == "1" || in == "SINGLE_ENTRY") {
+    *flag = dfly::CompressionMode::SINGLE_ENTRY;
+    return true;
+  }
+  if (in == "2" || in == "MULTI_ENTRY_ZSTD") {
+    *flag = dfly::CompressionMode::MULTI_ENTRY_ZSTD;
+    return true;
+  }
+  if (in == "3" || in == "MULTI_ENTRY_LZ4") {
+    *flag = dfly::CompressionMode::MULTI_ENTRY_LZ4;
+    return true;
+  }
+
+  *err = absl::StrCat("Unknown value ", in, " for compression_mode flag");
+  return false;
+}
+
+std::string AbslUnparseFlag(dfly::CompressionMode flag) {
+  switch (flag) {
+    case dfly::CompressionMode::NONE:
+      return "NONE";
+    case dfly::CompressionMode::SINGLE_ENTRY:
+      return "SINGLE_ENTRY";
+    case dfly::CompressionMode::MULTI_ENTRY_ZSTD:
+      return "MULTI_ENTRY_ZSTD";
+    case dfly::CompressionMode::MULTI_ENTRY_LZ4:
+      return "MULTI_ENTRY_LZ4";
+  }
+  DCHECK(false) << "Unknown compression_mode flag value " << int(flag);
+  return "NONE";
+}
+
+dfly::CompressionMode GetDefaultCompressionMode() {
+  return absl::GetFlag(FLAGS_compression_mode);
+}
+
+uint8_t RdbObjectType(const CompactObj& pv) {
+  unsigned type = pv.ObjType();
+  unsigned compact_enc = pv.Encoding();
+  switch (type) {
+    case OBJ_STRING:
+      return RDB_TYPE_STRING;
+    case OBJ_LIST:
+      return RDB_TYPE_LIST_QUICKLIST_2;
+      break;
+    case OBJ_SET:
+      if (compact_enc == kEncodingIntSet)
+        return RDB_TYPE_SET_INTSET;
+      else if (compact_enc == kEncodingStrMap2) {
+        return pv.HasMemberExpiration() ? RDB_TYPE_SET_WITH_EXPIRY : RDB_TYPE_SET;
+      }
+      break;
+    case OBJ_ZSET:
+      if (compact_enc == OBJ_ENCODING_LISTPACK)
+        return RDB_TYPE_ZSET_LISTPACK;
+      else if (compact_enc == OBJ_ENCODING_SKIPLIST)
+        return RDB_TYPE_ZSET_2;
+      break;
+    case OBJ_HASH:
+      if (compact_enc == kEncodingListPack)
+        return RDB_TYPE_HASH_LISTPACK;
+      else if (compact_enc == kEncodingStrMap2) {
+        if (pv.HasMemberExpiration())
+          return RDB_TYPE_HASH_WITH_EXPIRY;  // Incompatible with Redis
+        else
+          return RDB_TYPE_HASH;
+      }
+      break;
+    case OBJ_STREAM:
+      return RDB_TYPE_STREAM_LISTPACKS_3;
+    case OBJ_MODULE:
+      return RDB_TYPE_MODULE_2;
+    case OBJ_JSON:
+      return RDB_TYPE_JSON;
+    case OBJ_SBF:
+      return absl::GetFlag(FLAGS_rdb_sbf_chunked) ? RDB_TYPE_SBF2 : RDB_TYPE_SBF;
+    case OBJ_CMS:
+      return RDB_TYPE_CMS;
+    case OBJ_TOPK:
+      return RDB_TYPE_TOPK;
+    case OBJ_CUCKOOFILTER:
+      return RDB_TYPE_CUCKOO;
+  }
+  LOG(FATAL) << "Unknown encoding " << compact_enc << " for type " << type;
+  return 0; /* avoid warning */
+}
+
+RdbSerializer::RdbSerializer(CompressionMode compression_mode, ConsumeFun consume_fun,
+                             size_t flush_threshold)
+    : compression_mode_(compression_mode),
+      tmp_buf_(nullptr),
+      consume_fun_(std::move(consume_fun)),
+      flush_threshold_(flush_threshold) {
+}
+
+RdbSerializer::~RdbSerializer() {
+  VLOG(2) << "compression mode: " << uint32_t(compression_mode_);
+  if (compression_stats_) {
+    VLOG(2) << "compression not effective: " << compression_stats_->compression_no_effective;
+    VLOG(2) << "string compression skipped: " << compression_stats_->size_skip_count;
+    VLOG(2) << "compression failed: " << compression_stats_->compression_failed;
+    VLOG(2) << "compressed blobs:" << compression_stats_->compressed_blobs;
+  }
+}
+
+std::error_code RdbSerializer::SaveValue(const PrimeValue& pv) {
+  std::error_code ec;
+  if (pv.ObjType() == OBJ_STRING) {
+    auto opt_int = pv.TryGetInt();
+    if (opt_int) {
+      ec = SaveLongLongAsString(*opt_int);
+    } else {
+      if (pv.IsExternal()) {
+        if (pv.IsCool()) {
+          return SaveValue(pv.GetCool().record->value);
+        }
+        LOG(FATAL) << "External string not supported yet";
+      } else {
+        ec = SaveString(pv.GetSlice(&tmp_str_));
+      }
+    }
+  } else {
+    ec = SaveObject(pv);
+  }
+  return ec;
+}
+
+error_code RdbSerializer::SelectDb(uint32_t dbid) {
+  if (dbid == last_entry_db_index_) {
+    return error_code{};
+  }
+  last_entry_db_index_ = dbid;
+  uint8_t buf[16];
+  buf[0] = RDB_OPCODE_SELECTDB;
+  unsigned enclen = WritePackedUInt(dbid, io::MutableBytes{buf}.subspan(1));
+  return WriteRaw(Bytes{buf, enclen + 1});
+}
+
+// Called by snapshot
+io::Result<uint8_t> RdbSerializer::SaveEntry(const PrimeKey& pk, const PrimeValue& pv,
+                                             uint64_t expire_ms, uint32_t mc_flags, DbIndex dbid) {
+  if (!pv.TagAllowsEmptyValue() && pv.Size() == 0) {
+    // A read that lazily expires a container's last field deletes the key while a
+    // snapshot is active, so an empty value can reach here transiently; skipping is
+    // correct. ERROR (not DFATAL) still flags a genuinely empty key left by a bug.
+    string_view key = pk.GetSlice(&tmp_str_);
+    LOG(ERROR) << "SaveEntry skipped empty PrimeValue with key: " << key << " with tag "
+               << static_cast<int>(pv.Tag());
+    return 0;
+  }
+
+  DVLOG(3) << "Selecting " << dbid << " previous: " << last_entry_db_index_;
+  auto ec = SelectDb(dbid);
+  if (ec) {
+    return make_unexpected(ec);
+  }
+
+  mem_buf_controller_.StartEntry();
+  bool save_succeeded = false;
+  absl::Cleanup cleanup = [&] { mem_buf_controller_.FinishEntry(save_succeeded); };
+
+  /* Save the expire time */
+  if (expire_ms > 0) {
+    uint8_t buf[16] = {RDB_OPCODE_EXPIRETIME_MS};
+    absl::little_endian::Store64(buf + 1, expire_ms);
+    if (auto ec = WriteRaw(Bytes{buf, 9}); ec)
+      return make_unexpected(ec);
+  }
+
+  /* Save the key poperties */
+  uint32_t df_mask_flags = pk.IsSticky() ? DF_MASK_FLAG_STICKY : 0;
+  df_mask_flags |= pv.HasFlag() ? DF_MASK_FLAG_MC_FLAGS : 0;
+  if (df_mask_flags != 0) {
+    uint8_t buf[9] = {RDB_OPCODE_DF_MASK};
+    absl::little_endian::Store32(buf + 1, df_mask_flags);
+    size_t buf_size = 5;
+    if (df_mask_flags & DF_MASK_FLAG_MC_FLAGS) {
+      absl::little_endian::Store32(buf + buf_size, mc_flags);
+      buf_size += 4;
+    }
+    if (auto ec = WriteRaw(Bytes{buf, buf_size}); ec)
+      return make_unexpected(ec);
+  }
+
+  uint8_t rdb_type = RdbObjectType(pv);
+
+  string_view key = pk.GetSlice(&tmp_str_);
+  DVLOG(3) << ((void*)this) << ": Saving key/val start " << key << " in dbid=" << dbid;
+
+  if (auto ec = WriteOpcode(rdb_type); ec)
+    return make_unexpected(ec);
+
+  if (auto ec = SaveString(key); ec)
+    return make_unexpected(ec);
+
+  if (auto ec = SaveValue(pv); ec) {
+    LOG(ERROR) << "Problems saving value for key " << key << " in dbid=" << dbid;
+    return make_unexpected(ec);
+  }
+
+  // We flush here because if the next element in the bucket we are serializing is a container,
+  // it will first serialize the first entry and then flush the internal buffer, even if
+  // crossed the limit.
+  if (auto ec = PushToConsumerIfNeeded(FlushState::kFlushEndEntry); ec)
+    return make_unexpected(ec);
+  save_succeeded = true;
+  return rdb_type;
+}
+
+error_code RdbSerializer::SaveObject(const PrimeValue& pv) {
+  unsigned obj_type = pv.ObjType();
+  CHECK_NE(obj_type, OBJ_STRING);
+
+  if (obj_type == OBJ_LIST) {
+    return SaveListObject(pv);
+  }
+
+  if (obj_type == OBJ_SET) {
+    return SaveSetObject(pv);
+  }
+
+  if (obj_type == OBJ_HASH) {
+    return SaveHSetObject(pv);
+  }
+
+  if (obj_type == OBJ_ZSET) {
+    return SaveZSetObject(pv);
+  }
+
+  if (obj_type == OBJ_STREAM) {
+    return SaveStreamObject(pv);
+  }
+
+  if (obj_type == OBJ_JSON) {
+    return SaveJsonObject(pv);
+  }
+
+  if (obj_type == OBJ_SBF) {
+    return SaveSBFObject(pv);
+  }
+
+  if (obj_type == OBJ_CMS) {
+    return SaveCMSObject(pv);
+  }
+
+  if (obj_type == OBJ_TOPK) {
+    return SaveTOPKObject(pv);
+  }
+
+  if (obj_type == OBJ_CUCKOOFILTER) {
+    return SaveCuckooFilterObject(pv);
+  }
+
+  LOG(ERROR) << "Not implemented " << obj_type;
+  return make_error_code(errc::function_not_supported);
+}
+
+error_code RdbSerializer::SaveListObject(const PrimeValue& pv) {
+  /* Save a list value */
+  if (pv.Encoding() == kEncodingListPack) {
+    uint8_t* lp = (uint8_t*)pv.RObjPtr();
+    size_t len = 1;  // 1 node
+    RETURN_ON_ERR(SaveLen(len));
+
+    // Node 1
+    RETURN_ON_ERR(SaveLen(QUICKLIST_NODE_CONTAINER_PACKED));
+    size_t lp_bytes = lpBytes(lp);
+    RETURN_ON_ERR(SaveString(lp, lp_bytes));
+
+    RETURN_ON_ERR(PushToConsumerIfNeeded(FlushState::kFlushEndEntry));
+    return error_code{};
+  }
+
+  DCHECK_EQ(pv.Encoding(), kEncodingQL2);
+  QList* ql = reinterpret_cast<QList*>(pv.RObjPtr());
+
+  const QList::Node* node = ql->Head();
+  size_t len = ql->node_count();
+
+  RETURN_ON_ERR(SaveLen(len));
+
+  while (node) {
+    DVLOG(3) << "QL node (encoding/container/sz): " << node->encoding << "/" << node->container
+             << "/" << node->sz;
+
+    // Use listpack encoding
+    RETURN_ON_ERR(SaveLen(node->container));
+    // Materialize the node if it was offloaded to tiered storage, so that we can access its
+    // content. We have to drop const qualifier to update the node.
+    ql->Materialize(const_cast<QList::Node*>(node));
+    if (node->encoding == QLIST_NODE_ENCODING_ZSTD) {
+      // ZSTD-compressed nodes cannot be saved using RDB LZF encoding — the loader would
+      // call lzf_decompress on ZSTD bytes and corrupt the data. Decompress to raw first.
+      std::string raw;
+      if (!QList::DecompressZstdNode(node, &raw)) {
+        return make_error_code(errc::invalid_argument);
+      }
+      RETURN_ON_ERR(SaveString(string_view{raw.data(), raw.size()}));
+      FlushState flush_state = FlushState::kFlushMidEntry;
+      if (node->next == nullptr)
+        flush_state = FlushState::kFlushEndEntry;
+      RETURN_ON_ERR(PushToConsumerIfNeeded(flush_state));
+    } else if (node->IsCompressed()) {
+      void* data;
+      size_t compress_len = node->GetLZF(&data);
+      RETURN_ON_ERR(SaveLzfBlob(Bytes{reinterpret_cast<uint8_t*>(data), compress_len}, node->sz));
+    } else {
+      RETURN_ON_ERR(SaveString(node->entry, node->sz));
+      FlushState flush_state = FlushState::kFlushMidEntry;
+      if (node->next == nullptr)
+        flush_state = FlushState::kFlushEndEntry;
+      RETURN_ON_ERR(PushToConsumerIfNeeded(flush_state));
+    }
+    node = node->next;
+  }
+  return error_code{};
+}
+
+error_code RdbSerializer::SaveSetObject(const PrimeValue& obj) {
+  if (obj.Encoding() == kEncodingStrMap2) {
+    auto save_loop = [this](auto* set) -> error_code {
+      // set_time(0) disables lazy expiry during serialization. Restore on every
+      // exit path (including the early returns inside RETURN_ON_ERR) so a failed
+      // SAVE doesn't leave the set with expiry permanently disabled.
+      set->set_time(0);
+      absl::Cleanup restore_time = [set] { set->set_time(MemberTimeSeconds(GetCurrentTimeMs())); };
+
+      const bool has_expiry = set->ExpirationUsed();
+      RETURN_ON_ERR(SaveLen(set->UpperBoundSize()));
+      for (auto it = set->begin(); it != set->end();) {
+        RETURN_ON_ERR(SaveString(Key(it)));
+        if (has_expiry) {
+          int64_t expiry = it.HasExpiry() ? int64_t{it.ExpiryTime()} : -1;
+          RETURN_ON_ERR(SaveLongLongAsString(expiry));
+        }
+        ++it;
+        FlushState flush_state =
+            it == set->end() ? FlushState::kFlushEndEntry : FlushState::kFlushMidEntry;
+        RETURN_ON_ERR(PushToConsumerIfNeeded(flush_state));
+      }
+      return error_code{};
+    };
+
+    RETURN_ON_ERR(VisitSet(obj.RObjPtr(), save_loop));
+  } else {
+    CHECK_EQ(obj.Encoding(), kEncodingIntSet);
+    intset* is = (intset*)obj.RObjPtr();
+    size_t len = intsetBlobLen(is);
+
+    RETURN_ON_ERR(SaveString(string_view{(char*)is, len}));
+  }
+
+  return error_code{};
+}
+
+error_code RdbSerializer::SaveHSetObject(const PrimeValue& pv) {
+  DCHECK_EQ(OBJ_HASH, pv.ObjType());
+
+  if (pv.Encoding() == kEncodingStrMap2) {
+    // We don't expire any data during serialization
+    pv.SetMemberTime(0);
+
+    StringMap* string_map = (StringMap*)pv.RObjPtr();
+    const bool has_expiry = pv.HasMemberExpiration();
+
+    // due to we avoid expiring we can use UpperBoundSize() instead of SlowSize()
+    RETURN_ON_ERR(SaveLen(string_map->UpperBoundSize()));
+
+    for (auto it = string_map->begin(); it != string_map->end();) {
+      const auto& [k, v] = *it;
+      RETURN_ON_ERR(SaveString(string_view{k, sdslen(k)}));
+      RETURN_ON_ERR(SaveString(string_view{v, sdslen(v)}));
+      if (has_expiry) {
+        int64_t expiry = -1;
+        if (it.HasExpiry())
+          expiry = it.ExpiryTime();
+        RETURN_ON_ERR(SaveLongLongAsString(expiry));
+      }
+      ++it;
+      FlushState flush_state = FlushState::kFlushMidEntry;
+      if (it == string_map->end())
+        flush_state = FlushState::kFlushEndEntry;
+      RETURN_ON_ERR(PushToConsumerIfNeeded(flush_state));
+    }
+
+    pv.SetMemberTime(MemberTimeSeconds(GetCurrentTimeMs()));
+  } else {
+    CHECK_EQ(kEncodingListPack, pv.Encoding());
+    uint8_t* lp = (uint8_t*)pv.RObjPtr();
+    size_t lp_bytes = lpBytes(lp);
+    RETURN_ON_ERR(SaveString((uint8_t*)lp, lp_bytes));
+  }
+
+  return error_code{};
+}
+
+error_code RdbSerializer::SaveZSetObject(const PrimeValue& pv) {
+  DCHECK_EQ(OBJ_ZSET, pv.ObjType());
+  if (pv.Encoding() == OBJ_ENCODING_SKIPLIST) {
+    auto* zs = static_cast<detail::SortedMap*>(pv.RObjPtr());
+
+    RETURN_ON_ERR(SaveLen(zs->Size()));
+    std::error_code ec;
+
+    const size_t total = zs->Size();
+    size_t count = 0;
+
+    // Iterate over the sorted map and save the key and score.
+    // The order is important (from smallest to biggest) - so that the loader
+    // will load the entries faster.
+    zs->Iterate(0, total, false, [&](sds ele, double score) mutable {
+      ec = SaveString(string_view{ele, sdslen(ele)});
+      if (ec)
+        return false;
+      ec = SaveBinaryDouble(score);
+      if (ec)
+        return false;
+      ++count;
+      FlushState flush_state = FlushState::kFlushMidEntry;
+      if (count == total)
+        flush_state = FlushState::kFlushEndEntry;
+
+      ec = PushToConsumerIfNeeded(flush_state);
+      if (ec)
+        return false;
+      return true;
+    });
+    return ec;
+  } else {
+    CHECK_EQ(pv.Encoding(), unsigned(OBJ_ENCODING_LISTPACK));
+    uint8_t* lp = (uint8_t*)pv.RObjPtr();
+    size_t lp_bytes = lpBytes(lp);
+
+    RETURN_ON_ERR(SaveString((uint8_t*)lp, lp_bytes));
+  }
+
+  return error_code{};
+}
+
+error_code RdbSerializer::SaveStreamObject(const PrimeValue& pv) {
+  /* Store how many listpacks we have inside the radix tree. */
+  stream* s = (stream*)pv.RObjPtr();
+  const size_t rax_size = raxSize(s->rax);
+
+  RETURN_ON_ERR(SaveLen(rax_size));
+
+  /* Serialize all the listpacks inside the radix tree as they are,
+   * when loading back, we'll use the first entry of each listpack
+   * to insert it back into the radix tree. */
+  raxIterator ri;
+  raxStart(&ri, s->rax);
+  raxSeek(&ri, "^", NULL, 0);
+
+  auto stop_listpacks_rax = absl::MakeCleanup([&] { raxStop(&ri); });
+
+  for (size_t i = 0; raxNext(&ri); i++) {
+    StreamNodeObj node(ri.data);
+    uint8_t* lp = node.GetListpack();
+    size_t lp_bytes = node.UncompressedSize();
+
+    RETURN_ON_ERR(SaveString((uint8_t*)ri.key, ri.key_len));
+    RETURN_ON_ERR(SaveString(lp, lp_bytes));
+
+    // Do not split after the final listpack. The loader can resume between listpacks,
+    // but the stream metadata tail is expected to stay bundled with the last listpack chunk, not
+    // in its own separate chunk.
+    if (i + 1 < rax_size)
+      RETURN_ON_ERR(PushToConsumerIfNeeded(FlushState::kFlushMidEntry));
+  }
+
+  std::move(stop_listpacks_rax).Invoke();
+
+  /* Save the number of elements inside the stream. We cannot obtain
+   * this easily later, since our macro nodes should be checked for
+   * number of items: not a great CPU / space tradeoff. */
+
+  RETURN_ON_ERR(SaveLen(s->length));
+
+  /* Save the last entry ID. */
+  RETURN_ON_ERR(SaveLen(s->last_id.ms));
+  RETURN_ON_ERR(SaveLen(s->last_id.seq));
+
+  uint8_t rdb_type = RdbObjectType(pv);
+
+  // 'first_id', 'max_deleted_entry_id' and 'entries_added' are added
+  // in RDB_TYPE_STREAM_LISTPACKS_2
+  if (rdb_type >= RDB_TYPE_STREAM_LISTPACKS_2) {
+    /* Save the first entry ID. */
+    RETURN_ON_ERR(SaveLen(s->first_id.ms));
+    RETURN_ON_ERR(SaveLen(s->first_id.seq));
+
+    /* Save the maximal tombstone ID. */
+    RETURN_ON_ERR(SaveLen(s->max_deleted_entry_id.ms));
+    RETURN_ON_ERR(SaveLen(s->max_deleted_entry_id.seq));
+
+    /* Save the offset. */
+    RETURN_ON_ERR(SaveLen(s->entries_added));
+  }
+  /* The consumer groups and their clients are part of the stream
+   * type, so serialize every consumer group. */
+
+  /* Save the number of groups. */
+  size_t num_cgroups = s->cgroups ? raxSize(s->cgroups) : 0;
+  RETURN_ON_ERR(SaveLen(num_cgroups));
+
+  if (num_cgroups) {
+    /* Serialize each consumer group. */
+    raxStart(&ri, s->cgroups);
+    raxSeek(&ri, "^", NULL, 0);
+
+    auto stop_cgroups_rax = absl::MakeCleanup([&] { raxStop(&ri); });
+
+    while (raxNext(&ri)) {
+      streamCG* cg = (streamCG*)ri.data;
+
+      /* Save the group name. */
+      RETURN_ON_ERR(SaveString((uint8_t*)ri.key, ri.key_len));
+
+      /* Last ID. */
+      RETURN_ON_ERR(SaveLen(cg->last_id.ms));
+
+      RETURN_ON_ERR(SaveLen(cg->last_id.seq));
+
+      if (rdb_type >= RDB_TYPE_STREAM_LISTPACKS_2) {
+        /* Save the group's logical reads counter. */
+        RETURN_ON_ERR(SaveLen(cg->entries_read));
+      }
+
+      /* Save the global PEL. */
+      RETURN_ON_ERR(SaveStreamPEL(cg->pel, true));
+
+      /* Save the consumers of this group. */
+      RETURN_ON_ERR(SaveStreamConsumers(rdb_type >= RDB_TYPE_STREAM_LISTPACKS_3, cg));
+    }
+  }
+
+  RETURN_ON_ERR(PushToConsumerIfNeeded(FlushState::kFlushEndEntry));
+
+  return error_code{};
+}
+
+error_code RdbSerializer::SaveJsonObject(const PrimeValue& pv) {
+  auto json_string = pv.GetJson()->to_string();
+  return SaveString(json_string);
+}
+
+std::error_code RdbSerializer::SaveSBFObject(const PrimeValue& pv) {
+  SBF* sbf = pv.GetSBF();
+
+  // options to allow format mutations in the future.
+  RETURN_ON_ERR(SaveLen(0));  // options - reserved
+  RETURN_ON_ERR(SaveBinaryDouble(sbf->grow_factor()));
+  RETURN_ON_ERR(SaveBinaryDouble(sbf->fp_probability()));
+  RETURN_ON_ERR(SaveLen(sbf->prev_size()));
+  RETURN_ON_ERR(SaveLen(sbf->current_size()));
+  RETURN_ON_ERR(SaveLen(sbf->max_capacity()));
+  RETURN_ON_ERR(SaveLen(sbf->num_filters()));
+
+  for (unsigned i = 0; i < sbf->num_filters(); ++i) {
+    RETURN_ON_ERR(SaveLen(sbf->hashfunc_cnt(i)));
+
+    string_view blob = sbf->data(i);
+
+    FlushState flush_state = FlushState::kFlushMidEntry;
+    if ((i + 1) == sbf->num_filters())
+      flush_state = FlushState::kFlushEndEntry;
+
+    if (absl::GetFlag(FLAGS_rdb_sbf_chunked)) {
+      RETURN_ON_ERR(SaveLen(blob.size()));
+      for (size_t offset = 0; offset < blob.size(); offset += kFilterChunkSize) {
+        size_t chunk_len = std::min(kFilterChunkSize, blob.size() - offset);
+        string_view chunk = blob.substr(offset, chunk_len);
+        // Verbatim length prefix + raw bytes: the loader reads chunks with LoadLen + FetchBuf.
+        RETURN_ON_ERR(SaveLen(chunk.size()));
+        RETURN_ON_ERR(
+            WriteRaw(io::Bytes{reinterpret_cast<const uint8_t*>(chunk.data()), chunk_len}));
+        const bool is_last_chunk = (offset + chunk_len >= blob.size());
+        RETURN_ON_ERR(
+            PushToConsumerIfNeeded(is_last_chunk ? flush_state : FlushState::kFlushMidEntry));
+      }
+    } else {
+      RETURN_ON_ERR(SaveString(blob));
+      RETURN_ON_ERR(PushToConsumerIfNeeded(flush_state));
+    }
+  }
+
+  return {};
+}
+
+std::error_code RdbSerializer::SaveCMSObject(const PrimeValue& pv) {
+  CMS* cms = pv.GetCMS();
+
+  RETURN_ON_ERR(SaveLen(cms->width()));
+  RETURN_ON_ERR(SaveLen(cms->depth()));
+  RETURN_ON_ERR(SaveLen(cms->total_count()));
+
+  size_t num_counters = cms->NumCounters();
+  const int64_t* data = cms->Data();
+
+  // Serialize counters as little-endian 64-bit values, streaming in fixed-size chunks
+  // to avoid an O(N) memory spike. We allocate this 4KB buffer on the heap
+  // to respect Dragonfly's small fiber stack limits.
+  constexpr size_t kChunkCounters = 512;
+  std::vector<uint8_t> chunk_buf(kChunkCounters * sizeof(uint64_t));
+  size_t i{};
+  while (i < num_counters) {
+    size_t chunk_count = std::min(kChunkCounters, num_counters - i);
+    for (size_t j{}; j < chunk_count; ++j, ++i) {
+      absl::little_endian::Store64(chunk_buf.data() + (j * sizeof(uint64_t)),
+                                   static_cast<uint64_t>(data[i]));
+    }
+    RETURN_ON_ERR(WriteRaw(Bytes{chunk_buf.data(), chunk_count * sizeof(uint64_t)}));
+  }
+
+  return {};
+}
+
+std::error_code RdbSerializer::SaveTOPKObject(const PrimeValue& pv) {
+  TOPK* topk = pv.GetTOPK();
+
+  RETURN_ON_ERR(SaveLen(0));  // Options (reserved)
+  RETURN_ON_ERR(SaveLen(topk->K()));
+  RETURN_ON_ERR(SaveLen(topk->Width()));
+  RETURN_ON_ERR(SaveLen(topk->Depth()));
+  RETURN_ON_ERR(SaveBinaryDouble(topk->Decay()));
+
+  // Save heap items (top-k list). O(K) - always small, safe to copy.
+  auto heap_items = topk->List();
+  RETURN_ON_ERR(SaveLen(heap_items.size()));
+  for (const auto& item : heap_items) {
+    RETURN_ON_ERR(SaveString(item.item));
+    RETURN_ON_ERR(SaveLen(item.count));
+  }
+
+  // Stream the counter array directly from the internal PMR vector — no O(N) copy.
+  // Use a 4KB heap buffer to respect Dragonfly's small fiber stack limits.
+  const auto& counters = topk->Counters();
+  const size_t total_bytes = counters.size() * sizeof(uint32_t);
+  RETURN_ON_ERR(SaveLen(total_bytes));
+
+  constexpr size_t kChunkCounters = 1024;
+  std::vector<uint8_t> chunk_buf(kChunkCounters * sizeof(uint32_t));
+  size_t i{};
+  while (i < counters.size()) {
+    size_t chunk_count = std::min(kChunkCounters, counters.size() - i);
+    for (size_t j{}; j < chunk_count; ++j, ++i) {
+      absl::little_endian::Store32(chunk_buf.data() + (j * sizeof(uint32_t)), counters[i]);
+    }
+    RETURN_ON_ERR(WriteRaw(Bytes{chunk_buf.data(), chunk_count * sizeof(uint32_t)}));
+  }
+
+  return {};
+}
+
+std::error_code RdbSerializer::SaveCuckooFilterObject(const PrimeValue& pv) {
+  CuckooFilter* cf = pv.GetCuckooFilter();
+
+  RETURN_ON_ERR(SaveLen(cf->SlotsPerBucket()));
+  RETURN_ON_ERR(SaveLen(cf->MaxIterations()));
+  RETURN_ON_ERR(SaveLen(cf->Expansion()));
+  RETURN_ON_ERR(SaveLen(cf->NumBuckets()));
+  RETURN_ON_ERR(SaveLen(cf->NumItems()));
+  RETURN_ON_ERR(SaveLen(cf->NumDeletes()));
+
+  size_t num_filters = cf->NumFilters();
+  RETURN_ON_ERR(SaveLen(num_filters));
+  for (size_t i = 0; i < num_filters; ++i) {
+    string_view blob = cf->FilterBytes(i);
+    bool is_last_filter = (i + 1 == num_filters);
+    RETURN_ON_ERR(SaveLen(blob.size()));
+    for (size_t off = 0; off < blob.size(); off += kFilterChunkSize) {
+      size_t chunk_len = std::min(kFilterChunkSize, blob.size() - off);
+      bool is_last_chunk = (off + chunk_len >= blob.size());
+      RETURN_ON_ERR(SaveLen(chunk_len));
+      RETURN_ON_ERR(
+          WriteRaw(io::Bytes{reinterpret_cast<const uint8_t*>(blob.data() + off), chunk_len}));
+      RETURN_ON_ERR(PushToConsumerIfNeeded(is_last_filter && is_last_chunk
+                                               ? FlushState::kFlushEndEntry
+                                               : FlushState::kFlushMidEntry));
+    }
+  }
+
+  return {};
+}
+
+/* Save a long long value as either an encoded string or a string. */
+error_code RdbSerializer::SaveLongLongAsString(int64_t value) {
+  uint8_t buf[32];
+  unsigned enclen = EncodeInteger(value, buf);
+  if (enclen > 0) {
+    return WriteRaw(Bytes{buf, enclen});
+  }
+
+  /* Encode as string */
+  enclen = ll2string((char*)buf, 32, value);
+  DCHECK_LT(enclen, 32u);
+
+  RETURN_ON_ERR(SaveLen(enclen));
+  return WriteRaw(Bytes{buf, enclen});
+}
+
+/* Saves a double for RDB 8 or greater, where IE754 binary64 format is assumed.
+ * We just make sure the integer is always stored in little endian, otherwise
+ * the value is copied verbatim from memory to disk.
+ *
+ * Return -1 on error, the size of the serialized value on success. */
+error_code RdbSerializer::SaveBinaryDouble(double val) {
+  static_assert(sizeof(val) == 8);
+  uint64_t src = std::bit_cast<uint64_t>(val);
+  uint8_t buf[8];
+  absl::little_endian::Store64(buf, src);
+
+  return WriteRaw(Bytes{buf, sizeof(buf)});
+}
+
+error_code RdbSerializer::SaveStreamPEL(rax* pel, bool nacks) {
+  /* Number of entries in the PEL. */
+
+  RETURN_ON_ERR(SaveLen(raxSize(pel)));
+
+  /* Save each entry. */
+  raxIterator ri;
+  raxStart(&ri, pel);
+  raxSeek(&ri, "^", NULL, 0);
+  auto cleanup = absl::MakeCleanup([&] { raxStop(&ri); });
+
+  while (raxNext(&ri)) {
+    /* We store IDs in raw form as 128 big big endian numbers, like
+     * they are inside the radix tree key. */
+    RETURN_ON_ERR(WriteRaw(Bytes{ri.key, sizeof(streamID)}));
+
+    if (nacks) {
+      streamNACK* nack = (streamNACK*)ri.data;
+      uint8_t buf[8];
+      absl::little_endian::Store64(buf, nack->delivery_time);
+      RETURN_ON_ERR(WriteRaw(buf));
+      RETURN_ON_ERR(SaveLen(nack->delivery_count));
+
+      /* We don't save the consumer name: we'll save the pending IDs
+       * for each consumer in the consumer PEL, and resolve the consumer
+       * at loading time. */
+    }
+  }
+
+  return error_code{};
+}
+
+error_code RdbSerializer::SaveStreamConsumers(bool save_active, streamCG* cg) {
+  /* Number of consumers in this consumer group. */
+
+  RETURN_ON_ERR(SaveLen(raxSize(cg->consumers)));
+
+  /* Save each consumer. */
+  raxIterator ri;
+  raxStart(&ri, cg->consumers);
+  raxSeek(&ri, "^", NULL, 0);
+  auto cleanup = absl::MakeCleanup([&] { raxStop(&ri); });
+  uint8_t buf[8];
+
+  while (raxNext(&ri)) {
+    streamConsumer* consumer = (streamConsumer*)ri.data;
+
+    /* Consumer name. */
+    RETURN_ON_ERR(SaveString(ri.key, ri.key_len));
+
+    /* seen time. */
+    absl::little_endian::Store64(buf, consumer->seen_time);
+    RETURN_ON_ERR(WriteRaw(buf));
+
+    if (save_active) {
+      /* Active time. */
+      absl::little_endian::Store64(buf, consumer->active_time);
+      RETURN_ON_ERR(WriteRaw(buf));
+    }
+    /* Consumer PEL, without the ACKs (see last parameter of the function
+     * passed with value of 0), at loading time we'll lookup the ID
+     * in the consumer group global PEL and will put a reference in the
+     * consumer local PEL. */
+
+    RETURN_ON_ERR(SaveStreamPEL(consumer->pel, false));
+  }
+
+  return error_code{};
+}
+
+error_code RdbSerializer::SendEofAndChecksum() {
+  VLOG(2) << "SendEof";
+  /* EOF opcode */
+  RETURN_ON_ERR(WriteOpcode(RDB_OPCODE_EOF));
+
+  /* CRC64 checksum. It will be zero if checksum computation is disabled, the
+   * loading code skips the check in this case. */
+  uint8_t buf[8];
+  uint64_t chksum = 0;
+
+  absl::little_endian::Store64(buf, chksum);
+  return WriteRaw(buf);
+}
+
+error_code RdbSerializer::SendJournalOffset(uint64_t journal_offset) {
+  VLOG(2) << "SendJournalOffset";
+  RETURN_ON_ERR(WriteOpcode(RDB_OPCODE_JOURNAL_OFFSET));
+  uint8_t buf[sizeof(uint64_t)];
+  absl::little_endian::Store64(buf, journal_offset);
+  return WriteRaw(buf);
+}
+
+error_code RdbSerializer::SaveHNSWEntry(const search::HnswNodeData& node,
+                                        absl::Span<uint8_t> tmp_buf) {
+  // Binary format using little-endian encoding for efficiency:
+  // - internal_id: 4 bytes (uint32_t)
+  // - global_id: 8 bytes (uint64_t)
+  // - level: 4 bytes (int)
+  // - for each level (0 to level): links_num (4 bytes) + links (4 bytes each)
+
+  size_t total_size = node.TotalSize();
+  DCHECK_LE(total_size, tmp_buf.size());
+  uint8_t* ptr = tmp_buf.data();
+
+  absl::little_endian::Store32(ptr, static_cast<uint32_t>(node.internal_id));
+  ptr += 4;
+  absl::little_endian::Store64(ptr, node.global_id);
+  ptr += 8;
+  absl::little_endian::Store32(ptr, static_cast<uint32_t>(node.level));
+  ptr += 4;
+
+  for (const auto& level_links : node.levels_links) {
+    absl::little_endian::Store32(ptr, static_cast<uint32_t>(level_links.size()));
+    ptr += 4;
+    for (uint32_t link : level_links) {
+      absl::little_endian::Store32(ptr, link);
+      ptr += 4;
+    }
+  }
+
+  return WriteRaw(Bytes{tmp_buf.data(), total_size});
+}
+
+error_code RdbSerializer::SendFullSyncCut() {
+  VLOG(1) << "SendFullSyncCut";
+  RETURN_ON_ERR(WriteOpcode(RDB_OPCODE_FULLSYNC_END));
+
+  // RDB_OPCODE_FULLSYNC_END followed by 8 bytes of 0.
+  // The reason for this is that some opcodes require to have at least 8 bytes of data
+  // in the read buffer when consuming the rdb data, and since RDB_OPCODE_FULLSYNC_END is one of
+  // the last opcodes sent to replica, we respect this requirement by sending a blob of 8 bytes.
+  uint8_t buf[8] = {0};
+  return WriteRaw(buf);
+}
+
+std::error_code RdbSerializer::WriteOpcode(uint8_t opcode) {
+  return WriteRaw(::io::Bytes{&opcode, 1});
+}
+
+size_t RdbSerializer::GetBufferCapacity() const {
+  return mem_buf_controller_.BufferCapacity();
+}
+
+size_t RdbSerializer::GetTempBufferSize() const {
+  return tmp_buf_.size() + tmp_str_.size();
+}
+
+error_code RdbSerializer::WriteRaw(const io::Bytes& buf) {
+  auto* mem_buf = mem_buf_controller_.Buffer();
+  mem_buf->Reserve(mem_buf->InputLen() + buf.size());
+  IoBuf::Bytes dest = mem_buf->AppendBuffer();
+  memcpy(dest.data(), buf.data(), buf.size());
+  mem_buf->CommitWrite(buf.size());
+  return error_code{};
+}
+
+string RdbSerializer::Flush(FlushState flush_state) {
+  using enum CompressionMode;
+  const IoBuf* mem_buf = mem_buf_controller_.Buffer();
+
+  if (!mem_buf_controller_.TagEntriesEnabled()) {
+    const bool is_last_chunk = flush_state == FlushState::kFlushEndEntry;
+    const bool has_current_bytes = mem_buf->InputLen() != 0;
+    const bool is_compression_enabled =
+        compression_mode_ == MULTI_ENTRY_ZSTD || compression_mode_ == MULTI_ENTRY_LZ4;
+    VLOG(2) << "Flush: is_last_chunk" << is_last_chunk << " split=" << entry_was_split_;
+
+    // Legacy compressed blobs must contain a complete top-level RDB sequence, so only compress
+    // the current buffer when this is the only flush of an entry that never split. Otherwise, the
+    // latter half of an object might end up in its own compressed packet. The loader main loop will
+    // not be able to handle such values which begin from the middle.
+    if (is_last_chunk && !entry_was_split_ && is_compression_enabled && has_current_bytes)
+      // replaces the current buffer with compressed content
+      CompressBlob();
+
+    entry_was_split_ = !is_last_chunk;
+  }
+
+  string result = mem_buf_controller_.BuildBlob();
+  if (result.empty())
+    return {};
+
+  // For tagged entry, compress the entire blob as a whole. Since tagged entries contain envelope
+  // with an id, the loader loop can assemble values from saved context by id, so it is possible to
+  // split a large entry across multiple chunks
+  if (mem_buf_controller_.TagEntriesEnabled())
+    if (auto res = CompressBlob(result); res)
+      result = std::move(*res);
+
+  if (result.size() > serialization_peak_bytes_)
+    serialization_peak_bytes_ = result.size();
+
+  DVLOG(2) << "FlushToSink " << result.size() << " bytes";
+
+  // After every flush we should write the DB index again because the blobs in the channel are
+  // interleaved and multiple savers can correspond to a single writer (in case of single file rdb
+  // snapshot)
+  last_entry_db_index_ = kInvalidDbId;
+
+  return result;
+}
+
+namespace {
+using VersionBuffer = std::array<char, sizeof(uint16_t)>;
+using CrcBuffer = std::array<char, sizeof(uint64_t)>;
+
+VersionBuffer MakeRdbVersion() {
+  VersionBuffer buf;
+  buf[0] = RDB_SER_VERSION & 0xff;
+  buf[1] = (RDB_SER_VERSION >> 8) & 0xff;
+  return buf;
+}
+
+CrcBuffer MakeCheckSum(std::string_view dump_res, bool ignore_crc) {
+  uint64_t chksum =
+      ignore_crc ? 0 : crc64(0, reinterpret_cast<const uint8_t*>(dump_res.data()), dump_res.size());
+  CrcBuffer buf;
+  absl::little_endian::Store64(buf.data(), chksum);
+  return buf;
+}
+
+void AppendFooter(bool ignore_crc, string* dest) {
+  auto to_bytes = [dest](const auto& buf) { dest->append(buf.data(), buf.size()); };
+
+  /* Write the footer, this is how it looks like:
+   * ----------------+---------------------+---------------+
+   * ... RDB payload | 2 bytes RDB version | 8 bytes CRC64 |
+   * ----------------+---------------------+---------------+
+   * RDB version and CRC are both in little endian.
+   */
+  const auto ver = MakeRdbVersion();
+  to_bytes(ver);
+  const auto crc = MakeCheckSum(*dest, ignore_crc);
+  to_bytes(crc);
+}
+}  // namespace
+
+string RdbSerializer::DumpValue(RdbSerializer* serializer, const PrimeValue& obj, bool ignore_crc) {
+  CompressionMode serializer_used_compression_mode = serializer->compression_mode_;
+  if (serializer_used_compression_mode != CompressionMode::NONE) {
+    serializer->SetCompressionMode(CompressionMode::SINGLE_ENTRY);
+  }
+
+  // According to Redis code we need to
+  // 1. Save the value itself - without the key
+  // 2. Save footer: this include the RDB version and the CRC value for the message
+  auto type = RdbObjectType(obj);
+  DVLOG(2) << "We are going to dump object type: " << int(type);
+
+  std::error_code ec = serializer->WriteOpcode(type);
+  CHECK(!ec);
+  ec = serializer->SaveValue(obj);
+  CHECK(!ec);  // make sure that fully was successful
+  string res = serializer->Flush(FlushState::kFlushMidEntry);
+  CHECK(!res.empty());             // make sure that fully was successful
+  AppendFooter(ignore_crc, &res);  // version and crc
+  CHECK_GT(res.size(), 10u);
+
+  serializer->SetCompressionMode(serializer_used_compression_mode);
+  return res;
+}
+
+string RdbSerializer::DumpValue(const PrimeValue& obj, bool ignore_crc) {
+  RdbSerializer serializer(GetDefaultCompressionMode());
+  return DumpValue(&serializer, obj, ignore_crc);
+}
+
+error_code RdbSerializer::WriteJournalEntry(std::string_view serialized_entry) {
+  VLOG(2) << "WriteJournalEntry";
+  RETURN_ON_ERR(WriteOpcode(RDB_OPCODE_JOURNAL_BLOB));
+  RETURN_ON_ERR(SaveLen(1));
+  RETURN_ON_ERR(SaveString(serialized_entry));
+  return error_code{};
+}
+
+error_code RdbSerializer::SaveString(string_view val) {
+  /* Try integer encoding */
+  if (val.size() <= 11) {
+    uint8_t buf[16];
+
+    unsigned enclen = TryIntegerEncoding(val, buf);
+    if (enclen > 0) {
+      return WriteRaw(Bytes{buf, unsigned(enclen)});
+    }
+  }
+
+  /* Try LZF compression - under 20 bytes it's unable to compress even
+   * aaaaaaaaaaaaaaaaaa so skip it */
+  size_t len = val.size();
+  if ((compression_mode_ == CompressionMode::SINGLE_ENTRY) && (len > 20)) {
+    size_t comprlen, outlen = len;
+    tmp_buf_.resize(outlen + 1);
+
+    // Due to stack constraints im fibers we can not allow large arrays on stack.
+    // Therefore I am lazily allocating it on heap. It's not fixed in quicklist.
+    if (!lzf_) {
+      lzf_.reset(new LZF_HSLOT[1 << HLOG]);
+    }
+
+    /* We require at least 8 bytes compression for this to be worth it */
+    comprlen = lzf_compress(val.data(), len, tmp_buf_.data(), outlen, lzf_.get());
+    if (comprlen > 0 && comprlen < len - 8 && comprlen < size_t(len * 0.85)) {
+      return SaveLzfBlob(Bytes{tmp_buf_.data(), comprlen}, len);
+    }
+  }
+
+  /* Store verbatim */
+  RETURN_ON_ERR(SaveLen(len));
+  if (len > 0) {
+    Bytes b{reinterpret_cast<const uint8_t*>(val.data()), val.size()};
+    RETURN_ON_ERR(WriteRaw(b));
+  }
+  return error_code{};
+}
+
+error_code RdbSerializer::SaveLen(size_t len) {
+  uint8_t buf[16];
+  unsigned enclen = WritePackedUInt(len, buf);
+  return WriteRaw(Bytes{buf, enclen});
+}
+
+error_code RdbSerializer::SaveLzfBlob(const io::Bytes& src, size_t uncompressed_len) {
+  /* Data compressed! Let's save it on disk */
+  uint8_t opcode = (RDB_ENCVAL << 6) | RDB_ENC_LZF;
+  RETURN_ON_ERR(WriteOpcode(opcode));
+  RETURN_ON_ERR(SaveLen(src.size()));
+  RETURN_ON_ERR(SaveLen(uncompressed_len));
+  RETURN_ON_ERR(WriteRaw(src));
+
+  return error_code{};
+}
+
+AlignedBuffer::AlignedBuffer(size_t cap, ::io::Sink* upstream)
+    : capacity_(cap), upstream_(upstream) {
+  aligned_buf_ = (char*)mi_malloc_aligned(kBufLen, 4_KB);
+}
+
+AlignedBuffer::~AlignedBuffer() {
+  mi_free(aligned_buf_);
+}
+
+io::Result<size_t> AlignedBuffer::WriteSome(const iovec* v, uint32_t len) {
+  size_t total_len = 0;
+  uint32_t vindx = 0;
+
+  for (; vindx < len; ++vindx) {
+    auto item = v[vindx];
+    total_len += item.iov_len;
+
+    while (buf_offs_ + item.iov_len > capacity_) {
+      size_t to_write = capacity_ - buf_offs_;
+      memcpy(aligned_buf_ + buf_offs_, item.iov_base, to_write);
+      iovec ivec{.iov_base = aligned_buf_, .iov_len = capacity_};
+      error_code ec = upstream_->Write(&ivec, 1);
+      if (ec)
+        return nonstd::make_unexpected(ec);
+
+      item.iov_len -= to_write;
+      item.iov_base = reinterpret_cast<char*>(item.iov_base) + to_write;
+      buf_offs_ = 0;
+    }
+
+    DCHECK_GT(item.iov_len, 0u);
+    memcpy(aligned_buf_ + buf_offs_, item.iov_base, item.iov_len);
+    buf_offs_ += item.iov_len;
+  }
+
+  return total_len;
+}
+
+// Note that it may write more than AlignedBuffer has at this point since it rounds up the length
+// to the nearest page boundary.
+error_code AlignedBuffer::Flush() {
+  size_t len = (buf_offs_ + kAmask) & (~kAmask);
+  if (len == 0)
+    return error_code{};
+
+  iovec ivec{.iov_base = aligned_buf_, .iov_len = len};
+  buf_offs_ = 0;
+
+  return upstream_->Write(&ivec, 1);
+}
+
+// Ensures SliceSnapshot is destroyed on its owning shard thread.
+struct OwnerThreadDeleter {
+  ShardId owner_sid;
+
+  OwnerThreadDeleter() : owner_sid(0) {
+  }
+
+  explicit OwnerThreadDeleter(ShardId sid) : owner_sid(sid) {
+  }
+
+  static OwnerThreadDeleter FromShard(EngineShard* shard) {
+    return OwnerThreadDeleter(shard->shard_id());
+  }
+
+  void operator()(SliceSnapshot* ptr) const {
+    if (!ptr)
+      return;
+
+    if (EngineShard::tlocal() && EngineShard::tlocal()->shard_id() == owner_sid) {
+      delete ptr;
+      return;
+    }
+
+    shard_set->Await(owner_sid, [ptr] { delete ptr; });
+  }
+};
+
+using SnapshotPtr = std::unique_ptr<SliceSnapshot, OwnerThreadDeleter>;
+
+class RdbSaver::Impl final : public SliceSnapshot::SnapshotDataConsumerInterface {
+ private:
+  void CleanShardSnapshots();
+  SnapshotPtr CreateSliceSnapshot(EngineShard* shard, DbSlice* db_slice, ExecutionState* cntx);
+
+ public:
+  // We pass K=sz to say how many producers are pushing data in order to maintain
+  // correct closing semantics - channel is closing when K producers marked it as closed.
+  Impl(bool align_writes, unsigned producers_len, CompressionMode compression_mode,
+       SaveMode save_mode, io::Sink* sink, DflyVersion replica_dfly_version);
+
+  ~Impl();
+
+  void StartSnapshotting(bool stream_journal, ExecutionState* cntx, EngineShard* shard);
+
+  void StopSnapshotting(EngineShard* shard);
+  void WaitForSnapshottingFinish(EngineShard* shard);
+
+  // Pushes snapshot data. Called from SliceSnapshot
+  void ConsumeData(std::string data, ExecutionState* cntx) override;
+  // Finalizes the snapshot writing. Called from SliceSnapshot
+  void Finalize() override;
+
+  // used only for legacy rdb save flows.
+  error_code ConsumeChannel(const ExecutionState* cll);
+
+  void FillFreqMap(RdbTypeFreqMap* dest) const;
+
+  error_code SaveAuxFieldStrStr(string_view key, string_view val);
+
+  void CancelInShard(EngineShard* shard);
+
+  size_t GetTotalBuffersSize() const;
+
+  RdbSaver::SnapshotStats GetCurrentSnapshotProgress() const;
+
+  error_code FlushSerializer();
+
+  error_code FlushSink() {
+    return aligned_buf_ ? aligned_buf_->Flush() : error_code{};
+  }
+
+  size_t Size() const {
+    return shard_snapshots_.size();
+  }
+
+  RdbSerializer* serializer() {
+    return &meta_serializer_;
+  }
+
+  int64_t last_write_ts() const {
+    return last_write_time_ns_;
+  }
+
+ private:
+  error_code WriteRecord(io::Bytes src);
+
+  SnapshotPtr& GetSnapshot(EngineShard* shard);
+
+  io::Sink* sink_;
+  int64_t last_write_time_ns_ = -1;  // last write call.
+  vector<SnapshotPtr> shard_snapshots_;
+
+  // used for serializing non-body components in the calling fiber.
+  RdbSerializer meta_serializer_;
+  using RecordChannel = SizeTrackingChannel<string, base::mpmc_bounded_queue<string>>;
+  std::optional<RecordChannel> channel_;
+  std::optional<AlignedBuffer> aligned_buf_;
+
+  // Single entry compression is compatible with redis rdb snapshot
+  // Multi entry compression is available only on df snapshot, this will
+  // make snapshot size smaller and opreation faster.
+  CompressionMode compression_mode_;
+  SaveMode save_mode_;
+  DflyVersion replica_dfly_version_ = DflyVersion::CURRENT_VER;
+};
+
+// We pass K=sz to say how many producers are pushing data in order to maintain
+// correct closing semantics - channel is closing when K producers marked it as closed.
+RdbSaver::Impl::Impl(bool align_writes, unsigned producers_len, CompressionMode compression_mode,
+                     SaveMode sm, io::Sink* sink, DflyVersion replica_dfly_version)
+    : sink_(sink),
+      shard_snapshots_(producers_len),
+      meta_serializer_(CompressionMode::NONE),  // Note: I think there is not need for compression
+                                                // at all in meta serializer
+      compression_mode_(compression_mode) {
+  if (align_writes) {
+    aligned_buf_.emplace(kBufLen, sink);
+    sink_ = &aligned_buf_.value();
+  }
+  if (sm == SaveMode::RDB) {
+    channel_.emplace(kChannelLen, producers_len);
+  }
+  save_mode_ = sm;
+  replica_dfly_version_ = replica_dfly_version;
+}
+
+void RdbSaver::Impl::CleanShardSnapshots() {
+  // Deleter dispatches destruction to the owning shard thread when needed
+  shard_snapshots_.clear();
+}
+
+RdbSaver::Impl::~Impl() {
+  CleanShardSnapshots();
+}
+
+error_code RdbSaver::Impl::SaveAuxFieldStrStr(string_view key, string_view val) {
+  auto& ser = meta_serializer_;
+  RETURN_ON_ERR(ser.WriteOpcode(RDB_OPCODE_AUX));
+  RETURN_ON_ERR(ser.SaveString(key));
+  RETURN_ON_ERR(ser.SaveString(val));
+
+  return error_code{};
+}
+
+error_code RdbSaver::Impl::ConsumeChannel(const ExecutionState* es) {
+  error_code io_error;
+  string record;
+
+  auto& stats = ServerState::tlocal()->stats;
+  DCHECK(channel_.has_value());
+  // we can not exit on io-error since we spawn fibers that push data.
+  // TODO: we may signal them to stop processing and exit asap in case of the error.
+  while (channel_->Pop(record)) {
+    if (io_error || (!es->IsRunning()))
+      continue;
+
+    do {
+      if (!es->IsRunning())
+        continue;
+
+      auto start = absl::GetCurrentTimeNanos();
+      io_error = WriteRecord(io::Buffer(record));
+      if (io_error) {
+        break;  // from the inner TryPop loop.
+      }
+
+      auto delta_usec = (absl::GetCurrentTimeNanos() - start) / 1'000;
+      stats.rdb_save_usec += delta_usec;
+      stats.rdb_save_count++;
+    } while ((channel_->TryPop(record)));
+  }  // while (channel_.Pop())
+
+  for (auto& ptr : shard_snapshots_) {
+    ptr->WaitSnapshotting();
+  }
+  VLOG(1) << "ConsumeChannel finished " << io_error;
+
+  DCHECK(!channel_->TryPop(record));
+
+  return io_error;
+}
+
+error_code RdbSaver::Impl::WriteRecord(io::Bytes src) {
+  // For huge values, we break them up into chunks of upto several MBs to send in a single call,
+  // so we could be more responsive.
+  error_code ec;
+  size_t start_size = src.size();
+  last_write_time_ns_ = absl::GetCurrentTimeNanos();
+  do {
+    io::Bytes part = src.subspan(0, 8_MB);
+    src.remove_prefix(part.size());
+
+    ec = sink_->Write(part);
+
+    int64_t now = absl::GetCurrentTimeNanos();
+    unsigned delta_ms = (now - last_write_time_ns_) / 1000'000;
+    last_write_time_ns_ = now;
+
+    // Log extreme timings into the log for visibility.
+    LOG_IF(INFO, delta_ms > 1000) << "Channel write took " << delta_ms << " ms while writing "
+                                  << part.size() << "/" << start_size;
+    if (ec) {
+      LOG(INFO) << "Error writing to rdb sink " << ec.message();
+      break;
+    }
+  } while (!src.empty());
+  last_write_time_ns_ = -1;
+  return ec;
+}
+
+void RdbSaver::Impl::StartSnapshotting(bool stream_journal, ExecutionState* cntx,
+                                       EngineShard* shard) {
+  auto& s = GetSnapshot(shard);
+  auto& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+
+  s = CreateSliceSnapshot(shard, &db_slice, cntx);
+
+  const auto allow_flush = (save_mode_ != SaveMode::RDB) ? SliceSnapshot::SnapshotFlush::kAllow
+                                                         : SliceSnapshot::SnapshotFlush::kDisallow;
+
+  s->Start(stream_journal, allow_flush);
+}
+
+SnapshotPtr RdbSaver::Impl::CreateSliceSnapshot(EngineShard* shard, DbSlice* db_slice,
+                                                ExecutionState* cntx) {
+  return SnapshotPtr(
+      new SliceSnapshot(compression_mode_, db_slice, this, cntx, replica_dfly_version_),
+      OwnerThreadDeleter::FromShard(shard));
+}
+
+// called on save flow
+void RdbSaver::Impl::WaitForSnapshottingFinish(EngineShard* shard) {
+  auto& snapshot = GetSnapshot(shard);
+  CHECK(snapshot);
+  snapshot->WaitSnapshotting();
+}
+
+void RdbSaver::Impl::ConsumeData(std::string data, ExecutionState* cntx) {
+  if (!cntx->IsRunning()) {
+    return;
+  }
+  if (channel_) {  // Rdb write to channel
+    channel_->Push(std::move(data));
+  } else {  // Write directly to socket
+    auto ec = WriteRecord(io::Buffer(data));
+    if (ec) {
+      cntx->ReportError(ec);
+    }
+  }
+}
+
+void RdbSaver::Impl::Finalize() {
+  if (channel_) {
+    channel_->StartClosing();
+  }
+}
+
+// called from replication flow
+void RdbSaver::Impl::StopSnapshotting(EngineShard* shard) {
+  auto& snapshot = GetSnapshot(shard);
+  CHECK(snapshot);
+  snapshot->FinalizeJournalStream(false);
+}
+
+void RdbSaver::Impl::CancelInShard(EngineShard* shard) {
+  auto& snapshot = GetSnapshot(shard);
+  if (snapshot) {  // Cancel can be called before snapshotting started.
+    snapshot->FinalizeJournalStream(true);
+  }
+}
+
+// This function is called from connection thread when info command is invoked.
+// All accessed variableds must be thread safe, as they are fetched not from the rdb saver thread.
+size_t RdbSaver::Impl::GetTotalBuffersSize() const {
+  std::atomic<size_t> channel_bytes{0};
+  std::atomic<size_t> serializer_bytes{0};
+
+  auto cb = [this, &channel_bytes, &serializer_bytes](ShardId sid) {
+    auto& snapshot = shard_snapshots_[sid];
+    // before create a snapshot we save header so shard_snapshots_ are vector of nullptr until we
+    // start snapshots saving
+    if (!snapshot)
+      return;
+    if (channel_.has_value())
+      channel_bytes.fetch_add(channel_->GetSize(), memory_order_relaxed);
+    serializer_bytes.store(snapshot->GetBufferCapacity() + snapshot->GetTempBuffersSize(),
+                           memory_order_relaxed);
+  };
+
+  if (shard_snapshots_.size() == 1) {
+    cb(0);
+  } else {
+    shard_set->RunBriefInParallel([&](EngineShard* es) { cb(es->shard_id()); });
+  }
+
+  VLOG(2) << "channel_bytes:" << channel_bytes.load(memory_order_relaxed)
+          << " serializer_bytes: " << serializer_bytes.load(memory_order_relaxed);
+  return channel_bytes.load(memory_order_relaxed) + serializer_bytes.load(memory_order_relaxed);
+}
+
+RdbSaver::SnapshotStats RdbSaver::Impl::GetCurrentSnapshotProgress() const {
+  std::vector<RdbSaver::SnapshotStats> results(shard_snapshots_.size());
+
+  auto cb = [this, &results](ShardId sid) {
+    auto& snapshot = shard_snapshots_[sid];
+    // before create a snapshot we save header so shard_snapshots_ are vector of nullptr until we
+    // start snapshots saving
+    if (!snapshot)
+      return;
+    results[sid] = snapshot->GetCurrentSnapshotProgress();
+  };
+
+  if (shard_snapshots_.size() == 1) {
+    cb(0);
+    return results[0];
+  }
+
+  shard_set->RunBriefInParallel([&](EngineShard* es) { cb(es->shard_id()); });
+  RdbSaver::SnapshotStats init{0, 0};
+  return std::accumulate(
+      results.begin(), results.end(), init, [](auto init, auto pr) -> RdbSaver::SnapshotStats {
+        return {init.current_keys + pr.current_keys, init.total_keys + pr.total_keys};
+      });
+}
+
+error_code RdbSaver::Impl::FlushSerializer() {
+  last_write_time_ns_ = absl::GetCurrentTimeNanos();
+  string blob = serializer()->Flush(RdbSerializer::FlushState::kFlushMidEntry);
+  error_code ec;
+  if (!blob.empty()) {
+    ec = sink_->Write(io::Buffer(blob));
+  }
+  last_write_time_ns_ = -1;
+  return ec;
+}
+
+namespace {
+
+// Collect search index definitions for replication / RDB.
+// search_indices always gets simple "index_name cmd" restore commands.
+// For summary shards, search_synonyms gets synonym group restore commands.
+// (HNSW graph metadata travels inline with the node data in RDB_OPCODE_VECTOR_INDEX,
+//  so it is not collected here.)
+void CollectSearchIndices([[maybe_unused]] const EngineShard& shard,
+                          [[maybe_unused]] StringVec* search_indices,
+                          [[maybe_unused]] StringVec* search_synonyms,
+                          [[maybe_unused]] bool is_summary) {
+#ifdef WITH_SEARCH
+  auto* indices = shard.search_indices();
+  for (const auto& index_name : indices->GetIndexNames()) {
+    auto* index = indices->GetIndex(index_name);
+    auto index_info = index->GetInfo();
+
+    // Always store the simple restore command format
+    std::string restore_cmd = absl::StrCat(index_name, " ", index_info.BuildRestoreCommand());
+    search_indices->emplace_back(std::move(restore_cmd));
+
+    if (!is_summary)
+      continue;
+
+    // Save synonym groups
+    const auto& synonym_groups = index->GetSynonyms().GetGroups();
+    for (const auto& [group_id, terms] : synonym_groups) {
+      if (!terms.empty()) {
+        std::string syn_cmd =
+            absl::StrCat(index_name, " ", group_id, " ", absl::StrJoin(terms, " "));
+        search_synonyms->emplace_back(std::move(syn_cmd));
+      }
+    }
+  }
+#endif
+}
+
+}  // namespace
+
+RdbSaver::GlobalData RdbSaver::GetGlobalData(const Service* service, bool is_summary) {
+  StringVec script_bodies, search_indices, search_synonyms;
+  size_t table_mem_result = 0;
+
+  if (!is_summary) {
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      if (shard->shard_id() == 0)
+        CollectSearchIndices(*shard, &search_indices, &search_synonyms, is_summary);
+    });
+    return RdbSaver::GlobalData{std::move(script_bodies), std::move(search_indices),
+                                std::move(search_synonyms), table_mem_result};
+  }
+  {
+    // For summary file: collect all global data
+    auto scripts = service->script_mgr()->GetAll();
+    script_bodies.reserve(scripts.size());
+    for (auto& [sha, data] : scripts)
+      script_bodies.push_back(std::move(data.body));
+  }
+
+  atomic<size_t> table_mem{0};
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    if (shard->shard_id() == 0)
+      CollectSearchIndices(*shard, &search_indices, &search_synonyms, is_summary);
+
+    auto& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    size_t shard_table_mem = 0;
+    for (size_t db_id = 0; db_id < db_slice.db_array_size(); ++db_id) {
+      auto* db_table = db_slice.GetDBTable(db_id);
+      if (db_table) {
+        shard_table_mem += db_table->table_memory();
+      }
+    }
+    table_mem.fetch_add(shard_table_mem, memory_order_relaxed);
+  });
+
+  return RdbSaver::GlobalData{std::move(script_bodies), std::move(search_indices),
+                              std::move(search_synonyms), table_mem.load(memory_order_relaxed)};
+}
+
+void RdbSaver::Impl::FillFreqMap(RdbTypeFreqMap* dest) const {
+  for (auto& ptr : shard_snapshots_) {
+    const RdbTypeFreqMap& src_map = ptr->freq_map();
+    for (const auto& k_v : src_map)
+      (*dest)[k_v.first] += k_v.second;
+  }
+}
+
+SnapshotPtr& RdbSaver::Impl::GetSnapshot(EngineShard* shard) {
+  // For single shard configuration, we maintain only one snapshot,
+  // so we do not have to map it via shard_id.
+  unsigned sid = shard_snapshots_.size() == 1 ? 0 : shard->shard_id();
+  CHECK(sid < shard_snapshots_.size());
+  return shard_snapshots_[sid];
+}
+
+RdbSaver::RdbSaver(::io::Sink* sink, SaveMode save_mode, bool align_writes, std::string snapshot_id,
+                   DflyVersion replica_dfly_version)
+    : replica_dfly_version_(replica_dfly_version), snapshot_id_(std::move(snapshot_id)) {
+  CHECK_NOTNULL(sink);
+  CompressionMode compression_mode = GetDefaultCompressionMode();
+  int producer_count = 0;
+  switch (save_mode) {
+    case SaveMode::SUMMARY:
+      producer_count = 0;
+      if (compression_mode >= CompressionMode::SINGLE_ENTRY) {
+        compression_mode_ = CompressionMode::SINGLE_ENTRY;
+      } else {
+        compression_mode_ = CompressionMode::NONE;
+      }
+      break;
+    case SaveMode::SINGLE_SHARD:
+    case SaveMode::SINGLE_SHARD_WITH_SUMMARY:
+      producer_count = 1;
+      compression_mode_ = compression_mode;
+      break;
+    case SaveMode::RDB:
+      producer_count = shard_set->size();
+      if (compression_mode >= CompressionMode::SINGLE_ENTRY) {
+        compression_mode_ = CompressionMode::SINGLE_ENTRY;
+      } else {
+        compression_mode_ = CompressionMode::NONE;
+      }
+      break;
+  }
+  VLOG(1) << "Rdb save using compression mode:" << uint32_t(compression_mode_);
+  impl_.reset(new Impl(align_writes, producer_count, compression_mode_, save_mode, sink,
+                       replica_dfly_version_));
+  save_mode_ = save_mode;
+}
+
+RdbSaver::~RdbSaver() {
+  // Decommit local memory.
+  // We create an RdbSaver for each thread, so each one will Decommit for itself.
+  auto* tlocal = ServerState::tlocal();
+  tlocal->DecommitMemory(ServerState::kAllMemory);
+}
+
+void RdbSaver::StartSnapshotInShard(bool stream_journal, ExecutionState* cntx, EngineShard* shard) {
+  impl_->StartSnapshotting(stream_journal, cntx, shard);
+}
+
+error_code RdbSaver::WaitSnapshotInShard(EngineShard* shard) {
+  impl_->WaitForSnapshottingFinish(shard);
+  return SaveEpilog();
+}
+
+error_code RdbSaver::StopFullSyncInShard(EngineShard* shard) {
+  impl_->StopSnapshotting(shard);
+  return SaveEpilog();
+}
+
+error_code RdbSaver::SaveHeader(const GlobalData& glob_state) {
+  char magic[16];
+  // We should use RDB_VERSION here from rdb.h when we ditch redis 6 support
+  // For now we serialize to an older version.
+  size_t sz = absl::SNPrintF(magic, sizeof(magic), "REDIS%04d", RDB_SER_VERSION);
+  CHECK_EQ(9u, sz);
+
+  RETURN_ON_ERR(impl_->serializer()->WriteRaw(Bytes{reinterpret_cast<uint8_t*>(magic), sz}));
+  RETURN_ON_ERR(SaveAux(glob_state));  // Should be first after magic
+  RETURN_ON_ERR(impl_->FlushSerializer());
+  return error_code{};
+}
+
+error_code RdbSaver::SaveBody(const ExecutionState& cntx) {
+  RETURN_ON_ERR(impl_->FlushSerializer());
+
+  if (save_mode_ == SaveMode::RDB) {
+    VLOG(1) << "SaveBody , snapshots count: " << impl_->Size();
+    error_code io_error = impl_->ConsumeChannel(&cntx);
+    if (io_error) {
+      return io_error;
+    }
+    if (cntx.GetError()) {
+      return cntx.GetError();
+    }
+  } else {
+    DCHECK(save_mode_ == SaveMode::SUMMARY);
+  }
+
+  return SaveEpilog();
+}
+
+void RdbSaver::FillFreqMap(RdbTypeFreqMap* freq_map) {
+  freq_map->clear();
+  impl_->FillFreqMap(freq_map);
+}
+
+error_code RdbSaver::SaveAux(const GlobalData& glob_state) {
+  // Should be first
+  if (!snapshot_id_.empty()) {
+    RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("snapshot-id", snapshot_id_));
+  }
+
+  /* Add a few fields about the state when the RDB was created. */
+  RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("redis-ver", REDIS_VERSION));
+  RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("df-ver", GetVersion()));
+  RETURN_ON_ERR(SaveAuxFieldStrInt("redis-bits", 64));
+
+  RETURN_ON_ERR(SaveAuxFieldStrInt("ctime", time(NULL)));
+  auto used_mem = used_mem_current.load(memory_order_relaxed);
+  VLOG(1) << "Used memory during save: " << used_mem;
+  RETURN_ON_ERR(SaveAuxFieldStrInt("used-mem", used_mem));
+  RETURN_ON_ERR(SaveAuxFieldStrInt("aof-preamble", 0));
+
+  // Save lua scripts only in rdb or summary file
+  DCHECK(save_mode_ != SaveMode::SINGLE_SHARD || glob_state.lua_scripts.empty());
+  for (const string& s : glob_state.lua_scripts)
+    RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("lua", s));
+
+  if (save_mode_ == SaveMode::RDB) {
+    if (!glob_state.search_indices.empty())
+      LOG(WARNING) << "Dragonfly search index data is incompatible with the RDB format";
+  } else {
+    // Search index definitions - for non-summary shards only sent to replicas >= VER6,
+    // since older replicas only expect search-index from the summary shard.
+    bool send_search_index =
+        (save_mode_ != SaveMode::SINGLE_SHARD) || (replica_dfly_version_ >= DflyVersion::VER6);
+    if (send_search_index) {
+      for (const string& s : glob_state.search_indices)
+        RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("search-index", s));
+    }
+
+    // Save synonyms only in summary file
+    DCHECK(save_mode_ != SaveMode::SINGLE_SHARD || glob_state.search_synonyms.empty());
+    for (const string& s : glob_state.search_synonyms)
+      RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("search-synonyms", s));
+
+    if (save_mode_ == SaveMode::SINGLE_SHARD_WITH_SUMMARY || save_mode_ == SaveMode::SUMMARY) {
+      // We save the shard id in the summary file, so that we can restore it later.
+      RETURN_ON_ERR(SaveAuxFieldStrInt("shard-count", shard_set->size()));
+      RETURN_ON_ERR(SaveAuxFieldStrInt("table-mem", glob_state.table_used_memory));
+    }
+    if (EngineShard* shard = EngineShard::tlocal(); shard) {
+      RETURN_ON_ERR(SaveAuxFieldStrInt("shard-id", shard->shard_id()));
+    }
+  }
+
+  // TODO: "repl-stream-db", "repl-id", "repl-offset"
+  return error_code{};
+}
+
+error_code RdbSaver::SaveEpilog() {
+  RETURN_ON_ERR(impl_->serializer()->SendEofAndChecksum());
+
+  RETURN_ON_ERR(impl_->FlushSerializer());
+
+  return impl_->FlushSink();
+}
+
+error_code RdbSaver::SaveAuxFieldStrInt(string_view key, int64_t val) {
+  char buf[LONG_STR_SIZE];
+  int vlen = ll2string(buf, sizeof(buf), val);
+  return impl_->SaveAuxFieldStrStr(key, string_view(buf, vlen));
+}
+
+void RdbSaver::CancelInShard(EngineShard* shard) {
+  impl_->CancelInShard(shard);
+}
+
+size_t RdbSaver::GetTotalBuffersSize() const {
+  return impl_->GetTotalBuffersSize();
+}
+
+RdbSaver::SnapshotStats RdbSaver::GetCurrentSnapshotProgress() const {
+  return impl_->GetCurrentSnapshotProgress();
+}
+
+int64_t RdbSaver::GetLastWriteTime() const {
+  return impl_->last_write_ts();
+}
+
+void RdbSerializer::AllocateCompressorOnce() {
+  if (compressor_impl_) {
+    return;
+  }
+  if (compression_mode_ == CompressionMode::MULTI_ENTRY_ZSTD) {
+    compressor_impl_ = detail::CompressorImpl::CreateZstd();
+  } else if (compression_mode_ == CompressionMode::MULTI_ENTRY_LZ4) {
+    compressor_impl_ = detail::CompressorImpl::CreateLZ4();
+  } else {
+    LOG(FATAL) << "Invalid compression mode " << unsigned(compression_mode_);
+  }
+}
+
+std::optional<std::string> RdbSerializer::CompressBlob(std::string_view input) {
+  if (compression_mode_ != CompressionMode::MULTI_ENTRY_ZSTD &&
+      compression_mode_ != CompressionMode::MULTI_ENTRY_LZ4)
+    return std::nullopt;
+
+  if (!compression_stats_)
+    compression_stats_.emplace(CompressionStats{});
+
+  VLOG(2) << "CompressBlob size " << input.size();
+  size_t blob_size = input.size();
+
+  if (blob_size < kMinStrSizeToCompress || blob_size > kMaxStrSizeToCompress) {
+    ++compression_stats_->size_skip_count;
+    return std::nullopt;
+  }
+
+  AllocateCompressorOnce();
+
+  io::Result<io::Bytes> res = compressor_impl_->Compress(
+      Bytes{reinterpret_cast<const unsigned char*>(input.data()), input.size()});
+  if (!res) {
+    ++compression_stats_->compression_failed;
+    return std::nullopt;
+  }
+
+  Bytes compressed_blob = *res;
+  if (compressed_blob.length() > blob_size * kMinCompressionReductionPrecentage) {
+    ++compression_stats_->compression_no_effective;
+    return std::nullopt;
+  }
+
+  const uint8_t opcode = compression_mode_ == CompressionMode::MULTI_ENTRY_ZSTD
+                             ? RDB_OPCODE_COMPRESSED_ZSTD_BLOB_START
+                             : RDB_OPCODE_COMPRESSED_LZ4_BLOB_START;
+  uint8_t len_buf[16];
+  const unsigned encoded_size = WritePackedUInt(compressed_blob.size(), len_buf);
+
+  std::string out;
+  out.reserve(1 + encoded_size + compressed_blob.size());
+  out.push_back(static_cast<char>(opcode));
+  out.append(reinterpret_cast<const char*>(len_buf), encoded_size);
+  out.append(reinterpret_cast<const char*>(compressed_blob.data()), compressed_blob.size());
+
+  ++compression_stats_->compressed_blobs;
+  ++ServerState::tlocal()->stats.compressed_blobs;
+  return out;
+}
+
+void RdbSerializer::CompressBlob() {
+  auto* mem_buf = mem_buf_controller_.Buffer();
+  Bytes blob = mem_buf->InputBuffer();
+  std::string_view input{reinterpret_cast<const char*>(blob.data()), blob.size()};
+  auto compressed = CompressBlob(input);
+  if (!compressed)
+    return;
+
+  mem_buf->ConsumeInput(blob.size());
+  mem_buf->Reserve(compressed->size());
+  auto dest = mem_buf->AppendBuffer();
+  memcpy(dest.data(), compressed->data(), compressed->size());
+  mem_buf->CommitWrite(compressed->size());
+}
+
+std::error_code RdbSerializer::PushToConsumerIfNeeded(FlushState flush_state) {
+  if (!consume_fun_ || SerializedLen() <= flush_threshold_)
+    return {};
+
+  if (flush_state == FlushState::kFlushMidEntry)
+    mem_buf_controller_.MarkEntrySplit();
+
+  string blob = Flush(flush_state);
+  DCHECK(!blob.empty());
+
+  // save and restore id around preempt point consume_fun_
+  const auto id = mem_buf_controller_.SaveStateBeforeConsume();
+  std::error_code ec = consume_fun_(std::move(blob));
+  mem_buf_controller_.RestoreStateAfterConsume(id);
+  return ec;
+}
+
+void MemBufController::StartEntry() {
+  DCHECK_EQ(buffer_owner_, 0u);
+
+  // Roll over to 1, id=0 is a special case
+  if (next_id_ == std::numeric_limits<EntryId>::max())
+    next_id_ = 1;
+
+  active_id_ = next_id_++;
+  buffer_owner_ = active_id_;
+  // these bytes belong to another entry
+  prefix_len_ = buffer_.InputLen();
+}
+
+namespace {
+
+io::IoBuf RollbackBuffer(const io::IoBuf& buffer, const size_t cutoff) {
+  const auto bytes = io::View(buffer.InputBuffer());
+  DCHECK_LE(cutoff, bytes.size()) << "attempt to truncate more than buffer size";
+  IoBuf temp(cutoff);
+  temp.WriteAndCommit(bytes.data(), cutoff);
+  return temp;
+}
+
+}  // namespace
+
+void MemBufController::FinishEntry(const bool save_entry_successful) {
+  // remove the data from buffer if we were not able to write cleanly
+  if (!save_entry_successful) {
+    if (prefix_len_ == 0)
+      buffer_.Clear();
+    else
+      buffer_ = RollbackBuffer(buffer_, prefix_len_);
+  } else if (split_entries_.contains(active_id_) && send_tagged_entries_) {
+    MaybeTagEntryTail();
+  }
+
+  split_entries_.erase(active_id_);
+  buffer_owner_ = 0;
+  active_id_ = 0;
+  prefix_len_ = 0;
+}
+
+void MemBufController::MaybeTagEntryTail() {
+  if (buffer_.InputLen() == prefix_len_)
+    return;
+
+  std::string dest;
+  dest.reserve(buffer_.InputLen() + kHeaderSize);
+  ConsumePrefix(&dest);
+
+  PushTagHeader(buffer_.InputLen(), &dest);
+
+  const auto bytes = io::View(buffer_.InputBuffer());
+  dest.append(bytes.data(), bytes.size());
+
+  buffer_.Clear();
+  buffer_.WriteAndCommit(dest.data(), dest.size());
+}
+
+void MemBufController::ConsumePrefix(std::string* out) {
+  const auto bytes = io::View(buffer_.InputBuffer());
+  out->append(bytes.data(), prefix_len_);
+  buffer_.ConsumeInput(prefix_len_);
+  prefix_len_ = 0;
+}
+
+void MemBufController::PushTagHeader(size_t size, std::string* dest) const {
+  DCHECK_NE(active_id_, 0u) << "tagging when active entry is invalid";
+  DCHECK_LT(size, std::numeric_limits<uint32>::max());
+
+  const size_t old_size = dest->size();
+  dest->resize(dest->size() + kHeaderSize);
+  char* data = dest->data() + old_size;
+
+  *data = RDB_OPCODE_TAGGED_CHUNK;
+  absl::little_endian::Store32(data + 1, active_id_);
+  absl::little_endian::Store32(data + 5, size);
+}
+
+MemBufController::EntryId MemBufController::SaveStateBeforeConsume() {
+  DCHECK_EQ(buffer_owner_, active_id_);
+  DCHECK_EQ(buffer_.InputLen(), 0u);
+  const EntryId id = active_id_;
+  buffer_owner_ = 0;
+  active_id_ = 0;
+  return id;
+}
+
+void MemBufController::RestoreStateAfterConsume(EntryId id) {
+  DCHECK_EQ(buffer_owner_, 0u);
+  buffer_owner_ = id;
+  active_id_ = id;
+  // prepare to write a new chunk
+  prefix_len_ = buffer_.InputLen();
+}
+
+std::string MemBufController::BuildBlob() {
+  // In case of tagged chunks disabled, there is no prefix-suffix divide and no header to inject.
+  // The entire buffer should be returned as a whole, it may have been compressed already.
+  if (!send_tagged_entries_) {
+    std::string out{io::View(buffer_.InputBuffer())};
+    buffer_.Clear();
+    prefix_len_ = 0;
+    return out;
+  }
+
+  // tag only data entries (active id > 0) which were split at some point
+  bool should_tag = active_id_ != 0 && split_entries_.contains(active_id_);
+
+  // do not tag empty bytes, it will send a useless header
+  const bool has_suffix = buffer_.InputLen() > prefix_len_;
+  should_tag &= has_suffix;
+
+  std::string out;
+  out.reserve(buffer_.InputLen() + (should_tag ? kHeaderSize : 0));
+
+  ConsumePrefix(&out);
+
+  if (should_tag)
+    PushTagHeader(buffer_.InputLen(), &out);
+
+  out.append(io::View(buffer_.InputBuffer()));
+  buffer_.ConsumeInput(buffer_.InputLen());
+  return out;
+}
+
+}  // namespace dfly

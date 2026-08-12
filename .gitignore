@@ -1,0 +1,35 @@
+build/*
+build-*
+clang/*
+clang-*
+.vscode/*.db
+.vscode/settings.json
+.vscode/launch.json
+third_party
+genfiles/*
+*.sublime-*
+.release_notes_cache/
+*.orig
+.tags
+!third_party/include/*
+*.pyc
+/CMakeLists.txt.user
+_deps
+releases
+.DS_Store
+.idea/*
+.hypothesis
+.secrets
+cmake-build-debug
+.venv/
+fuzz/artifacts/
+fuzz/corpus/
+tools/replay/traffic-replay
+.claude/settings.local.json
+.claude/agent-memory/
+.claude/skills/benchmark-workspace/
+# Valkey-search integration tests (synced from external repo)
+tests/dragonfly/valkey_search/integration/
+_codeql_build_dir/
+# CocoIndex Code (ccc)
+/.cocoindex_code/

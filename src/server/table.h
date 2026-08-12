@@ -1,0 +1,185 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <absl/container/flat_hash_map.h>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ref_counter.hpp>
+
+#include "core/intent_lock.h"
+#include "server/detail/table.h"
+#include "server/tx_base.h"
+
+extern "C" {
+#include "redis/redis_aux.h"
+}
+namespace base {
+class Histogram;
+}
+
+namespace dfly {
+
+using PrimeKey = detail::PrimeKey;
+using PrimeValue = detail::PrimeValue;
+
+using PrimeTable = DashTable<PrimeKey, PrimeValue, detail::PrimeTablePolicy>;
+
+/// Iterators are invalidated when new keys are added to the table or some entries are deleted.
+/// Iterators are still valid if a different entry in the table was mutated.
+using PrimeIterator = PrimeTable::iterator;
+using PrimeConstIterator = PrimeTable::const_iterator;
+
+class TopKeys;
+
+inline bool IsValid(PrimeIterator it) {
+  return !it.is_done();
+}
+
+inline bool IsValid(PrimeConstIterator it) {
+  return !it.is_done();
+}
+
+struct SlotStats {
+  uint64_t key_count = 0;
+  uint64_t total_reads = 0;
+  uint64_t total_writes = 0;
+  uint64_t memory_bytes = 0;
+  SlotStats& operator+=(const SlotStats& o);
+};
+
+struct DbTableStats {
+  // Number of inline keys.
+  uint64_t inline_keys = 0;
+
+  // number of keys with ttls set.
+  uint64_t expire_count = 0;
+
+  // Object memory usage besides hash-table capacity.
+  // Applies for any non-inline objects.
+  size_t obj_memory_usage = 0;
+
+  // Number of entries currently offloaded to tiered storage.
+  size_t tiered_entries = 0;
+
+  // Sum of the actual value sizes (in bytes) for all tiered entries.
+  // Unlike TieredStats::allocated_bytes, this reflects logical value sizes only —
+  // not the disk space physically reserved, which is larger due to block alignment
+  // and fragmentation in ExternalAllocator.
+  size_t tiered_used_bytes = 0;
+
+  struct {
+    // Per-database hits/misses on keys
+    size_t hits = 0;
+    size_t misses = 0;
+
+    // Per-database expired/evicted keys
+    size_t expired_keys = 0;
+    size_t evicted_keys = 0;
+  } events;
+
+  std::array<size_t, OBJ_TYPE_MAX> memory_usage_by_type = {};
+
+  // Mostly used internally, exposed for tiered storage.
+  void AddTypeMemoryUsage(unsigned type, int64_t delta);
+
+  DbTableStats& operator+=(const DbTableStats& o);
+};
+
+// Table for recording locks. Keys used with the lock table should be normalized with LockTag.
+class LockTable {
+ public:
+  size_t Size() const {
+    return locks_.size();
+  }
+  std::optional<const IntentLock> Find(LockTag tag) const;
+  std::optional<const IntentLock> Find(LockFp fp) const;
+
+  bool Acquire(LockFp fp, IntentLock::Mode mode) {
+    return locks_[fp].Acquire(mode);
+  }
+
+  void Release(LockFp fp, IntentLock::Mode mode);
+
+  auto begin() const {
+    return locks_.cbegin();
+  }
+
+  auto end() const {
+    return locks_.cend();
+  }
+
+ private:
+  // We use fingerprinting before accessing locks - no need to mix more.
+  struct Hasher {
+    size_t operator()(LockFp val) const {
+      return val;
+    }
+  };
+  absl::flat_hash_map<LockFp, IntentLock, Hasher> locks_;
+};
+
+// A single Db table that represents a table that can be chosen with "SELECT" command.
+struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_counter> {
+  PrimeTable prime;
+  DashTable<PrimeKey, uint32_t, detail::ExpireTablePolicy> mcflag;
+
+  // Contains transaction locks
+  LockTable trans_locks;
+
+  // Stores a list of dependant dirty flags for each watched key.
+  absl::flat_hash_map<std::string, std::vector<std::atomic_bool*>> watched_keys;
+
+  mutable DbTableStats stats;
+  std::unique_ptr<SlotStats[]> slots_stats;
+  PrimeTable::Cursor expire_cursor;
+
+  struct SampleTopKeys {
+    TopKeys* top_keys = nullptr;
+    uint64_t total_samples = 0;
+
+    SampleTopKeys() = default;
+    ~SampleTopKeys();
+    void operator=(const SampleTopKeys& other) = delete;
+    SampleTopKeys(const SampleTopKeys& other) = delete;
+  };
+  SampleTopKeys* sample_top_keys = nullptr;
+
+  struct SampleUniqueKeys {
+    uint8_t* dense_hll = nullptr;
+    uint64_t total_samples = 0;
+
+    SampleUniqueKeys() = default;
+    ~SampleUniqueKeys();
+
+    void operator=(const SampleUniqueKeys& other) = delete;
+    SampleUniqueKeys(const SampleUniqueKeys& other) = delete;
+  };
+  SampleUniqueKeys* sample_unique_keys = nullptr;
+  base::Histogram* sample_values_hist = nullptr;
+
+  DbIndex index;
+  uint32_t thread_index;
+
+  explicit DbTable(PMR_NS::memory_resource* mr, DbIndex index);
+  ~DbTable();
+
+  void Clear();
+  PrimeIterator Launder(PrimeIterator it, std::string_view key);
+
+  size_t table_memory() const {
+    return prime.mem_usage();
+  }
+};
+
+// We use reference counting semantics of DbTable when doing snapshotting.
+// There we need to preserve the copy of the table in case someone flushes it during
+// the snapshot process. We copy the pointers in StartSnapshotInShard function.
+using DbTableArray = std::vector<boost::intrusive_ptr<DbTable>>;
+
+// ChangeReq - describes the set of buckets about to be mutated.
+using ChangeReq = PrimeTable::BucketSet;
+
+}  // namespace dfly

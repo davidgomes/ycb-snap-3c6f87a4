@@ -1,0 +1,418 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+#include "server/container_utils.h"
+
+#include "base/flags.h"
+#include "base/logging.h"
+#include "core/detail/listpack_wrap.h"
+#include "core/oah_set.h"
+#include "core/qlist.h"
+#include "core/sorted_map.h"
+#include "core/string_map.h"
+#include "core/string_set.h"
+#include "server/db_slice.h"
+#include "server/engine_shard_set.h"
+#include "server/namespaces.h"
+#include "server/transaction.h"
+#include "src/facade/op_status.h"
+
+extern "C" {
+#include "redis/intset.h"
+#include "redis/listpack.h"
+#include "redis/redis_aux.h"
+#include "redis/util.h"
+}
+
+ABSL_FLAG(uint32_t, container_iteration_yield_interval_usec, 500,
+          "Yield the fiber every N microseconds during container iteration. "
+          "0 disables yielding.");
+
+namespace rng = std::ranges;
+
+namespace dfly::container_utils {
+using namespace std;
+namespace {
+
+struct ShardFFResult {
+  std::string key;
+  ShardId sid = kInvalidSid;
+};
+
+// Returns (iterator, args-index) if found, KEY_NOTFOUND otherwise.
+// If multiple keys are found, returns the first index in the ArgSlice.
+OpResult<std::pair<DbSlice::ConstIterator, unsigned>> FindFirstReadOnly(const DbSlice& db_slice,
+                                                                        const DbContext& cntx,
+                                                                        const ShardArgs& args,
+                                                                        int req_obj_type) {
+  DCHECK(!args.Empty());
+
+  for (auto it = args.begin(); it != args.end(); ++it) {
+    OpResult<DbSlice::ConstIterator> res = db_slice.FindReadOnly(cntx, *it, req_obj_type);
+    if (res)
+      return make_pair(res.value(), unsigned(it.index()));
+    if (res.status() != OpStatus::KEY_NOTFOUND)
+      return res.status();
+  }
+
+  VLOG(2) << "FindFirst not found";
+  return OpStatus::KEY_NOTFOUND;
+}
+
+// Find first non-empty key of a single shard transaction, pass it to `func` and return the key.
+// If no such key exists or a wrong type is found, the apropriate status is returned.
+// Optimized version of `FindFirstNonEmpty` below.
+OpResult<string> FindFirstNonEmptySingleShard(Transaction* trans, int req_obj_type,
+                                              BlockingResultCb func) {
+  DCHECK_EQ(trans->GetUniqueShardCnt(), 1u);
+  string key;
+  auto cb = [&](Transaction* t, EngineShard* shard) -> Transaction::RunnableResult {
+    ShardId sid = shard->shard_id();
+    auto args = t->GetShardArgs(sid);
+    auto ff_res = FindFirstReadOnly(t->GetDbSlice(sid), t->GetDbContext(), args, req_obj_type);
+
+    if (ff_res == OpStatus::WRONG_TYPE)
+      return OpStatus::WRONG_TYPE;
+
+    if (ff_res == OpStatus::KEY_NOTFOUND)
+      return {OpStatus::KEY_NOTFOUND, Transaction::RunnableResult::AVOID_CONCLUDING};
+
+    CHECK(ff_res.ok());  // No other errors possible
+    ff_res->first->first.GetString(&key);
+    func(t, shard, key);
+    return OpStatus::OK;
+  };
+
+  // Schedule single hop and hopefully find a key, otherwise avoid concluding
+  OpStatus status = trans->ScheduleSingleHop(cb);
+  if (status == OpStatus::OK)
+    return key;
+  return status;
+}
+
+// Find first non-empty key (sorted by order in command arguments) and return it,
+// otherwise return not found or wrong type error.
+OpResult<ShardFFResult> FindFirstNonEmpty(Transaction* trans, int req_obj_type) {
+  DCHECK_GT(trans->GetUniqueShardCnt(), 1u);
+
+  using FFResult = std::tuple<std::string, unsigned, ShardId>;  // key, argument index, sid
+  VLOG(2) << "FindFirst::Find " << trans->DebugId();
+
+  // Holds Find results: (iterator to a found key, and its index in the passed arguments).
+  // See DbSlice::FindFirst for more details.
+  std::vector<OpResult<FFResult>> find_res(shard_set->size());
+  std::fill(find_res.begin(), find_res.end(), OpStatus::KEY_NOTFOUND);
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    ShardId sid = shard->shard_id();
+    auto args = t->GetShardArgs(sid);
+    auto ff_res = FindFirstReadOnly(t->GetDbSlice(sid), t->GetDbContext(), args, req_obj_type);
+    if (ff_res) {
+      std::string ff_key;
+      ff_res->first->first.GetString(&ff_key);
+      find_res[shard->shard_id()] = FFResult{std::move(ff_key), ff_res->second, shard->shard_id()};
+    } else {
+      find_res[shard->shard_id()] = ff_res.status();
+    }
+    return OpStatus::OK;
+  };
+
+  trans->Execute(std::move(cb), false);
+
+  // If any key is of the wrong type, report it immediately
+  if (rng::find_if(find_res, [](const auto& r) { return r == OpStatus::WRONG_TYPE; }) !=
+      find_res.end())
+    return OpStatus::WRONG_TYPE;
+
+  // Order result by their keys position in the command arguments, push errors to back
+  auto comp = [](const OpResult<FFResult>& lhs, const OpResult<FFResult>& rhs) {
+    if (!lhs || !rhs)
+      return lhs.ok();
+    size_t i1 = std::get<1>(*lhs);
+    size_t i2 = std::get<1>(*rhs);
+    return i1 < i2;
+  };
+
+  // Find first element by the order above, so the first key. Returns error only if all are errors
+  auto it = std::min_element(find_res.begin(), find_res.end(), comp);
+  DCHECK(it != find_res.end());
+
+  if (*it == OpStatus::KEY_NOTFOUND)
+    return OpStatus::KEY_NOTFOUND;
+
+  CHECK(it->ok());  // No other errors than WRONG_TYPE and KEY_NOTFOUND
+  FFResult& res = **it;
+  return ShardFFResult{std::get<0>(res), std::get<2>(res)};
+}
+
+void YieldLongIteration(bool allow_yield) {
+  static const uint32_t interval_usec =
+      absl::GetFlag(FLAGS_container_iteration_yield_interval_usec);
+  if (allow_yield && interval_usec > 0 &&
+      base::CycleClock::ToUsec(util::ThisFiber::GetRunningTimeCycles()) > interval_usec) {
+    util::ThisFiber::Yield();
+  }
+}
+
+}  // namespace
+
+using namespace std;
+
+bool IterateList(const PrimeValue& pv, const IterateFunc& func, size_t start, size_t end,
+                 bool allow_yield) {
+  DCHECK_LE(start, end);
+  bool success = true;
+  size_t len = pv.Size();
+  if (len == 0) {
+    return true;
+  }
+
+  if (end >= len) {
+    end = len - 1;
+    if (start > end) {
+      return true;
+    }
+  }
+
+  if (pv.Encoding() == kEncodingListPack) {
+    uint8_t* lp = static_cast<uint8_t*>(pv.RObjPtr());
+    uint8_t* p = lpSeek(lp, start);
+    while (p && start <= end) {
+      unsigned int slen;
+      long long lval;
+      uint8_t* vstr = lpGetValue(p, &slen, &lval);
+
+      if (vstr) {
+        success = func(ContainerEntry{reinterpret_cast<const char*>(vstr), slen});
+      } else {
+        success = func(ContainerEntry{lval});
+      }
+
+      if (!success)
+        break;
+
+      p = lpNext(lp, p);
+      start++;
+    }
+    return success;
+  }
+
+  DCHECK_EQ(pv.Encoding(), kEncodingQL2);
+  QList* ql = static_cast<QList*>(pv.RObjPtr());
+
+  ql->Iterate(
+      [&](const CollectionEntry& entry) {
+        YieldLongIteration(allow_yield);
+        success = func(entry);
+        return success;
+      },
+      start, end);
+  return success;
+}
+
+bool IterateSet(const PrimeValue& pv, const IterateFunc& func, bool allow_yield) {
+  bool success = true;
+  if (pv.Encoding() == kEncodingIntSet) {
+    intset* is = static_cast<intset*>(pv.RObjPtr());
+    int64_t ival;
+    int ii = 0;
+
+    while (success && intsetGet(is, ii++, &ival)) {
+      YieldLongIteration(allow_yield);
+      success = func(ContainerEntry{ival});
+    }
+  } else {
+    VisitSet(pv.RObjPtr(), [&](auto* set) {
+      for (auto it = set->begin(); it != set->end(); ++it) {
+        YieldLongIteration(allow_yield);
+        std::string_view key = Key(it);
+        if (!func(ContainerEntry{key.data(), key.size()})) {
+          success = false;
+          break;
+        }
+      }
+    });
+  }
+
+  return success;
+}
+
+bool IterateSortedSet(const PrimeValue& pv, const IterateSortedFunc& func, size_t start, size_t end,
+                      bool reverse, bool use_score, bool allow_yield) {
+  size_t llen = pv.Size();
+  if (llen == 0)
+    return true;
+
+  if (end >= llen)
+    end = llen - 1;
+
+  if (start > end || start >= llen)
+    return true;
+
+  size_t rangelen = end - start + 1;
+
+  if (pv.Encoding() == OBJ_ENCODING_LISTPACK) {
+    uint8_t* zl = static_cast<uint8_t*>(pv.RObjPtr());
+    uint8_t *eptr, *sptr;
+    uint8_t* vstr;
+    unsigned int vlen;
+    long long vlong;
+    double score = 0.0;
+
+    if (reverse) {
+      eptr = lpSeek(zl, -2 - long(2 * start));
+    } else {
+      eptr = lpSeek(zl, 2 * start);
+    }
+    DCHECK(eptr);
+
+    sptr = lpNext(zl, eptr);
+
+    bool success = true;
+    while (success && rangelen--) {
+      DCHECK(eptr != NULL && sptr != NULL);
+      vstr = lpGetValue(eptr, &vlen, &vlong);
+
+      // don't bother to extract the score if it's gonna be ignored.
+      if (use_score)
+        score = detail::ZzlGetScore(sptr);
+
+      if (vstr == NULL) {
+        success = func(ContainerEntry{vlong}, score);
+      } else {
+        success = func(ContainerEntry{reinterpret_cast<const char*>(vstr), vlen}, score);
+      }
+
+      if (reverse) {
+        detail::ZzlPrev(zl, &eptr, &sptr);
+      } else {
+        detail::ZzlNext(zl, &eptr, &sptr);
+      };
+    }
+    return success;
+  } else {
+    CHECK_EQ(pv.Encoding(), OBJ_ENCODING_SKIPLIST);
+    auto* smap = static_cast<detail::SortedMap*>(pv.RObjPtr());
+    return smap->Iterate(start, rangelen, reverse, [&](sds ele, double score) {
+      YieldLongIteration(allow_yield);
+      return func(ContainerEntry{ele, sdslen(ele)}, score);
+    });
+  }
+  return false;
+}
+
+bool IterateMap(const PrimeValue& pv, const IterateKVFunc& func, bool allow_yield) {
+  bool finished = true;
+
+  if (pv.Encoding() == kEncodingListPack) {
+    detail::ListpackWrap lw{static_cast<uint8_t*>(pv.RObjPtr())};
+    for (const auto [key, val] : lw) {
+      if (!func(ContainerEntry{key.data(), key.size()}, ContainerEntry{val.data(), val.size()})) {
+        finished = false;
+        break;
+      }
+    }
+  } else {
+    StringMap* sm = static_cast<StringMap*>(pv.RObjPtr());
+    for (const auto& k_v : *sm) {
+      YieldLongIteration(allow_yield);
+      if (!func(ContainerEntry{k_v.first, sdslen(k_v.first)},
+                ContainerEntry{k_v.second, sdslen(k_v.second)})) {
+        finished = false;
+        break;
+      }
+    }
+  }
+  return finished;
+}
+
+StringMap* GetStringMap(const PrimeValue& pv, const DbContext& db_context) {
+  DCHECK_EQ(pv.Encoding(), kEncodingStrMap2);
+  pv.SetMemberTime(MemberTimeSeconds(db_context.time_now_ms));
+  return static_cast<StringMap*>(pv.RObjPtr());
+}
+
+OpResult<string> RunCbOnFirstNonEmptyBlocking(Transaction* trans, int req_obj_type,
+                                              BlockingResultCb func, unsigned limit_ms,
+                                              bool* block_flag, bool* pause_flag) {
+  string result_key;
+
+  // Fast path. If we have only a single shard, we can run opportunistically with a single hop.
+  // If we don't find anything, we abort concluding and keep scheduled.
+  // Slow path: schedule, find results from shards, execute action if found.
+  OpResult<ShardFFResult> result;
+  if (trans->GetUniqueShardCnt() == 1) {
+    auto res = FindFirstNonEmptySingleShard(trans, req_obj_type, func);
+    if (res.ok()) {
+      return res;
+    } else {
+      result = res.status();
+    }
+  } else {
+    result = FindFirstNonEmpty(trans, req_obj_type);
+  }
+
+  // If a non-empty key exists, execute the callback immediately
+  if (result.ok()) {
+    auto cb = [&](Transaction* t, EngineShard* shard) {
+      if (shard->shard_id() == result->sid) {
+        result_key = result->key;
+        func(t, shard, result_key);
+      }
+      return OpStatus::OK;
+    };
+    trans->Execute(std::move(cb), true);
+    return result_key;
+  }
+
+  // Abort on possible errors: wrong type, etc
+  if (result.status() != OpStatus::KEY_NOTFOUND) {
+    trans->Conclude();
+    return result.status();
+  }
+
+  // Multi transactions are not allowed to block
+  if (trans->IsMulti()) {
+    trans->Conclude();
+    return OpStatus::TIMED_OUT;
+  }
+
+  DCHECK(trans->IsScheduled());  // single shard optimization didn't forget to schedule
+  VLOG(1) << "Blocking " << trans->DebugId();
+
+  // If timeout (limit_ms) is zero, block indefinitely
+  auto limit_tp = Transaction::time_point::max();
+  if (limit_ms > 0) {
+    using namespace std::chrono;
+    limit_tp = steady_clock::now() + milliseconds(limit_ms);
+  }
+
+  auto* ns = &trans->GetNamespace();
+  const auto key_checker = [req_obj_type, ns](EngineShard* owner, const DbContext& context,
+                                              std::string_view key) -> KeyReadyResult {
+    auto res = ns->GetDbSlice(owner->shard_id()).FindReadOnly(context, key, req_obj_type);
+    if (res.ok())
+      return KeyReadyResult::kReady;
+    if (res.status() == OpStatus::WRONG_TYPE)
+      return KeyReadyResult::kNotReady;
+    return KeyReadyResult::kKeyNotFound;
+  };
+
+  auto status =
+      trans->WaitOnWatch(limit_tp, Transaction::kShardArgs, key_checker, block_flag, pause_flag);
+
+  if (status != OpStatus::OK)
+    return status;
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    if (auto wake_key = t->GetWakeKey(shard->shard_id()); wake_key) {
+      result_key = *wake_key;
+      func(t, shard, result_key);
+    }
+    return OpStatus::OK;
+  };
+  trans->Execute(std::move(cb), true);
+  return result_key;
+}
+
+}  // namespace dfly::container_utils

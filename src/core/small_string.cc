@@ -1,0 +1,163 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "core/small_string.h"
+
+#include <mimalloc.h>
+#include <xxhash.h>
+
+#include <memory>
+
+#include "base/logging.h"
+#include "core/page_usage/page_usage_stats.h"
+#include "core/segment_allocator.h"
+
+namespace dfly {
+using namespace std;
+
+namespace {
+
+class XXH3_Deleter {
+ public:
+  void operator()(XXH3_state_t* ptr) const {
+    XXH3_freeState(ptr);
+  }
+};
+
+struct TL {
+  unique_ptr<XXH3_state_t, XXH3_Deleter> xxh_state;
+  unique_ptr<SegmentAllocator> seg_alloc;
+};
+
+thread_local TL tl;
+
+constexpr XXH64_hash_t kHashSeed = 24061983;  // same as in compact_object.cc
+
+static constexpr unsigned kMaxSize = (1 << 8) - 1;
+
+}  // namespace
+
+void SmallString::InitThreadLocal(void* heap) {
+  SegmentAllocator* ns = new SegmentAllocator((mi_heap_t*)heap);
+
+  tl.seg_alloc.reset(ns);
+  tl.xxh_state.reset(XXH3_createState());
+  XXH3_64bits_reset_withSeed(tl.xxh_state.get(), kHashSeed);
+}
+
+bool SmallString::CanAllocate(size_t size) {
+  return size <= kMaxSize && tl.seg_alloc->CanAllocate();
+}
+
+size_t SmallString::UsedThreadLocal() {
+  return tl.seg_alloc ? tl.seg_alloc->used() : 0;
+}
+
+static_assert(sizeof(SmallString) == 16);
+
+size_t SmallString::Assign(std::string_view s) {
+  DCHECK_GT(s.size(), kPrefLen);
+  DCHECK(CanAllocate(s.size()));
+  uint8_t* realptr = nullptr;
+
+  // reallocate if we need a larger allocation or it becomes space-inefficient
+  size_t heap_len = s.size() - kPrefLen;
+  if (size_t available = MallocUsed(); available < heap_len || heap_len * 2 < available) {
+    Free();
+
+    auto [sp, rp] = tl.seg_alloc->Allocate(heap_len);
+    small_ptr_ = sp;
+    realptr = rp;
+  } else {
+    realptr = tl.seg_alloc->Translate(small_ptr_);
+  }
+
+  size_ = s.size();
+  memcpy(prefix_, s.data(), kPrefLen);
+  memcpy(realptr, s.data() + kPrefLen, heap_len);
+  return mi_malloc_usable_size(realptr);
+}
+
+void SmallString::Free() {
+  if (size_)
+    tl.seg_alloc->Free(small_ptr_);
+  size_ = 0;
+}
+
+uint16_t SmallString::MallocUsed() const {
+  if (size_)
+    return mi_malloc_usable_size(tl.seg_alloc->Translate(small_ptr_));
+  return 0;
+}
+
+bool SmallString::Equal(std::string_view o) const {
+  if (size_ != o.size())
+    return false;
+
+  if (size_ == 0)
+    return true;
+
+  if (memcmp(prefix_, o.data(), kPrefLen) != 0)
+    return false;
+
+  uint8_t* realp = tl.seg_alloc->Translate(small_ptr_);
+  return memcmp(realp, o.data() + kPrefLen, size_ - kPrefLen) == 0;
+}
+
+bool SmallString::Equal(const SmallString& os) const {
+  if (size_ != os.size_)
+    return false;
+
+  return Get() == os.Get();
+}
+
+uint64_t SmallString::HashCode() const {
+  array<string_view, 2> slice = Get();
+
+  XXH3_state_t* state = tl.xxh_state.get();
+  XXH3_64bits_reset_withSeed(state, kHashSeed);
+  XXH3_64bits_update(state, slice[0].data(), slice[0].size());
+  XXH3_64bits_update(state, slice[1].data(), slice[1].size());
+
+  return XXH3_64bits_digest(state);
+}
+
+array<string_view, 2> SmallString::Get() const {
+  DCHECK(size_);
+
+  array<string_view, 2> dest;
+  dest[0] = string_view{prefix_, kPrefLen};
+  uint8_t* ptr = tl.seg_alloc->Translate(small_ptr_);
+  dest[1] = string_view{reinterpret_cast<char*>(ptr), size_ - kPrefLen};
+  return dest;
+}
+
+void SmallString::Get(char* out) const {
+  auto strs = Get();
+  memcpy(out, strs[0].data(), strs[0].size());
+  memcpy(out + strs[0].size(), strs[1].data(), strs[1].size());
+}
+
+void SmallString::Get(std::string* dest) const {
+  dest->resize(size_);
+  Get(dest->data());
+}
+
+bool SmallString::DefragIfNeeded(PageUsage* page_usage) {
+  uint8_t* cur_real_ptr = tl.seg_alloc->Translate(small_ptr_);
+  if (!page_usage->IsPageForObjectUnderUtilized(tl.seg_alloc->heap(), cur_real_ptr))
+    return false;
+
+  if (!CanAllocate(size_ - kPrefLen))  // Forced
+    return false;
+
+  auto [sp, rp] = tl.seg_alloc->Allocate(size_ - kPrefLen);
+  memcpy(rp, cur_real_ptr, size_ - kPrefLen);
+  tl.seg_alloc->Free(small_ptr_);
+  small_ptr_ = sp;
+
+  return true;
+}
+
+}  // namespace dfly

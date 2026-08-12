@@ -1,0 +1,4110 @@
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "core/search/search.h"
+
+#include <absl/cleanup/cleanup.h>
+#include <absl/container/flat_hash_map.h>
+#include <absl/strings/escaping.h>
+#include <absl/strings/numbers.h>
+#include <absl/strings/str_split.h>
+#include <benchmark/benchmark.h>
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+#include <mimalloc.h>
+
+#include <algorithm>
+#include <cmath>
+#include <memory_resource>
+#include <random>
+
+#include "absl/base/macros.h"
+#include "base/gtest.h"
+#include "base/logging.h"
+#include "core/search/base.h"
+#include "core/search/hnsw_index.h"
+#include "core/search/indices.h"
+#include "core/search/query_driver.h"
+#include "core/search/scoring.h"
+#include "core/search/stateless_allocator.h"
+#include "core/search/vector_utils.h"
+
+extern "C" {
+#include "redis/zmalloc.h"
+}
+
+namespace dfly {
+namespace search {
+
+using namespace std;
+
+using ::testing::HasSubstr;
+
+// Used for NumericIndex benchmarks.
+// The value is used to determine the maximum size of a range block in the range tree.
+constexpr size_t kMaxRangeBlockSize = 500000;
+
+struct MockedDocument : public DocumentAccessor {
+ public:
+  using Map = absl::flat_hash_map<std::string, std::string>;
+
+  MockedDocument() = default;
+  MockedDocument(Map map) : fields_{map} {
+  }
+  MockedDocument(std::string test_field) : fields_{{"field", test_field}} {
+  }
+
+  std::optional<StringList> GetStrings(string_view field) const override {
+    auto it = fields_.find(field);
+    if (it == fields_.end()) {
+      return EmptyAccessResult<StringList>();
+    }
+    return StringList{string_view{it->second}};
+  }
+
+  std::optional<StringList> GetTags(string_view field) const override {
+    return GetStrings(field);
+  }
+
+  std::optional<VectorInfo> GetVector(string_view field, size_t dim,
+                                      VectorDataType dtype) const override {
+    auto strings_list = GetStrings(field);
+    if (!strings_list)
+      return std::nullopt;
+    return !strings_list->empty() ? BytesToFtVectorSafe(strings_list->front()) : OwnedFtVector{};
+  }
+
+  std::optional<NumsList> GetNumbers(std::string_view field) const override {
+    auto strings_list = GetStrings(field);
+    if (!strings_list)
+      return std::nullopt;
+
+    NumsList nums_list;
+    nums_list.reserve(strings_list->size());
+    for (auto str : strings_list.value()) {
+      auto num = ParseNumericField(str);
+      if (!num) {
+        return std::nullopt;
+      }
+      nums_list.push_back(num.value());
+    }
+    return nums_list;
+  }
+
+  string DebugFormat() {
+    string out = "{";
+    for (const auto& [field, value] : fields_)
+      absl::StrAppend(&out, field, "=", value, ",");
+    if (out.size() > 1)
+      out.pop_back();
+    out += "}";
+    return out;
+  }
+
+  void Set(Map hset) {
+    fields_ = hset;
+  }
+
+ private:
+  Map fields_{};
+};
+
+IndicesOptions kEmptyOptions{{}};
+
+struct SchemaFieldInitializer {
+  SchemaFieldInitializer(std::string_view name, SchemaField::FieldType type)
+      : name{name}, type{type} {
+    switch (type) {
+      case SchemaField::TAG:
+        special_params = SchemaField::TagParams{};
+        break;
+      case SchemaField::TEXT:
+        special_params = SchemaField::TextParams{};
+        break;
+      case SchemaField::NUMERIC:
+        special_params = SchemaField::NumericParams{};
+        break;
+      case SchemaField::VECTOR:
+        special_params = SchemaField::VectorParams{};
+        break;
+      case SchemaField::GEO:
+        break;
+    }
+  }
+
+  SchemaFieldInitializer(std::string_view name, SchemaField::FieldType type,
+                         SchemaField::ParamsVariant special_params)
+      : name{name}, type{type}, special_params{special_params} {
+  }
+
+  std::string_view name;
+  SchemaField::FieldType type;
+  SchemaField::ParamsVariant special_params{std::monostate{}};
+};
+
+Schema MakeSimpleSchema(initializer_list<SchemaFieldInitializer> ilist,
+                        bool make_sortable = false) {
+  Schema schema;
+  uint8_t flags = make_sortable ? SchemaField::SORTABLE : 0;
+  for (auto ifield : ilist) {
+    auto& field = schema.fields[ifield.name];
+    field = {ifield.type, flags, string{ifield.name}, ifield.special_params};
+  }
+  return schema;
+}
+
+class SearchTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    auto* tlh = mi_heap_get_backing();
+    init_zmalloc_threadlocal(tlh);
+    // Initialize SimSIMD runtime for tests that may exercise vector kernels
+    InitSimSIMD();
+  }
+
+  SearchTest() {
+    PrepareSchema({{"field", SchemaField::TEXT}});
+  }
+
+  ~SearchTest() {
+    EXPECT_EQ(entries_.size(), 0u) << "Missing check";
+  }
+
+  void PrepareSchema(initializer_list<SchemaFieldInitializer> ilist) {
+    schema_ = MakeSimpleSchema(ilist);
+  }
+
+  void PrepareQuery(string_view query) {
+    query_ = query;
+  }
+
+  template <typename... Args> void ExpectAll(Args... args) {
+    (entries_.emplace_back(args, true), ...);
+  }
+
+  template <typename... Args> void ExpectNone(Args... args) {
+    (entries_.emplace_back(args, false), ...);
+  }
+
+  bool Check() {
+    absl::Cleanup cl{[this] { entries_.clear(); }};
+
+    FieldIndices index{schema_, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+    shuffle(entries_.begin(), entries_.end(), default_random_engine{});
+    for (DocId i = 0; i < entries_.size(); i++)
+      index.Add(i, entries_[i].first);
+    index.FinalizeInitialization();
+
+    SearchAlgorithm search_algo{};
+    if (!search_algo.Init(query_, &params_)) {
+      error_ = "Failed to parse query";
+      return false;
+    }
+
+    auto matched = search_algo.Search(&index);
+
+    if (!is_sorted(matched.ids.begin(), matched.ids.end()))
+      LOG(FATAL) << "Search result is not sorted";
+
+    for (DocId i = 0; i < entries_.size(); i++) {
+      bool doc_matched = binary_search(matched.ids.begin(), matched.ids.end(), i);
+      if (doc_matched != entries_[i].second) {
+        error_ = "doc: \"" + entries_[i].first.DebugFormat() + "\"" + " was expected" +
+                 (entries_[i].second ? "" : " not") + " to match" + " query: \"" + query_ + "\"";
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  string_view GetError() const {
+    return error_;
+  }
+
+ private:
+  using DocEntry = pair<MockedDocument, bool /*should_match*/>;
+
+  QueryParams params_;
+  Schema schema_;
+  vector<DocEntry> entries_;
+  string query_, error_;
+};
+
+TEST_F(SearchTest, MatchTerm) {
+  PrepareQuery("foo");
+
+  // Check basic cases
+  ExpectAll("foo", "foo bar", "more foo bar");
+  ExpectNone("wrong", "nomatch");
+
+  // Check part of sentence + case.
+  ExpectAll("Foo is cool.", "Where is foo?", "One. FOO!. More", "Foo is foo.");
+
+  // Check part of word is not matched
+  ExpectNone("foocool", "veryfoos", "ufoo", "morefoomore", "thefoo");
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchNotTerm) {
+  PrepareQuery("-foo");
+
+  ExpectAll("faa", "definitielyright");
+  ExpectNone("foo", "foo bar", "more foo bar");
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchLogicalNode) {
+  {
+    PrepareQuery("foo bar");
+
+    ExpectAll("foo bar", "bar foo", "more bar and foo");
+    ExpectNone("wrong", "foo", "bar", "foob", "far");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  {
+    PrepareQuery("foo | bar");
+
+    ExpectAll("foo bar", "foo", "bar", "foo and more", "or only bar");
+    ExpectNone("wrong", "only far");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  {
+    PrepareQuery("foo bar baz");
+
+    ExpectAll("baz bar foo", "bar and foo and baz");
+    ExpectNone("wrong", "foo baz", "bar baz", "and foo");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+}
+
+TEST_F(SearchTest, MatchParenthesis) {
+  PrepareQuery("( foo | oof ) ( bar | rab )");
+
+  ExpectAll("foo bar", "oof rab", "foo rab", "oof bar", "foo oof bar rab");
+  ExpectNone("wrong", "bar rab", "foo oof");
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, CheckNotPriority) {
+  for (auto expr : {"-bar foo baz", "foo -bar baz", "foo baz -bar"}) {
+    PrepareQuery(expr);
+
+    ExpectAll("foo baz", "foo rab baz", "baz rab foo");
+    ExpectNone("wrong", "bar", "foo bar baz", "foo baz bar");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  for (auto expr : {"-bar | foo", "foo | -bar"}) {
+    PrepareQuery(expr);
+
+    ExpectAll("foo", "right", "foo bar");
+    ExpectNone("bar", "bar baz");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  for (auto expr : {"-bar far|-foo tam"}) {
+    PrepareQuery(expr);
+
+    ExpectAll("far baz", "far foo", "bar tam");
+    ExpectNone("bar far", "foo tam", "bar foo", "far bar foo");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+}
+
+TEST_F(SearchTest, CheckParenthesisPriority) {
+  {
+    PrepareQuery("foo | -(bar baz)");
+
+    ExpectAll("foo", "not b/r and b/z", "foo bar baz", "single bar", "only baz");
+    ExpectNone("bar baz", "some more bar and baz");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+  {
+    PrepareQuery("( foo (bar | baz) (rab | zab) ) | true");
+
+    ExpectAll("true", "foo bar rab", "foo baz zab", "foo bar zab");
+    ExpectNone("wrong", "foo bar baz", "foo rab zab", "foo bar what", "foo rab foo");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+}
+
+TEST_F(SearchTest, EnglishStemming) {
+  for (auto query : {"learn", "learning", "learns", "learned"}) {
+    PrepareQuery(query);
+    ExpectAll("machine learning fundamentals", "I will learn tomorrow", "she learned yesterday",
+              "the model learns fast");
+    ExpectNone("unrelated text", "completely different");
+    EXPECT_TRUE(Check()) << "query=" << query << " err=" << GetError();
+  }
+}
+
+TEST_F(SearchTest, NoStemAttribute) {
+  PrepareSchema({{"field", SchemaField::TEXT, SchemaField::TextParams{.no_stem = true}}});
+
+  PrepareQuery("learn");
+  ExpectAll("I will learn tomorrow");
+  ExpectNone("machine learning fundamentals", "she learned yesterday", "the model learns fast");
+  EXPECT_TRUE(Check()) << GetError();
+
+  PrepareQuery("learning");
+  ExpectAll("machine learning fundamentals");
+  ExpectNone("I will learn tomorrow", "she learned yesterday", "the model learns fast");
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, StemmingNormalizesCase) {
+  PrepareQuery("Running");
+  ExpectAll("He was RUNNING fast", "the runs were good");
+  ExpectNone("she sat still", "runner ahead");  // Porter does not unify -er nouns with -ing verbs
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, CheckPrefix) {
+  {
+    PrepareQuery("pre*");
+
+    ExpectAll("pre", "prepre", "preachers", "prepared", "pRetty", "PRedators", "prEcisely!");
+    ExpectNone("pristine", "represent", "repair", "depreciation");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+  {
+    PrepareQuery("new*");
+
+    ExpectAll("new", "New York", "Newham", "newbie", "news", "Welcome to Newark!");
+    ExpectNone("ne", "renew", "nev", "ne-w", "notnew", "casino in neVada");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+}
+
+using Map = MockedDocument::Map;
+
+TEST_F(SearchTest, MatchField) {
+  PrepareSchema({{"f1", SchemaField::TEXT}, {"f2", SchemaField::TEXT}, {"f3", SchemaField::TEXT}});
+  PrepareQuery("@f1:foo @f2:bar @f3:baz");
+
+  ExpectAll(Map{{"f1", "foo"}, {"f2", "bar"}, {"f3", "baz"}});
+  ExpectNone(Map{{"f1", "foo"}, {"f2", "bar"}, {"f3", "last is wrong"}},
+             Map{{"f1", "its"}, {"f2", "totally"}, {"f3", "wrong"}},
+             Map{{"f1", "im foo but its only me and"}, {"f2", "bar"}});
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchFieldPerTermWeight) {
+  PrepareSchema({{"f1", SchemaField::TEXT}, {"f2", SchemaField::TEXT}});
+
+  // A per-term weight inside a field group keeps the term scoped to that field.
+  PrepareQuery("@f1:(machine=>{$weight:2.0} | learning)");
+
+  ExpectAll(Map{{"f1", "machine models"}, {"f2", "x"}}, Map{{"f1", "deep learning"}, {"f2", "x"}},
+            Map{{"f1", "machine learning"}, {"f2", "x"}});
+  ExpectNone(Map{{"f1", "unrelated"}, {"f2", "machine learning"}},  // only in f2
+             Map{{"f1", "nothing here"}, {"f2", "x"}});
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchRange) {
+  PrepareSchema({{"f1", SchemaField::NUMERIC}, {"f2", SchemaField::NUMERIC}});
+  PrepareQuery("@f1:[1 10] @f2:[50 100]");
+
+  ExpectAll(Map{{"f1", "5"}, {"f2", "50"}}, Map{{"f1", "1"}, {"f2", "100"}},
+            Map{{"f1", "10"}, {"f2", "50"}});
+  ExpectNone(Map{{"f1", "11"}, {"f2", "49"}}, Map{{"f1", "0"}, {"f2", "101"}});
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchDoubleRange) {
+  PrepareSchema({{"f1", SchemaField::NUMERIC}});
+
+  {
+    PrepareQuery("@f1: [100.03 199.97]");
+
+    ExpectAll(Map{{"f1", "130"}}, Map{{"f1", "170"}}, Map{{"f1", "100.03"}}, Map{{"f1", "199.97"}});
+
+    ExpectNone(Map{{"f1", "0"}}, Map{{"f1", "200"}}, Map{{"f1", "100.02999"}},
+               Map{{"f1", "199.9700001"}});
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  {
+    PrepareQuery("@f1: [(100 (199.9]");
+
+    ExpectAll(Map{{"f1", "150"}}, Map{{"f1", "100.00001"}}, Map{{"f1", "199.8999999"}});
+
+    ExpectNone(Map{{"f1", "50"}}, Map{{"f1", "100"}}, Map{{"f1", "199.9"}}, Map{{"f1", "200"}});
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+}
+
+TEST_F(SearchTest, MatchStar) {
+  PrepareQuery("*");
+  ExpectAll("one", "two", "three", "and", "all", "documents");
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, CheckExprInField) {
+  PrepareSchema({{"f1", SchemaField::TEXT}, {"f2", SchemaField::TEXT}, {"f3", SchemaField::TEXT}});
+  {
+    PrepareQuery("@f1:(a|b) @f2:(c d) @f3:-e");
+
+    ExpectAll(Map{{"f1", "a"}, {"f2", "c and d"}, {"f3", "right"}},
+              Map{{"f1", "b"}, {"f2", "d and c"}, {"f3", "ok"}});
+    ExpectNone(Map{{"f1", "none"}, {"f2", "only d"}, {"f3", "ok"}},
+               Map{{"f1", "b"}, {"f2", "d and c"}, {"f3", "it has an e"}});
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+  {
+    PrepareQuery({"@f1:(a (b | c) -(d | e)) @f2:-(a|b)"});
+
+    ExpectAll(Map{{"f1", "a b w"}, {"f2", "c"}});
+    ExpectNone(Map{{"f1", "a b d"}, {"f2", "c"}}, Map{{"f1", "a b w"}, {"f2", "a"}},
+               Map{{"f1", "a w"}, {"f2", "c"}});
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+  {
+    PrepareQuery("@f1:(-a c|-b d)");
+
+    ExpectAll(Map{{"f1", "c"}}, Map{{"f1", "d"}});
+    ExpectNone(Map{{"f1", "a"}}, Map{{"f1", "b"}});
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+}
+
+TEST_F(SearchTest, CheckTag) {
+  PrepareSchema({{"f1", SchemaField::TAG}, {"f2", SchemaField::TAG}});
+
+  PrepareQuery("@f1:{red | blue} @f2:{circle | square}");
+
+  ExpectAll(Map{{"f1", "red"}, {"f2", "square"}}, Map{{"f1", "blue"}, {"f2", "square"}},
+            Map{{"f1", "red"}, {"f2", "circle"}}, Map{{"f1", "red"}, {"f2", "circle, square"}},
+            Map{{"f1", "red"}, {"f2", "triangle, circle"}},
+            Map{{"f1", "red, green"}, {"f2", "square"}},
+            Map{{"f1", "green, blue"}, {"f2", "circle"}});
+  ExpectNone(Map{{"f1", "green"}, {"f2", "square"}}, Map{{"f1", "green"}, {"f2", "circle"}},
+             Map{{"f1", "red"}, {"f2", "triangle"}}, Map{{"f1", "blue"}, {"f2", "line, triangle"}});
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, CheckTagPrefix) {
+  PrepareSchema({{"color", SchemaField::TAG}});
+  PrepareQuery("@color:{green* | orange | yellow*}");
+
+  ExpectAll(Map{{"color", "green"}}, Map{{"color", "yellow"}}, Map{{"color", "greenish"}},
+            Map{{"color", "yellowish"}}, Map{{"color", "green-forestish"}},
+            Map{{"color", "yellowsunish"}}, Map{{"color", "orange"}});
+  ExpectNone(Map{{"color", "red"}}, Map{{"color", "blue"}}, Map{{"color", "orangeish"}},
+             Map{{"color", "darkgreen"}}, Map{{"color", "light-yellow"}});
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, IntegerTerms) {
+  PrepareSchema({{"status", SchemaField::TAG}, {"title", SchemaField::TEXT}});
+
+  PrepareQuery("@status:{1} @title:33");
+
+  ExpectAll(Map{{"status", "1"}, {"title", "33 cars on the road"}});
+  ExpectNone(Map{{"status", "0"}, {"title", "22 trains on the tracks"}});
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, StopWords) {
+  auto schema = MakeSimpleSchema({{"title", SchemaField::TEXT}});
+  IndicesOptions options{{"some", "words", "are", "left", "out"}};
+
+  FieldIndices indices{schema, options, PMR_NS::get_default_resource(), nullptr};
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  vector<string> documents = {"some words left out",      //
+                              "some can be found",        //
+                              "words are never matched",  //
+                              "explicitly found!"};
+  for (size_t i = 0; i < documents.size(); i++) {
+    MockedDocument doc{{{"title", documents[i]}}};
+    indices.Add(i, doc);
+  }
+
+  // words is a stopword
+  algo.Init("words", &params);
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre());
+
+  // some is a stopword
+  algo.Init("some", &params);
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre());
+
+  // found is not a stopword
+  algo.Init("found", &params);
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1, 3));
+}
+
+// A stopword among query terms must be dropped, not kept as a required term. Otherwise the
+// implicit-AND query reduces to an empty result because stopwords are never indexed.
+TEST_F(SearchTest, StopWordsDroppedFromQuery) {
+  auto schema = MakeSimpleSchema({{"title", SchemaField::TEXT}});
+  IndicesOptions options{{"some", "words", "are", "left", "out"}};
+
+  FieldIndices indices{schema, options, PMR_NS::get_default_resource(), nullptr};
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  vector<string> documents = {"some words left out",      //
+                              "some can be found",        //
+                              "words are never matched",  //
+                              "explicitly found!"};
+  for (size_t i = 0; i < documents.size(); i++) {
+    MockedDocument doc{{{"title", documents[i]}}};
+    indices.Add(i, doc);
+  }
+
+  // Trailing stopword is dropped -> query behaves like "found".
+  algo.Init("found some", &params);
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1, 3));
+
+  // Stopword between two real terms is dropped -> "explicitly found".
+  algo.Init("explicitly are found", &params);
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(3));
+
+  // Stopword as an OR operand contributes nothing; the real operand still matches.
+  algo.Init("found | some", &params);
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1, 3));
+
+  // Field-scoped group with a trailing stopword still matches.
+  algo.Init("@title:(found are)", &params);
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1, 3));
+
+  // A non-stopword term still constrains the result as usual.
+  algo.Init("found matched", &params);
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre());
+}
+
+class SearchRaxTest
+    : public SearchTest,
+      public testing::WithParamInterface<pair<bool /* build suffix trie */, bool /* tag index */>> {
+};
+
+TEST_P(SearchRaxTest, SuffixInfix) {
+  auto [with_trie, use_tag] = GetParam();
+  Schema schema = MakeSimpleSchema({{"title", use_tag ? SchemaField::TAG : SchemaField::TEXT}});
+  if (use_tag) {
+    schema.fields["title"].special_params = SchemaField::TagParams{.with_suffixtrie = with_trie};
+  } else {
+    schema.fields["title"].special_params = SchemaField::TextParams{.with_suffixtrie = with_trie};
+  }
+
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  vector<string> documents = {"Berries",     "BlueBeRRies", "Blackberries", "APPLES",
+                              "CranbeRRies", "Wolfberry",   "StraWberry"};
+  for (size_t i = 0; i < documents.size(); i++) {
+    MockedDocument doc{{{"title", documents[i]}}};
+    indices.Add(i, doc);
+  }
+
+  auto prepare = [&, use_tag = use_tag](string q) {
+    if (use_tag)
+      q = "@title:{"s + q + "}"s;
+    algo.Init(q, &params);
+  };
+
+  // suffix queries
+
+  prepare("*Es");
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 2, 3, 4));
+
+  prepare("*beRRies");
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 2, 4));
+
+  prepare("*les");
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(3));
+
+  prepare("*lueBERRies");
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1));
+
+  prepare("*berrY");
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(5, 6));
+
+  // infix queries
+
+  prepare("*berr*");
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 2, 4, 5, 6));
+
+  prepare("*ANB*");
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(4));
+
+  prepare("*berries*");
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 2, 4));
+
+  prepare("*bL*");
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1, 2));
+}
+
+INSTANTIATE_TEST_SUITE_P(NoTrieText, SearchRaxTest, testing::Values(pair{false, false}));
+INSTANTIATE_TEST_SUITE_P(WithTrieText, SearchRaxTest, testing::Values(pair{true, false}));
+INSTANTIATE_TEST_SUITE_P(NoTrieTag, SearchRaxTest, testing::Values(pair{false, true}));
+INSTANTIATE_TEST_SUITE_P(WithTrieTag, SearchRaxTest, testing::Values(pair{true, true}));
+
+std::string ToBytes(absl::Span<const float> vec) {
+  return string{reinterpret_cast<const char*>(vec.data()), sizeof(float) * vec.size()};
+}
+
+TEST_F(SearchTest, Errors) {
+  auto schema = MakeSimpleSchema(
+      {{"score", SchemaField::NUMERIC}, {"even", SchemaField::TAG}, {"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 1};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // Non-existent field
+  algo.Init("@cantfindme:[1 10]", &params);
+  EXPECT_THAT(algo.Search(&indices).error, HasSubstr("Invalid field"));
+
+  // Invalid type
+  algo.Init("@even:[1 10]", &params);
+  EXPECT_THAT(algo.Search(&indices).error, HasSubstr("Wrong access type"));
+
+  // Wrong vector index dimensions
+  params["vec"] = ToBytes({1, 2, 3, 4});
+  algo.Init("* => [KNN 5 @pos $vec]", &params);
+  EXPECT_THAT(algo.Search(&indices).error, HasSubstr("Wrong vector index dimensions"));
+}
+
+TEST_F(SearchTest, MatchNumericRangeWithCommas) {
+  PrepareSchema({{"f1", SchemaField::NUMERIC}, {"draw_end", SchemaField::NUMERIC}});
+
+  // Main tests for point range with identical values and different delimiters
+  {
+    PrepareQuery("@draw_end:[1742916180 1742916180]");
+    ExpectAll(Map{{"draw_end", "1742916180"}});
+    ExpectNone(Map{{"draw_end", "1742916181"}}, Map{{"draw_end", "1742916179"}});
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  {
+    PrepareQuery("@draw_end:[1742916180, 1742916180]");
+    ExpectAll(Map{{"draw_end", "1742916180"}});
+    ExpectNone(Map{{"draw_end", "1742916181"}}, Map{{"draw_end", "1742916179"}});
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  {
+    PrepareQuery("@draw_end:[1742916180 ,1742916180]");
+    ExpectAll(Map{{"draw_end", "1742916180"}});
+    ExpectNone(Map{{"draw_end", "1742916181"}}, Map{{"draw_end", "1742916179"}});
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  {
+    PrepareQuery("@draw_end:[1742916180   1742916180]");
+    ExpectAll(Map{{"draw_end", "1742916180"}});
+    ExpectNone(Map{{"draw_end", "1742916181"}}, Map{{"draw_end", "1742916179"}});
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  {
+    PrepareQuery("@f1:[100   ,     200]");
+    ExpectAll(Map{{"f1", "100"}}, Map{{"f1", "150"}}, Map{{"f1", "200"}});
+    ExpectNone(Map{{"f1", "99"}}, Map{{"f1", "201"}});
+    EXPECT_TRUE(Check()) << GetError();
+  }
+}
+
+class KnnTest : public SearchTest {};
+
+class VectorRangeTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    auto* tlh = mi_heap_get_backing();
+    init_zmalloc_threadlocal(tlh);
+    InitSimSIMD();
+  }
+};
+
+TEST_F(VectorRangeTest, FlatRange1D) {
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 1};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  // Place 10 points on a line: 1, 2, ..., 10 (avoid zero vector for doc 0)
+  for (size_t i = 0; i < 10; i++) {
+    MockedDocument doc{Map{{"pos", ToBytes({float(i + 1)})}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // Query at 5.0 with radius 1.5 → points at pos 4,5,6 → doc ids 3,4,5
+  {
+    params["vec"] = ToBytes({5.0f});
+    algo.Init("@pos:[VECTOR_RANGE 1.5 $vec]=>{$YIELD_DISTANCE_AS: dist}", &params);
+    auto result = algo.Search(&indices);
+    EXPECT_THAT(result.ids, testing::UnorderedElementsAre(3, 4, 5));
+  }
+
+  // Exact match at pos 4.0 with radius 0 → only doc 3
+  {
+    params["vec"] = ToBytes({4.0f});
+    algo.Init("@pos:[VECTOR_RANGE 0 $vec]=>{$YIELD_DISTANCE_AS: dist}", &params);
+    auto result = algo.Search(&indices);
+    EXPECT_THAT(result.ids, testing::UnorderedElementsAre(3));
+  }
+
+  // Large radius → all 10 points
+  {
+    params["vec"] = ToBytes({5.0f});
+    algo.Init("@pos:[VECTOR_RANGE 100 $vec]=>{$YIELD_DISTANCE_AS: dist}", &params);
+    auto result = algo.Search(&indices);
+    EXPECT_EQ(result.ids.size(), 10u);
+  }
+
+  // Empty result when radius is too small
+  {
+    params["vec"] = ToBytes({5.5f});
+    algo.Init("@pos:[VECTOR_RANGE 0.1 $vec]=>{$YIELD_DISTANCE_AS: dist}", &params);
+    auto result = algo.Search(&indices);
+    EXPECT_TRUE(result.ids.empty());
+  }
+}
+
+TEST_F(VectorRangeTest, FlatRangeWithoutYieldDistanceAs) {
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 1};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  for (size_t i = 0; i < 10; i++) {
+    MockedDocument doc{Map{{"pos", ToBytes({float(i + 1)})}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // VECTOR_RANGE without =>{$YIELD_DISTANCE_AS: ...} — must parse and return correct results
+  params["vec"] = ToBytes({5.0f});
+  algo.Init("@pos:[VECTOR_RANGE 1.5 $vec]", &params);
+  auto result = algo.Search(&indices);
+  EXPECT_THAT(result.ids, testing::UnorderedElementsAre(3, 4, 5));
+
+  // score_alias should be empty when not specified
+  ASSERT_NE(nullptr, algo.GetVectorRangeNode());
+  EXPECT_TRUE(algo.GetVectorRangeNode()->score_alias.empty());
+}
+
+TEST_F(VectorRangeTest, FlatRangeDistancesStoredInScores) {
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 1};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  // Use i+1 so doc positions are 1..5 (query radius 1.5 from pos 2.0 catches docs 0,1,2)
+  for (size_t i = 0; i < 5; i++) {
+    MockedDocument doc{Map{{"pos", ToBytes({float(i + 1)})}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+  params["vec"] = ToBytes({2.0f});
+
+  algo.Init("@pos:[VECTOR_RANGE 1.5 $vec]=>{$YIELD_DISTANCE_AS: vector_distance}", &params);
+  ASSERT_NE(nullptr, algo.GetVectorRangeNode());
+  EXPECT_STREQ("vector_distance", algo.GetVectorRangeNode()->score_alias.c_str());
+
+  auto result = algo.Search(&indices);
+  // Positions 1,2,3 (docs 0,1,2) are within L2 distance 1.5 from query pos 2.0
+  EXPECT_THAT(result.ids, testing::UnorderedElementsAre(0, 1, 2));
+  // knn_scores should contain distances for all matched docs
+  EXPECT_EQ(result.knn_scores.size(), 3u);
+}
+
+TEST_F(VectorRangeTest, FlatRangeRejectsEpsilon) {
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 1};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  indices.Add(0, MockedDocument{Map{{"pos", ToBytes({1.0f})}}});
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+  params["vec"] = ToBytes({1.0f});
+
+  ASSERT_TRUE(algo.Init("@pos:[VECTOR_RANGE 1.5 $vec]=>{$EPSILON: 0.1}", &params));
+  auto result = algo.Search(&indices);
+  EXPECT_THAT(result.error, testing::HasSubstr("EPSILON"));
+}
+
+TEST_F(VectorRangeTest, FlatRangeRejectsInfiniteRadius) {
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 1};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  indices.Add(0, MockedDocument{Map{{"pos", ToBytes({1.0f})}}});
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+  params["vec"] = ToBytes({1.0f});
+
+  ASSERT_TRUE(algo.Init("@pos:[VECTOR_RANGE inf $vec]", &params));
+  auto result = algo.Search(&indices);
+  EXPECT_THAT(result.error, testing::HasSubstr("radius"));
+}
+
+TEST_F(VectorRangeTest, RangeOrFilterScoresByDoc) {
+  // OR-ing a range with a filter makes the result larger than the range-match set. knn_scores is
+  // keyed by DocId: only in-range docs carry a distance, filter-only docs are simply absent.
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}, {"route", SchemaField::TAG}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 1};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  for (size_t i = 0; i < 10; i++) {
+    MockedDocument doc{Map{{"pos", ToBytes({float(i)})}, {"route", (i % 2 == 0) ? "a" : "b"}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+  params["vec"] = ToBytes({5.0f});
+
+  // range (pos 4,5,6 -> docs 4,5,6) OR route "a" (docs 0,2,4,6,8) = union {0,2,4,5,6,8}.
+  ASSERT_TRUE(
+      algo.Init("@pos:[VECTOR_RANGE 1.5 $vec]=>{$YIELD_DISTANCE_AS: dist} | @route:{a}", &params));
+  auto result = algo.Search(&indices);
+  EXPECT_THAT(result.ids, testing::UnorderedElementsAre(0, 2, 4, 5, 6, 8));
+  // Distances exist only for the in-range docs; filter-only docs (0, 2, 8) are absent.
+  EXPECT_THAT(result.knn_scores,
+              testing::UnorderedElementsAre(testing::Key(4u), testing::Key(5u), testing::Key(6u)));
+  EXPECT_FLOAT_EQ(result.knn_scores.at(5), 0.0f);
+}
+
+TEST_F(VectorRangeTest, FlatStarQueryZeroVectorIsValid) {
+  // Regression: @field:* on a FLAT vector index uses GetAllDocsWithNonNullValues(), which
+  // incorrectly skips zero vectors. The zero vector [0.0,...,0.0] is a valid embedding.
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 2};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  // doc 0: zero vector [0.0, 0.0] — valid embedding, must not be skipped
+  indices.Add(0, MockedDocument{Map{{"pos", ToBytes({0.0f, 0.0f})}}});
+  // doc 1: non-zero vector [1.0, 0.0]
+  indices.Add(1, MockedDocument{Map{{"pos", ToBytes({1.0f, 0.0f})}}});
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+  algo.Init("@pos:*", &params);
+  auto result = algo.Search(&indices);
+  // Both docs must appear — zero vector is NOT null
+  EXPECT_THAT(result.ids, testing::UnorderedElementsAre(0, 1));
+}
+
+TEST_F(VectorRangeTest, FlatStarQueryRemovedDocNotMatched) {
+  // Regression: @field:* on a FLAT vector index uses GetAllDocsWithNonNullValues(), which
+  // iterates entries_ directly and does NOT respect all_ids_. After Remove(), the doc's
+  // slot in entries_ is still non-zero, so the removed doc incorrectly appears in results.
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 1};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  indices.Add(0, MockedDocument{Map{{"pos", ToBytes({1.0f})}}});
+  indices.Add(1, MockedDocument{Map{{"pos", ToBytes({2.0f})}}});
+  indices.Add(2, MockedDocument{Map{{"pos", ToBytes({3.0f})}}});
+
+  // Remove doc 1
+  MockedDocument doc1{Map{{"pos", ToBytes({2.0f})}}};
+  indices.Remove(1, doc1);
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+  algo.Init("@pos:*", &params);
+  auto result = algo.Search(&indices);
+  // Doc 1 was removed, only docs 0 and 2 should appear
+  EXPECT_THAT(result.ids, testing::UnorderedElementsAre(0, 2));
+}
+
+TEST_F(KnnTest, Simple1D) {
+  auto schema = MakeSimpleSchema({{"even", SchemaField::TAG}, {"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 1};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  // Place points on a straight line
+  for (size_t i = 0; i < 100; i++) {
+    Map values{{{"even", i % 2 == 0 ? "YES" : "NO"}, {"pos", ToBytes({float(i)})}}};
+    MockedDocument doc{values};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // Five closest to 50
+  {
+    params["vec"] = ToBytes({50.0});
+    algo.Init("*=>[KNN 5 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(48, 49, 50, 51, 52));
+  }
+
+  // Five closest to 0
+  {
+    params["vec"] = ToBytes({0.0});
+    algo.Init("*=>[KNN 5 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 2, 3, 4));
+  }
+
+  // Five closest to 20, all even
+  {
+    params["vec"] = ToBytes({20.0});
+    algo.Init("@even:{yes} =>[KNN 5 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(16, 18, 20, 22, 24));
+  }
+
+  // Three closest to 31, all odd
+  {
+    params["vec"] = ToBytes({31.0});
+    algo.Init("@even:{no} =>[KNN 3 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(29, 31, 33));
+  }
+
+  // Two closest to 70.5
+  {
+    params["vec"] = ToBytes({70.5});
+    algo.Init("* =>[KNN 2 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(70, 71));
+  }
+
+  // Two closest to 70.5
+  {
+    params["vec"] = ToBytes({70.5});
+    algo.Init("* =>[KNN 2 @pos $vec as vector_distance]", &params);
+    EXPECT_EQ("vector_distance", algo.GetKnnScoreSortOption()->score_field_alias);
+    SearchResult result = algo.Search(&indices);
+    EXPECT_THAT(result.ids, testing::UnorderedElementsAre(70, 71));
+  }
+}
+
+TEST_F(KnnTest, Simple2D) {
+  // Square:
+  // 3      2
+  //    4
+  // 0      1
+  const pair<float, float> kTestCoords[] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}, {0.5, 0.5}};
+
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 2};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  for (size_t i = 0; i < ABSL_ARRAYSIZE(kTestCoords); i++) {
+    string coords = ToBytes({kTestCoords[i].first, kTestCoords[i].second});
+    MockedDocument doc{Map{{"pos", coords}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // Single center
+  {
+    params["vec"] = ToBytes({0.5, 0.5});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(4));
+  }
+
+  // Lower left
+  {
+    params["vec"] = ToBytes({0, 0});
+    algo.Init("* =>[KNN 4 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 3, 4));
+  }
+
+  // Upper right
+  {
+    params["vec"] = ToBytes({1, 1});
+    algo.Init("* =>[KNN 4 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1, 2, 3, 4));
+  }
+
+  // Request more than there is
+  {
+    params["vec"] = ToBytes({0, 0});
+    algo.Init("* => [KNN 10 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 2, 3, 4));
+  }
+
+  // Test correct order: (0.7, 0.15)
+  {
+    params["vec"] = ToBytes({0.7, 0.15});
+    algo.Init("* => [KNN 10 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::ElementsAre(1, 4, 0, 2, 3));
+  }
+
+  // Test correct order: (0.8, 0.9)
+  {
+    params["vec"] = ToBytes({0.8, 0.9});
+    algo.Init("* => [KNN 10 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::ElementsAre(2, 4, 3, 1, 0));
+  }
+}
+
+TEST_F(KnnTest, Cosine) {
+  // Four arrows, closest cosing distance will be closes by angle
+  // 0 🡢 1 🡣 2 🡠 3 🡡
+  const pair<float, float> kTestCoords[] = {{1, 0}, {0, -1}, {-1, 0}, {0, 1}};
+
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params =
+      SchemaField::VectorParams{false, 2, VectorSimilarity::COSINE};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  for (size_t i = 0; i < ABSL_ARRAYSIZE(kTestCoords); i++) {
+    string coords = ToBytes({kTestCoords[i].first, kTestCoords[i].second});
+    MockedDocument doc{Map{{"pos", coords}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // Point down
+  {
+    params["vec"] = ToBytes({-0.1, -10});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1));
+  }
+
+  // Point left
+  {
+    params["vec"] = ToBytes({-0.1, -0.01});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(2));
+  }
+
+  // Point up
+  {
+    params["vec"] = ToBytes({0, 5});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(3));
+  }
+
+  // Point right
+  {
+    params["vec"] = ToBytes({0.2, 0.05});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0));
+  }
+}
+
+TEST_F(KnnTest, IP) {
+  // Test with normalized unit vectors for IP distance
+  // Using unit vectors pointing in different directions
+  const pair<float, float> kTestCoords[] = {
+      {1.0f, 0.0f}, {0.0f, 1.0f}, {-1.0f, 0.0f}, {0.0f, -1.0f}};
+
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 2, VectorSimilarity::IP};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  for (size_t i = 0; i < ABSL_ARRAYSIZE(kTestCoords); i++) {
+    string coords = ToBytes({kTestCoords[i].first, kTestCoords[i].second});
+    MockedDocument doc{Map{{"pos", coords}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // Query with vector pointing right - should find exact match (highest dot product)
+  {
+    params["vec"] = ToBytes({1.0f, 0.0f});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0));
+  }
+
+  // Query with vector pointing up - should find exact match (highest dot product)
+  {
+    params["vec"] = ToBytes({0.0f, 1.0f});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1));
+  }
+}
+
+TEST_F(KnnTest, AddRemove) {
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 1, VectorSimilarity::L2};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  vector<MockedDocument> documents(10);
+  for (size_t i = 0; i < 10; i++) {
+    documents[i] = Map{{"pos", ToBytes({float(i)})}};
+    indices.Add(i, documents[i]);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // search leftmost 5
+  {
+    params["vec"] = ToBytes({-1.0});
+    algo.Init("* =>[KNN 5 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::ElementsAre(0, 1, 2, 3, 4));
+  }
+
+  // delete leftmost 5
+  for (size_t i = 0; i < 5; i++)
+    indices.Remove(i, documents[i]);
+
+  // search leftmost 5 again
+  {
+    params["vec"] = ToBytes({-1.0});
+    algo.Init("* =>[KNN 5 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::ElementsAre(5, 6, 7, 8, 9));
+  }
+
+  // add removed elements
+  for (size_t i = 0; i < 5; i++)
+    indices.Add(i, documents[i]);
+
+  // repeat first search
+  {
+    params["vec"] = ToBytes({-1.0});
+    algo.Init("* =>[KNN 5 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::ElementsAre(0, 1, 2, 3, 4));
+  }
+}
+
+TEST_F(KnnTest, AutoResize) {
+  // Make sure index resizes automatically even with a small initial capacity
+  const size_t kInitialCapacity = 5;
+
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params =
+      SchemaField::VectorParams{false, 1, VectorSimilarity::L2, kInitialCapacity};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  for (size_t i = 0; i < 100; i++) {
+    MockedDocument doc{Map{{"pos", ToBytes({float(i)})}}};
+    indices.Add(i, doc);
+  }
+
+  EXPECT_EQ(indices.GetAllDocs().size(), 100);
+}
+
+// Seeds the given HNSW index with `n` deterministic random vectors of dim `dim` using
+// the given RNG seed. Returns the owning MockedDocuments so the caller can pass them
+// back to UpdateVectorData after a restore. Used by the serialization/restore tests.
+inline vector<MockedDocument> SeedHnswIndex(HnswVectorIndex& index, size_t n, size_t dim,
+                                            uint32_t rng_seed) {
+  vector<MockedDocument> docs(n);
+  std::mt19937 rng(rng_seed);
+  std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+  for (size_t i = 0; i < n; i++) {
+    vector<float> coords(dim);
+    for (size_t d = 0; d < dim; d++)
+      coords[d] = dist(rng);
+    docs[i] = MockedDocument::Map{{"vec", ToBytes(absl::MakeConstSpan(coords))}};
+    index.Add(i, docs[i], "vec");
+  }
+  return docs;
+}
+
+// Snapshots all nodes from the index under its read lock.
+inline vector<HnswNodeData> SnapshotHnswNodes(const HnswVectorIndex& index) {
+  auto lock = index.GetReadLock();
+  return index.GetNodesRange(0, index.GetNodeCount());
+}
+
+// Parameterized HNSW serialization round-trip test.
+// Parameters: {num_elements, dim, similarity}
+struct HnswSerParam {
+  size_t num_elements;
+  size_t dim;
+  VectorSimilarity sim;
+
+  friend std::ostream& operator<<(std::ostream& os, const HnswSerParam& p) {
+    const char* sim_name[] = {"L2", "IP", "COSINE"};
+    return os << p.num_elements << "el_" << p.dim << "d_" << sim_name[static_cast<int>(p.sim)];
+  }
+};
+
+class HnswSerializationTest : public ::testing::TestWithParam<HnswSerParam> {
+ protected:
+  void SetUp() override {
+    InitTLSearchMR(PMR_NS::get_default_resource());
+  }
+
+  void TearDown() override {
+    InitTLSearchMR(nullptr);
+  }
+};
+
+TEST_P(HnswSerializationTest, RoundTrip) {
+  const auto [num_elements, dim, sim] = GetParam();
+
+  SchemaField::VectorParams params;
+  params.use_hnsw = true;
+  params.dim = dim;
+  params.sim = sim;
+  params.capacity = std::max<size_t>(num_elements, 10);
+  params.hnsw_m = 16;
+  params.hnsw_ef_construction = 200;
+
+  HnswVectorIndex original(params, /*copy_vector=*/true);
+  vector<MockedDocument> docs = SeedHnswIndex(original, num_elements, dim, /*rng_seed=*/42);
+
+  auto metadata = original.GetMetadata();
+  ASSERT_EQ(original.GetNodeCount(), num_elements);
+
+  std::vector<HnswNodeData> nodes = SnapshotHnswNodes(original);
+  ASSERT_EQ(nodes.size(), num_elements);
+
+  // Verify node data integrity
+  for (const auto& node : nodes) {
+    EXPECT_EQ(node.levels_links.size(), static_cast<size_t>(node.level + 1));
+    EXPECT_GT(node.TotalSize(), 0u);
+  }
+
+  // Deserialize into a fresh index
+  HnswVectorIndex restored(params, /*copy_vector=*/true);
+  ASSERT_TRUE(restored.RestoreFromNodes(nodes, metadata));
+
+  // Before UpdateVectorData, all nodes must be marked deleted.
+  // KNN should safely return empty results (no crash from nullptr dereference).
+  if (num_elements > 0) {
+    vector<float> probe(dim, 0.5f);
+    auto pre_results = restored.Knn(probe.data(), 10, std::nullopt);
+    EXPECT_TRUE(pre_results.empty()) << "All nodes should be deleted before UpdateVectorData";
+  }
+
+  for (size_t i = 0; i < num_elements; i++)
+    restored.UpdateVectorData(i, docs[i], "vec");
+
+  auto rm = restored.GetMetadata();
+  EXPECT_EQ(restored.GetNodeCount(), num_elements);
+  EXPECT_EQ(rm.enterpoint_node, metadata.enterpoint_node);
+  EXPECT_EQ(restored.GetMaxLevel(), original.GetMaxLevel());
+
+  // Graph links must be identical
+  std::vector<HnswNodeData> restored_nodes;
+  {
+    auto lock = restored.GetReadLock();
+    restored_nodes = restored.GetNodesRange(0, restored.GetNodeCount());
+  }
+  ASSERT_EQ(restored_nodes.size(), nodes.size());
+  for (size_t i = 0; i < nodes.size(); i++) {
+    EXPECT_EQ(restored_nodes[i].internal_id, nodes[i].internal_id);
+    EXPECT_EQ(restored_nodes[i].global_id, nodes[i].global_id);
+    EXPECT_EQ(restored_nodes[i].level, nodes[i].level);
+    ASSERT_EQ(restored_nodes[i].levels_links.size(), nodes[i].levels_links.size());
+    for (size_t lvl = 0; lvl < nodes[i].levels_links.size(); lvl++)
+      EXPECT_EQ(restored_nodes[i].levels_links[lvl], nodes[i].levels_links[lvl]);
+  }
+
+  if (num_elements == 0)
+    return;
+
+  // KNN results must match for several queries
+  auto compare_knn = [&](vector<float> query, size_t k) {
+    auto orig = original.Knn(query.data(), k, std::nullopt);
+    auto rest = restored.Knn(query.data(), k, std::nullopt);
+    ASSERT_EQ(orig.size(), rest.size());
+    for (size_t j = 0; j < orig.size(); j++) {
+      EXPECT_EQ(orig[j].second, rest[j].second);
+      EXPECT_NEAR(orig[j].first, rest[j].first, 1e-5);
+    }
+  };
+
+  size_t k = std::min<size_t>(num_elements, 10);
+  compare_knn(vector<float>(dim, 0.0f), k);
+  compare_knn(vector<float>(dim, 0.5f), k);
+  compare_knn(vector<float>(dim, 1.0f), k);
+
+  // Filtered KNN must also match
+  vector<GlobalDocId> allowed;
+  for (size_t i = 0; i < num_elements; i += 2)
+    allowed.push_back(i);
+  size_t fk = std::min<size_t>(allowed.size(), 5);
+  vector<float> q(dim, 0.5f);
+  auto orig_f = original.Knn(q.data(), fk, std::nullopt, allowed);
+  auto rest_f = restored.Knn(q.data(), fk, std::nullopt, allowed);
+  ASSERT_EQ(orig_f.size(), rest_f.size());
+  for (size_t i = 0; i < orig_f.size(); i++) {
+    EXPECT_EQ(orig_f[i].second, rest_f[i].second);
+    EXPECT_NEAR(orig_f[i].first, rest_f[i].first, 1e-5);
+  }
+}
+
+// Regression for the save-side race where an Add raises maxlevel between metadata
+// capture and node serialization (see RestoreFromNodes for the rationale). Simulated
+// by forging metadata with a low-level entry point against a multi-level node set;
+// expects maxlevel_ to clamp to the entry point's level rather than max(node.level).
+TEST(HnswRestoreInvariant, MaxLevelClampedToEntryPointLevel) {
+  constexpr size_t kDim = 8;
+  constexpr size_t kN = 100;
+
+  InitTLSearchMR(PMR_NS::get_default_resource());
+  absl::Cleanup cleanup = [] { InitTLSearchMR(nullptr); };
+
+  SchemaField::VectorParams params;
+  params.use_hnsw = true;
+  params.dim = kDim;
+  params.sim = VectorSimilarity::L2;
+  params.capacity = kN;
+  params.hnsw_m = 16;
+  params.hnsw_ef_construction = 200;
+
+  HnswVectorIndex original(params, /*copy_vector=*/true);
+  SeedHnswIndex(original, kN, kDim, /*rng_seed=*/42);
+  std::vector<HnswNodeData> nodes = SnapshotHnswNodes(original);
+
+  int global_max_level = -1;
+  std::optional<uint32_t> low_level_internal_id;
+  for (const auto& n : nodes) {
+    global_max_level = std::max(global_max_level, n.level);
+    if (!low_level_internal_id && n.level == 0)
+      low_level_internal_id = n.internal_id;
+  }
+  ASSERT_GT(global_max_level, 0) << "test setup: need a multi-level graph";
+  ASSERT_TRUE(low_level_internal_id.has_value()) << "test setup: need a level-0 node";
+
+  HnswIndexMetadata forged_metadata{.enterpoint_node = *low_level_internal_id};
+
+  HnswVectorIndex restored(params, /*copy_vector=*/true);
+  ASSERT_TRUE(restored.RestoreFromNodes(nodes, forged_metadata));
+
+  EXPECT_EQ(restored.GetMaxLevel(), 0)
+      << "maxlevel_ must equal entry-point level; got " << restored.GetMaxLevel()
+      << " while node set max level=" << global_max_level;
+}
+
+// Malformed/mismatched metadata (entry point not in serialized node set) must
+// fail restoration gracefully — returning false — instead of SIGABRT'ing via
+// CHECK. Callers then rebuild the index from the keyspace.
+TEST(HnswRestoreInvariant, MissingEntrypointFailsGracefully) {
+  constexpr size_t kDim = 4;
+  constexpr size_t kN = 10;
+
+  InitTLSearchMR(PMR_NS::get_default_resource());
+  absl::Cleanup cleanup = [] { InitTLSearchMR(nullptr); };
+
+  SchemaField::VectorParams params;
+  params.use_hnsw = true;
+  params.dim = kDim;
+  params.sim = VectorSimilarity::L2;
+  params.capacity = kN;
+  params.hnsw_m = 16;
+  params.hnsw_ef_construction = 200;
+
+  HnswVectorIndex original(params, /*copy_vector=*/true);
+  SeedHnswIndex(original, kN, kDim, /*rng_seed=*/7);
+  std::vector<HnswNodeData> nodes = SnapshotHnswNodes(original);
+
+  HnswIndexMetadata bad_metadata{.enterpoint_node = 999999};  // well past any real id
+  HnswVectorIndex restored(params, /*copy_vector=*/true);
+  EXPECT_FALSE(restored.RestoreFromNodes(nodes, bad_metadata));
+}
+
+// Regression: in borrowed mode (copy_vector=false), Remove marks the node deleted
+// but hnswlib still traverses it and dereferences its data pointer.  If the external
+// data is freed (as happens after DEL), the pointer dangles.  The fix in DoRemove
+// replaces it with stub_vector_.  This test catches the use-after-free under ASAN;
+// without ASAN it exercises the code path but freed memory may still be readable.
+TEST(HnswBorrowedMode, DanglingPointerAfterRemove) {
+  constexpr size_t kDim = 256;
+  constexpr size_t kN = 50;
+
+  InitTLSearchMR(PMR_NS::get_default_resource());
+  absl::Cleanup cleanup = [] { InitTLSearchMR(nullptr); };
+
+  SchemaField::VectorParams params;
+  params.use_hnsw = true;
+  params.dim = kDim;
+  params.sim = VectorSimilarity::L2;
+  params.capacity = kN * 2;
+  params.hnsw_m = 16;
+  params.hnsw_ef_construction = 200;
+  HnswVectorIndex index(params, /*copy_vector=*/false);
+
+  struct BorrowedDoc : public DocumentAccessor {
+    const char* data;
+    explicit BorrowedDoc(const char* d) : data(d) {
+    }
+    std::optional<VectorInfo> GetVector(string_view, size_t, VectorDataType) const override {
+      return BorrowedFtVector{data};
+    }
+    std::optional<StringList> GetStrings(string_view) const override {
+      return std::nullopt;
+    }
+    std::optional<StringList> GetTags(string_view) const override {
+      return std::nullopt;
+    }
+    std::optional<NumsList> GetNumbers(string_view) const override {
+      return std::nullopt;
+    }
+  };
+
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+  auto MakeBuf = [&] {
+    auto buf = std::make_unique<float[]>(kDim);
+    for (size_t d = 0; d < kDim; d++)
+      buf[d] = dist(rng);
+    return buf;
+  };
+
+  // Add nodes — graph stores pointers into these buffers.
+  std::vector<std::unique_ptr<float[]>> bufs(kN);
+  for (size_t i = 0; i < kN; i++) {
+    bufs[i] = MakeBuf();
+    BorrowedDoc doc(reinterpret_cast<const char*>(bufs[i].get()));
+    index.Add(i, doc, "vec");
+  }
+
+  // Remove + free first 10 (simulates DEL freeing PrimeValue).
+  for (size_t i = 0; i < 10; i++) {
+    index.Remove(i);
+    bufs[i].reset();
+  }
+
+  // Add new nodes — addPoint traverses deleted nodes with freed data.
+  for (size_t i = kN; i < kN + 10; i++) {
+    bufs.push_back(MakeBuf());
+    BorrowedDoc doc(reinterpret_cast<const char*>(bufs.back().get()));
+    index.Add(i, doc, "vec");
+  }
+
+  vector<float> query(kDim, 0.0f);
+  auto results = index.Knn(query.data(), 5, std::nullopt);
+  EXPECT_GT(results.size(), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(HnswSer, HnswSerializationTest,
+                         testing::Values(HnswSerParam{0, 2, VectorSimilarity::L2},
+                                         HnswSerParam{10, 2, VectorSimilarity::L2},
+                                         HnswSerParam{1000, 4, VectorSimilarity::L2},
+                                         HnswSerParam{10000, 8, VectorSimilarity::L2},
+                                         HnswSerParam{10, 3, VectorSimilarity::COSINE},
+                                         HnswSerParam{1000, 4, VectorSimilarity::COSINE},
+                                         HnswSerParam{10, 2, VectorSimilarity::IP},
+                                         HnswSerParam{1000, 4, VectorSimilarity::IP}),
+                         [](const testing::TestParamInfo<HnswSerParam>& info) {
+                           std::ostringstream name;
+                           name << info.param;
+                           return name.str();
+                         });
+
+class HnswSubsetKnnTest : public ::testing::TestWithParam<VectorSimilarity> {
+ protected:
+  void SetUp() override {
+    InitTLSearchMR(PMR_NS::get_default_resource());
+  }
+
+  void TearDown() override {
+    InitTLSearchMR(nullptr);
+  }
+
+  // Helper to create a simple index with vectors on a line for easy verification
+  unique_ptr<HnswVectorIndex> CreateSimple1DIndex(size_t num_elements, VectorSimilarity sim) {
+    SchemaField::VectorParams params;
+    params.use_hnsw = true;
+    params.dim = 1;
+    params.sim = sim;
+    params.capacity = std::max<size_t>(num_elements, 10);
+    params.hnsw_m = 16;
+    params.hnsw_ef_construction = 200;
+
+    auto index = make_unique<HnswVectorIndex>(params, /*copy_vector=*/true);
+
+    for (size_t i = 0; i < num_elements; i++) {
+      vector<float> coords = {static_cast<float>(i)};
+      auto doc = MockedDocument::Map{{"vec", ToBytes(absl::MakeConstSpan(coords))}};
+      index->Add(i, MockedDocument(doc), "vec");
+    }
+
+    return index;
+  }
+
+  // Helper to create a 2D index with unit-circle vectors, for COSINE similarity testing.
+  // Vector i is placed at angle i * (2π / num_elements), giving meaningful cosine distances.
+  unique_ptr<HnswVectorIndex> CreateCircle2DIndex(size_t num_elements, VectorSimilarity sim) {
+    SchemaField::VectorParams params;
+    params.use_hnsw = true;
+    params.dim = 2;
+    params.sim = sim;
+    params.capacity = std::max<size_t>(num_elements, 10);
+    params.hnsw_m = 16;
+    params.hnsw_ef_construction = 200;
+
+    auto index = make_unique<HnswVectorIndex>(params, /*copy_vector=*/true);
+
+    const float step = 2.0f * static_cast<float>(acos(-1.0)) / static_cast<float>(num_elements);
+    for (size_t i = 0; i < num_elements; i++) {
+      float angle = step * static_cast<float>(i);
+      vector<float> coords = {cosf(angle), sinf(angle)};
+      auto doc = MockedDocument::Map{{"vec", ToBytes(absl::MakeConstSpan(coords))}};
+      index->Add(i, MockedDocument(doc), "vec");
+    }
+
+    return index;
+  }
+};
+
+TEST_P(HnswSubsetKnnTest, CorrectResults) {
+  // Test that SubsetKnn returns correct top-k from a subset
+  auto sim = GetParam();
+  auto index = CreateSimple1DIndex(100, sim);
+
+  vector<float> query = {50.0f};
+  vector<GlobalDocId> subset;
+
+  // Create subset: only even numbers from 40 to 60
+  for (size_t i = 40; i <= 60; i += 2) {
+    subset.push_back(i);
+  }
+
+  // Ask for top 5
+  auto results = index->SubsetKnn(query.data(), 5, subset);
+
+  // Should get exactly 5 results
+  ASSERT_EQ(results.size(), 5u);
+
+  // All results should be from the subset
+  for (const auto& [dist, id] : results) {
+    EXPECT_TRUE(std::find(subset.begin(), subset.end(), id) != subset.end())
+        << "Result ID " << id << " not in subset";
+  }
+
+  // For L2 similarity, verify the closest point is 50
+  if (sim == VectorSimilarity::L2) {
+    bool found_50 = false;
+    for (const auto& [dist, id] : results) {
+      if (id == 50) {
+        found_50 = true;
+        break;
+      }
+    }
+    EXPECT_TRUE(found_50) << "For L2, point 50 should be in top 5 closest to query {50}";
+  }
+}
+
+TEST_P(HnswSubsetKnnTest, EmptySubset) {
+  // Test edge case: empty subset
+  auto sim = GetParam();
+  auto index = CreateSimple1DIndex(10, sim);
+
+  vector<float> query = {5.0f};
+  vector<GlobalDocId> empty_subset;
+
+  auto results = index->SubsetKnn(query.data(), 5, empty_subset);
+  EXPECT_TRUE(results.empty()) << "SubsetKnn with empty subset should return empty results";
+}
+
+TEST_P(HnswSubsetKnnTest, KEqualsZero) {
+  // Test edge case: k = 0
+  auto sim = GetParam();
+  auto index = CreateSimple1DIndex(10, sim);
+
+  vector<float> query = {5.0f};
+  vector<GlobalDocId> subset = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+
+  auto results = index->SubsetKnn(query.data(), 0, subset);
+  EXPECT_TRUE(results.empty()) << "SubsetKnn with k=0 should return empty results";
+}
+
+TEST_P(HnswSubsetKnnTest, KGreaterThanSubsetSize) {
+  // Test edge case: k > number of valid documents in subset
+  auto sim = GetParam();
+  auto index = CreateSimple1DIndex(10, sim);
+
+  vector<float> query = {5.0f};
+  vector<GlobalDocId> subset = {1, 3, 5};  // Only 3 elements
+
+  auto results = index->SubsetKnn(query.data(), 10, subset);  // Ask for 10
+  EXPECT_EQ(results.size(), 3u) << "SubsetKnn should return at most subset.size() results";
+
+  // Verify all 3 are returned
+  vector<GlobalDocId> result_ids;
+  for (const auto& [dist, id] : results) {
+    result_ids.push_back(id);
+  }
+  EXPECT_THAT(result_ids, testing::UnorderedElementsAre(1, 3, 5));
+}
+
+TEST_P(HnswSubsetKnnTest, NonExistentIds) {
+  // Test that non-existent IDs in subset are gracefully ignored
+  auto sim = GetParam();
+  auto index = CreateSimple1DIndex(10, sim);
+
+  vector<float> query = {5.0f};
+  // Mix of valid (0-9) and invalid (100-105) IDs
+  vector<GlobalDocId> subset = {100, 4, 101, 5, 102, 6, 103, 104, 105};
+
+  auto results = index->SubsetKnn(query.data(), 3, subset);
+  EXPECT_EQ(results.size(), 3u);
+
+  // Should only return valid IDs: 5, 4, 6 (closest to 5)
+  vector<GlobalDocId> result_ids;
+  for (const auto& [dist, id] : results) {
+    result_ids.push_back(id);
+  }
+  EXPECT_THAT(result_ids, testing::UnorderedElementsAre(4, 5, 6));
+}
+
+TEST_P(HnswSubsetKnnTest, AllDeletedDocuments) {
+  // Test edge case: all documents in subset are marked deleted
+  auto sim = GetParam();
+
+  SchemaField::VectorParams params;
+  params.use_hnsw = true;
+  params.dim = 1;
+  params.sim = sim;
+  params.capacity = 10;
+  params.hnsw_m = 16;
+  params.hnsw_ef_construction = 200;
+
+  HnswVectorIndex index(params, /*copy_vector=*/true);
+
+  // Add and then remove documents
+  vector<MockedDocument> docs;
+  for (size_t i = 0; i < 5; i++) {
+    vector<float> coords = {static_cast<float>(i)};
+    docs.push_back(
+        MockedDocument(MockedDocument::Map{{"vec", ToBytes(absl::MakeConstSpan(coords))}}));
+    index.Add(i, docs[i], "vec");
+  }
+
+  // Delete all documents
+  for (size_t i = 0; i < 5; i++) {
+    index.Remove(i);
+  }
+
+  vector<float> query = {2.5f};
+  vector<GlobalDocId> subset = {0, 1, 2, 3, 4};
+
+  auto results = index.SubsetKnn(query.data(), 3, subset);
+  EXPECT_TRUE(results.empty()) << "SubsetKnn should return empty when all docs are deleted";
+}
+
+TEST_P(HnswSubsetKnnTest, MixedDeletedAndValidDocs) {
+  // Test with a mix of deleted and valid documents
+  auto sim = GetParam();
+
+  SchemaField::VectorParams params;
+  params.use_hnsw = true;
+  params.dim = 1;
+  params.sim = sim;
+  params.capacity = 10;
+  params.hnsw_m = 16;
+  params.hnsw_ef_construction = 200;
+
+  HnswVectorIndex index(params, /*copy_vector=*/true);
+
+  // Add documents
+  vector<MockedDocument> docs;
+  for (size_t i = 0; i < 10; i++) {
+    vector<float> coords = {static_cast<float>(i)};
+    docs.push_back(
+        MockedDocument(MockedDocument::Map{{"vec", ToBytes(absl::MakeConstSpan(coords))}}));
+    index.Add(i, docs[i], "vec");
+  }
+
+  // Delete even documents
+  for (size_t i = 0; i < 10; i += 2) {
+    index.Remove(i);
+  }
+
+  vector<float> query = {5.0f};
+  // Subset includes both deleted (even) and valid (odd) docs
+  vector<GlobalDocId> subset = {2, 3, 4, 5, 6, 7, 8};
+
+  auto results = index.SubsetKnn(query.data(), 3, subset);
+  EXPECT_EQ(results.size(), 3u);
+
+  // Should only return odd (non-deleted) IDs: 5, 3, 7 (closest to 5)
+  vector<GlobalDocId> result_ids;
+  for (const auto& [dist, id] : results) {
+    result_ids.push_back(id);
+  }
+  EXPECT_THAT(result_ids, testing::UnorderedElementsAre(3, 5, 7));
+}
+
+TEST_P(HnswSubsetKnnTest, CompareWithFilteredKnn) {
+  // Integration test: verify SubsetKnn produces similar results to filtered Knn
+  // SubsetKnn uses brute-force exact search, while Knn uses HNSW approximate search
+  // So results may differ slightly, but should have significant overlap
+  constexpr double kMinOverlapRatio = 0.7;  // 70% minimum overlap threshold
+
+  auto sim = GetParam();
+
+  // COSINE similarity is undefined for 1D positive vectors (all share the same direction,
+  // so all cosine distances equal 0). Use 2D unit-circle vectors instead, where element i
+  // is at angle i * 2π/100, giving each pair a distinct, meaningful cosine distance.
+  unique_ptr<HnswVectorIndex> index;
+  vector<float> query;
+  if (sim == VectorSimilarity::COSINE) {
+    constexpr size_t kNumElements = 100;
+    index = CreateCircle2DIndex(kNumElements, sim);
+    const float step = 2.0f * static_cast<float>(acos(-1.0)) / static_cast<float>(kNumElements);
+    float angle = step * 50.0f;
+    query = {cosf(angle), sinf(angle)};
+  } else {
+    index = CreateSimple1DIndex(100, sim);
+    query = {50.0f};
+  }
+
+  vector<GlobalDocId> subset;
+
+  // Create a small subset (well below typical 8192 threshold)
+  for (size_t i = 40; i <= 60; i++) {
+    subset.push_back(i);
+  }
+
+  size_t k = 10;
+
+  // Get results from SubsetKnn (exact brute-force)
+  auto subset_results = index->SubsetKnn(query.data(), k, subset);
+
+  // Get results from regular filtered Knn (HNSW approximate)
+  auto knn_results = index->Knn(query.data(), k, std::nullopt, subset);
+
+  // Both should return k results (or fewer if subset is smaller)
+  EXPECT_LE(subset_results.size(), k);
+  EXPECT_LE(knn_results.size(), k);
+
+  // Extract IDs from both
+  std::set<GlobalDocId> subset_ids;
+  for (const auto& [dist, id] : subset_results) {
+    subset_ids.insert(id);
+  }
+
+  std::set<GlobalDocId> knn_ids;
+  for (const auto& [dist, id] : knn_results) {
+    knn_ids.insert(id);
+  }
+
+  // Count overlap - since HNSW is approximate, we expect good but not perfect overlap
+  size_t overlap = 0;
+  for (const auto& id : subset_ids) {
+    if (knn_ids.count(id) > 0) {
+      overlap++;
+    }
+  }
+
+  // Expect at least kMinOverlapRatio overlap (HNSW is approximate, so some difference is expected)
+  size_t min_overlap =
+      static_cast<size_t>(std::min(subset_ids.size(), knn_ids.size()) * kMinOverlapRatio);
+  EXPECT_GE(overlap, min_overlap) << "Expected at least " << min_overlap
+                                  << " overlapping results, got " << overlap;
+}
+
+INSTANTIATE_TEST_SUITE_P(SubsetKnnSimilarities, HnswSubsetKnnTest,
+                         testing::Values(VectorSimilarity::L2, VectorSimilarity::COSINE,
+                                         VectorSimilarity::IP),
+                         [](const testing::TestParamInfo<VectorSimilarity>& info) {
+                           switch (info.param) {
+                             case VectorSimilarity::L2:
+                               return "L2";
+                             case VectorSimilarity::COSINE:
+                               return "COSINE";
+                             case VectorSimilarity::IP:
+                               return "IP";
+                             default:
+                               return "Unknown";
+                           }
+                         });
+
+// Tests for HnswVectorIndex::RangeQuery
+class HnswRangeQueryTest : public ::testing::TestWithParam<VectorSimilarity> {
+ protected:
+  void SetUp() override {
+    InitTLSearchMR(PMR_NS::get_default_resource());
+  }
+
+  void TearDown() override {
+    InitTLSearchMR(nullptr);
+  }
+
+  // 1-D index: doc i has vector {float(i)}, GlobalDocId = i
+  unique_ptr<HnswVectorIndex> CreateSimple1DIndex(size_t num_elements) {
+    SchemaField::VectorParams params;
+    params.use_hnsw = true;
+    params.dim = 1;
+    params.sim = VectorSimilarity::L2;
+    params.capacity = std::max<size_t>(num_elements, 10);
+    params.hnsw_m = 16;
+    params.hnsw_ef_construction = 200;
+
+    auto index = make_unique<HnswVectorIndex>(params, /*copy_vector=*/true);
+    for (size_t i = 0; i < num_elements; i++) {
+      vector<float> coords = {static_cast<float>(i)};
+      index->Add(i,
+                 MockedDocument(MockedDocument::Map{{"vec", ToBytes(absl::MakeConstSpan(coords))}}),
+                 "vec");
+    }
+    return index;
+  }
+};
+
+TEST_P(HnswRangeQueryTest, BasicRange) {
+  // 10 docs at positions 0..9. Query at 5.0 with radius 1.5 → docs 4,5,6 (dist 1.0,0.0,1.0)
+  (void)GetParam();  // L2 only for 1-D
+  auto index = CreateSimple1DIndex(10);
+
+  vector<float> query = {5.0f};
+  auto results = index->RangeQuery(query.data(), 1.5f, std::nullopt);
+
+  set<GlobalDocId> ids;
+  for (const auto& [dist, id] : results)
+    ids.insert(id);
+
+  EXPECT_THAT(ids, testing::UnorderedElementsAre(4, 5, 6));
+}
+
+TEST_P(HnswRangeQueryTest, ExactMatch) {
+  // Radius 0: only the doc at exact position
+  (void)GetParam();
+  auto index = CreateSimple1DIndex(10);
+
+  vector<float> query = {3.0f};
+  auto results = index->RangeQuery(query.data(), 0.0f, std::nullopt);
+
+  ASSERT_EQ(results.size(), 1u);
+  EXPECT_EQ(results[0].second, GlobalDocId{3});
+  EXPECT_FLOAT_EQ(results[0].first, 0.0f);
+}
+
+TEST_P(HnswRangeQueryTest, LargeRadiusReturnsAll) {
+  (void)GetParam();
+  auto index = CreateSimple1DIndex(20);
+
+  vector<float> query = {10.0f};
+  auto results = index->RangeQuery(query.data(), 1000.0f, std::nullopt);
+
+  EXPECT_EQ(results.size(), 20u);
+}
+
+TEST_P(HnswRangeQueryTest, EmptyResultOutsideRadius) {
+  (void)GetParam();
+  auto index = CreateSimple1DIndex(10);
+
+  vector<float> query = {5.5f};
+  auto results = index->RangeQuery(query.data(), 0.1f, std::nullopt);
+
+  EXPECT_TRUE(results.empty());
+}
+
+TEST_P(HnswRangeQueryTest, EmptyIndex) {
+  (void)GetParam();
+  auto index = CreateSimple1DIndex(0);
+
+  vector<float> query = {0.0f};
+  auto results = index->RangeQuery(query.data(), 100.0f, std::nullopt);
+
+  EXPECT_TRUE(results.empty());
+}
+
+TEST_P(HnswRangeQueryTest, DistancesCorrect) {
+  // Verify returned distances match actual L2 distances
+  (void)GetParam();
+  auto index = CreateSimple1DIndex(10);
+
+  vector<float> query = {5.0f};
+  auto results = index->RangeQuery(query.data(), 2.0f, std::nullopt);  // docs 3,4,5,6,7
+
+  EXPECT_EQ(results.size(), 5u);
+  for (const auto& [dist, id] : results) {
+    float expected = std::abs(static_cast<float>(id) - 5.0f);
+    // L2Distance returns sqrt(sum of squares); for 1-D: sqrt((a-b)²) = |a-b|
+    EXPECT_FLOAT_EQ(dist, expected);
+  }
+}
+
+TEST_P(HnswRangeQueryTest, DeletedDocNotReturned) {
+  (void)GetParam();
+  auto index = CreateSimple1DIndex(10);
+
+  // Remove doc 5 (at position 5.0, distance 0 from query)
+  index->Remove(5);
+
+  vector<float> query = {5.0f};
+  auto results = index->RangeQuery(query.data(), 1.5f, std::nullopt);
+
+  set<GlobalDocId> ids;
+  for (const auto& [dist, id] : results)
+    ids.insert(id);
+
+  EXPECT_THAT(ids, testing::UnorderedElementsAre(4, 6));
+  EXPECT_THAT(ids, testing::Not(testing::Contains(GlobalDocId{5})));
+}
+
+TEST_P(HnswRangeQueryTest, ConsistentWithBruteForce) {
+  // Compare RangeQuery results against brute-force SubsetKnn-based check
+  (void)GetParam();
+  const size_t n = 50;
+  auto index = CreateSimple1DIndex(n);
+
+  vector<float> query = {25.0f};
+  float radius = 5.0f;
+
+  auto results = index->RangeQuery(query.data(), radius, std::nullopt);
+
+  // Brute force: collect all docs within radius.
+  // L2Distance returns |a-b| for 1-D vectors (actual Euclidean, not squared).
+  set<GlobalDocId> expected;
+  for (size_t i = 0; i < n; i++) {
+    float dist = std::abs(static_cast<float>(i) - 25.0f);
+    if (dist <= radius)
+      expected.insert(i);
+  }
+
+  set<GlobalDocId> got;
+  for (const auto& [dist, id] : results)
+    got.insert(id);
+
+  EXPECT_EQ(got, expected);
+}
+
+TEST_P(HnswRangeQueryTest, EpsilonDoesNotReturnOutOfRadiusDocs) {
+  (void)GetParam();
+  auto index = CreateSimple1DIndex(20);
+
+  vector<float> query = {5.0f};
+  float radius = 1.5f;
+  auto results = index->RangeQuery(query.data(), radius, 1000.0);
+
+  for (const auto& [dist, id] : results) {
+    EXPECT_LE(dist, radius) << id;
+  }
+}
+
+TEST_P(HnswRangeQueryTest, RangeMatchesBruteForceAcrossQueries) {
+  // Sweep several queries/radii; range search must return EXACTLY the brute-force in-radius set
+  // (full recall + nothing out of radius). This guards the dynamic-range boundary update against a
+  // regression that drops in-radius docs. NOTE: on a 1-D L2 line the greedy descent always lands on
+  // the nearest doc, so the phase-2 entry point is within radius whenever any in-radius doc exists
+  // -- there the boundary clamp is provably equivalent. A truly clamp-sensitive case needs >=2-D;
+  // this test still guards completeness/soundness of the boundary logic on the available fixture.
+  (void)GetParam();
+  const size_t n = 100;
+  auto index = CreateSimple1DIndex(n);
+
+  for (float center : {12.0f, 50.0f, 87.0f}) {
+    for (float radius : {0.5f, 2.0f, 7.5f}) {
+      vector<float> query = {center};
+      auto results = index->RangeQuery(query.data(), radius, std::nullopt);
+
+      set<GlobalDocId> expected;
+      for (size_t i = 0; i < n; i++) {
+        if (std::abs(static_cast<float>(i) - center) <= radius)
+          expected.insert(i);
+      }
+      set<GlobalDocId> got;
+      for (const auto& [dist, id] : results)
+        got.insert(id);
+
+      EXPECT_EQ(got, expected) << "center=" << center << " radius=" << radius;
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(HnswRangeL2, HnswRangeQueryTest, testing::Values(VectorSimilarity::L2),
+                         [](const testing::TestParamInfo<VectorSimilarity>&) { return "L2"; });
+
+TEST_F(SearchTest, GeoSearch) {
+  auto schema = MakeSimpleSchema({{"name", SchemaField::TEXT}, {"location", SchemaField::GEO}});
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  indices.Add(0, MockedDocument(Map{{"name", "Mountain View"}, {"location", "-122.08, 37.386"}}));
+  indices.Add(1, MockedDocument(Map{{"name", "Palo Alto"}, {"location", "-122.143, 37.444"}}));
+  indices.Add(2, MockedDocument(Map{{"name", "San Jose"}, {"location", "-121.886, 37.338"}}));
+  indices.Add(3, MockedDocument(Map{{"name", "San Francisco"}, {"location", "-122.419, 37.774"}}));
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // Search around Mount View 30 miles - San Francisco not included
+  {
+    algo.Init("@location:[-122.083 37.386 30 mi]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 2));
+  }
+
+  // Search around Mount View 50 miles - all points included
+  {
+    algo.Init("@location:[-122.083 37.386 50 mi]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 2, 3));
+  }
+
+  // Return all indexes
+  {
+    algo.Init("@location:*", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 2, 3));
+  }
+
+  // Search around Mount View 50 miles - all points included and filter on prefix
+  {
+    algo.Init("San* @location:[-122.083 37.386 50 mi]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(2, 3));
+  }
+
+  // Add duplicate point of San Francisco and search again to include this point also
+  {
+    indices.Add(4,
+                MockedDocument(Map{{"name", "San Francisco"}, {"location", "-122.419, 37.774"}}));
+    algo.Init("San* @location:[-122.083 37.386 50 mi]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(2, 3, 4));
+  }
+
+  // Remove first index of San Francisco (id = 3) and search
+  {
+    indices.Remove(
+        3, MockedDocument(Map{{"name", "San Francisco"}, {"location", "-122.419, 37.774"}}));
+    algo.Init("San* @location:[-122.083 37.386 50 mi]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(2, 4));
+  }
+}
+
+TEST_F(SearchTest, VectorDistanceBasic) {
+  // Test basic vector distance calculations
+  std::vector<float> vec1 = {1.0f, 2.0f, 3.0f};
+  std::vector<float> vec2 = {4.0f, 5.0f, 6.0f};
+
+  // Test L2 distance
+  float l2_dist = VectorDistance(vec1.data(), vec2.data(), 3, VectorSimilarity::L2);
+  EXPECT_GT(l2_dist, 0.0f);
+  EXPECT_LT(l2_dist, 10.0f);  // Should be reasonable value
+
+  // Test Cosine distance
+  float cos_dist = VectorDistance(vec1.data(), vec2.data(), 3, VectorSimilarity::COSINE);
+  EXPECT_GE(cos_dist, 0.0f);
+  EXPECT_LE(cos_dist, 2.0f);  // Cosine distance range
+
+  // Test IP distance
+  float ip_dist = VectorDistance(vec1.data(), vec2.data(), 3, VectorSimilarity::IP);
+  // IP distance can be negative for non-normalized vectors
+  EXPECT_NE(ip_dist, 0.0f);  // Should be non-zero for different vectors
+
+  // Test identical vectors
+  float l2_same = VectorDistance(vec1.data(), vec1.data(), 3, VectorSimilarity::L2);
+  EXPECT_NEAR(l2_same, 0.0f, 1e-6);
+
+  float cos_same = VectorDistance(vec1.data(), vec1.data(), 3, VectorSimilarity::COSINE);
+  EXPECT_NEAR(cos_same, 0.0f, 1e-6);
+
+  float ip_same = VectorDistance(vec1.data(), vec1.data(), 3, VectorSimilarity::IP);
+  // For identical vectors: IP = 1 - dot_product(v, v) = 1 - ||v||^2
+  // For vec1 = {1, 2, 3}: ||v||^2 = 1 + 4 + 9 = 14, so IP = 1 - 14 = -13
+  EXPECT_LT(ip_same, 0.0f);  // Should be negative for non-normalized vectors
+}
+
+TEST_F(SearchTest, VectorDistanceTypedDtypes) {
+  EXPECT_FLOAT_EQ(HalfToFloat(0x3C00), 1.0f);
+  EXPECT_FLOAT_EQ(HalfToFloat(0x4000), 2.0f);
+  EXPECT_FLOAT_EQ(HalfToFloat(0xC000), -2.0f);
+  EXPECT_FLOAT_EQ(HalfToFloat(0x0000), 0.0f);
+  EXPECT_FLOAT_EQ(HalfToFloat(0x4200), 3.0f);
+  EXPECT_FLOAT_EQ(Bf16ToFloat(0x3F80), 1.0f);
+  EXPECT_FLOAT_EQ(Bf16ToFloat(0x4000), 2.0f);
+  EXPECT_FLOAT_EQ(Bf16ToFloat(0x40C0), 6.0f);
+
+  // Encoders (float -> half), exact for representable values and round-trip.
+  EXPECT_EQ(FloatToHalf(1.0f), 0x3C00);
+  EXPECT_EQ(FloatToHalf(-2.0f), 0xC000);
+  EXPECT_EQ(FloatToBf16(1.0f), 0x3F80);
+  for (float x : {0.0f, 1.0f, -3.5f, 42.0f, 0.25f})
+    EXPECT_FLOAT_EQ(HalfToFloat(FloatToHalf(x)), x);
+
+  // Every dtype holding {1,2,3} vs {4,5,6} must match the float32 reference under all metrics
+  // (integers 1..6 are exactly representable in all six dtypes).
+  const std::vector<float> f1 = {1.0f, 2.0f, 3.0f};
+  const std::vector<float> f2 = {4.0f, 5.0f, 6.0f};
+  auto check = [&](const void* a, const void* b, VectorDataType dt) {
+    for (auto sim : {VectorSimilarity::L2, VectorSimilarity::IP, VectorSimilarity::COSINE}) {
+      float ref = VectorDistance(f1.data(), f2.data(), 3, sim);
+      float got = VectorDistance(a, b, 3, sim, dt);
+      EXPECT_NEAR(got, ref, 1e-4) << "dtype=" << VectorDataTypeToString(dt);
+    }
+  };
+
+  const int8_t i8a[3] = {1, 2, 3}, i8b[3] = {4, 5, 6};
+  const uint8_t u8a[3] = {1, 2, 3}, u8b[3] = {4, 5, 6};
+  const float f32a[3] = {1, 2, 3}, f32b[3] = {4, 5, 6};
+  const double f64a[3] = {1, 2, 3}, f64b[3] = {4, 5, 6};
+  const uint16_t f16a[3] = {0x3C00, 0x4000, 0x4200}, f16b[3] = {0x4400, 0x4500, 0x4600};
+  const uint16_t bf16a[3] = {0x3F80, 0x4000, 0x4040}, bf16b[3] = {0x4080, 0x40A0, 0x40C0};
+
+  check(i8a, i8b, VectorDataType::INT8);
+  check(u8a, u8b, VectorDataType::UINT8);
+  check(f32a, f32b, VectorDataType::FLOAT32);
+  check(f64a, f64b, VectorDataType::FLOAT64);
+  check(f16a, f16b, VectorDataType::FLOAT16);
+  check(bf16a, bf16b, VectorDataType::BFLOAT16);
+}
+
+TEST_F(SearchTest, StubOnesVectorCosineWellDefined) {
+  // The HNSW deleted-node stub is EncodeOnesVector(...). Under COSINE it must have a nonzero norm,
+  // otherwise the distance degenerates to 0 (= maximally close) and biases traversal toward
+  // deleted nodes. Regresses for FLOAT32/BFLOAT16/FLOAT64 if the stub is a raw 0x01 byte fill,
+  // whose squared magnitude underflows the accumulator to zero.
+  const size_t dim = 3;
+  const float kExpected = 1.0f - 1.0f / std::sqrt(3.0f);  // cosine([1,0,0], [1,1,1])
+
+  auto check = [&](VectorDataType dt, const void* query) {
+    std::vector<std::byte> ones = EncodeOnesVector(dim, dt);
+    float d = VectorDistance(query, ones.data(), dim, VectorSimilarity::COSINE, dt);
+    EXPECT_NEAR(d, kExpected, 1e-3) << "dtype=" << VectorDataTypeToString(dt);
+    EXPECT_GT(d, 0.01f) << "degenerate zero-norm stub for dtype=" << VectorDataTypeToString(dt);
+  };
+
+  const float f32q[3] = {1, 0, 0};
+  const double f64q[3] = {1, 0, 0};
+  const uint16_t f16q[3] = {0x3C00, 0, 0};
+  const uint16_t bf16q[3] = {0x3F80, 0, 0};
+  const int8_t i8q[3] = {1, 0, 0};
+  const uint8_t u8q[3] = {1, 0, 0};
+
+  check(VectorDataType::FLOAT32, f32q);
+  check(VectorDataType::FLOAT64, f64q);
+  check(VectorDataType::FLOAT16, f16q);
+  check(VectorDataType::BFLOAT16, bf16q);
+  check(VectorDataType::INT8, i8q);
+  check(VectorDataType::UINT8, u8q);
+}
+
+TEST_F(SearchTest, HalfBf16SpecialValues) {
+  // Special-value branches of the half/bfloat converters (unexercised by the finite-normals test).
+  EXPECT_TRUE(std::isinf(HalfToFloat(0x7C00)));  // +inf
+  EXPECT_TRUE(std::isinf(HalfToFloat(0xFC00)) && HalfToFloat(0xFC00) < 0.0f);
+  EXPECT_TRUE(std::isnan(HalfToFloat(0x7E00)));
+  EXPECT_EQ(FloatToHalf(INFINITY), 0x7C00);
+  EXPECT_EQ(FloatToHalf(1e30f), 0x7C00);  // overflow -> inf
+  EXPECT_TRUE(std::isnan(HalfToFloat(FloatToHalf(std::nanf("")))));
+
+  EXPECT_TRUE(std::isinf(Bf16ToFloat(0x7F80)));
+  EXPECT_TRUE(std::isnan(Bf16ToFloat(0x7FC0)));
+  EXPECT_EQ(FloatToBf16(INFINITY), 0x7F80);
+  EXPECT_TRUE(std::isnan(Bf16ToFloat(FloatToBf16(std::nanf("")))));
+
+  // Smallest positive subnormal half round-trips and stays finite.
+  float sub = HalfToFloat(0x0001);
+  EXPECT_GT(sub, 0.0f);
+  EXPECT_LT(sub, 1e-6f);
+  EXPECT_EQ(FloatToHalf(sub), 0x0001);
+}
+
+TEST_F(SearchTest, VectorDistanceConsistency) {
+  // Test that results are consistent across multiple calls
+  std::vector<float> vec1 = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f};
+  std::vector<float> vec2 = {0.6f, 0.7f, 0.8f, 0.9f, 1.0f};
+
+  float l2_dist1 = VectorDistance(vec1.data(), vec2.data(), 5, VectorSimilarity::L2);
+  float l2_dist2 = VectorDistance(vec1.data(), vec2.data(), 5, VectorSimilarity::L2);
+  EXPECT_EQ(l2_dist1, l2_dist2);
+
+  float cos_dist1 = VectorDistance(vec1.data(), vec2.data(), 5, VectorSimilarity::COSINE);
+  float cos_dist2 = VectorDistance(vec1.data(), vec2.data(), 5, VectorSimilarity::COSINE);
+  EXPECT_EQ(cos_dist1, cos_dist2);
+
+  float ip_dist1 = VectorDistance(vec1.data(), vec2.data(), 5, VectorSimilarity::IP);
+  float ip_dist2 = VectorDistance(vec1.data(), vec2.data(), 5, VectorSimilarity::IP);
+  EXPECT_EQ(ip_dist1, ip_dist2);
+}
+
+static void BM_VectorSearch(benchmark::State& state) {
+  // Ensure SimSIMD dynamic dispatch is initialized for the benchmark
+  InitSimSIMD();
+  unsigned ndims = state.range(0);
+  unsigned nvecs = state.range(1);
+
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, ndims};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  auto random_vec = [ndims]() {
+    vector<float> coords;
+    for (size_t j = 0; j < ndims; j++)
+      coords.push_back(static_cast<float>(rand()) / static_cast<float>(RAND_MAX));
+    return coords;
+  };
+
+  for (size_t i = 0; i < nvecs; i++) {
+    auto rv = random_vec();
+    MockedDocument doc{Map{{"pos", ToBytes(rv)}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  auto rv = random_vec();
+  params["vec"] = ToBytes(rv);
+  algo.Init("* =>[KNN 1 @pos $vec]", &params);
+
+  while (state.KeepRunningBatch(10)) {
+    for (size_t i = 0; i < 10; i++)
+      benchmark::DoNotOptimize(algo.Search(&indices));
+  }
+}
+
+BENCHMARK(BM_VectorSearch)->Args({120, 10'000});
+
+TEST_F(SearchTest, MatchNonNullField) {
+  PrepareSchema({{"text_field", SchemaField::TEXT},
+                 {"tag_field", SchemaField::TAG},
+                 {"num_field", SchemaField::NUMERIC}});
+
+  {
+    PrepareQuery("@text_field:*");
+
+    ExpectAll(Map{{"text_field", "any value"}}, Map{{"text_field", "another value"}},
+              Map{{"text_field", "third"}, {"tag_field", "tag1"}});
+
+    ExpectNone(Map{{"tag_field", "wrong field"}}, Map{{"num_field", "123"}}, Map{});
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  {
+    PrepareQuery("@tag_field:*");
+
+    ExpectAll(Map{{"tag_field", "tag1"}}, Map{{"tag_field", "tag2"}},
+              Map{{"text_field", "value"}, {"tag_field", "tag3"}});
+
+    ExpectNone(Map{{"text_field", "wrong field"}}, Map{{"num_field", "456"}}, Map{});
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  {
+    PrepareQuery("@num_field:*");
+
+    ExpectAll(Map{{"num_field", "123"}}, Map{{"num_field", "456"}},
+              Map{{"text_field", "value"}, {"num_field", "789"}});
+
+    ExpectNone(Map{{"text_field", "wrong field"}}, Map{{"tag_field", "tag1"}}, Map{});
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+}
+
+TEST_F(SearchTest, InvalidVectorParameter) {
+  search::Schema schema;
+  schema.fields["v"] = search::SchemaField{
+      search::SchemaField::VECTOR,
+      0,   // flags
+      "v"  // short_name
+  };
+
+  search::SchemaField::VectorParams params;
+  params.use_hnsw = true;
+  params.dim = 2;
+  params.sim = search::VectorSimilarity::L2;
+  params.capacity = 10;
+  params.hnsw_m = 16;
+  params.hnsw_ef_construction = 200;
+  schema.fields["v"].special_params = params;
+
+  search::IndicesOptions options;
+  search::FieldIndices indices{schema, options, PMR_NS::get_default_resource(), nullptr};
+
+  search::SearchAlgorithm algo;
+  search::QueryParams query_params;
+
+  query_params["b"] = "abcdefg";
+
+  // Parser accepts any string as placeholder
+  // Invalid vectors result in empty vector (dimension 0) which returns empty results
+  ASSERT_TRUE(algo.Init("*=>[KNN 2 @v $b]", &query_params));
+
+  // Search should return empty results for invalid vector
+  auto result = algo.Search(&indices);
+  EXPECT_TRUE(result.ids.empty());
+}
+
+class SortIndexTest : public testing::Test {
+ protected:
+  void SetUp() override {
+    InitTLSearchMR(PMR_NS::get_default_resource());
+  }
+
+  void TearDown() override {
+    InitTLSearchMR(nullptr);
+  }
+};
+
+TEST_F(SortIndexTest, StringSort) {
+  constexpr auto field = "name";
+  const auto schema = MakeSimpleSchema({{field, SchemaField::TAG}}, true);
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  indices.Add(0, MockedDocument{Map{{field, "charlie"}}});
+  indices.Add(1, MockedDocument{Map{{field, "alpha"}}});
+  indices.Add(2, MockedDocument{Map{{field, "bravo"}}});
+
+  std::vector<DocId> ids{0, 1, 2};
+  constexpr bool desc = false;
+
+  const auto index = indices.GetSortIndex(field);
+
+  index->Sort(&ids, ids.size(), desc);
+  std::vector<DocId> expected{1, 2, 0};
+  EXPECT_EQ(ids, expected);
+
+  index->Sort(&ids, ids.size(), !desc);
+  expected = {0, 2, 1};
+  EXPECT_EQ(ids, expected);
+
+  // conversion from stateless to normal string
+  auto lookup = index->Lookup(1);
+  EXPECT_TRUE(std::holds_alternative<std::string>(lookup));
+  EXPECT_EQ(std::get<std::string>(lookup), "alpha");
+}
+
+TEST_F(SortIndexTest, NumSort) {
+  constexpr auto field = "cost";
+  const auto schema = MakeSimpleSchema({{field, SchemaField::NUMERIC}}, true);
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  indices.Add(0, MockedDocument{Map{{field, "2999"}}});
+  indices.Add(1, MockedDocument{Map{{field, "999"}}});
+  indices.Add(2, MockedDocument{Map{{field, "12"}}});
+
+  std::vector<DocId> ids{0, 1, 2};
+  constexpr bool desc = false;
+
+  auto index = indices.GetSortIndex(field);
+  index->Sort(&ids, ids.size(), desc);
+  std::vector<DocId> expected{2, 1, 0};
+  EXPECT_EQ(ids, expected);
+
+  index->Sort(&ids, ids.size(), !desc);
+  expected = {0, 1, 2};
+  EXPECT_EQ(ids, expected);
+
+  auto lookup = index->Lookup(1);
+  EXPECT_TRUE(std::holds_alternative<double>(lookup));
+  EXPECT_EQ(std::get<double>(lookup), 999);
+}
+
+// Enumeration for different search types
+enum class SearchType { PREFIX = 0, SUFFIX = 1, INFIX = 2 };
+
+// Helper function to generate content with ASCII characters
+static std::string GenerateWordSequence(size_t word_count, size_t doc_offset = 0) {
+  std::string content;
+  for (size_t i = 0; i < word_count; ++i) {
+    std::string word;
+    char start_char = 'a' + ((doc_offset + i) % 26);
+    size_t word_len = 3 + (i % 5);  // Word length 3-7 chars
+
+    for (size_t j = 0; j < word_len; ++j) {
+      char c = start_char + (j % 26);
+      if (c > 'z')
+        c = 'a' + (c - 'z' - 1);
+      word += c;
+    }
+
+    if (i > 0)
+      content += " ";
+    content += word;
+  }
+  return content;
+}
+
+// Helper function to generate pattern with variety
+static std::string GeneratePattern(SearchType search_type, size_t pattern_len, bool use_uniform) {
+  if (use_uniform) {
+    // Original uniform pattern for comparison
+    switch (search_type) {
+      case SearchType::PREFIX:
+        return std::string(pattern_len, 'p');
+      case SearchType::SUFFIX:
+        return std::string(pattern_len, 's');
+      case SearchType::INFIX:
+        return std::string(pattern_len, 'i');
+    }
+  } else {
+    // Diverse ASCII pattern
+    std::string pattern;
+    char base_char = (search_type == SearchType::PREFIX)   ? 'p'
+                     : (search_type == SearchType::SUFFIX) ? 's'
+                                                           : 'i';
+
+    for (size_t i = 0; i < pattern_len; ++i) {
+      char c = base_char + (i % 10);  // Use variety of chars
+      if (c > 'z')
+        c = 'a' + (c - 'z' - 1);
+      pattern += c;
+    }
+    return pattern;
+  }
+  return "";
+}
+
+static void BM_SearchByTypeImpl(benchmark::State& state, bool use_diverse_pattern) {
+  size_t num_docs = state.range(0);
+  size_t pattern_len = state.range(1);
+  SearchType search_type = static_cast<SearchType>(state.range(2));
+
+  auto schema = MakeSimpleSchema({{"title", SchemaField::TEXT}});
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  // Generate pattern
+  std::string pattern = GeneratePattern(search_type, pattern_len, !use_diverse_pattern);
+  std::string search_type_name = (search_type == SearchType::PREFIX)   ? "prefix"
+                                 : (search_type == SearchType::SUFFIX) ? "suffix"
+                                                                       : "infix";
+
+  // Generate test data with more realistic content
+  for (size_t i = 0; i < num_docs; i++) {
+    std::string content;
+    if (i < num_docs / 2) {
+      // Half documents have the pattern in appropriate position
+      std::string base_content = GenerateWordSequence(5 + (i % 5), i);
+
+      switch (search_type) {
+        case SearchType::PREFIX:
+          content = pattern + base_content;
+          break;
+        case SearchType::SUFFIX:
+          content = base_content + pattern;
+          break;
+        case SearchType::INFIX:
+          // Fix: embed pattern inside a word, not as separate word
+          size_t split_pos = base_content.length() / 2;
+          content = base_content.substr(0, split_pos) + pattern + base_content.substr(split_pos);
+          break;
+      }
+    } else {
+      // Half don't have the pattern - generate different content
+      content = GenerateWordSequence(8 + (i % 3), i + 1000);
+    }
+    MockedDocument doc{Map{{"title", content}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+  std::string query;
+
+  // Generate query based on search type
+  switch (search_type) {
+    case SearchType::PREFIX:
+      query = pattern + "*";
+      break;
+    case SearchType::SUFFIX:
+      query = "*" + pattern;
+      break;
+    case SearchType::INFIX:
+      query = "*" + pattern + "*";
+      break;
+  }
+
+  if (!algo.Init(query, &params)) {
+    state.SkipWithError("Failed to initialize " + search_type_name + " search");
+    return;
+  }
+
+  while (state.KeepRunning()) {
+    auto result = algo.Search(&indices);
+    benchmark::DoNotOptimize(result);
+
+    // If result has error, skip the benchmark
+    if (!result.error.empty()) {
+      state.SkipWithError(search_type_name + " search returned error: " + result.error);
+      return;
+    }
+  }
+
+  // Set counters for analysis
+  state.counters["docs_total"] = num_docs;
+  state.counters["pattern_length"] = pattern_len;
+  state.counters["diverse_pattern"] = use_diverse_pattern ? 1 : 0;
+  state.SetLabel(search_type_name + (use_diverse_pattern ? "_diverse" : "_uniform"));
+}
+
+// Instantiate template functions
+static void BM_SearchByType_Uniform(benchmark::State& state) {
+  BM_SearchByTypeImpl(state, false);
+}
+
+static void BM_SearchByType_Diverse(benchmark::State& state) {
+  BM_SearchByTypeImpl(state, true);
+}
+
+// Benchmark to compare all search types - removed 100K docs per romange's suggestion
+BENCHMARK(BM_SearchByType_Uniform)
+    // Uniform patterns (original test)
+    ->Args({1000, 3, static_cast<int>(SearchType::PREFIX)})
+    ->Args({1000, 5, static_cast<int>(SearchType::PREFIX)})
+    ->Args({10000, 3, static_cast<int>(SearchType::PREFIX)})
+    ->Args({10000, 5, static_cast<int>(SearchType::PREFIX)})
+    ->Args({1000, 3, static_cast<int>(SearchType::SUFFIX)})
+    ->Args({1000, 5, static_cast<int>(SearchType::SUFFIX)})
+    ->Args({10000, 3, static_cast<int>(SearchType::SUFFIX)})
+    ->Args({10000, 5, static_cast<int>(SearchType::SUFFIX)})
+    ->Args({1000, 3, static_cast<int>(SearchType::INFIX)})
+    ->Args({1000, 5, static_cast<int>(SearchType::INFIX)})
+    ->Args({10000, 3, static_cast<int>(SearchType::INFIX)})
+    ->Args({10000, 5, static_cast<int>(SearchType::INFIX)})
+    ->ArgNames({"docs", "pattern_len", "search_type"})
+    ->Unit(benchmark::kMicrosecond);
+
+BENCHMARK(BM_SearchByType_Diverse)
+    // Diverse patterns (new test with ASCII variety)
+    ->Args({1000, 3, static_cast<int>(SearchType::PREFIX)})
+    ->Args({1000, 5, static_cast<int>(SearchType::PREFIX)})
+    ->Args({10000, 3, static_cast<int>(SearchType::PREFIX)})
+    ->Args({10000, 5, static_cast<int>(SearchType::PREFIX)})
+    ->Args({1000, 3, static_cast<int>(SearchType::SUFFIX)})
+    ->Args({1000, 5, static_cast<int>(SearchType::SUFFIX)})
+    ->Args({10000, 3, static_cast<int>(SearchType::SUFFIX)})
+    ->Args({10000, 5, static_cast<int>(SearchType::SUFFIX)})
+    ->Args({1000, 3, static_cast<int>(SearchType::INFIX)})
+    ->Args({1000, 5, static_cast<int>(SearchType::INFIX)})
+    ->Args({10000, 3, static_cast<int>(SearchType::INFIX)})
+    ->Args({10000, 5, static_cast<int>(SearchType::INFIX)})
+    ->ArgNames({"docs", "pattern_len", "search_type"})
+    ->Unit(benchmark::kMicrosecond);
+
+// Helper function to generate random vector
+static std::vector<float> GenerateRandomVector(size_t dims, unsigned seed = 42) {
+  std::mt19937 gen(seed);
+  std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+  std::vector<float> vec(dims);
+  for (size_t i = 0; i < dims; ++i) {
+    vec[i] = dis(gen);
+  }
+  return vec;
+}
+
+static void BM_SearchDocIds(benchmark::State& state) {
+  auto schema = MakeSimpleSchema({{"score", SchemaField::NUMERIC}, {"tag", SchemaField::TAG}});
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  default_random_engine rnd;
+  const char* tag_vals[] = {"test", "example", "sample", "demo", "demo2"};
+  uniform_int_distribution<size_t> tag_dist(0, ABSL_ARRAYSIZE(tag_vals) - 1);
+  uniform_int_distribution<size_t> score_dist(0, 100);
+
+  for (size_t i = 0; i < 1000; i++) {
+    MockedDocument doc{
+        Map{{"score", std::to_string(score_dist(rnd))}, {"tag", tag_vals[tag_dist(rnd)]}}};
+    indices.Add(i, doc);
+  }
+
+  std::string queries[] = {"@tag:{test} @score:[10 50]", "@tag: *", "@score:*"};
+  size_t query_type = state.range(0);
+  CHECK_LT(query_type, ABSL_ARRAYSIZE(queries));
+  CHECK(algo.Init(queries[query_type], &params));
+  while (state.KeepRunning()) {
+    auto result = algo.Search(&indices);
+    CHECK(result.error.empty());
+  }
+}
+BENCHMARK(BM_SearchDocIds)->Range(0, 2);
+
+static void BM_SearchNumericIndexes(benchmark::State& state) {
+  auto schema = MakeSimpleSchema({{"numeric", SchemaField::NUMERIC,
+                                   SchemaField::NumericParams{.block_size = kMaxRangeBlockSize}}});
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  default_random_engine rnd;
+
+  using NumericType = long long;
+  uniform_int_distribution<NumericType> dist(std::numeric_limits<NumericType>::min(),
+                                             std::numeric_limits<NumericType>::max());
+
+  const size_t num_docs = state.range(0);
+  for (size_t i = 0; i < num_docs; i++) {
+    MockedDocument doc{Map{{"numeric", std::to_string(dist(rnd))}}};
+    indices.Add(i, doc);
+  }
+  indices.FinalizeInitialization();
+
+  std::string queries[] = {"@numeric:[15 +inf]", "@numeric:[-inf 20]", "@numeric:[-inf +inf]",
+                           "@numeric:[0 100000]"};
+
+  std::unordered_map<size_t, std::vector<size_t>> expected_results_per_num_docs = {
+      {10000, {4982, 5018, 10000, 0}},
+      {100000, {49885, 50115, 100000, 0}},
+      {1000000, {500853, 499147, 1000000, 0}},
+  };
+
+  while (state.KeepRunning()) {
+    for (size_t i = 0; i < ABSL_ARRAYSIZE(queries); ++i) {
+      const auto& query = queries[i];
+
+      CHECK(algo.Init(query, &params));
+      auto result = algo.Search(&indices);
+      CHECK(result.error.empty());
+
+      const size_t expected_result = expected_results_per_num_docs[num_docs][i];
+      CHECK_EQ(result.total, expected_result);
+      CHECK_EQ(result.ids.size(), expected_result);
+    }
+  }
+}
+
+BENCHMARK(BM_SearchNumericIndexes)->Arg(10000)->Arg(100000)->Arg(1000000)->ArgNames({"num_docs"});
+
+static void BM_SearchNumericIndexesSmallRanges(benchmark::State& state) {
+  auto schema = MakeSimpleSchema({{"numeric", SchemaField::NUMERIC,
+                                   SchemaField::NumericParams{.block_size = kMaxRangeBlockSize}}});
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  default_random_engine rnd;
+
+  using NumericType = uint16_t;
+  uniform_int_distribution<NumericType> dist(0, std::numeric_limits<NumericType>::max());
+
+  const size_t num_docs = state.range(0);
+  // Insert zero values
+  for (size_t i = 0; i < num_docs / 50; i++) {
+    MockedDocument doc{Map{{"numeric", "0"}}};
+    indices.Add(i, doc);
+  }
+  for (size_t i = num_docs / 50; i < num_docs; i++) {
+    MockedDocument doc{Map{{"numeric", std::to_string(dist(rnd))}}};
+    indices.Add(i, doc);
+  }
+  indices.FinalizeInitialization();
+
+  std::string queries[] = {"@numeric:[0 40000]", "@numeric:[-inf +inf]"};
+
+  std::unordered_map<size_t, std::vector<size_t>> expected_results_per_num_docs = {
+      {100000, {61939, 100000}},
+      {1000000, {618365, 1000000}},
+  };
+
+  while (state.KeepRunning()) {
+    for (size_t i = 0; i < ABSL_ARRAYSIZE(queries); ++i) {
+      const auto& query = queries[i];
+
+      CHECK(algo.Init(query, &params));
+      auto result = algo.Search(&indices);
+      CHECK(result.error.empty());
+
+      const size_t expected_result = expected_results_per_num_docs[num_docs][i];
+      CHECK_EQ(result.total, expected_result);
+      CHECK_EQ(result.ids.size(), expected_result);
+    }
+  }
+}
+
+BENCHMARK(BM_SearchNumericIndexesSmallRanges)
+    ->Arg(100000)   // One block
+    ->Arg(1000000)  // Two blocks
+    ->ArgNames({"num_docs"});
+
+static void BM_SearchTwoNumericIndexes(benchmark::State& state) {
+  auto schema = MakeSimpleSchema({
+      {"numeric1", SchemaField::NUMERIC,
+       SchemaField::NumericParams{.block_size = kMaxRangeBlockSize}},
+      {"numeric2", SchemaField::NUMERIC,
+       SchemaField::NumericParams{.block_size = kMaxRangeBlockSize}},
+  });
+
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  std::default_random_engine rnd;
+
+  using NumericType = long long;
+  uniform_int_distribution<NumericType> dist1(std::numeric_limits<NumericType>::min(),
+                                              std::numeric_limits<NumericType>::max());
+  uniform_int_distribution<NumericType> dist2(std::numeric_limits<NumericType>::min(),
+                                              std::numeric_limits<NumericType>::max());
+
+  const size_t num_docs = state.range(0);
+  for (size_t i = 0; i < num_docs; ++i) {
+    MockedDocument doc{Map{
+        {"numeric1", std::to_string(dist1(rnd))},
+        {"numeric2", std::to_string(dist2(rnd))},
+    }};
+    indices.Add(i, doc);
+  }
+  indices.FinalizeInitialization();
+
+  std::string queries[] = {absl::StrCat("@numeric1:[15 +inf] @numeric2:[-inf 20]"),
+                           absl::StrCat("@numeric1:[-inf 20] @numeric2:[15 +inf]"),
+                           absl::StrCat("@numeric1:[0 100000] @numeric2:[-100000 0]"),
+                           absl::StrCat("@numeric1:[-100000 0] @numeric2:[0 100000]")};
+
+  std::unordered_map<size_t, std::vector<size_t>> expected_results_per_num_docs = {
+      {10000, {2508, 2507, 0, 0}},
+      {100000, {25119, 25232, 0, 0}},
+      {1000000, {250623, 250643, 0, 0}},
+  };
+
+  while (state.KeepRunning()) {
+    for (size_t i = 0; i < ABSL_ARRAYSIZE(queries); ++i) {
+      const auto& query = queries[i];
+
+      CHECK(algo.Init(query, &params));
+      auto result = algo.Search(&indices);
+      CHECK(result.error.empty());
+
+      const size_t expected_result = expected_results_per_num_docs[num_docs][i];
+      CHECK_EQ(result.total, expected_result);
+      CHECK_EQ(result.ids.size(), expected_result);
+    }
+  }
+}
+
+BENCHMARK(BM_SearchTwoNumericIndexes)
+    ->Arg(10000)
+    ->Arg(100000)
+    ->Arg(1000000)
+    ->ArgNames({"num_docs"});
+
+static void BM_SearchNumericAndTagIndexes(benchmark::State& state) {
+  auto schema = MakeSimpleSchema({{"tag", SchemaField::TAG},
+                                  {"numeric", SchemaField::NUMERIC,
+                                   SchemaField::NumericParams{.block_size = kMaxRangeBlockSize}}});
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  default_random_engine rnd;
+
+  using NumericType = long long;
+  uniform_int_distribution<NumericType> dist(std::numeric_limits<NumericType>::min(),
+                                             std::numeric_limits<NumericType>::max());
+
+  size_t tag_number = 0;
+  const size_t max_tag_number = 1000;
+
+  const size_t num_docs = state.range(0);
+  for (size_t i = 0; i < num_docs; i++) {
+    MockedDocument doc{
+        Map{{"tag", absl::StrCat("tag", tag_number)}, {"numeric", std::to_string(dist(rnd))}}};
+    indices.Add(i, doc);
+
+    tag_number = (tag_number + 1) % max_tag_number;
+  }
+  indices.FinalizeInitialization();
+
+  std::string queries[] = {absl::StrCat("@tag:{tag230|tag3|tag942} @numeric:[15 +inf]"),
+                           absl::StrCat("@tag:{tag1|tag829|tag236} @numeric:[-inf 20]"),
+                           absl::StrCat("@tag:{tag0|tag999} @numeric:[-1000000 +inf]")};
+
+  std::unordered_map<size_t, std::vector<size_t>> expected_results_per_num_docs = {
+      {10000, {19, 16, 8}},
+      {100000, {164, 157, 97}},
+      {1000000, {1528, 1518, 1017}},
+  };
+
+  while (state.KeepRunning()) {
+    for (size_t i = 0; i < ABSL_ARRAYSIZE(queries); ++i) {
+      const auto& query = queries[i];
+
+      CHECK(algo.Init(query, &params));
+      auto result = algo.Search(&indices);
+      CHECK(result.error.empty());
+
+      const size_t expected_result = expected_results_per_num_docs[num_docs][i];
+      CHECK_EQ(result.total, expected_result);
+      CHECK_EQ(result.ids.size(), expected_result);
+    }
+  }
+}
+
+BENCHMARK(BM_SearchNumericAndTagIndexes)
+    ->Arg(10000)
+    ->Arg(100000)
+    ->Arg(1000000)
+    ->ArgNames({"num_docs"});
+
+static void BM_SearchSeveralNumericAndTagIndexes(benchmark::State& state) {
+  auto schema = MakeSimpleSchema({{"tag", SchemaField::TAG},
+                                  {"numeric1", SchemaField::NUMERIC,
+                                   SchemaField::NumericParams{.block_size = kMaxRangeBlockSize}},
+                                  {"numeric2", SchemaField::NUMERIC,
+                                   SchemaField::NumericParams{.block_size = kMaxRangeBlockSize}},
+                                  {"numeric3", SchemaField::NUMERIC,
+                                   SchemaField::NumericParams{.block_size = kMaxRangeBlockSize}}});
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  default_random_engine rnd;
+
+  using NumericType = uint16_t;
+  uniform_int_distribution<NumericType> dist(std::numeric_limits<NumericType>::min(),
+                                             std::numeric_limits<NumericType>::max());
+
+  const size_t num_docs = state.range(0);
+
+  size_t tag_number = 0;
+  const size_t max_tag_number = num_docs / 30;
+
+  for (size_t i = 0; i < num_docs; i++) {
+    MockedDocument doc{Map{{"tag", absl::StrCat("tag", tag_number)},
+                           {"numeric1", std::to_string(dist(rnd))},
+                           {"numeric2", std::to_string(dist(rnd))},
+                           {"numeric3", std::to_string(dist(rnd))}}};
+    indices.Add(i, doc);
+
+    tag_number = (tag_number + 1) % max_tag_number;
+  }
+  indices.FinalizeInitialization();
+
+  std::string queries[] = {
+      absl::StrCat(
+          "@tag:{tag230|tag3} @numeric1:[0 10000] @numeric2:[20000 30000] @numeric3:[-1000 +inf]"),
+      absl::StrCat("@tag:{tag829|tag236} @numeric1:[-inf 10000] @numeric2:[40000 +inf] "
+                   "@numeric3:[10000 30000]"),
+      absl::StrCat(
+          "@tag:{tag0|tag999} @numeric1:[-inf +inf] @numeric2:[20 +inf] @numeric3:[1000 10000]")};
+
+  std::unordered_map<size_t, std::vector<size_t>> expected_results_per_num_docs = {
+      {10000, {1, 0, 4}},
+      {100000, {1, 1, 10}},
+      {1000000, {0, 1, 9}},
+  };
+
+  while (state.KeepRunning()) {
+    for (size_t i = 0; i < ABSL_ARRAYSIZE(queries); ++i) {
+      const auto& query = queries[i];
+
+      CHECK(algo.Init(query, &params));
+      auto result = algo.Search(&indices);
+      CHECK(result.error.empty());
+
+      const size_t expected_result = expected_results_per_num_docs[num_docs][i];
+      CHECK_EQ(result.total, expected_result);
+      CHECK_EQ(result.ids.size(), expected_result);
+    }
+  }
+}
+
+BENCHMARK(BM_SearchSeveralNumericAndTagIndexes)
+    ->Arg(10000)
+    ->Arg(100000)
+    ->Arg(1000000)
+    ->ArgNames({"num_docs"});
+
+static void BM_SearchMergeEqualSets(benchmark::State& state) {
+  auto schema = MakeSimpleSchema({
+      {"numeric1", SchemaField::NUMERIC,
+       SchemaField::NumericParams{.block_size = kMaxRangeBlockSize}},
+      {"numeric2", SchemaField::NUMERIC,
+       SchemaField::NumericParams{.block_size = kMaxRangeBlockSize}},
+  });
+
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  std::default_random_engine rnd;
+
+  using NumericType = long long;
+  uniform_int_distribution<NumericType> dist1(std::numeric_limits<NumericType>::min(),
+                                              std::numeric_limits<NumericType>::max());
+  uniform_int_distribution<NumericType> dist2(std::numeric_limits<NumericType>::min(),
+                                              std::numeric_limits<NumericType>::max());
+
+  const size_t num_docs = state.range(0);
+  for (size_t i = 0; i < num_docs; ++i) {
+    MockedDocument doc{Map{
+        {"numeric1", std::to_string(dist1(rnd))},
+        {"numeric2", std::to_string(dist2(rnd))},
+    }};
+    indices.Add(i, doc);
+  }
+  indices.FinalizeInitialization();
+
+  std::string query = absl::StrCat("@numeric1:[-inf +inf] @numeric2:[-inf +inf]");
+
+  while (state.KeepRunning()) {
+    CHECK(algo.Init(query, &params));
+    auto result = algo.Search(&indices);
+    CHECK(result.error.empty());
+
+    // All documents should match both conditions, so total should equal num_docs
+    CHECK_EQ(result.total, num_docs);
+    CHECK_EQ(result.ids.size(), num_docs);
+  }
+}
+
+BENCHMARK(BM_SearchMergeEqualSets)
+    ->Arg(100)
+    ->Arg(1000)
+    ->Arg(10000)
+    ->Arg(100000)
+    ->Arg(1000000)
+    ->ArgNames({"num_docs"});
+
+static void BM_SearchRangeTreeSplits(benchmark::State& state) {
+  auto schema = MakeSimpleSchema({
+      {"num", SchemaField::NUMERIC, SchemaField::NumericParams{}},
+  });
+
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  const size_t batch_size = state.range(0);
+  std::default_random_engine rnd;
+
+  using NumericType = long long;
+  uniform_int_distribution<NumericType> dist(0, batch_size + 1);
+
+  size_t doc_index = 0;
+  while (state.KeepRunning()) {
+    for (size_t i = 0; i < batch_size; i++) {
+      MockedDocument doc{Map{{"num", std::to_string(dist(rnd))}}};
+      indices.Add(doc_index++, doc);
+    }
+  }
+}
+
+BENCHMARK(BM_SearchRangeTreeSplits)
+    ->Arg(100000)
+    ->Arg(1000000)
+    ->Arg(3000000)
+    ->ArgNames({"batch_size"});
+
+// Semantics test for cosine on zero vectors (independent of SimSIMD)
+TEST(CosineDistanceTest, ZeroVectors) {
+  const size_t dims = 128;
+  std::vector<float> zero(dims, 0.0f);
+  float d = VectorDistance(zero.data(), zero.data(), dims, VectorSimilarity::COSINE);
+  EXPECT_EQ(d, 0.0f);
+}
+
+// Unified vector distance benchmarks using VectorDistance function
+static void BM_VectorDistance(benchmark::State& state) {
+  // Ensure SimSIMD dynamic dispatch is initialized for the benchmark
+  InitSimSIMD();
+  size_t dims = state.range(0);
+  size_t num_pairs = state.range(1);
+  VectorSimilarity sim = static_cast<VectorSimilarity>(state.range(2));
+
+  std::vector<std::vector<float>> vectors_a, vectors_b;
+  vectors_a.reserve(num_pairs);
+  vectors_b.reserve(num_pairs);
+
+  for (size_t i = 0; i < num_pairs; ++i) {
+    vectors_a.push_back(GenerateRandomVector(dims, i));
+    vectors_b.push_back(GenerateRandomVector(dims, i + 1000));
+  }
+
+  size_t pair_idx = 0;
+  for (auto _ : state) {
+    float distance =
+        VectorDistance(vectors_a[pair_idx].data(), vectors_b[pair_idx].data(), dims, sim);
+    benchmark::DoNotOptimize(distance);
+    pair_idx = (pair_idx + 1) % num_pairs;
+  }
+
+  state.counters["dims"] = dims;
+  state.counters["pairs"] = num_pairs;
+
+  std::string sim_name = (sim == VectorSimilarity::L2)       ? "L2"
+                         : (sim == VectorSimilarity::COSINE) ? "Cosine"
+                                                             : "IP";
+  state.SetLabel(sim_name);
+}
+
+// Intensive benchmark with batch processing
+static void BM_VectorDistance_Intensive(benchmark::State& state) {
+  // Ensure SimSIMD dynamic dispatch is initialized for the benchmark
+  InitSimSIMD();
+  size_t dims = 512;  // Fixed medium size
+  size_t batch_size = 1000;
+  VectorSimilarity sim = static_cast<VectorSimilarity>(state.range(0));
+
+  std::vector<std::vector<float>> vectors_a, vectors_b;
+  vectors_a.reserve(batch_size);
+  vectors_b.reserve(batch_size);
+
+  for (size_t i = 0; i < batch_size; ++i) {
+    vectors_a.push_back(GenerateRandomVector(dims, i));
+    vectors_b.push_back(GenerateRandomVector(dims, i + 4000));
+  }
+
+  size_t total_ops = 0;
+  while (state.KeepRunning()) {
+    for (size_t i = 0; i < batch_size; ++i) {
+      float distance = VectorDistance(vectors_a[i].data(), vectors_b[i].data(), dims, sim);
+      benchmark::DoNotOptimize(distance);
+      ++total_ops;
+    }
+  }
+
+  state.counters["ops"] = total_ops;
+  state.counters["ops_per_sec"] = benchmark::Counter(total_ops, benchmark::Counter::kIsRate);
+
+  std::string sim_name = (sim == VectorSimilarity::L2)       ? "L2"
+                         : (sim == VectorSimilarity::COSINE) ? "Cosine"
+                                                             : "IP";
+  state.SetLabel(sim_name + "_Intensive");
+}
+
+// Benchmark declarations
+BENCHMARK(BM_VectorDistance)
+    // Small vectors - L2 Distance
+    ->Args({32, 100, static_cast<int>(VectorSimilarity::L2)})
+    ->Args({32, 1000, static_cast<int>(VectorSimilarity::L2)})
+    ->Args({32, 10000, static_cast<int>(VectorSimilarity::L2)})
+    // Medium vectors - L2 Distance
+    ->Args({128, 100, static_cast<int>(VectorSimilarity::L2)})
+    ->Args({128, 1000, static_cast<int>(VectorSimilarity::L2)})
+    ->Args({128, 10000, static_cast<int>(VectorSimilarity::L2)})
+    // Large vectors - L2 Distance
+    ->Args({512, 100, static_cast<int>(VectorSimilarity::L2)})
+    ->Args({512, 1000, static_cast<int>(VectorSimilarity::L2)})
+    ->Args({512, 5000, static_cast<int>(VectorSimilarity::L2)})
+    // Very large vectors - L2 Distance
+    ->Args({1536, 100, static_cast<int>(VectorSimilarity::L2)})
+    ->Args({1536, 1000, static_cast<int>(VectorSimilarity::L2)})
+
+    // Small vectors - Cosine Distance
+    ->Args({32, 100, static_cast<int>(VectorSimilarity::COSINE)})
+    ->Args({32, 1000, static_cast<int>(VectorSimilarity::COSINE)})
+    ->Args({32, 10000, static_cast<int>(VectorSimilarity::COSINE)})
+    // Medium vectors - Cosine Distance
+    ->Args({128, 100, static_cast<int>(VectorSimilarity::COSINE)})
+    ->Args({128, 1000, static_cast<int>(VectorSimilarity::COSINE)})
+    ->Args({128, 10000, static_cast<int>(VectorSimilarity::COSINE)})
+    // Large vectors - Cosine Distance
+    ->Args({512, 100, static_cast<int>(VectorSimilarity::COSINE)})
+    ->Args({512, 1000, static_cast<int>(VectorSimilarity::COSINE)})
+    ->Args({512, 5000, static_cast<int>(VectorSimilarity::COSINE)})
+    // Very large vectors - Cosine Distance
+    ->Args({1536, 100, static_cast<int>(VectorSimilarity::COSINE)})
+    ->Args({1536, 1000, static_cast<int>(VectorSimilarity::COSINE)})
+
+    // Small vectors - IP Distance
+    ->Args({32, 100, static_cast<int>(VectorSimilarity::IP)})
+    ->Args({32, 1000, static_cast<int>(VectorSimilarity::IP)})
+    ->Args({32, 10000, static_cast<int>(VectorSimilarity::IP)})
+    // Medium vectors - IP Distance
+    ->Args({128, 100, static_cast<int>(VectorSimilarity::IP)})
+    ->Args({128, 1000, static_cast<int>(VectorSimilarity::IP)})
+    ->Args({128, 10000, static_cast<int>(VectorSimilarity::IP)})
+    // Large vectors - IP Distance
+    ->Args({512, 100, static_cast<int>(VectorSimilarity::IP)})
+    ->Args({512, 1000, static_cast<int>(VectorSimilarity::IP)})
+    ->Args({512, 5000, static_cast<int>(VectorSimilarity::IP)})
+    // Very large vectors - IP Distance
+    ->Args({1536, 100, static_cast<int>(VectorSimilarity::IP)})
+    ->Args({1536, 1000, static_cast<int>(VectorSimilarity::IP)})
+    ->ArgNames({"dims", "pairs", "similarity"})
+    ->Unit(benchmark::kMicrosecond);
+
+BENCHMARK(BM_VectorDistance_Intensive)
+    ->Arg(static_cast<int>(VectorSimilarity::L2))
+    ->Arg(static_cast<int>(VectorSimilarity::COSINE))
+    ->Arg(static_cast<int>(VectorSimilarity::IP))
+    ->ArgNames({"similarity_type"})
+    ->Unit(benchmark::kMicrosecond);
+
+// BM25STD Scoring Tests
+class ScoringTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    auto* tlh = mi_heap_get_backing();
+    init_zmalloc_threadlocal(tlh);
+  }
+};
+
+TEST_F(ScoringTest, BM25StdFormula) {
+  // Single term, single doc, verify the math
+  ScoringContext ctx{.num_docs = 10};
+  ScoringTermInfo term{
+      .term_freq = 2, .term_docs = 3, .field_doc_len = 5, .field_avg_doc_len = 5.0};
+
+  double score = BM25Std(ctx, term);
+
+  // IDF = ln(1 + (10 - 3 + 0.5) / (3 + 0.5)) = ln(1 + 7.5/3.5) = ln(3.142857) ~ 1.1451
+  // TF = 2 * (1.2 + 1) / (2 + 1.2 * (1 - 0.75 + 0.75 * 5/5)) = 2*2.2/(2+1.2) = 4.4/3.2 = 1.375
+  // score = 1.1451 * 1.375 ~ 1.5745
+  EXPECT_NEAR(score, 1.5745, 0.01);
+}
+
+TEST_F(ScoringTest, BM25StdZeroFreq) {
+  ScoringContext ctx{.num_docs = 10};
+  ScoringTermInfo term{
+      .term_freq = 0, .term_docs = 3, .field_doc_len = 5, .field_avg_doc_len = 5.0};
+
+  EXPECT_EQ(BM25Std(ctx, term), 0.0);
+}
+
+TEST_F(ScoringTest, BM25StdDocLenNormalization) {
+  // Longer doc -> lower score for same TF
+  ScoringContext ctx{.num_docs = 100};
+  ScoringTermInfo term_short{
+      .term_freq = 2, .term_docs = 10, .field_doc_len = 5, .field_avg_doc_len = 10.0};
+  ScoringTermInfo term_long{
+      .term_freq = 2, .term_docs = 10, .field_doc_len = 20, .field_avg_doc_len = 10.0};
+
+  double score_short = BM25Std(ctx, term_short);
+  double score_long = BM25Std(ctx, term_long);
+
+  EXPECT_GT(score_short, score_long);
+}
+
+TEST_F(ScoringTest, BM25StdRareTermHigherIDF) {
+  // Rarer term -> higher IDF -> higher score
+  ScoringContext ctx{.num_docs = 100};
+  ScoringTermInfo rare{
+      .term_freq = 1, .term_docs = 2, .field_doc_len = 10, .field_avg_doc_len = 10.0};
+  ScoringTermInfo common{
+      .term_freq = 1, .term_docs = 50, .field_doc_len = 10, .field_avg_doc_len = 10.0};
+
+  EXPECT_GT(BM25Std(ctx, rare), BM25Std(ctx, common));
+}
+
+TEST_F(ScoringTest, BM25StdMultiTerm) {
+  ScoringContext ctx{.num_docs = 100};
+  ScoringTermInfo t1{
+      .term_freq = 2, .term_docs = 5, .field_doc_len = 10, .field_avg_doc_len = 10.0};
+  ScoringTermInfo t2{
+      .term_freq = 1, .term_docs = 20, .field_doc_len = 10, .field_avg_doc_len = 10.0};
+
+  double multi = ScoreDocument(&BM25Std, ctx, {t1, t2});
+  double sum = BM25Std(ctx, t1) + BM25Std(ctx, t2);
+
+  EXPECT_DOUBLE_EQ(multi, sum);
+}
+
+TEST_F(ScoringTest, BM25StdNonFiniteWeightStaysFinite) {
+  // A pathological field weight can overflow the effective frequency to +inf; BM25 must not turn
+  // that into NaN (which would corrupt top-K sorting). The TF saturation limit is k1 + 1.
+  ScoringContext ctx{.num_docs = 100};
+  ScoringTermInfo term{.term_freq = 10,
+                       .term_docs = 5,
+                       .field_doc_len = 10,
+                       .field_avg_doc_len = 10.0,
+                       .field_weight = 1e308};  // f = field_weight * term_freq overflows to +inf
+
+  double score = BM25Std(ctx, term);
+  EXPECT_TRUE(std::isfinite(score));
+  EXPECT_GT(score, 0.0);
+}
+
+TEST_F(ScoringTest, TfIdfFormula) {
+  // f=2, N=10, n=3
+  // IDF = ln(10/3) ~ 1.2039
+  // score = 2 * 1.2039 ~ 2.4079
+  ScoringContext ctx{.num_docs = 10};
+  ScoringTermInfo term{.term_freq = 2, .term_docs = 3};
+
+  EXPECT_NEAR(TfIdf(ctx, term), 2.4079, 0.01);
+}
+
+TEST_F(ScoringTest, TfIdfZeroFreq) {
+  ScoringContext ctx{.num_docs = 10};
+  ScoringTermInfo term{.term_freq = 0, .term_docs = 3};
+
+  EXPECT_EQ(TfIdf(ctx, term), 0.0);
+}
+
+TEST_F(ScoringTest, TfIdfRareTermHigherScore) {
+  // Same TF, but rare term (small n) should score higher than common term (large n)
+  ScoringContext ctx{.num_docs = 100};
+  ScoringTermInfo rare{.term_freq = 1, .term_docs = 2};
+  ScoringTermInfo common{.term_freq = 1, .term_docs = 50};
+
+  EXPECT_GT(TfIdf(ctx, rare), TfIdf(ctx, common));
+}
+
+TEST_F(ScoringTest, TfIdfDocNormShorterDocScoresHigher) {
+  // Same TF/IDF, but shorter doc should score higher after length normalization
+  ScoringContext ctx{.num_docs = 10};
+  ScoringTermInfo short_doc{.term_freq = 1, .term_docs = 3, .field_doc_len = 5};
+  ScoringTermInfo long_doc{.term_freq = 1, .term_docs = 3, .field_doc_len = 50};
+
+  EXPECT_GT(TfIdfDocNorm(ctx, short_doc), TfIdfDocNorm(ctx, long_doc));
+}
+
+TEST_F(ScoringTest, TfIdfDocNormZeroDocLen) {
+  // field_doc_len = 0 should not cause division by zero — falls back to unnormalized score
+  ScoringContext ctx{.num_docs = 10};
+  ScoringTermInfo term{.term_freq = 1, .term_docs = 3, .field_doc_len = 0};
+
+  EXPECT_EQ(TfIdfDocNorm(ctx, term), TfIdf(ctx, term));
+}
+
+TEST_F(ScoringTest, ScoreDocumentDispatchesByScorerType) {
+  ScoringContext ctx{.num_docs = 10};
+  ScoringTermInfo term{
+      .term_freq = 2, .term_docs = 3, .field_doc_len = 5, .field_avg_doc_len = 5.0};
+
+  EXPECT_DOUBLE_EQ(ScoreDocument(&BM25Std, ctx, {term}), BM25Std(ctx, term));
+  EXPECT_DOUBLE_EQ(ScoreDocument(ScorerSpec{ScorerKind::BM25STD_NORM}, ctx, {term}),
+                   BM25Std(ctx, term));
+  EXPECT_DOUBLE_EQ(ScoreDocument(&TfIdf, ctx, {term}), TfIdf(ctx, term));
+  EXPECT_DOUBLE_EQ(ScoreDocument(&TfIdfDocNorm, ctx, {term}), TfIdfDocNorm(ctx, term));
+}
+
+TEST_F(ScoringTest, BM25StdTanhAppliesDefaultFactor) {
+  ScoringContext ctx{.num_docs = 10};
+  ScoringTermInfo term{
+      .term_freq = 2, .term_docs = 3, .field_doc_len = 5, .field_avg_doc_len = 5.0};
+
+  ScorerSpec scorer{ScorerKind::BM25STD_TANH};
+  double raw = ScoreDocument(ScorerSpec{ScorerKind::BM25STD}, ctx, {term});
+
+  EXPECT_NEAR(ScoreDocument(scorer, ctx, {term}), std::tanh(raw / kDefaultBM25StdTanhFactor),
+              1e-12);
+}
+
+TEST_F(ScoringTest, BM25StdTanhAppliesCustomFactor) {
+  ScoringContext ctx{.num_docs = 10};
+  ScoringTermInfo term{
+      .term_freq = 2, .term_docs = 3, .field_doc_len = 5, .field_avg_doc_len = 5.0};
+
+  ScorerSpec scorer{.kind = ScorerKind::BM25STD_TANH, .bm25std_tanh_factor = 20};
+  double raw = ScoreDocument(ScorerSpec{ScorerKind::BM25STD}, ctx, {term});
+
+  EXPECT_NEAR(ScoreDocument(scorer, ctx, {term}), std::tanh(raw / 20), 1e-12);
+}
+
+TEST_F(ScoringTest, SearchWithScorer) {
+  // Integration test: build index, search with scorer, verify scores are non-zero
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc1("hello world hello");  // "hello" appears 2x
+  MockedDocument doc2("hello there");        // "hello" appears 1x
+  MockedDocument doc3("goodbye world");      // no "hello"
+
+  index.Add(0, doc1);
+  index.Add(1, doc2);
+  index.Add(2, doc3);
+  index.FinalizeInitialization();
+
+  QueryParams params;
+  SearchAlgorithm algo;
+  ASSERT_TRUE(algo.Init("hello", &params));
+  algo.SetScorer(ScorerSpec{});
+
+  auto result = algo.Search(&index);
+
+  // doc1 and doc2 should match, doc3 should not
+  ASSERT_EQ(result.ids.size(), 2u);
+  EXPECT_EQ(result.text_scores.size(), 2u);
+
+  // Both scores should be positive
+  for (auto& [doc, score] : result.text_scores) {
+    EXPECT_GT(score, 0.0f) << "DocId " << doc << " should have positive score";
+  }
+
+  // doc1 has "hello" 2x in shorter context -> should score higher
+  float score0 = 0, score1 = 0;
+  for (auto& [doc, score] : result.text_scores) {
+    if (doc == 0)
+      score0 = score;
+    if (doc == 1)
+      score1 = score;
+  }
+  EXPECT_GT(score0, score1) << "Doc with higher TF should score higher";
+}
+
+TEST_F(ScoringTest, SearchPrefixWithScorer) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc1("hello help helm");  // 3 terms match "hel*"
+  MockedDocument doc2("hello world");      // 1 term matches "hel*"
+  MockedDocument doc3("goodbye world");    // 0 terms match "hel*"
+
+  index.Add(0, doc1);
+  index.Add(1, doc2);
+  index.Add(2, doc3);
+  index.FinalizeInitialization();
+
+  QueryParams params;
+  SearchAlgorithm algo;
+  ASSERT_TRUE(algo.Init("hel*", &params));
+  algo.SetScorer(ScorerSpec{});
+
+  auto result = algo.Search(&index);
+
+  // doc1 and doc2 should match, doc3 should not
+  ASSERT_EQ(result.ids.size(), 2u);
+  EXPECT_EQ(result.text_scores.size(), 2u);
+
+  float score0 = 0, score1 = 0;
+  for (auto& [doc, score] : result.text_scores) {
+    if (doc == 0)
+      score0 = score;
+    if (doc == 1)
+      score1 = score;
+  }
+
+  // doc1 matches 3 prefix-expanded terms, doc2 matches 1 -> doc1 should score higher
+  EXPECT_GT(score0, score1) << "Doc matching more prefix terms should score higher";
+  EXPECT_GT(score0, 0.0f);
+  EXPECT_GT(score1, 0.0f);
+}
+
+TEST_F(ScoringTest, SearchWithoutScorerNoScores) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc1("hello world");
+  index.Add(0, doc1);
+  index.FinalizeInitialization();
+
+  QueryParams params;
+  SearchAlgorithm algo;
+  ASSERT_TRUE(algo.Init("hello", &params));
+  // No SetScorer call
+
+  auto result = algo.Search(&index);
+
+  EXPECT_EQ(result.ids.size(), 1u);
+  EXPECT_TRUE(result.text_scores.empty()) << "No scores without scorer";
+}
+
+TEST_F(ScoringTest, IndexStats) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc1("hello world foo");  // 3 tokens
+  MockedDocument doc2("hello");            // 1 token
+  MockedDocument doc3("bar baz");          // 2 tokens
+
+  index.Add(0, doc1);
+  index.Add(1, doc2);
+  index.Add(2, doc3);
+
+  // Per-field stats via TextIndex
+  auto text_indices = index.GetAllTextIndices();
+  ASSERT_EQ(text_indices.size(), 1u);
+  auto* ti = text_indices[0];
+
+  size_t num_docs = index.GetAllDocs().size();
+  EXPECT_EQ(num_docs, 3u);
+  EXPECT_EQ(ti->GetFieldDocLength(0), 3u);
+  EXPECT_EQ(ti->GetFieldDocLength(1), 1u);
+  EXPECT_EQ(ti->GetFieldDocLength(2), 2u);
+  EXPECT_DOUBLE_EQ(ti->GetFieldAvgDocLen(), 2.0);  // (3+1+2)/3
+}
+
+TEST_F(ScoringTest, IndexStatsAfterRemove) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc1("hello world");  // 2 tokens
+  MockedDocument doc2("foo bar baz");  // 3 tokens
+
+  index.Add(0, doc1);
+  index.Add(1, doc2);
+
+  auto text_indices = index.GetAllTextIndices();
+  ASSERT_EQ(text_indices.size(), 1u);
+  auto* ti = text_indices[0];
+
+  EXPECT_EQ(index.GetAllDocs().size(), 2u);
+  EXPECT_DOUBLE_EQ(ti->GetFieldAvgDocLen(), 2.5);  // (2+3)/2
+
+  index.Remove(0, doc1);
+
+  EXPECT_EQ(index.GetAllDocs().size(), 1u);
+  EXPECT_DOUBLE_EQ(ti->GetFieldAvgDocLen(), 3.0);  // 3/1
+}
+
+TEST_F(ScoringTest, BM25StdAfterDocRemoval) {
+  // Verify scoring correctness after removing a document from the index
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc1("hello world hello");  // "hello" TF=2
+  MockedDocument doc2("hello there");        // "hello" TF=1
+  MockedDocument doc3("hello universe");     // "hello" TF=1
+
+  index.Add(0, doc1);
+  index.Add(1, doc2);
+  index.Add(2, doc3);
+  index.FinalizeInitialization();
+
+  // Score before removal
+  QueryParams params;
+  SearchAlgorithm algo;
+  ASSERT_TRUE(algo.Init("hello", &params));
+  algo.SetScorer(ScorerSpec{});
+
+  auto result_before = algo.Search(&index);
+  ASSERT_EQ(result_before.ids.size(), 3u);
+  EXPECT_EQ(result_before.text_scores.size(), 3u);
+
+  // Remove doc1
+  index.Remove(0, doc1);
+
+  // Re-search
+  SearchAlgorithm algo2;
+  ASSERT_TRUE(algo2.Init("hello", &params));
+  algo2.SetScorer(ScorerSpec{});
+
+  auto result_after = algo2.Search(&index);
+  ASSERT_EQ(result_after.ids.size(), 2u);
+  EXPECT_EQ(result_after.text_scores.size(), 2u);
+
+  // All remaining scores should be positive
+  for (auto& [doc, score] : result_after.text_scores) {
+    EXPECT_GT(score, 0.0f) << "DocId " << doc << " should have positive score after removal";
+    EXPECT_TRUE(doc == 1 || doc == 2) << "Unexpected DocId " << doc;
+  }
+}
+
+// Verify that with a scorer active and a cutoff limit, the search returns the
+// highest-scoring documents (top-K by score), not arbitrary ones.
+TEST_F(ScoringTest, ScorerTopKCutoff) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  // Create 10 docs with increasing TF for "hello": doc0=TF1, doc1=TF2, ..., doc9=TF10
+  for (uint32_t i = 0; i < 10; i++) {
+    string content;
+    for (uint32_t j = 0; j <= i; j++) {
+      if (!content.empty())
+        content += " ";
+      content += "hello";
+    }
+    content += " filler";
+    index.Add(i, MockedDocument(content));
+  }
+  index.FinalizeInitialization();
+
+  QueryParams params;
+  SearchAlgorithm algo;
+  ASSERT_TRUE(algo.Init("hello", &params));
+  algo.SetScorer(ScorerSpec{});
+
+  // Request only top 3 - should return docs 9, 8, 7 (highest TF)
+  auto result = algo.Search(&index, 3);
+
+  ASSERT_EQ(result.ids.size(), 3u);
+  ASSERT_EQ(result.text_scores.size(), 3u);
+  EXPECT_EQ(result.total, 10u);
+
+  // Verify returned docs are the top-3 scorers (highest TF = doc9, doc8, doc7)
+  set<DocId> returned(result.ids.begin(), result.ids.end());
+  EXPECT_TRUE(returned.count(9)) << "Doc9 (TF=10) should be in top-3";
+  EXPECT_TRUE(returned.count(8)) << "Doc8 (TF=9) should be in top-3";
+  EXPECT_TRUE(returned.count(7)) << "Doc7 (TF=8) should be in top-3";
+
+  // Verify scores are in descending order along result.ids, which carries the ranking.
+  for (size_t i = 1; i < result.ids.size(); i++) {
+    EXPECT_GE(result.text_scores.at(result.ids[i - 1]), result.text_scores.at(result.ids[i]))
+        << "Scores should be in descending order";
+  }
+}
+
+TEST_F(SearchTest, MatchOptional) {
+  // ~term returns ALL documents, not just matching ones
+  PrepareQuery("~hello");
+
+  ExpectAll("hello world", "no match here", "something else");
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchOptionalWithRequired) {
+  // "foo ~bar" means: must match "foo", optionally match "bar"
+  PrepareQuery("foo ~bar");
+
+  ExpectAll("foo", "foo bar", "foo and something");
+  ExpectNone("bar only", "nothing");
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchOptionalScoreBoost) {
+  // ~hello: all docs returned, but docs with "hello" get higher score
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc_with("hello world");
+  MockedDocument doc_without("goodbye world");
+
+  index.Add(0, doc_with);
+  index.Add(1, doc_without);
+  index.FinalizeInitialization();
+
+  QueryParams params;
+  SearchAlgorithm algo;
+  ASSERT_TRUE(algo.Init("~hello", &params));
+  algo.SetScorer(ScorerSpec{});
+
+  auto result = algo.Search(&index);
+
+  // Both docs are returned (optional never filters)
+  ASSERT_EQ(result.ids.size(), 2u);
+
+  // Use optional<float> so an absent score is distinguishable from 0.
+  std::optional<float> score_with, score_without;
+  for (auto& [doc, score] : result.text_scores) {
+    if (doc == 0)
+      score_with = score;
+    if (doc == 1)
+      score_without = score;
+  }
+  ASSERT_TRUE(score_with.has_value()) << "doc:0 must have a score entry";
+  ASSERT_TRUE(score_without.has_value()) << "doc:1 must have a score entry";
+  EXPECT_GT(*score_with, 0.0f) << "Doc matching the optional term should score > 0";
+  EXPECT_GT(*score_with, *score_without) << "Matching doc must score higher than non-matching";
+}
+
+TEST_F(SearchTest, MatchDoubleOptional) {
+  // ~foo ~bar: all docs returned
+  PrepareQuery("~foo ~bar");
+
+  ExpectAll("foo bar", "only foo", "only bar", "neither one");
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchOptionalNonExistentTerm) {
+  // ~xyznonexistent: term never matches anything, but all docs still returned
+  PrepareQuery("~xyznonexistent");
+
+  ExpectAll("anything goes", "another doc", "third one");
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchNestedOptional) {
+  // ~~hello: double optional should still return all docs
+  PrepareQuery("~~hello");
+
+  ExpectAll("hello world", "no match here", "third doc");
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchOptionalWithOr) {
+  // ~hello | world: '~hello' is all docs; OR with anything is still all docs
+  PrepareQuery("~hello | world");
+
+  ExpectAll("hello there", "world peace", "neither term", "both hello world");
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchFieldOptionalUnparen) {
+  // @field:~hello (no parens) — was a parser fix, ensure it executes correctly
+  PrepareQuery("@field:~hello");
+
+  ExpectAll("hello there", "no match", "another");
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, MatchOptionalSwallowsInnerErrors) {
+  // ~@invalid_field:hello: ~ is a soft boost, not a filter. Inner errors
+  // (missing/NOINDEX field) must NOT poison the outer query — return all docs
+  // without error, matching Redis's silent no-op semantics.
+  Schema schema = MakeSimpleSchema({{"text", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  MockedDocument doc{Map{{"text", "anything"}}};
+  index.Add(0, doc);
+  index.FinalizeInitialization();
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  ASSERT_TRUE(algo.Init("~@invalid_field:hello", &params));
+  auto result = algo.Search(&index);
+  EXPECT_TRUE(result.error.empty()) << "~ should swallow inner errors, got: " << result.error;
+  EXPECT_EQ(result.ids.size(), 1u) << "~ should still return all docs";
+}
+
+TEST_F(SearchTest, MatchEscapedTermLiteral) {
+  // \X escape: lexer must produce a TERM with the literal char, not a separate
+  // operator token. The actual tokenizer typically strips punctuation when
+  // building the index, so these searches usually return 0 docs — the point of
+  // this test is the *parse + search* path doesn't error or return the wrong
+  // docs through misinterpreting `\~` as TILDE.
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  MockedDocument plain("hello world");
+  index.Add(0, plain);
+  index.FinalizeInitialization();
+
+  for (auto* query : {"\\~hello", "foo\\~bar", "\\-test", "\\|word", "\\(group\\)"}) {
+    SearchAlgorithm algo;
+    QueryParams params;
+    ASSERT_TRUE(algo.Init(query, &params)) << "should parse: " << query;
+    auto result = algo.Search(&index);
+    EXPECT_TRUE(result.error.empty()) << "no error for escaped query: " << query;
+  }
+}
+
+TEST_F(SearchTest, MatchNestedOptionalNoDoubleScore) {
+  // ~~hello: nested optionals should not double-count "hello" in scoring.
+  // matched_text_terms_ uses a set keyed by (index, term) so the second
+  // OPT(hello) shouldn't add an extra cursor; doc with one "hello" must score
+  // the same as a plain ~hello.
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  MockedDocument doc_hello("hello world");
+  index.Add(0, doc_hello);
+  index.FinalizeInitialization();
+
+  auto run = [&](const char* query) {
+    SearchAlgorithm algo;
+    QueryParams params;
+    EXPECT_TRUE(algo.Init(query, &params));
+    algo.SetScorer(ScorerSpec{});
+    return algo.Search(&index);
+  };
+
+  auto single = run("~hello");
+  auto nested = run("~~hello");
+
+  ASSERT_EQ(single.text_scores.size(), 1u);
+  ASSERT_EQ(nested.text_scores.size(), 1u);
+  EXPECT_NEAR(single.text_scores.at(0), nested.text_scores.at(0), 1e-6)
+      << "Nested optionals must not inflate the score";
+}
+
+TEST_F(SearchTest, MatchNegateErrorPropagation) {
+  // -@invalid_field:hello: pre-existing AstNegateNode pattern, error must propagate
+  Schema schema = MakeSimpleSchema({{"text", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  index.FinalizeInitialization();
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  ASSERT_TRUE(algo.Init("-@invalid_field:hello", &params));
+  auto result = algo.Search(&index);
+  EXPECT_FALSE(result.error.empty()) << "error from negated subtree must propagate";
+}
+
+TEST_F(SearchTest, MatchOptionalFieldScopedReturnsAllDocs) {
+  Schema schema = MakeSimpleSchema({{"text", SchemaField::TEXT}, {"other", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument with_text{Map{{"text", "hello"}}};
+  MockedDocument without_text{Map{{"other", "world"}}};  // no "text" field
+  index.Add(0, with_text);
+  index.Add(1, without_text);
+  index.FinalizeInitialization();
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  ASSERT_TRUE(algo.Init("@text:~hello", &params));
+  auto result = algo.Search(&index);
+
+  EXPECT_TRUE(result.error.empty()) << result.error;
+  EXPECT_EQ(result.ids.size(), 2u)
+      << "@field:~term must return all docs, including ones without the field";
+}
+
+TEST_F(SearchTest, MatchOptionalFieldScopedSortableNoIndex) {
+  InitTLSearchMR(PMR_NS::get_default_resource());
+  absl::Cleanup mr_cleanup{[] { InitTLSearchMR(nullptr); }};
+
+  Schema schema = MakeSimpleSchema({{"txt", SchemaField::TEXT}});
+  schema.fields["txt"].flags = SchemaField::SORTABLE | SchemaField::NOINDEX;
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  MockedDocument doc{Map{{"txt", "hello"}}};
+  index.Add(0, doc);
+  index.FinalizeInitialization();
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  ASSERT_TRUE(algo.Init("@txt:~hello", &params));
+  auto result = algo.Search(&index);
+
+  EXPECT_TRUE(result.error.empty()) << "SORTABLE+NOINDEX field must not error: " << result.error;
+}
+
+TEST_F(SearchTest, MatchOptionalKnnIdsScoresAligned) {
+  auto schema = MakeSimpleSchema({{"text", SchemaField::TEXT}, {"vec", SchemaField::VECTOR}});
+  schema.fields["vec"].special_params = SchemaField::VectorParams{false, 1};
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  // 4 docs with different text and 1-D vector positions.
+  for (size_t i = 0; i < 4; ++i) {
+    MockedDocument doc{Map{{"text", i == 0 || i == 3 ? "hello world" : "other"},
+                           {"vec", ToBytes({float(i + 1)})}}};
+    index.Add(i, doc);
+  }
+  index.FinalizeInitialization();
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  params["v"] = ToBytes({2.5f});  // closest is doc:1 (pos=2) and doc:2 (pos=3)
+  ASSERT_TRUE(algo.Init("~hello => [KNN 4 @vec $v]", &params));
+  algo.SetScorer(ScorerSpec{});
+  auto result = algo.Search(&index);
+
+  ASSERT_TRUE(result.error.empty()) << result.error;
+  ASSERT_EQ(result.ids.size(), result.knn_scores.size())
+      << "every KNN result must carry a distance";
+  for (DocId id : result.ids) {
+    EXPECT_TRUE(result.knn_scores.contains(id)) << "id " << id << " must have a knn_score entry";
+  }
+}
+
+// Positions end-to-end via TextIndex: verifies that TokenizeWords -> BaseStringIndex::Add ->
+// BlockList -> CompressedSortedSet plumbing preserves per-token positions, that stopwords
+// don't advance positions, and that stem and raw tokens share the same position.
+class PositionsTest : public SearchTest {
+ protected:
+  std::vector<uint32_t> Positions(TextIndex* idx, std::string_view term, DocId doc) {
+    const auto* container = idx->Matching(term);
+    if (!container)
+      return {};
+    for (auto it = container->begin(); it != container->end(); ++it) {
+      if (*it == doc) {
+        auto p = it.Positions();
+        return std::vector<uint32_t>(p.begin(), p.end());
+      }
+    }
+    return {};
+  }
+};
+
+TEST_F(PositionsTest, BasicAdjacent) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc("machine learning algorithm");
+  index.Add(0, doc);
+
+  auto text_indices = index.GetAllTextIndices();
+  ASSERT_EQ(text_indices.size(), 1u);
+  auto* ti = text_indices[0];
+
+  // Tokens "machine", "learning", "algorithm" should land at sequential positions.
+  auto m = Positions(ti, "machine", 0);
+  auto l = Positions(ti, "learning", 0);
+  auto a = Positions(ti, "algorithm", 0);
+  ASSERT_EQ(m.size(), 1u);
+  ASSERT_EQ(l.size(), 1u);
+  ASSERT_EQ(a.size(), 1u);
+  EXPECT_EQ(l[0], m[0] + 1) << "learning must be adjacent to machine";
+  EXPECT_EQ(a[0], l[0] + 1) << "algorithm must follow learning";
+}
+
+TEST_F(PositionsTest, RepeatedTermAccumulates) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc("foo bar foo baz foo");
+  index.Add(0, doc);
+  auto* ti = index.GetAllTextIndices()[0];
+
+  auto foo = Positions(ti, "foo", 0);
+  EXPECT_EQ(foo.size(), 3u);
+  ASSERT_TRUE(std::is_sorted(foo.begin(), foo.end()));
+  // bar and baz fall between the foos at positions foo[0]+1 and foo[1]+1.
+  auto bar = Positions(ti, "bar", 0);
+  auto baz = Positions(ti, "baz", 0);
+  ASSERT_EQ(bar.size(), 1u);
+  ASSERT_EQ(baz.size(), 1u);
+  EXPECT_EQ(bar[0], foo[0] + 1);
+  EXPECT_EQ(baz[0], foo[1] + 1);
+}
+
+TEST_F(PositionsTest, StopwordsDoNotAdvance) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  // "a", "the", "of" are typical English stopwords used by default.
+  IndicesOptions opts{};
+  FieldIndices index{schema, opts, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc("a machine the learning of");
+  index.Add(0, doc);
+  auto* ti = index.GetAllTextIndices()[0];
+
+  auto m = Positions(ti, "machine", 0);
+  auto l = Positions(ti, "learning", 0);
+  ASSERT_EQ(m.size(), 1u);
+  ASSERT_EQ(l.size(), 1u);
+  EXPECT_EQ(l[0], m[0] + 1)
+      << "Stopwords (a/the/of) must not advance positions; machine and learning should be adjacent";
+}
+
+// Exact phrase queries — issue #7294 reproduction and edge cases.
+class PhraseTest : public SearchTest {};
+
+TEST_F(PhraseTest, BasicReproductionFromIssue7294) {
+  PrepareQuery("\"machine learning\"");
+  ExpectAll("machine learning algorithm",  // adjacent, in order
+            "machine learning",            // adjacent, exact
+            "preface machine learning epilogue");
+  ExpectNone("learning machine works",  // reversed order
+             "machine deep learning",   // not adjacent
+             "only machine", "no learning here");
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(PhraseTest, SingleTokenPhraseEqualsTerm) {
+  PrepareQuery("\"foo\"");
+  ExpectAll("foo", "foo bar", "bar foo baz");
+  ExpectNone("food", "afoo", "bar");
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(PhraseTest, StopwordsInPhraseDoNotAdvancePositions) {
+  // Both indexing and phrase-tokenize drop stopwords without advancing positions, so
+  // "a machine the learning" indexes as machine@1, learning@2 and the phrase
+  // "the machine learning" tokenizes to [machine, learning] — adjacency holds.
+  auto schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  IndicesOptions options{{"a", "the", "of"}};
+  FieldIndices indices{schema, options, PMR_NS::get_default_resource(), nullptr};
+
+  vector<string> documents = {"a machine the learning algorithm",  // pos: machine@1, learning@2
+                              "machine learning works",            // pos: machine@1, learning@2
+                              "learning machine"};                 // pos: learning@1, machine@2
+  for (size_t i = 0; i < documents.size(); i++) {
+    MockedDocument doc{{{"field", documents[i]}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+  ASSERT_TRUE(algo.Init("\"the machine learning\"", &params));
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0u, 1u));
+}
+
+TEST_F(PhraseTest, ThreeWordAdjacency) {
+  PrepareQuery("\"fully convolutional network\"");
+  ExpectAll("the fully convolutional network is great", "fully convolutional network");
+  ExpectNone("fully network convolutional",       // wrong order
+             "fully deep convolutional network",  // not adjacent
+             "convolutional network only");
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(PhraseTest, RepeatedTermInPhrase) {
+  // "the the" → after stopword filter is empty → matches nothing.
+  // But repeated content terms like "foo foo" must find adjacent foo,foo.
+  PrepareQuery("\"foo foo\"");
+  ExpectAll("foo foo bar",
+            "bar foo foo baz",  // adjacent pair in middle
+            "foo foo foo");     // three foos contain adjacent pair
+  ExpectNone("foo bar foo",     // separated
+             "foo");            // single
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(PhraseTest, FieldScopedPhrase) {
+  PrepareSchema({{"title", SchemaField::TEXT}, {"body", SchemaField::TEXT}});
+  PrepareQuery("@title:\"machine learning\"");
+  ExpectAll(Map{{"title", "machine learning algorithm"}, {"body", "anything"}});
+  ExpectNone(Map{{"title", "learning machine"}, {"body", "machine learning"}});  // wrong field
+  ExpectNone(Map{{"title", "deep learning"}, {"body", "machine learning"}});
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(PhraseTest, PhraseAndedWithTerm) {
+  PrepareQuery("algorithm \"machine learning\"");
+  ExpectAll("machine learning algorithm", "algorithm runs machine learning");
+  ExpectNone("machine learning",             // missing 'algorithm'
+             "algorithm works",              // missing phrase
+             "learning machine algorithm");  // phrase order wrong
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(PhraseTest, SlopAllowsGap) {
+  PrepareQuery("\"machine learning\"~1");
+  ExpectAll("machine learning",             // gap=0
+            "machine deep learning",        // gap=1
+            "machine learning algorithm");  // contains gap=0 run
+  ExpectNone("machine very deep learning",  // gap=2 (over budget)
+             "learning machine",            // wrong order
+             "machine only");
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(PhraseTest, SlopThreeWordPhrase) {
+  PrepareQuery("\"a b c\"~1");
+  // slop=1: at most 1 intervening word between consecutive phrase terms.
+  ExpectAll("a b c",       // 0,1,2
+            "a x b c",     // 0,2,3 → gap 1 then 0
+            "a b x c",     // 0,1,3 → gap 0 then 1
+            "a x b y c");  // 0,2,4 → gap 1 each
+  ExpectNone("a x y b c",  // gap=2 between a and b
+             "b a c",      // wrong order
+             "a b");       // missing c
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(PhraseTest, SlopRequiresOrder) {
+  // slop > 0 still requires terms in order.
+  PrepareQuery("\"machine learning\"~10");
+  ExpectAll("machine and learning");
+  ExpectNone("learning the machine");
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(PhraseTest, SlopBacktrackingFindsLaterCandidate) {
+  // Greedy "smallest first" fails when an earlier candidate dead-ends: text "a x a y b" with
+  // "a b"~1 should pick a@2 → b@4 (gap=1), not give up at a@0 where no b is within slop range.
+  PrepareQuery("\"a b\"~1");
+  ExpectAll("a x a y b");
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(PhraseTest, OnlyStopwordsInPhraseMatchesNothing) {
+  // Phrase that tokenizes to zero terms (all stopwords) must match no docs.
+  auto schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  IndicesOptions options{{"a", "the", "of"}};
+  FieldIndices indices{schema, options, PMR_NS::get_default_resource(), nullptr};
+
+  vector<string> documents = {"a the of", "machine learning", "anything else"};
+  for (size_t i = 0; i < documents.size(); i++) {
+    MockedDocument doc{{{"field", documents[i]}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+  ASSERT_TRUE(algo.Init("\"a the of\"", &params));
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre());
+}
+
+TEST_F(PhraseTest, PhraseMatchedDocsAreScored) {
+  // Phrase matches must populate text_scores via BM25 — i.e. constituent terms are registered
+  // as matched. Without this, top-K ranking would treat phrase-matched docs as score=0.
+  auto schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  // doc 0 contains the phrase with extra repetition (higher TF → higher BM25).
+  MockedDocument doc0("machine learning machine learning algorithm");
+  MockedDocument doc1("machine learning works");
+  MockedDocument doc2("unrelated content");
+  index.Add(0, doc0);
+  index.Add(1, doc1);
+  index.Add(2, doc2);
+  index.FinalizeInitialization();
+
+  QueryParams params;
+  SearchAlgorithm algo;
+  ASSERT_TRUE(algo.Init("\"machine learning\"", &params));
+  algo.SetScorer(ScorerSpec{});
+
+  auto result = algo.Search(&index);
+  ASSERT_EQ(result.ids.size(), 2u);
+  EXPECT_EQ(result.text_scores.size(), 2u);
+  for (auto& [doc, score] : result.text_scores)
+    EXPECT_GT(score, 0.0f) << "Phrase-matched doc " << doc << " must have positive score";
+
+  // doc 0 has higher term frequency → must rank higher than doc 1.
+  std::optional<float> s0, s1;
+  for (auto& [doc, score] : result.text_scores) {
+    if (doc == 0)
+      s0 = score;
+    if (doc == 1)
+      s1 = score;
+  }
+  ASSERT_TRUE(s0 && s1);
+  EXPECT_GT(*s0, *s1) << "Higher TF must score higher";
+}
+
+// UTF-8 phrase eval — adjacency works across Unicode word boundaries (Cyrillic).
+// Corpus drawn from a small Ukrainian poem; verifies Cyrillic lowercase + adjacency
+// through the full eval pipeline:
+//   Кіт заліз у холодильник —
+//   Шукав там ковбасу.
+//   Знайшов лише каструлю борщу
+//   І втратив віру в красу.
+TEST_F(PhraseTest, UnicodePhraseAdjacency) {
+  PrepareQuery("\"втратив віру\"");
+  ExpectAll("І втратив віру в красу",         // adjacent, in order (line 4)
+            "він втратив віру назавжди");     // adjacent, embedded
+  ExpectNone("віру втратив швидко",           // reversed
+             "втратив надію а потім віру",    // not adjacent
+             "Кіт заліз у холодильник",       // unrelated line
+             "Знайшов лише каструлю борщу");  // unrelated line
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+// Phrase of 5+ tokens (exceeds positions_stash_ inline capacity of 4).
+TEST_F(PhraseTest, LongPhraseFiveTokens) {
+  PrepareQuery("\"the quick brown fox jumps\"");
+  ExpectAll("the quick brown fox jumps over", "before the quick brown fox jumps after");
+  ExpectNone("the quick brown fox runs",
+             "quick brown fox jumps over",  // missing 'the'
+             "the brown fox jumps over");   // missing 'quick'
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+// Document with many occurrences of a phrase term — exercises position-decoding loop
+// past the InlinedVector<uint32_t, 4> inline capacity.
+TEST_F(PhraseTest, ManyPositionsPerTerm) {
+  auto schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  // 'foo' appears 10x, 'bar' 1x adjacent to one of the foos. Forces the position list
+  // for 'foo' to spill to the heap inside positions_stash_.
+  std::string text;
+  for (int i = 0; i < 9; ++i)
+    text += "foo zzz ";
+  text += "foo bar";  // adjacency at the 10th foo
+  MockedDocument doc({{"field", text}});
+  indices.Add(0, doc);
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  ASSERT_TRUE(algo.Init("\"foo bar\"", &params));
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0u));
+}
+
+// Empty phrase "" must safely match nothing — neither crash nor match-all.
+TEST_F(PhraseTest, EmptyPhrase) {
+  PrepareQuery("\"\"");
+  ExpectNone("foo", "anything", "literally any document");
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+// NOOFFSETS index surfaces a typed error to FT.SEARCH callers, not silently empty.
+TEST_F(PhraseTest, NoOffsetsErrorIsExplicit) {
+  auto schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  IndicesOptions options{{}};
+  options.no_offsets = true;
+  FieldIndices indices{schema, options, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc("machine learning algorithm");
+  indices.Add(0, doc);
+
+  SearchAlgorithm algo;
+  QueryParams params;
+  ASSERT_TRUE(algo.Init("\"machine learning\"", &params));
+  auto result = algo.Search(&indices);
+  EXPECT_THAT(result.error, testing::HasSubstr("phrase queries require offsets"));
+}
+
+}  // namespace search
+}  // namespace dfly

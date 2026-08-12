@@ -1,0 +1,315 @@
+local LG_funcs = {}
+
+function LG_funcs.init(dsize, csize, large_val_count, large_val_sz)
+    LG_funcs.dsize = dsize
+    LG_funcs.csize = csize
+    LG_funcs.esize = math.ceil(dsize / csize)
+    LG_funcs.huge_value_target = large_val_count
+    LG_funcs.huge_value_size = large_val_sz
+end
+
+local huge_entries = 0
+
+
+local function is_huge_entry()
+    if huge_entries >= LG_funcs.huge_value_target then
+        return false
+    else
+        huge_entries = huge_entries + 1
+        return true
+    end
+end
+
+
+local function randstr()
+    local str
+    local is_huge = is_huge_entry()
+    if is_huge then
+        str = dragonfly.randstr(LG_funcs.huge_value_size)
+    else
+        str = dragonfly.randstr(LG_funcs.esize)
+    end
+    return str
+end
+
+local function randstr_sequence()
+    local strs
+    local is_huge = is_huge_entry()
+    if is_huge then
+        strs = dragonfly.randstr(LG_funcs.huge_value_size, LG_funcs.csize)
+    else
+        strs = dragonfly.randstr(LG_funcs.esize, LG_funcs.csize)
+    end
+    return strs
+end
+
+-- strings
+-- store blobs of random chars
+
+function LG_funcs.add_string(key)
+    redis.apcall('SET', key, dragonfly.randstr(LG_funcs.dsize))
+end
+
+function LG_funcs.mod_string(key)
+    -- APPEND and SETRANGE are the only modifying operations for strings,
+    -- issue APPEND rarely to not grow data too much
+    -- replace the whole string fully sometimes
+    local p = math.random()
+    if p < 0.2 then
+        redis.apcall('APPEND', key, dragonfly.randstr(2))
+    elseif p < 0.9 then
+        local replacement = dragonfly.randstr(LG_funcs.dsize // 2)
+        redis.apcall('SETRANGE', key, math.random(0, LG_funcs.dsize // 2), replacement)
+    else
+        redis.apcall('SET', key, dragonfly.randstr(LG_funcs.dsize))
+    end
+end
+
+-- lists
+-- store list of random blobs of default container/element sizes
+
+function LG_funcs.add_list(key, keys)
+    redis.apcall('LPUSH', key, unpack(randstr_sequence()))
+end
+
+function LG_funcs.mod_list(key, keys)
+    -- equally likely pops and pushes, we rely on the list size being large enough
+    -- to "highly likely" not get emptied out by consequitve pops
+    local action = math.random(1, 4)
+    if action == 1 then
+        redis.apcall('RPOP', key)
+    elseif action == 2 then
+        redis.apcall('LPOP', key)
+    elseif action == 3 then
+      redis.apcall('LPUSH', key, randstr())
+    else
+      redis.apcall('RPUSH', key, randstr())
+    end
+end
+
+-- sets
+-- store sets of blobs of default container/element sizes
+
+function LG_funcs.add_set(key, keys)
+    if #keys > 100 and math.random() < 0.05 then
+        -- we assume that elements overlap with a very low proabiblity, so
+        -- SDIFF is expected to be equal to the origin set.
+        -- Repeating this operation too often can lead to two equal sets being chosen
+        local i1 = math.random(#keys)
+        local i2 = math.random(#keys)
+        while i1 == i2 do
+            i2 = math.random(#keys)
+        end
+        redis.apcall('SDIFFSTORE', key, keys[i1], keys[i2])
+    else
+        redis.apcall('SADD', key, unpack(randstr_sequence()))
+    end
+end
+
+function LG_funcs.mod_set(key, keys)
+     -- equally likely pops and additions
+    if math.random() < 0.5 then
+        redis.apcall('SPOP', key)
+    else
+        redis.apcall('SADD', key, randstr())
+    end
+end
+
+
+-- hashes
+-- store  {to_string(i): value for i in [1, csize]},
+-- where `value` is a random string for even indices and a number for odd indices
+
+function LG_funcs.add_hash(key, keys)
+    local blobs = randstr_sequence()
+    local limit = LG_funcs.csize
+
+    local htable = {}
+    for i = 1, limit do
+        htable[i * 2 - 1] = tostring(i)
+        htable[i * 2] = blobs[i]
+    end
+
+    redis.apcall('HSET', key, unpack(htable))
+end
+
+function LG_funcs.mod_hash(key, keys)
+    local idx = math.random(LG_funcs.csize)
+    redis.apcall('HSET', key, tostring(idx), randstr())
+end
+
+-- sorted sets
+
+function LG_funcs.add_zset(key, keys)
+    -- TODO: We don't support ZDIFFSTORE
+    local blobs = randstr_sequence()
+    local ztable = {}
+
+    local limit = LG_funcs.csize
+
+    for i = 1, limit do
+        ztable[i * 2 - 1] = tostring(i)
+        ztable[i * 2] = blobs[i]
+    end
+    redis.apcall('ZADD', key, unpack(ztable))
+end
+
+function LG_funcs.mod_zset(key, keys)
+    local action = math.random(1, 4)
+    if action <= 2 then
+        local size = LG_funcs.csize * 2
+        redis.apcall('ZADD', key, math.random(0, size), randstr())
+    elseif action == 3 then
+        redis.apcall('ZPOPMAX', key)
+    else
+        redis.apcall('ZPOPMIN', key)
+    end
+end
+
+-- json
+-- store single list of integers inside object
+
+function LG_funcs.add_json(key)
+    -- generate single list of counters
+    local seed = math.random(100)
+    local counters = {}
+    for i = 1, LG_funcs.csize do
+        counters[i] = ((i + seed) * 123) % 701
+    end
+    redis.apcall('JSON.SET', key, '$', cjson.encode({counters = counters}))
+end
+
+function LG_funcs.mod_json(key, dbsize)
+    local action = math.random(1, 4)
+    if action == 1 then
+        redis.apcall('JSON.ARRAPPEND', key, '$.counters', math.random(701))
+    elseif action == 2 then
+        redis.apcall('JSON.ARRPOP', key, '$.counters')
+    elseif action == 3 then
+        redis.apcall('JSON.NUMMULTBY', key, '$.counters[' .. math.random(LG_funcs.csize ) .. ']', 2)
+    else
+        redis.apcall('JSON.NUMINCRBY', key, '$.counters[' .. math.random(LG_funcs.csize ) .. ']', 1)
+    end
+end
+
+-- streams
+-- store sequences of timestamped events
+
+function LG_funcs.add_stream(key)
+    local entries = {}
+
+    local limit = LG_funcs.csize
+    local blobs = randstr_sequence()
+
+    for i = 1, limit do
+        table.insert(entries, tostring(i))
+        table.insert(entries, blobs[i])
+    end
+
+    redis.apcall('XADD', key, '*', unpack(entries))
+end
+
+function LG_funcs.mod_stream(key)
+    local action = math.random(1, 3)
+    if action <= 2 then
+        local size = LG_funcs.csize * 2
+        redis.apcall('XADD', key, '*', math.random(0, size), randstr())
+    else
+        local maxlen = math.random(0, 100)
+        redis.apcall('XTRIM', key, 'MAXLEN', '~', maxlen)
+    end
+end
+
+-- cuckoo filters
+-- reserve with enough capacity, then bulk-insert random items.
+-- cf_items tracks inserted items per key for the lifetime of this script
+-- execution so mod_cf can issue real deletes and trigger auto-compaction.
+
+local cf_items = {}
+
+function LG_funcs.add_cf(key)
+    local items = randstr_sequence()
+    redis.apcall('CF.RESERVE', key, math.max(LG_funcs.csize * 10, 64))
+    local args = {'CF.INSERT', key, 'NOCREATE', 'ITEMS'}
+    for _, item in ipairs(items) do
+        table.insert(args, item)
+    end
+    redis.apcall(unpack(args))
+    cf_items[key] = items
+end
+
+function LG_funcs.mod_cf(key)
+    local items = cf_items[key] or {}
+    local action = math.random(1, 3)
+    if action == 1 and #items > 0 then
+        -- delete a tracked item; may trigger auto-compaction via CF.DEL
+        local idx = math.random(#items)
+        redis.apcall('CF.DEL', key, items[idx])
+        items[idx] = items[#items]
+        items[#items] = nil
+    elseif action == 2 then
+        local item = randstr()
+        redis.apcall('CF.ADD', key, item)
+        table.insert(items, item)
+        cf_items[key] = items
+    else
+        redis.apcall('CF.ADD', key, randstr())
+    end
+end
+
+-- sbf (scalable bloom filter)
+-- store random items in a bloom filter; append-only structure
+
+function LG_funcs.add_sbf(key)
+    redis.apcall('BF.RESERVE', key, '0.01', LG_funcs.csize * 10)
+    redis.apcall('BF.MADD', key, unpack(randstr_sequence()))
+end
+
+function LG_funcs.mod_sbf(key)
+    redis.apcall('BF.ADD', key, randstr())
+end
+
+-- cms (count-min sketch)
+-- store frequency estimates for random items
+
+function LG_funcs.add_cms(key)
+    redis.apcall('CMS.INITBYDIM', key, LG_funcs.csize * 4, 5)
+    local strs = randstr_sequence()
+    local args = {}
+    for i = 1, #strs do
+        table.insert(args, strs[i])
+        table.insert(args, math.random(1, 100))
+    end
+    redis.apcall('CMS.INCRBY', key, unpack(args))
+end
+
+function LG_funcs.mod_cms(key)
+    redis.apcall('CMS.INCRBY', key, randstr(), math.random(1, 10))
+end
+
+-- topk
+-- store top-k heavy hitters from a stream of items
+
+function LG_funcs.add_topk(key)
+    local k = math.max(1, LG_funcs.csize // 2)
+    redis.apcall('TOPK.RESERVE', key, k)
+    redis.apcall('TOPK.ADD', key, unpack(randstr_sequence()))
+end
+
+function LG_funcs.mod_topk(key)
+    redis.apcall('TOPK.ADD', key, randstr())
+end
+
+function LG_funcs.get_huge_entries()
+  return huge_entries
+end
+
+-- Check if next entry generate huge value keys
+function LG_funcs.is_huge_entry(type)
+    -- These types don't generate huge values
+    if type == "string" or type == "json" then
+        return false
+    else
+        return huge_entries < LG_funcs.huge_value_target
+    end
+end

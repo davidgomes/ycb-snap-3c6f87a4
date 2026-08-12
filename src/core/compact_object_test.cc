@@ -1,0 +1,1586 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+#include "core/compact_object.h"
+
+#include <absl/functional/overload.h>
+#include <absl/strings/str_cat.h>
+#include <gtest/gtest.h>
+#include <mimalloc.h>
+#include <xxhash.h>
+
+#include <cstddef>
+#include <random>
+
+#include "base/gtest.h"
+#include "base/logging.h"
+#include "core/cuckoo.h"
+#include "core/detail/bitpacking.h"
+#include "core/huff_coder.h"
+#include "core/mi_memory_resource.h"
+#include "core/page_usage/page_usage_stats.h"
+#include "core/string_map.h"
+#include "core/string_set.h"
+
+extern "C" {
+#include "redis/intset.h"
+#include "redis/redis_aux.h"
+#include "redis/stream.h"
+#include "redis/zmalloc.h"
+}
+
+namespace dfly {
+
+XXH64_hash_t kSeed = 24061983;
+constexpr size_t kRandomStartIndex = 24;
+constexpr size_t kRandomStep = 26;
+constexpr float kUnderUtilizedRatio = 1.0f;  // ensure that we would detect
+using namespace std;
+using namespace jsoncons;
+using namespace jsoncons::jsonpath;
+
+void PrintTo(const CompactObj& cobj, std::ostream* os) {
+  if (cobj.ObjType() == OBJ_STRING) {
+    *os << "'" << cobj.ToString() << "' ";
+    return;
+  }
+  *os << "cobj: [" << cobj.ObjType() << "]";
+}
+
+// This is for the mimalloc test - being able to find an address in memory
+// where we have memory underutilzation
+// see issue number 448 (https://github.com/dragonflydb/dragonfly/issues/448)
+std::vector<void*> AllocateForTest(int size, std::size_t allocate_size, int factor1 = 1,
+                                   int factor2 = 1) {
+  const int kAllocRandomChangeSize = 13;  // just some random value
+  std::vector<void*> ptrs;
+  for (int index = 0; index < size; index++) {
+    auto alloc_size =
+        index % kAllocRandomChangeSize == 0 ? allocate_size * factor1 : allocate_size * factor2;
+    auto heap_alloc = mi_heap_get_backing();
+    void* ptr = mi_heap_malloc(heap_alloc, alloc_size);
+    ptrs.push_back(ptr);
+  }
+  return ptrs;
+}
+
+bool HasUnderutilizedMemory(const std::vector<void*>& ptrs, float ratio) {
+  PageUsage page_usage{CollectPageStats::NO, ratio};
+  auto it = std::find_if(ptrs.begin(), ptrs.end(), [&](auto p) {
+    int r = p && page_usage.IsPageForObjectUnderUtilized(p);
+    return r > 0;
+  });
+  return it != ptrs.end();
+}
+
+// Go over ptrs vector and free memory at locations every "steps".
+// This is so that we will trigger the under utilization - some
+// pages will have "holes" in them and we are expecting to find these pages.
+void DeallocateAtRandom(size_t steps, std::vector<void*>* ptrs) {
+  for (size_t i = kRandomStartIndex; i < ptrs->size(); i += steps) {
+    mi_free(ptrs->at(i));
+    ptrs->at(i) = nullptr;
+  }
+}
+
+static void InitThreadStructs() {
+  auto* tlh = mi_heap_get_backing();
+  init_zmalloc_threadlocal(tlh);
+  SmallString::InitThreadLocal(tlh);
+  thread_local MiMemoryResource mi_resource(tlh);
+  CompactObj::InitThreadLocal(&mi_resource);
+  InitTLStatelessAllocMR(&mi_resource);
+};
+
+static void CheckEverythingDeallocated() {
+  mi_heap_collect(mi_heap_get_backing(), true);
+
+  auto cb_visit = [](const mi_heap_t* heap, const mi_heap_area_t* area, void* block,
+                     size_t block_size, void* arg) {
+    LOG(ERROR) << "Unfreed allocations: block_size " << block_size
+               << ", allocated: " << area->used * block_size;
+    return true;
+  };
+
+  mi_heap_visit_blocks(mi_heap_get_backing(), false /* do not visit all blocks*/, cb_visit,
+                       nullptr);
+}
+
+class CompactObjectTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    InitRedisTables();  // to initialize server struct.
+
+    InitThreadStructs();
+  }
+
+  static void TearDownTestSuite() {
+    CheckEverythingDeallocated();
+    CleanupStatelessAllocMR();
+  }
+
+  CompactValue cobj_;
+  CompactKey ckey_;
+  string tmp_;
+};
+
+TEST_F(CompactObjectTest, WastedMemoryDetection) {
+  size_t allocated = 0, commited = 0, wasted = 0;
+  // By setting the threshold to high value we are expecting
+  // To find locations where we have wasted memory
+  float ratio = 0.8;
+  zmalloc_get_allocator_wasted_blocks(ratio, &allocated, &commited, &wasted);
+  EXPECT_EQ(allocated, 0);
+  EXPECT_EQ(commited, 0);
+  EXPECT_EQ(wasted, (commited - allocated));
+
+  std::size_t allocated_mem = 64;
+  auto* myheap = mi_heap_get_backing();
+
+  void* p1 = mi_heap_malloc(myheap, 64);
+
+  void* ptrs_end[50];
+  for (size_t i = 0; i < 50; ++i) {
+    ptrs_end[i] = mi_heap_malloc(myheap, 128);
+    allocated_mem += 128;
+  }
+
+  allocated = commited = wasted = 0;
+  zmalloc_get_allocator_wasted_blocks(ratio, &allocated, &commited, &wasted);
+  EXPECT_EQ(allocated, allocated_mem);
+  EXPECT_GT(commited, allocated_mem);
+  EXPECT_EQ(wasted, (commited - allocated));
+  void* ptr[50];
+  // allocate 50
+  for (size_t i = 0; i < 50; ++i) {
+    ptr[i] = mi_heap_malloc(myheap, 256);
+    allocated_mem += 256;
+  }
+
+  // At this point all the blocks has committed > 0 and used > 0
+  // and since we expecting to find these locations, the size of
+  // wasted == commited memory - allocated memory.
+  allocated = commited = wasted = 0;
+  zmalloc_get_allocator_wasted_blocks(ratio, &allocated, &commited, &wasted);
+  EXPECT_EQ(allocated, allocated_mem);
+  EXPECT_GT(commited, allocated_mem);
+  EXPECT_EQ(wasted, (commited - allocated));
+
+  // free 50/50 -
+  for (size_t i = 0; i < 50; ++i) {
+    mi_free(ptr[i]);
+    allocated_mem -= 256;
+  }
+
+  // After all the memory at block size 256 is free, we would have commited there
+  // but the used is expected to be 0, so the number now is different from the
+  // case above
+  allocated = commited = wasted = 0;
+  zmalloc_get_allocator_wasted_blocks(ratio, &allocated, &commited, &wasted);
+  EXPECT_EQ(allocated, allocated_mem);
+  EXPECT_GT(commited, allocated_mem);
+  // since we release all 256 memory block, it should not be counted
+  EXPECT_EQ(wasted, (commited - allocated));
+  for (size_t i = 0; i < 50; ++i) {
+    mi_free(ptrs_end[i]);
+  }
+  mi_free(p1);
+
+  // Now that its all freed, we are not expecting to have any wasted memory any more
+  allocated = commited = wasted = 0;
+  zmalloc_get_allocator_wasted_blocks(ratio, &allocated, &commited, &wasted);
+  EXPECT_EQ(allocated, 0);
+  EXPECT_GT(commited, allocated);
+  EXPECT_EQ(wasted, (commited - allocated));
+
+  mi_collect(false);
+}
+
+TEST_F(CompactObjectTest, WastedMemoryDontCount) {
+  // The commited memory per blocks are:
+  // 64bit => 4K
+  // 128bit => 8k
+  // 256 => 16k
+  // and so on, which mean every n * sizeof(ptr) ^ 2 == 2^11*2*(n-1) (where n starts with 1)
+  constexpr std::size_t kExpectedFor256MemWasted = 0x4000;  // memory block 256
+  auto* myheap = mi_heap_get_backing();
+
+  size_t allocated = 0, commited = 0, wasted = 0;
+  // By setting the threshold to a very low number
+  // we don't expect to find and locations where memory is wasted
+  float ratio = 0.01;
+  zmalloc_get_allocator_wasted_blocks(ratio, &allocated, &commited, &wasted);
+  EXPECT_EQ(allocated, 0);
+  EXPECT_EQ(commited, 0);
+  EXPECT_EQ(wasted, (commited - allocated));
+
+  std::size_t allocated_mem = 64;
+
+  void* p1 = mi_heap_malloc(myheap, 64);
+
+  void* ptrs_end[50];
+  for (size_t i = 0; i < 50; ++i) {
+    ptrs_end[i] = mi_heap_malloc(myheap, 128);
+    (void)p1;
+    allocated_mem += 128;
+  }
+
+  void* ptr[50];
+
+  // allocate 50
+  for (size_t i = 0; i < 50; ++i) {
+    ptr[i] = mi_heap_malloc(myheap, 256);
+    allocated_mem += 256;
+  }
+  allocated = commited = wasted = 0;
+  zmalloc_get_allocator_wasted_blocks(ratio, &allocated, &commited, &wasted);
+  // Threshold is low so we are not expecting any wasted memory to be found.
+  EXPECT_EQ(allocated, allocated_mem);
+  EXPECT_GT(commited, allocated_mem);
+  EXPECT_EQ(wasted, 0);
+
+  // free 50/50 -
+  for (size_t i = 0; i < 50; ++i) {
+    mi_free(ptr[i]);
+    allocated_mem -= 256;
+  }
+  allocated = commited = wasted = 0;
+  zmalloc_get_allocator_wasted_blocks(ratio, &allocated, &commited, &wasted);
+
+  EXPECT_EQ(allocated, allocated_mem);
+  EXPECT_GT(commited, allocated_mem);
+  // We will detect only wasted memory for block size of
+  // 256 - and all of it is wasted.
+  EXPECT_EQ(wasted, kExpectedFor256MemWasted);
+  // Threshold is low so we are not expecting any wasted memory to be found.
+  for (size_t i = 0; i < 50; ++i) {
+    mi_free(ptrs_end[i]);
+  }
+  mi_free(p1);
+
+  mi_collect(false);
+}
+
+TEST_F(CompactObjectTest, NonInline) {
+  string s(22, 'a');
+  CompactKey obj{s};
+
+  uint64_t expected_val = XXH3_64bits_withSeed(s.data(), s.size(), kSeed);
+  EXPECT_EQ(18261733907982517826UL, expected_val);
+  EXPECT_EQ(expected_val, obj.HashCode());
+  EXPECT_EQ(s, obj);
+
+  s.assign(25, 'b');
+  obj.SetString(s);
+  EXPECT_EQ(s, obj);
+  EXPECT_EQ(s.size(), obj.Size());
+}
+
+TEST_F(CompactObjectTest, InlineAsciiEncoded) {
+  string s = "key:0000000000000";
+  uint64_t expected_val = XXH3_64bits_withSeed(s.data(), s.size(), kSeed);
+  CompactValue obj{s};
+  EXPECT_EQ(expected_val, obj.HashCode());
+  EXPECT_EQ(s.size(), obj.Size());
+}
+
+TEST_F(CompactObjectTest, Int) {
+  ckey_.SetString("0");
+  EXPECT_EQ(0, ckey_.TryGetInt());
+  EXPECT_EQ(1, ckey_.Size());
+  EXPECT_EQ(ckey_, "0");
+  EXPECT_EQ("0", ckey_.GetSlice(&tmp_));
+  EXPECT_EQ(OBJ_STRING, ckey_.ObjType());
+}
+
+TEST_F(CompactObjectTest, Expire) {
+  CompactKey key;
+  key.SetString("42");
+  key.SetExpireTime(10000);
+
+  EXPECT_EQ(8181779779123079347, key.HashCode());
+  EXPECT_EQ(OBJ_ENCODING_RAW, key.Encoding());
+  EXPECT_EQ(2, key.Size());
+  EXPECT_TRUE(key.HasExpire());
+}
+
+TEST_F(CompactObjectTest, SdsTtlTag) {
+  // 1. Inline key + SetTtl
+  {
+    CompactKey key("hello");
+    ASSERT_TRUE(key.IsInline());
+    uint64_t hash_before = key.HashCode();
+
+    key.SetExpireTime(1000);
+    EXPECT_TRUE(key.HasExpire());
+    EXPECT_EQ(1000, key.GetExpireTime());
+    EXPECT_EQ(hash_before, key.HashCode());
+    EXPECT_TRUE(key == "hello"sv);
+    EXPECT_EQ(5, key.Size());
+    EXPECT_EQ(OBJ_STRING, key.ObjType());
+
+    string slice;
+    EXPECT_EQ("hello", key.GetSlice(&slice));
+    EXPECT_GT(key.MallocUsed(), 0u);
+  }
+
+  // 2. INT_TAG key + SetTtl
+  {
+    CompactKey key("42");
+    ASSERT_TRUE(key.TryGetInt().has_value());
+    uint64_t hash_before = key.HashCode();
+
+    key.SetExpireTime(2000);
+    EXPECT_TRUE(key.HasExpire());
+    EXPECT_EQ(2000, key.GetExpireTime());
+    EXPECT_TRUE(key == "42"sv);
+    EXPECT_EQ(hash_before, key.HashCode());
+    // No longer INT_TAG — TryGetInt should return nullopt.
+    EXPECT_FALSE(key.TryGetInt().has_value());
+  }
+
+  // 3. SMALL_TAG key + SetTtl
+  {
+    string s(64, 'x');
+    for (size_t i = 0; i < s.size(); ++i)
+      s[i] = 'a' + (i % 26);
+    CompactKey key(s);
+    uint64_t hash_before = key.HashCode();
+
+    key.SetExpireTime(3000);
+    EXPECT_TRUE(key.HasExpire());
+    EXPECT_EQ(3000, key.GetExpireTime());
+    EXPECT_TRUE(key == s);
+    EXPECT_EQ(hash_before, key.HashCode());
+    EXPECT_EQ(s.size(), key.Size());
+  }
+
+  // 4. ROBJ_TAG key + SetExpireTime
+  {
+    string s(512, 'z');
+    for (size_t i = 0; i < s.size(); ++i)
+      s[i] = static_cast<char>(128 + (i % 128));
+    CompactKey key(s);
+    uint64_t hash_before = key.HashCode();
+
+    key.SetExpireTime(4000);
+    EXPECT_TRUE(key.HasExpire());
+    EXPECT_EQ(4000, key.GetExpireTime());
+    EXPECT_TRUE(key == s);
+    EXPECT_EQ(hash_before, key.HashCode());
+    EXPECT_EQ(s.size(), key.Size());
+  }
+
+  // 5. ExpireTime update in-place
+  {
+    CompactKey key("hello");
+    key.SetExpireTime(1000);
+    EXPECT_EQ(1000, key.GetExpireTime());
+
+    key.SetExpireTime(2000);
+    EXPECT_EQ(2000, key.GetExpireTime());
+    EXPECT_TRUE(key == "hello"sv);
+  }
+
+  // 6. ClearTtl (inline recovery)
+  {
+    CompactKey key("hello");
+    key.SetExpireTime(1000);
+    EXPECT_TRUE(key.ClearExpireTime());
+
+    EXPECT_FALSE(key.HasExpire());
+    EXPECT_TRUE(key.IsInline());
+    EXPECT_TRUE(key == "hello"sv);
+  }
+
+  // 7. ClearTtl (INT recovery)
+  {
+    CompactKey key("42");
+    key.SetExpireTime(1000);
+    EXPECT_TRUE(key.ClearExpireTime());
+    EXPECT_FALSE(key.HasExpire());
+    EXPECT_TRUE(key.TryGetInt().has_value());
+    EXPECT_EQ(42, key.TryGetInt().value());
+  }
+
+  // 8. ClearTtl (SMALL recovery)
+  {
+    string s(64, 'x');
+    for (size_t i = 0; i < s.size(); ++i)
+      s[i] = 'a' + (i % 26);
+    CompactKey key(s);
+    key.SetExpireTime(1000);
+    EXPECT_TRUE(key.ClearExpireTime());
+    EXPECT_FALSE(key.HasExpire());
+    EXPECT_TRUE(key == s);
+  }
+
+  // 9. Move semantics
+  {
+    CompactKey a("test");
+    a.SetExpireTime(100);
+    CompactKey b(std::move(a));
+    EXPECT_TRUE(b.HasExpire());
+    EXPECT_EQ(100, b.GetExpireTime());
+    EXPECT_TRUE(b == "test"sv);
+  }
+
+  // 10. Free/destructor — just verify no leaks (TearDown catches them).
+  {
+    CompactKey key("hello");
+    key.SetExpireTime(5000);
+  }
+}
+
+TEST_F(CompactObjectTest, MediumString) {
+  string tmp(511, 'b');
+
+  cobj_.SetString(tmp);
+  EXPECT_EQ(tmp.size(), cobj_.Size());
+
+  cobj_.SetString(tmp);
+  EXPECT_EQ(tmp.size(), cobj_.Size());
+  cobj_.Reset();
+
+  tmp.assign(27463, 'c');
+  cobj_.SetString(tmp);
+  EXPECT_EQ(27463, cobj_.Size());
+}
+
+TEST_F(CompactObjectTest, AsciiUtil) {
+  std::string_view data{"aaaaaabb"};
+  uint8_t buf[32];
+
+  char outbuf[32] = "xxxxxxxxxxxxxx";
+  detail::ascii_pack_simd(data.data(), 7, buf);
+  detail::ascii_unpack_simd(buf, 7, outbuf);
+
+  ASSERT_EQ('x', outbuf[7]) << outbuf;
+  std::string_view actual{outbuf, 7};
+  ASSERT_EQ(data.substr(0, 7), actual);
+
+  string data3;
+  for (unsigned i = 0; i < 13; ++i) {
+    data3.append("12345678910");
+  }
+  string act_str(data3.size(), 'y');
+  std::vector<uint8_t> binvec(detail::binpacked_len(data3.size()));
+  detail::ascii_pack_simd2(data3.data(), data3.size(), binvec.data());
+  detail::ascii_unpack_simd(binvec.data(), data3.size(), act_str.data());
+
+  ASSERT_EQ(data3, act_str);
+}
+
+TEST_F(CompactObjectTest, AsciiPackByte) {
+  // Test ascii_pack_byte and ascii_unpack_byte for correctness.
+  for (size_t len : {8, 16, 24, 31, 32, 33, 64, 100}) {
+    string original(len, 'a');
+    for (size_t i = 0; i < len; ++i)
+      original[i] = 'A' + (i % 26);
+
+    size_t packed_len = detail::binpacked_len(len);
+    vector<uint8_t> packed(packed_len);
+    detail::ascii_pack(original.data(), len, packed.data());
+
+    // Verify initial pack/unpack round-trip at byte level.
+    for (size_t i = 0; i < len; ++i) {
+      uint8_t got = detail::ascii_unpack_byte(packed.data(), len, i);
+      ASSERT_EQ(static_cast<uint8_t>(original[i]), got) << "len=" << len << " offset=" << i;
+    }
+
+    // Now set each byte to a different value via ascii_pack_byte, verify round-trip.
+    for (size_t i = 0; i < len; ++i) {
+      uint8_t new_val = 'a' + ((i + 3) % 26);
+
+      // Pack the full string, then modify one byte.
+      vector<uint8_t> modified(packed);
+      detail::ascii_pack_byte(modified.data(), len, i, new_val);
+
+      // The modified byte should read back correctly.
+      uint8_t got = detail::ascii_unpack_byte(modified.data(), len, i);
+      EXPECT_EQ(new_val, got) << "len=" << len << " set offset=" << i;
+
+      // All other bytes should be unchanged.
+      for (size_t j = 0; j < len; ++j) {
+        if (j == i)
+          continue;
+        uint8_t other = detail::ascii_unpack_byte(modified.data(), len, j);
+        EXPECT_EQ(static_cast<uint8_t>(original[j]), other)
+            << "len=" << len << " set offset=" << i << " check offset=" << j;
+      }
+    }
+
+    // Test setting all bytes to zero (edge case: clearing bits).
+    {
+      vector<uint8_t> zeroed(packed);
+      string expected = original;
+      for (size_t i = 0; i < len; ++i) {
+        detail::ascii_pack_byte(zeroed.data(), len, i, 0);
+        expected[i] = '\0';
+      }
+      for (size_t i = 0; i < len; ++i) {
+        uint8_t got = detail::ascii_unpack_byte(zeroed.data(), len, i);
+        EXPECT_EQ(0, got) << "len=" << len << " zero check offset=" << i;
+      }
+    }
+
+    // Test setting all bytes to 0x7F (all bits set in 7-bit ASCII).
+    {
+      vector<uint8_t> maxed(packed);
+      for (size_t i = 0; i < len; ++i) {
+        detail::ascii_pack_byte(maxed.data(), len, i, 0x7F);
+      }
+      for (size_t i = 0; i < len; ++i) {
+        uint8_t got = detail::ascii_unpack_byte(maxed.data(), len, i);
+        EXPECT_EQ(0x7F, got) << "len=" << len << " max check offset=" << i;
+      }
+    }
+  }
+}
+
+TEST_F(CompactObjectTest, IntSet) {
+  intset* is = intsetNew();
+  cobj_.InitRobj(OBJ_SET, kEncodingIntSet, is);
+
+  EXPECT_EQ(0, cobj_.Size());
+  is = (intset*)cobj_.RObjPtr();
+  uint8_t success = 0;
+
+  is = intsetAdd(is, 10, &success);
+  EXPECT_EQ(1, success);
+  is = intsetAdd(is, 10, &success);
+  EXPECT_EQ(0, success);
+  cobj_.SetRObjPtr(is);
+
+  EXPECT_GT(cobj_.MallocUsed(), 0);
+}
+
+TEST_F(CompactObjectTest, ZSet) {
+  // unrelated, checking that sds static encoding works.
+  // it is used in zset special strings.
+  char kMinStrData[] =
+      "\110"
+      "minstring";
+  EXPECT_EQ(9, sdslen(kMinStrData + 1));
+
+  cobj_.InitRobj(OBJ_ZSET, OBJ_ENCODING_LISTPACK, lpNew(0));
+
+  EXPECT_EQ(OBJ_ZSET, cobj_.ObjType());
+  EXPECT_EQ(OBJ_ENCODING_LISTPACK, cobj_.Encoding());
+}
+
+TEST_F(CompactObjectTest, Hash) {
+  uint8_t* lp = lpNew(0);
+  lp = lpAppend(lp, reinterpret_cast<const uint8_t*>("foo"), 3);
+  lp = lpAppend(lp, reinterpret_cast<const uint8_t*>("barrr"), 5);
+  cobj_.InitRobj(OBJ_HASH, kEncodingListPack, lp);
+  EXPECT_EQ(OBJ_HASH, cobj_.ObjType());
+  EXPECT_EQ(1, cobj_.Size());
+}
+
+TEST_F(CompactObjectTest, SBF) {
+  cobj_.SetSBF(1000, 0.001, 2);
+  EXPECT_EQ(cobj_.ObjType(), OBJ_SBF);
+  EXPECT_GT(cobj_.MallocUsed(), 0);
+}
+
+TEST_F(CompactObjectTest, CuckooFilter) {
+  cobj_.SetCuckooFilter(CuckooFilterOptions{.capacity = 1000});
+  EXPECT_EQ(cobj_.ObjType(), OBJ_CUCKOOFILTER);
+  EXPECT_GT(cobj_.MallocUsed(), 0);
+
+  CuckooFilter* cf = cobj_.GetCuckooFilter();
+  uint64_t hash = CuckooFilter::Hash("foo");
+  EXPECT_TRUE(cf->Insert(hash));
+  EXPECT_TRUE(cf->Exists(hash));
+  EXPECT_EQ(cobj_.Size(), 1u);
+  EXPECT_TRUE(cf->Delete(hash));
+  EXPECT_FALSE(cf->Exists(hash));
+}
+
+TEST_F(CompactObjectTest, MimallocUnderutilzation) {
+  // We are testing with the same object size allocation here
+  // This test is for https://github.com/dragonflydb/dragonfly/issues/448
+  size_t allocation_size = 94;
+  int count = 2000;
+  std::vector<void*> ptrs = AllocateForTest(count, allocation_size);
+  bool found = HasUnderutilizedMemory(ptrs, kUnderUtilizedRatio);
+  ASSERT_FALSE(found);
+  DeallocateAtRandom(kRandomStep, &ptrs);
+  found = HasUnderutilizedMemory(ptrs, kUnderUtilizedRatio);
+  ASSERT_TRUE(found);
+  for (auto* ptr : ptrs) {
+    mi_free(ptr);
+  }
+}
+
+TEST_F(CompactObjectTest, MimallocUnderutilzationDifferentSizes) {
+  // This test uses different objects sizes to cover more use cases
+  // related to issue https://github.com/dragonflydb/dragonfly/issues/448
+  size_t allocation_size = 97;
+  int count = 2000;
+  int mem_factor_1 = 3;
+  int mem_factor_2 = 2;
+  std::vector<void*> ptrs = AllocateForTest(count, allocation_size, mem_factor_1, mem_factor_2);
+  bool found = HasUnderutilizedMemory(ptrs, kUnderUtilizedRatio);
+  ASSERT_FALSE(found);
+  DeallocateAtRandom(kRandomStep, &ptrs);
+  found = HasUnderutilizedMemory(ptrs, kUnderUtilizedRatio);
+  ASSERT_TRUE(found);
+  for (auto* ptr : ptrs) {
+    mi_free(ptr);
+  }
+}
+
+TEST_F(CompactObjectTest, MimallocUnderutilzationWithRealloc) {
+  // This test is checking underutilzation with reallocation as well as deallocation
+  // of the memory - see issue https://github.com/dragonflydb/dragonfly/issues/448
+  size_t allocation_size = 102;
+  int count = 2000;
+  int mem_factor_1 = 4;
+  int mem_factor_2 = 1;
+
+  std::vector<void*> ptrs = AllocateForTest(count, allocation_size, mem_factor_1, mem_factor_2);
+  bool found = HasUnderutilizedMemory(ptrs, kUnderUtilizedRatio);
+  ASSERT_FALSE(found);
+  DeallocateAtRandom(kRandomStep, &ptrs);
+
+  //  This is another case, where we are filling the "gaps" by doing re-allocations
+  //  in this case, since we are not setting all the values back it should still have
+  //  places that are not used. Plus since we are not looking at the first page
+  //  other pages should be underutilized.
+  for (size_t i = kRandomStartIndex; i < ptrs.size(); i += kRandomStep) {
+    if (!ptrs[i]) {
+      ptrs[i] = mi_heap_malloc(mi_heap_get_backing(), allocation_size);
+    }
+  }
+  found = HasUnderutilizedMemory(ptrs, kUnderUtilizedRatio);
+  ASSERT_TRUE(found);
+  for (auto* ptr : ptrs) {
+    mi_free(ptr);
+  }
+}
+
+TEST_F(CompactObjectTest, JsonTypeTest) {
+  using namespace jsoncons;
+  // This test verify that we can set a json type
+  // and that we "know", it JSON and not a string
+  std::string_view json_str = R"(
+    {"firstName":"John","lastName":"Smith","age":27,"weight":135.25,"isAlive":true,
+    "address":{"street":"21 2nd Street","city":"New York","state":"NY","zipcode":"10021-3100"},
+    "phoneNumbers":[{"type":"home","number":"212 555-1234"},{"type":"office","number":"646 555-4567"}],
+    "children":[],"spouse":null}
+  )";
+  std::optional<JsonType> json_option2 =
+      ParseJsonUsingShardHeap(R"({"a":{}, "b":{"a":1}, "c":{"a":1, "b":2}})");
+
+  cobj_.SetString(json_str);
+  ASSERT_TRUE(cobj_.ObjType() == OBJ_STRING);  // we set this as a string
+  JsonType* failed_json = cobj_.GetJson();
+  ASSERT_TRUE(failed_json == nullptr);
+  ASSERT_TRUE(cobj_.ObjType() == OBJ_STRING);
+  std::optional<JsonType> json_option = ParseJsonUsingShardHeap(json_str);
+  ASSERT_TRUE(json_option.has_value());
+  cobj_.SetJson(std::move(json_option.value()));
+  ASSERT_TRUE(cobj_.ObjType() == OBJ_JSON);  // and now this is a JSON type
+  JsonType* json = cobj_.GetJson();
+  ASSERT_TRUE(json != nullptr);
+  ASSERT_TRUE(json->contains("firstName"));
+  // set second object make sure that we don't have any memory issue
+  ASSERT_TRUE(json_option2.has_value());
+  cobj_.SetJson(std::move(json_option2.value()));
+  ASSERT_TRUE(cobj_.ObjType() == OBJ_JSON);  // still is a JSON type
+  json = cobj_.GetJson();
+  ASSERT_TRUE(json != nullptr);
+  ASSERT_TRUE(json->contains("b"));
+  ASSERT_FALSE(json->contains("firstName"));
+  std::optional<JsonType> set_array = ParseJsonUsingShardHeap("");
+  // now set it to string again
+  cobj_.SetString(R"({"a":{}, "b":{"a":1}, "c":{"a":1, "b":2}})");
+  ASSERT_TRUE(cobj_.ObjType() == OBJ_STRING);  // we set this as a string
+  failed_json = cobj_.GetJson();
+  ASSERT_TRUE(failed_json == nullptr);
+}
+
+TEST_F(CompactObjectTest, JsonTypeWithPathTest) {
+  std::string_view books_json =
+      R"({"books":[{
+            "category": "fiction",
+            "title" : "A Wild Sheep Chase",
+            "author" : "Haruki Murakami"
+        },{
+            "category": "fiction",
+            "title" : "The Night Watch",
+            "author" : "Sergei Lukyanenko"
+        },{
+            "category": "fiction",
+            "title" : "The Comedians",
+            "author" : "Graham Greene"
+        },{
+            "category": "memoir",
+            "title" : "The Night Watch",
+            "author" : "Phillips, David Atlee"
+        }]})";
+  std::optional<JsonType> json_array = ParseJsonUsingShardHeap(books_json);
+  ASSERT_TRUE(json_array.has_value());
+  cobj_.SetJson(std::move(json_array.value()));
+  ASSERT_TRUE(cobj_.ObjType() == OBJ_JSON);  // and now this is a JSON type
+  auto f = [](const auto& /*path*/, JsonType& book) {
+    if (book.at("category") == "memoir" && !book.contains("price")) {
+      book.try_emplace("price", 140.0);
+    }
+  };
+  JsonType* json = cobj_.GetJson();
+  ASSERT_TRUE(json != nullptr);
+  auto allocator_set = jsoncons::combine_allocators(json->get_allocator());
+  jsonpath::json_replace(allocator_set, *json, "$.books[*]"sv, f);
+
+  // Check whether we've changed the entry for json in place
+  // we should have prices only for memoir books
+  JsonType* json2 = cobj_.GetJson();
+  ASSERT_TRUE(json != nullptr);
+  ASSERT_TRUE(json->contains("books"));
+  for (auto&& book : (*json2)["books"].array_range()) {
+    // make sure that we add prices only to "memoir"
+    if (book.at("category") == "memoir") {
+      ASSERT_TRUE(book.contains("price"));
+    } else {
+      ASSERT_FALSE(book.contains("price"));
+    }
+  }
+}
+
+// Test listpack defragmentation.
+// StringMap has built-in defragmantation that is tested in its own test suite.
+TEST_F(CompactObjectTest, DefragHash) {
+  auto build_str = [](size_t i) { return string(111, 'v') + to_string(i); };
+
+  vector<uint8_t*> lps(10'00);
+
+  for (size_t i = 0; i < lps.size(); i++) {
+    uint8_t* lp = lpNew(100);
+    for (size_t j = 0; j < 100; j++) {
+      auto s = build_str(j);
+      lp = lpAppend(lp, reinterpret_cast<const unsigned char*>(s.data()), s.length());
+    }
+    DCHECK_EQ(lpLength(lp), 100u);
+    lps[i] = lp;
+  }
+
+  for (size_t i = 0; i < lps.size(); i++) {
+    if (i % 10 == 0)
+      continue;
+    lpFree(lps[i]);
+  }
+
+  // Find a listpack that is located on a underutilized page
+  uint8_t* target_lp = nullptr;
+  PageUsage page_usage{CollectPageStats::NO, 0.8};
+  for (size_t i = 0; i < lps.size(); i += 10) {
+    if (page_usage.IsPageForObjectUnderUtilized(lps[i]))
+      target_lp = lps[i];
+  }
+  CHECK_NE(target_lp, nullptr);
+
+  // Trigger re-allocation
+  cobj_.InitRobj(OBJ_HASH, kEncodingListPack, target_lp);
+  ASSERT_TRUE(cobj_.DefragIfNeeded(&page_usage));
+
+  // Check the pointer changes as the listpack needed defragmentation
+  auto lp = (uint8_t*)cobj_.RObjPtr();
+  EXPECT_NE(lp, target_lp) << "must have changed due to realloc";
+
+  uint8_t* fptr = lpFirst(lp);
+  for (size_t i = 0; i < 100; i++) {
+    int64_t len;
+    auto* s = lpGet(fptr, &len, nullptr);
+
+    string_view sv{reinterpret_cast<const char*>(s), static_cast<uint64_t>(len)};
+    EXPECT_EQ(sv, build_str(i));
+
+    fptr = lpNext(lp, fptr);
+  }
+
+  for (size_t i = 0; i < lps.size(); i += 10) {
+    if (lps[i] != target_lp)
+      lpFree(lps[i]);
+  }
+}
+
+TEST_F(CompactObjectTest, DefragSet) {
+  // This is still not implemented
+  StringSet* s = CompactObj::AllocateMR<StringSet>();
+  s->Add("str");
+  cobj_.InitRobj(OBJ_SET, kEncodingStrMap2, s);
+  PageUsage page_usage{CollectPageStats::NO, 0.8};
+  ASSERT_FALSE(cobj_.DefragIfNeeded(&page_usage));
+}
+
+TEST_F(CompactObjectTest, MemberTimeSet) {
+  StringSet* s = CompactObj::AllocateMR<StringSet>();
+  cobj_.InitRobj(OBJ_SET, kEncodingStrMap2, s);
+
+  cobj_.SetMemberTime(0);
+  EXPECT_EQ(cobj_.MemberTime(), 0u);
+  EXPECT_FALSE(cobj_.HasMemberExpiration());
+
+  cobj_.SetMemberTime(1234);
+  EXPECT_EQ(cobj_.MemberTime(), 1234u);
+  EXPECT_EQ(s->time_now(), 1234u);
+
+  s->Add("a", 60);  // adding TTL'd entry marks expiration as used
+  EXPECT_TRUE(cobj_.HasMemberExpiration());
+}
+
+TEST_F(CompactObjectTest, MemberTimeHash) {
+  StringMap* m = CompactObj::AllocateMR<StringMap>();
+  cobj_.InitRobj(OBJ_HASH, kEncodingStrMap2, m);
+
+  cobj_.SetMemberTime(100);
+  EXPECT_EQ(cobj_.MemberTime(), 100u);
+  EXPECT_EQ(m->time_now(), 100u);
+  EXPECT_FALSE(cobj_.HasMemberExpiration());
+
+  m->AddOrUpdate("k", "v", 60);
+  EXPECT_TRUE(cobj_.HasMemberExpiration());
+}
+
+TEST_F(CompactObjectTest, MemberTimeSafeOnNonDense) {
+  // Methods must be safe to call on objects that don't use kEncodingStrMap2.
+  cobj_.SetString("hello");
+  cobj_.SetMemberTime(42);  // no-op
+  EXPECT_EQ(cobj_.MemberTime(), 0u);
+  EXPECT_FALSE(cobj_.HasMemberExpiration());
+
+  intset* is = intsetNew();
+  cobj_.InitRobj(OBJ_SET, kEncodingIntSet, is);
+  cobj_.SetMemberTime(42);  // no-op
+  EXPECT_EQ(cobj_.MemberTime(), 0u);
+  EXPECT_FALSE(cobj_.HasMemberExpiration());
+}
+
+TEST_F(CompactObjectTest, StrEncodingAndMaterialize) {
+  for (bool ascii : {true, false}) {
+    for (size_t len : {64, 128, 256, 512, 1024}) {
+      string test_str(len, 'a');
+      for (size_t i = 0; i < len; i++)
+        test_str[i] = char('a' + (i % 10));
+      if (!ascii)
+        test_str.push_back(char(200));  // non-ascii
+
+      CompactValue obj;
+      obj.SetString(test_str);
+
+      // Test StrEncoding helper
+      auto strs = obj.GetRawString();
+      string raw_str = string{strs[0]} + string{strs[1]};
+      CompactObj::StrEncoding enc = obj.GetStrEncoding();
+      EXPECT_EQ(test_str, enc.Decode(raw_str).Take());
+
+      // Test Materialize
+      obj.SetExternal(0, 0, CompactObj::ExternalRep::STRING);  // dummy values
+      obj.Materialize(raw_str, true);
+      EXPECT_EQ(test_str, obj.ToString());
+
+      // Restore from external again, but not as a raw value
+      obj.SetExternal(0, 0, CompactObj::ExternalRep::STRING);
+      auto test_str2 = test_str + "updated";
+      obj.Materialize(test_str2, false);
+      EXPECT_EQ(obj.ToString(), test_str2);
+    }
+  }
+}
+
+TEST_F(CompactObjectTest, LargeStringSetReplacesContents) {
+  // SetString must fully replace contents, including when the new string is
+  // shorter than or equal in length to the current one. See LargeString::SetString.
+  detail::LargeString ls{};
+  auto* mr = CompactObj::memory_resource();
+
+  // 1. Initial set with a long value.
+  string long_str(128, 'a');
+  ls.SetString(long_str, mr);
+  EXPECT_EQ(ls.Size(), long_str.size());
+  EXPECT_EQ(ls.AsView(), long_str);
+
+  // 2. Replace with a shorter value of a different content.
+  string short_str(40, 'b');
+  ls.SetString(short_str, mr);
+  EXPECT_EQ(ls.Size(), short_str.size());
+  EXPECT_EQ(ls.AsView(), short_str);
+
+  // 3. Replace with an equal-length but different value.
+  string equal_len_str(40, 'c');
+  ls.SetString(equal_len_str, mr);
+  EXPECT_EQ(ls.Size(), equal_len_str.size());
+  EXPECT_EQ(ls.AsView(), equal_len_str);
+
+  // 4. Replace with a longer value (the growth path).
+  string longer_str(200, 'd');
+  ls.SetString(longer_str, mr);
+  EXPECT_EQ(ls.Size(), longer_str.size());
+  EXPECT_EQ(ls.AsView(), longer_str);
+
+  // 5. Free() clears the value.
+  ls.Free(mr);
+  EXPECT_EQ(ls.Size(), 0u);
+}
+
+TEST_F(CompactObjectTest, ExternalRepresentation) {
+  {
+    CompactValue obj;
+    obj.SetString("test");
+    obj.SetExternal(0, 4, CompactObj::ExternalRep::STRING);
+    EXPECT_EQ(obj.ObjType(), OBJ_STRING);
+  }
+  {
+    StringMap sm{};
+    CompactValue obj;
+    obj.SetRObjPtr(&sm);
+    obj.SetExternal(0, 4, CompactObj::ExternalRep::SERIALIZED_MAP);
+    EXPECT_EQ(obj.ObjType(), OBJ_HASH);
+  }
+}
+
+TEST_F(CompactObjectTest, AsanTriggerReadOverflow) {
+  cobj_.SetString(string(32, 'a'));
+  auto dest = make_unique<char[]>(32);
+  cobj_.GetString(dest.get());
+}
+
+TEST_F(CompactObjectTest, lpGetInteger) {
+  int64_t val = -1;
+  uint8_t* lp = lpNew(0);
+  for (int j = 0; j < 60; ++j) {
+    lp = lpAppendInteger(lp, val);
+    val *= 2;
+  }
+  val = 1;
+  for (int j = 0; j < 600; ++j) {
+    string str(j * 500, 'a');
+    lp = lpAppend(lp, reinterpret_cast<const uint8_t*>(str.data()), str.size());
+  }
+  uint8_t* ptr = lpFirst(lp);
+  while (ptr) {
+    int64_t len1, len2;
+    uint8_t* val1 = lpGet(ptr, &len1, nullptr);
+    int res = lpGetInteger(ptr, &len2);
+    if (res) {
+      ASSERT_EQ(len1, len2);
+      ASSERT_TRUE(val1 == NULL);
+    } else {
+      ASSERT_TRUE(val1 != NULL);
+    }
+    ptr = lpNext(lp, ptr);
+  }
+  lpFree(lp);
+}
+
+static void BuildEncoderAB(HuffmanEncoder* encoder) {
+  array<unsigned, 256> hist;
+  hist.fill(1);
+  hist['a'] = 100;
+  hist['b'] = 50;
+  CHECK(encoder->Build(hist.data(), hist.size() - 1, nullptr));
+}
+
+TEST_F(CompactObjectTest, Huffman) {
+  HuffmanEncoder encoder;
+  BuildEncoderAB(&encoder);
+  auto bindata = encoder.Export();
+  ASSERT_TRUE(bindata.has_value());
+
+  for (CompactObj::HuffmanDomain domain : {CompactObj::HUFF_KEYS, CompactObj::HUFF_STRING_VALUES}) {
+    ASSERT_TRUE(CompactObj::InitHuffmanThreadLocal(domain, *bindata));
+    for (unsigned i = 30; i < 2048; i += 10) {
+      string data(i, 'a');
+
+      variant<CompactKey, CompactValue> obj_backing;
+      if (domain)
+        obj_backing = CompactValue{};
+      auto& cobj = visit([&](auto& co) -> CompactObj& { return co; }, obj_backing);
+
+      visit([&](auto& co) { co.SetString(data); }, obj_backing);
+      bool malloc_used = i >= 60;
+      ASSERT_EQ(malloc_used, cobj.MallocUsed() > 0) << i;
+      ASSERT_EQ(data.size(), cobj.Size());
+      ASSERT_EQ(CompactObj::HashCode(data), cobj.HashCode());
+
+      string actual;
+      cobj.GetString(&actual);
+      EXPECT_EQ(data, actual);
+      visit(absl::Overload{[&](CompactKey& co) { EXPECT_EQ(co, data); }, [&](CompactValue& co) {}},
+            obj_backing);
+    }
+
+    // Exercise the extended huffman range (formerly capped at 288 bytes, now up to 16KB).
+    for (unsigned i : {1024u, 4096u, 8192u, 16384u}) {
+      string data(i, 'a');
+      CompactValue cobj;
+      cobj.SetString(data);
+      ASSERT_EQ(data.size(), cobj.Size()) << i;
+      ASSERT_EQ(CompactObj::HashCode(data), cobj.HashCode()) << i;
+
+      string actual;
+      cobj.GetString(&actual);
+      EXPECT_EQ(data, actual) << i;
+    }
+  }
+}
+
+// Sweeps input lengths across the 1-byte vs 2-byte huffman header boundary (delta == 128).
+// All inputs are highly compressible (all-'a'), so SetString picks HUFFMAN_ENC for every n,
+// which means GetFirstByte() returns the raw header byte 0 and its top bit tells us which
+// header form was used.
+TEST_F(CompactObjectTest, HuffmanVarintHeader) {
+  HuffmanEncoder encoder;
+  BuildEncoderAB(&encoder);
+  auto bindata = encoder.Export();
+  ASSERT_TRUE(bindata.has_value());
+  // The thread-local encoder may already be installed by a previous test in this fixture;
+  // re-init is a no-op (and returns false). Either way, the encoder is valid afterwards.
+  CompactObj::InitHuffmanThreadLocal(CompactObj::HUFF_STRING_VALUES, *bindata);
+
+  bool seen_1byte = false, seen_2byte = false;
+  for (unsigned n = 100; n <= 1000; ++n) {
+    string data(n, 'a');
+    CompactValue cobj;
+    cobj.SetString(data);
+    ASSERT_EQ(n, cobj.Size()) << "Size mismatch at n=" << n;
+    ASSERT_EQ(CompactObj::HashCode(data), cobj.HashCode()) << "HashCode mismatch at n=" << n;
+
+    string actual;
+    cobj.GetString(&actual);
+    ASSERT_EQ(data, actual) << "Roundtrip failed at n=" << n;
+
+    // For HUFFMAN_ENC, byte 0's top bit distinguishes the 1-byte (clear) vs 2-byte (set)
+    // header form. Crossing happens as delta passes 127 -> 128.
+    if (cobj.GetFirstByte() & 0x80) {
+      seen_2byte = true;
+    } else {
+      seen_1byte = true;
+    }
+  }
+  EXPECT_TRUE(seen_1byte) << "Expected at least one 1-byte header (delta <= 127)";
+  EXPECT_TRUE(seen_2byte) << "Expected at least one 2-byte header (delta >= 128)";
+}
+
+TEST_F(CompactObjectTest, GetByteAtOffset) {
+  // Inline string (INLINE_TAG)
+  {
+    string s = "hello";
+    cobj_.SetString(s);
+    for (size_t i = 0; i < s.size(); ++i) {
+      uint8_t res = 0;
+      EXPECT_TRUE(cobj_.GetByteAtIndex(i, &res));
+      EXPECT_EQ(s[i], res) << "inline offset " << i;
+    }
+  }
+
+  // Integer-encoded string (INT_TAG)
+  {
+    cobj_.SetString("12345");
+    string expected = "12345";
+    for (size_t i = 0; i < expected.size(); ++i) {
+      uint8_t res = 0;
+      EXPECT_TRUE(cobj_.GetByteAtIndex(i, &res));
+      EXPECT_EQ(expected[i], res) << "int offset " << i;
+    }
+  }
+
+  //  ASCII string with SMALL_TAG
+  {
+    string s(64, 'x');
+    for (size_t i = 0; i < s.size(); ++i)
+      s[i] = 'a' + (i % 26);
+    cobj_.SetString(s);
+    for (size_t i = 0; i < s.size(); ++i) {
+      uint8_t res = 0;
+      EXPECT_TRUE(cobj_.GetByteAtIndex(i, &res));
+      EXPECT_EQ(static_cast<uint8_t>(s[i]), res) << "long ascii offset " << i;
+    }
+  }
+
+  // Non-ASCII string with SMALL_TAG
+  {
+    string s(64, '\xC0');
+    for (size_t i = 0; i < s.size(); ++i)
+      s[i] = static_cast<char>(128 + (i % 128));
+    cobj_.SetString(s);
+    for (size_t i = 0; i < s.size(); ++i) {
+      uint8_t res = 0;
+      EXPECT_TRUE(cobj_.GetByteAtIndex(i, &res));
+      EXPECT_EQ(static_cast<uint8_t>(s[i]), res) << "non-ascii offset " << i;
+    }
+  }
+
+  // ASCII string ROBJ_TAG
+  {
+    string s(512, 'z');
+    for (size_t i = 0; i < s.size(); ++i)
+      s[i] = 'A' + (i % 26);
+    cobj_.SetString(s);
+    for (size_t i = 0; i < s.size(); ++i) {
+      uint8_t res = 0;
+      EXPECT_TRUE(cobj_.GetByteAtIndex(i, &res));
+      EXPECT_EQ(static_cast<uint8_t>(s[i]), res) << "medium offset " << i;
+    }
+  }
+
+  // Non-ASCII string ROBJ_TAG
+  {
+    string s(512, 'z');
+    for (size_t i = 0; i < s.size(); ++i)
+      s[i] = static_cast<char>(128 + (i % 128));
+    cobj_.SetString(s);
+    for (size_t i = 0; i < s.size(); ++i) {
+      uint8_t res = 0;
+      EXPECT_TRUE(cobj_.GetByteAtIndex(i, &res));
+      EXPECT_EQ(static_cast<uint8_t>(s[i]), res) << "medium offset " << i;
+    }
+  }
+
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, SetByteAtOffset) {
+  // Inline string (INLINE_TAG)
+  {
+    string s = "abcde";
+    cobj_.SetString(s);
+    for (size_t i = 0; i < s.size(); ++i) {
+      std::pair<bool, bool> res_set_byte = cobj_.SetByteAtIndex(i, 'Z');
+      EXPECT_TRUE(res_set_byte.first);
+      EXPECT_TRUE(res_set_byte.second);
+      uint8_t res = 0;
+      EXPECT_TRUE(cobj_.GetByteAtIndex(i, &res));
+      EXPECT_EQ('Z', res) << "inline set offset " << i;
+    }
+    // All bytes should now be 'Z'
+    string result;
+    cobj_.GetString(&result);
+    EXPECT_EQ(string(5, 'Z'), result);
+  }
+
+  // Integer-encoded string (INT_TAG)
+  {
+    cobj_.SetString("999");
+    std::pair<bool, bool> res_set_byte = cobj_.SetByteAtIndex(0, 'x');
+    EXPECT_TRUE(res_set_byte.first);
+    // We didn't modify in-place, SetString is called
+    EXPECT_FALSE(res_set_byte.second);
+    string result;
+    cobj_.GetString(&result);
+    EXPECT_EQ("x99", result);
+  }
+
+  // ASCII string with SMALL_TAG
+  {
+    string s(64, 'a');
+    for (size_t i = 0; i < s.size(); ++i)
+      s[i] = 'a' + (i % 26);
+    cobj_.SetString(s);
+
+    // Modify every 10th byte
+    for (size_t i = 0; i < s.size(); i += 10) {
+      std::pair<bool, bool> res_set_byte = cobj_.SetByteAtIndex(i, '!');
+      EXPECT_TRUE(res_set_byte.first);
+      EXPECT_FALSE(res_set_byte.second);
+      s[i] = '!';
+    }
+
+    // Verify all bytes
+    for (size_t i = 0; i < s.size(); ++i) {
+      uint8_t res = 0;
+      EXPECT_TRUE(cobj_.GetByteAtIndex(i, &res));
+      EXPECT_EQ(static_cast<uint8_t>(s[i]), res) << "long ascii set offset " << i;
+    }
+  }
+
+  // Non-ASCII string with SMALL_TAG
+  {
+    string s(64, '\x80');
+    for (size_t i = 0; i < s.size(); ++i)
+      s[i] = static_cast<char>(128 + (i % 128));
+    cobj_.SetString(s);
+
+    std::pair<bool, bool> res_set_byte = cobj_.SetByteAtIndex(63, 0xFF);
+    EXPECT_TRUE(res_set_byte.first);
+    EXPECT_FALSE(res_set_byte.second);
+    s[63] = '\xFF';
+
+    for (size_t i = 0; i < s.size(); ++i) {
+      uint8_t res = 0;
+      EXPECT_TRUE(cobj_.GetByteAtIndex(i, &res));
+      EXPECT_EQ(static_cast<uint8_t>(s[i]), res) << "non-ascii set offset " << i;
+    }
+  }
+
+  // ASCII string with ROBJ_TAG
+  {
+    string s(512, 'a');
+    for (size_t i = 0; i < s.size(); ++i)
+      s[i] = 'a' + (i % 26);
+    cobj_.SetString(s);
+
+    // Modify every 10th byte
+    for (size_t i = 0; i < s.size(); i += 10) {
+      std::pair<bool, bool> res_set_byte = cobj_.SetByteAtIndex(i, '!');
+      EXPECT_TRUE(res_set_byte.first);
+      EXPECT_TRUE(res_set_byte.second);
+      s[i] = '!';
+    }
+
+    // Verify all bytes
+    for (size_t i = 0; i < s.size(); ++i) {
+      uint8_t res = 0;
+      EXPECT_TRUE(cobj_.GetByteAtIndex(i, &res));
+      EXPECT_EQ(static_cast<uint8_t>(s[i]), res) << "long ascii set offset " << i;
+    }
+  }
+
+  // ASCII string with ROBJ_TAG modified to non-ASCII
+  {
+    string s(512, 'a');
+    for (size_t i = 0; i < s.size(); ++i)
+      s[i] = 'a' + (i % 26);
+    cobj_.SetString(s);
+
+    // Modify in-place ascii packed string
+    std::pair<bool, bool> res_set_byte = cobj_.SetByteAtIndex(0, 'A');
+    EXPECT_TRUE(res_set_byte.first);
+    EXPECT_TRUE(res_set_byte.second);
+
+    // Adding non-ascii byte modification should still succeed, but not in-place
+    res_set_byte = cobj_.SetByteAtIndex(255, 0xFF);
+    EXPECT_TRUE(res_set_byte.first);
+    EXPECT_FALSE(res_set_byte.second);
+
+    // Modification of non-ascii ROBJ string should succeed and in-place
+    res_set_byte = cobj_.SetByteAtIndex(511, 'C');
+    EXPECT_TRUE(res_set_byte.first);
+    EXPECT_TRUE(res_set_byte.second);
+
+    uint8_t res;
+    EXPECT_TRUE(cobj_.GetByteAtIndex(0, &res));
+    EXPECT_EQ('A', res);
+    EXPECT_TRUE(cobj_.GetByteAtIndex(255, &res));
+    EXPECT_EQ(0xFF, res);
+    EXPECT_TRUE(cobj_.GetByteAtIndex(511, &res));
+    EXPECT_EQ('C', res);
+  }
+
+  // Out-of-bounds access should be handled gracefully.
+  {
+    string s = "abc";
+    cobj_.SetString(s);
+    // SetByteAtIndex: index equal to size() is out-of-bounds.
+    auto res_pair = cobj_.SetByteAtIndex(s.size(), 'X');
+    EXPECT_FALSE(res_pair.first);
+    EXPECT_FALSE(res_pair.second);
+    // GetByteAtIndex: out-of-bounds should set result to 0.
+    uint8_t res = 123;  // sentinel non-zero value
+    EXPECT_FALSE(cobj_.GetByteAtIndex(s.size(), &res));
+    EXPECT_EQ(0u, res);
+  }
+
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, TryBorrow_NulloptForNonLargeStr) {
+  cobj_.SetString("hello");
+  EXPECT_FALSE(cobj_.TryBorrow().has_value());
+
+  cobj_.SetString("12345");
+  EXPECT_FALSE(cobj_.TryBorrow().has_value());
+
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, TryBorrow_NoneEncLargeString) {
+  // 300 non-ASCII bytes → NONE_ENC + LARGE_STR_TAG (no compression applied).
+  string val(300, '\x80');
+  cobj_.SetString(val);
+  ASSERT_EQ(cobj_.Encoding(), 0u);  // NONE_ENC == 0
+
+  {
+    auto borrow = cobj_.TryBorrow();
+    ASSERT_TRUE(borrow.has_value());
+    EXPECT_EQ(borrow->encoding(), 0u);  // NONE_ENC
+    CompactObj::StrEncoding str_enc(borrow->encoding(), false);
+    EXPECT_EQ(str_enc.DecodedSize(borrow->view()), val.size());
+    EXPECT_EQ(borrow->view(), val);
+    EXPECT_EQ(CompactObj::TEST_PinRefcnt(*borrow), 1u);
+  }
+
+  CompactObj::DrainPendingReads();
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, TryBorrow_AsciiLargeString) {
+  // 300 ASCII bytes: packed size (263) exceeds SmallString::kMaxSize (255),
+  // so the value ends up as ASCII1_ENC or ASCII2_ENC + LARGE_STR_TAG.
+  string val(300, 'a');
+  for (size_t i = 0; i < val.size(); ++i)
+    val[i] = char('a' + (i % 26));
+  cobj_.SetString(val);
+
+  {
+    auto borrow = cobj_.TryBorrow();
+    ASSERT_TRUE(borrow.has_value());
+    EXPECT_TRUE(borrow->encoding() == 1u || borrow->encoding() == 2u);  // ASCII1 or ASCII2
+    CompactObj::StrEncoding str_enc(borrow->encoding(), false);
+    EXPECT_EQ(str_enc.DecodedSize(borrow->view()), val.size());
+    EXPECT_LT(borrow->view().size(), val.size());  // packed representation is smaller
+
+    // Verify the packed bytes decode back to the original string.
+    string decoded(str_enc.DecodedSize(borrow->view()), '\0');
+    detail::ascii_unpack(reinterpret_cast<const uint8_t*>(borrow->view().data()),
+                         str_enc.DecodedSize(borrow->view()), decoded.data());
+    EXPECT_EQ(decoded, val);
+  }
+
+  CompactObj::DrainPendingReads();
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, TryBorrow_PinRefcountAndDrain) {
+  string val(300, '\x80');
+  cobj_.SetString(val);
+
+  auto b1 = cobj_.TryBorrow();
+  auto b2 = cobj_.TryBorrow();
+  ASSERT_TRUE(b1.has_value() && b2.has_value());
+  EXPECT_EQ(CompactObj::TEST_PinRefcnt(*b1), 2u);
+  EXPECT_EQ(CompactObj::TEST_PinRefcnt(*b2), 2u);
+
+  // Drain must not reap an entry with outstanding references.
+  CompactObj::DrainPendingReads();
+  EXPECT_EQ(CompactObj::TEST_PinRefcnt(*b1), 2u);
+
+  b1.reset();
+  EXPECT_EQ(CompactObj::TEST_PinRefcnt(*b2), 1u);
+  CompactObj::DrainPendingReads();  // still live
+  EXPECT_EQ(CompactObj::TEST_PinRefcnt(*b2), 1u);
+
+  b2.reset();
+  CompactObj::DrainPendingReads();  // entry is now reaped; do not dereference pin after this
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, TryBorrow_CowOnMutation) {
+  string val(3000, '\x80');
+  cobj_.SetString(val);
+
+  {
+    auto borrow = cobj_.TryBorrow();
+    ASSERT_TRUE(borrow.has_value());
+
+    // Mutate the value while the read pin is still held.
+    string new_val(3000, '\x81');
+    cobj_.SetString(new_val);
+
+    // SetString must orphan the old pinned buffer rather than freeing it inline.
+    EXPECT_TRUE(CompactObj::TEST_PinOrphaned(*borrow));
+    // Mutating while pinned should preserve correctness and not crash.
+    EXPECT_EQ(cobj_.ToString(), new_val);
+  }
+
+  // Drain frees the orphaned old buffer after borrow lifetime ends.
+  CompactObj::DrainPendingReads();
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, TryBorrow_DefragSkipsWhenPinned) {
+  string val(300, '\x80');
+  cobj_.SetString(val);
+
+  {
+    auto borrow = cobj_.TryBorrow();
+    ASSERT_TRUE(borrow.has_value());
+
+    PageUsage page_usage{CollectPageStats::NO, 0.8};
+    EXPECT_FALSE(cobj_.DefragIfNeeded(&page_usage));
+  }
+
+  CompactObj::DrainPendingReads();
+  cobj_.Reset();
+}
+
+static void ascii_pack_naive(const char* ascii, size_t len, uint8_t* bin) {
+  const char* end = ascii + len;
+
+  unsigned i = 0;
+  while (ascii + 8 <= end) {
+    for (i = 0; i < 7; ++i) {
+      *bin++ = (ascii[0] >> i) | (ascii[1] << (7 - i));
+      ++ascii;
+    }
+    ++ascii;
+  }
+
+  // epilog - we do not pack since we have less than 8 bytes.
+  while (ascii < end) {
+    *bin++ = *ascii++;
+  }
+}
+
+static void BM_PackNaive(benchmark::State& state) {
+  string val(1024, 'a');
+  uint8_t buf[1024];
+
+  while (state.KeepRunning()) {
+    ascii_pack_naive(val.data(), val.size(), buf);
+  }
+}
+BENCHMARK(BM_PackNaive);
+
+static void BM_Pack(benchmark::State& state) {
+  string val(1024, 'a');
+  uint8_t buf[1024];
+
+  while (state.KeepRunning()) {
+    detail::ascii_pack(val.data(), val.size(), buf);
+  }
+}
+BENCHMARK(BM_Pack);
+
+static void BM_PackSimd(benchmark::State& state) {
+  string val(1024, 'a');
+  uint8_t buf[1024];
+
+  while (state.KeepRunning()) {
+    detail::ascii_pack_simd(val.data(), val.size(), buf);
+  }
+}
+BENCHMARK(BM_PackSimd);
+
+static void BM_PackSimd2(benchmark::State& state) {
+  string val(1024, 'a');
+  uint8_t buf[1024];
+
+  while (state.KeepRunning()) {
+    detail::ascii_pack_simd2(val.data(), val.size(), buf);
+  }
+}
+BENCHMARK(BM_PackSimd2);
+
+static void BM_Unpack(benchmark::State& state) {
+  string val(1024, 'a');
+  uint8_t buf[1024];
+
+  detail::ascii_pack(val.data(), val.size(), buf);
+
+  while (state.KeepRunning()) {
+    detail::ascii_unpack(buf, val.size(), val.data());
+  }
+}
+BENCHMARK(BM_Unpack);
+
+static void BM_UnpackSimd(benchmark::State& state) {
+  string val(1024, 'a');
+  uint8_t buf[1024];
+
+  detail::ascii_pack(val.data(), val.size(), buf);
+
+  while (state.KeepRunning()) {
+    detail::ascii_unpack_simd(buf, val.size(), val.data());
+  }
+}
+BENCHMARK(BM_UnpackSimd);
+
+static void BM_LpCompare(benchmark::State& state) {
+  std::mt19937_64 rd;
+  uint8_t* lp = lpNew(0);
+  for (unsigned i = 0; i < 100; ++i) {
+    lp = lpAppendInteger(lp, rd() % (1ULL << 48));
+  }
+
+  string val = absl::StrCat(1ULL << 49);
+  while (state.KeepRunning()) {
+    uint8_t* elem = lpLast(lp);
+    while (elem) {
+      lpCompare(elem, reinterpret_cast<const uint8_t*>(val.data()), val.size());
+      elem = lpPrev(lp, elem);
+    }
+  }
+  lpFree(lp);
+}
+BENCHMARK(BM_LpCompare);
+
+static void BM_LpCompareInt(benchmark::State& state) {
+  std::mt19937_64 rd;
+  uint8_t* lp = lpNew(0);
+  for (unsigned i = 0; i < 100; ++i) {
+    lp = lpAppendInteger(lp, rd() % (1ULL << 48));
+  }
+
+  int64_t val = 1ULL << 49;
+  while (state.KeepRunning()) {
+    uint8_t* elem = lpLast(lp);
+    int64_t sz;
+    while (elem) {
+      DCHECK_NE(0xFF, *elem);
+      lpGetInteger(elem, &sz);
+      int res = sz == val;
+      benchmark::DoNotOptimize(res);
+      elem = lpPrev(lp, elem);
+    }
+  }
+  lpFree(lp);
+}
+BENCHMARK(BM_LpCompareInt);
+
+static void BM_LpGet(benchmark::State& state) {
+  unsigned version = state.range(0);
+  uint8_t* lp = lpNew(0);
+  int64_t val = -1;
+  for (unsigned i = 0; i < 60; ++i) {
+    lp = lpAppendInteger(lp, val);
+    val *= 2;
+  }
+
+  while (state.KeepRunning()) {
+    uint8_t* elem = lpLast(lp);
+    int64_t ival;
+    if (version == 1) {
+      while (elem) {
+        unsigned char* value = lpGet(elem, &ival, NULL);
+        benchmark::DoNotOptimize(value);
+        elem = lpPrev(lp, elem);
+      }
+    } else {
+      while (elem) {
+        int res = lpGetInteger(elem, &ival);
+        benchmark::DoNotOptimize(res);
+        elem = lpPrev(lp, elem);
+      }
+    }
+  }
+  lpFree(lp);
+}
+BENCHMARK(BM_LpGet)->Arg(1)->Arg(2);
+
+extern "C" int lpStringToInt64(const char* s, unsigned long slen, int64_t* value);
+
+static void BM_LpString2Int(benchmark::State& state) {
+  int version = state.range(0);
+  std::mt19937_64 rd;
+  vector<string> values;
+  for (unsigned i = 0; i < 1000; ++i) {
+    int64_t val = rd();
+    values.push_back(absl::StrCat(val));
+  }
+
+  int64_t ival = 0;
+  while (state.KeepRunning()) {
+    for (const auto& val : values) {
+      int res = version == 1 ? lpStringToInt64(val.data(), val.size(), &ival)
+                             : absl::SimpleAtoi(val, &ival);
+      benchmark::DoNotOptimize(res);
+    }
+  }
+}
+BENCHMARK(BM_LpString2Int)->Arg(1)->Arg(2);
+
+}  // namespace dfly

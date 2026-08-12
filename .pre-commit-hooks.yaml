@@ -1,0 +1,15 @@
+- id: conventional-commits
+  name: Conventional Commits Minder
+  entry: contrib/scripts/conventional-commits
+  language: script
+  description: Conventional Commits Enforcement at the `git commit` client-side level
+  always_run: true
+  stages: [commit-msg]
+
+- id: signed-commit
+  name: Signed Commit Enforcer
+  entry: contrib/scripts/signed-commit
+  language: script
+  description: Ensures all commits contain a Signed-off-by line
+  always_run: true
+  stages: [commit-msg]

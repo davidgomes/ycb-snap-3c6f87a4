@@ -1,0 +1,86 @@
+// Copyright 2024, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <system_error>
+
+#include "io/io.h"
+#include "server/tiering/common.h"
+#include "server/tiering/external_alloc.h"
+#include "util/fibers/uring_types.h"
+
+namespace util::fb2 {
+class LinuxFile;
+}  // namespace util::fb2
+
+namespace dfly::tiering {
+
+// Disk storage controlled by asynchronous operations.
+// Provides Random Access Read/Stash asynchronous interface around low level linux file.
+// Handles ranges management and file growth via underlying ExternalAllocator.
+class DiskStorage {
+ public:
+  struct Stats {
+    size_t allocated_bytes = 0;
+    size_t capacity_bytes = 0;
+    uint64_t heap_buf_alloc_count = 0;
+    uint64_t registered_buf_alloc_count = 0;
+    size_t max_file_size = 0;
+    size_t pending_ops = 0;
+    size_t pending_stash_bytes = 0;
+  };
+
+  using ReadCb = std::function<void(io::Result<std::string_view>)>;
+  using StashCb = std::function<void(std::error_code)>;
+
+  explicit DiskStorage(size_t max_size);
+  ~DiskStorage();
+
+  std::error_code Open(std::string_view path);
+  void Close();
+
+  // Request read for segment, cb will be called on completion with read value
+  void Read(DiskSegment segment, ReadCb cb);
+
+  // Mark segment as free, performed immediately
+  void MarkAsFree(DiskSegment segment);
+
+  // Allocate segment of at least given length and prepare buffer. Might block to grow backing file.
+  // Return error if not enough space is available or growing failed.
+  // Every successful preparation must end in a Stash(), otherwise resources are leaked.
+  io::Result<std::pair<size_t /* offset */, util::fb2::RegisteredSlice>> PrepareStash(
+      size_t length);
+
+  // Write prepared buffer to given segment and resolve completion callback when write is done.
+  void Stash(DiskSegment segment, util::fb2::RegisteredSlice buf, StashCb cb);
+
+  Stats GetStats() const;
+
+ private:
+  // Try asynchronously growing backing file by at least min requested size
+  std::error_code RequestGrow(off_t min_size);
+
+  // Returns a buffer with size greater or equal to len.
+  util::fb2::RegisteredSlice PrepareBuf(size_t len);
+
+  off_t max_size_;
+  size_t pending_ops_ = 0;          // number of ongoing ops for safe shutdown
+  size_t pending_stash_bytes_ = 0;  // bytes currently in-flight to disk
+
+  // how many times we allocate registered/heap buffers.
+  uint64_t heap_buf_alloc_cnt_ = 0, reg_buf_alloc_cnt_ = 0;
+
+  struct {
+    bool pending = false;  // currently in progress
+    std::error_code last_err;
+    uint64_t timestamp_cycles;  // last grow finished, base::CycleClock::Now() cycles
+  } grow_;                      // status of last RequestGrow() operation
+
+  std::string backing_file_path_;
+  std::unique_ptr<util::fb2::LinuxFile> backing_file_;
+  ExternalAllocator alloc_;
+};
+
+};  // namespace dfly::tiering

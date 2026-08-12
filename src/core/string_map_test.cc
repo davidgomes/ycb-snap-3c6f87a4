@@ -1,0 +1,431 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "core/string_map.h"
+
+#include <absl/strings/match.h>
+#include <absl/strings/str_cat.h>
+#include <gtest/gtest.h>
+#include <mimalloc.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <memory_resource>
+#include <random>
+#include <string>
+#include <string_view>
+#include <unordered_set>
+#include <vector>
+
+#include "base/logging.h"
+#include "core/compact_object.h"
+#include "core/detail/stateless_allocator.h"
+#include "core/page_usage/page_usage_stats.h"
+
+extern "C" {
+#include "redis/zmalloc.h"
+}
+
+namespace dfly {
+
+using namespace std;
+
+class StringMapTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    auto* tlh = mi_heap_get_backing();
+    init_zmalloc_threadlocal(tlh);
+    InitTLStatelessAllocMR(PMR_NS::get_default_resource());
+  }
+
+  static void TearDownTestSuite() {
+    mi_heap_collect(mi_heap_get_backing(), true);
+
+    auto cb_visit = [](const mi_heap_t* heap, const mi_heap_area_t* area, void* block,
+                       size_t block_size, void* arg) {
+      LOG(ERROR) << "Unfreed allocations: block_size " << block_size
+                 << ", allocated: " << area->used * block_size;
+      return true;
+    };
+
+    mi_heap_visit_blocks(mi_heap_get_backing(), false /* do not visit all blocks*/, cb_visit,
+                         nullptr);
+  }
+
+  StringMapTest() : mi_alloc_(mi_heap_get_backing()) {
+  }
+
+  void SetUp() override {
+    sm_.reset(new StringMap(&mi_alloc_));
+  }
+
+  void TearDown() override {
+    sm_.reset();
+    EXPECT_EQ(zmalloc_used_memory_tl, 0);
+  }
+
+  MiMemoryResource mi_alloc_;
+  std::unique_ptr<StringMap> sm_;
+};
+
+TEST_F(StringMapTest, Basic) {
+  EXPECT_TRUE(sm_->AddOrUpdate("foo", "bar"));
+  EXPECT_TRUE(sm_->Contains("foo"));
+  auto it = sm_->Find("foo");
+  EXPECT_STREQ("bar", it->second);
+
+  it = sm_->begin();
+  EXPECT_STREQ("foo", it->first);
+  EXPECT_STREQ("bar", it->second);
+  ++it;
+  EXPECT_TRUE(it == sm_->end());
+
+  for (const auto& k_v : *sm_) {
+    EXPECT_STREQ("foo", k_v.first);
+    EXPECT_STREQ("bar", k_v.second);
+  }
+
+  size_t sz = sm_->ObjMallocUsed();
+  EXPECT_FALSE(sm_->AddOrUpdate("foo", "baraaaaaaaaaaaa2"));
+  EXPECT_GT(sm_->ObjMallocUsed(), sz);
+  it = sm_->begin();
+  EXPECT_STREQ("baraaaaaaaaaaaa2", it->second);
+
+  EXPECT_FALSE(sm_->AddOrSkip("foo", "bar2"));
+  EXPECT_STREQ("baraaaaaaaaaaaa2", it->second);
+}
+
+TEST_F(StringMapTest, EmptyFind) {
+  sm_->Find("bar");
+}
+
+TEST_F(StringMapTest, Ttl) {
+  EXPECT_TRUE(sm_->AddOrUpdate("bla", "val1", 1));
+  EXPECT_FALSE(sm_->AddOrUpdate("bla", "val2", 1));
+  sm_->set_time(1);
+  EXPECT_TRUE(sm_->AddOrUpdate("bla", "val2", 1));
+  EXPECT_EQ(1u, sm_->UpperBoundSize());
+
+  EXPECT_FALSE(sm_->AddOrSkip("bla", "val3", 2));
+
+  // set ttl to 2, meaning that the key will expire at time 3.
+  EXPECT_TRUE(sm_->AddOrSkip("bla2", "val3", 2));
+  EXPECT_TRUE(sm_->Contains("bla2"));
+
+  sm_->set_time(3);
+  auto it = sm_->begin();
+  EXPECT_TRUE(it == sm_->end());
+}
+
+TEST_F(StringMapTest, IterateExpired) {
+  EXPECT_TRUE(sm_->AddOrUpdate("k1", "v1", 1));
+  EXPECT_TRUE(sm_->AddOrUpdate("k2", "v2", 1));
+  sm_->set_time(1);
+  auto it = sm_->begin();
+  it += 1;
+  EXPECT_EQ(it, sm_->end());
+}
+
+TEST_F(StringMapTest, SetFieldExpireHasExpiry) {
+  EXPECT_TRUE(sm_->AddOrUpdate("k1", "v1", 5));
+  auto k = sm_->Find("k1");
+  EXPECT_TRUE(k.HasExpiry());
+  EXPECT_EQ(k.ExpiryTime(), 5);
+  k.SetExpiryTime(1);
+  EXPECT_TRUE(k.HasExpiry());
+  EXPECT_EQ(k.ExpiryTime(), 1);
+}
+
+TEST_F(StringMapTest, SetFieldExpireNoHasExpiry) {
+  EXPECT_TRUE(sm_->AddOrUpdate("k1", "v1"));
+  auto k = sm_->Find("k1");
+  EXPECT_FALSE(k.HasExpiry());
+  k.SetExpiryTime(1);
+  EXPECT_TRUE(k.HasExpiry());
+  EXPECT_EQ(k.ExpiryTime(), 1);
+}
+
+TEST_F(StringMapTest, Bug3973) {
+  for (unsigned i = 0; i < 8; i++) {
+    EXPECT_TRUE(sm_->AddOrUpdate(to_string(i), "val"));
+  }
+  for (unsigned i = 0; i < 8; i++) {
+    auto k = sm_->Find(to_string(i));
+    ASSERT_FALSE(k.HasExpiry());
+    k.SetExpiryTime(1);
+    EXPECT_EQ(k.ExpiryTime(), 1);
+  }
+  for (unsigned i = 100; i < 1000; i++) {
+    EXPECT_TRUE(sm_->AddOrUpdate(to_string(i), "val"));
+  }
+
+  // make sure the first 8 keys have expiry set
+  for (unsigned i = 0; i < 8; i++) {
+    auto k = sm_->Find(to_string(i));
+    ASSERT_TRUE(k.HasExpiry());
+    EXPECT_EQ(k.ExpiryTime(), 1);
+  }
+}
+
+TEST_F(StringMapTest, Bug3984) {
+  for (unsigned i = 0; i < 6; i++) {
+    EXPECT_TRUE(sm_->AddOrUpdate(to_string(i), "val"));
+  }
+  for (unsigned i = 0; i < 6; i++) {
+    auto k = sm_->Find(to_string(i));
+    ASSERT_FALSE(k.HasExpiry());
+    k.SetExpiryTime(1);
+    EXPECT_EQ(k.ExpiryTime(), 1);
+  }
+
+  for (unsigned i = 0; i < 6; i++) {
+    EXPECT_FALSE(sm_->AddOrUpdate(to_string(i), "val"));
+  }
+}
+
+unsigned total_wasted_memory = 0;
+
+TEST_F(StringMapTest, ReallocIfNeeded) {
+  auto build_str = [](size_t i) { return to_string(i) + string(131, 'a'); };
+
+  auto count_waste = [](const mi_heap_t* heap, const mi_heap_area_t* area, void* block,
+                        size_t block_size, void* arg) {
+    size_t used = block_size * area->used;
+    total_wasted_memory += area->committed - used;
+    return true;
+  };
+
+  for (size_t i = 0; i < 10'000; i++)
+    sm_->AddOrUpdate(build_str(i), build_str(i + 1), i * 10 + 1);
+
+  for (size_t i = 0; i < 10'000; i++) {
+    if (i % 10 == 0)
+      continue;
+    sm_->Erase(build_str(i));
+  }
+
+  mi_heap_collect(mi_heap_get_backing(), true);
+  mi_heap_visit_blocks(mi_heap_get_backing(), false, count_waste, nullptr);
+  size_t wasted_before = total_wasted_memory;
+
+  size_t underutilized = 0;
+  PageUsage page_usage{CollectPageStats::NO, 0.9};
+  for (auto it = sm_->begin(); it != sm_->end(); ++it) {
+    underutilized += page_usage.IsPageForObjectUnderUtilized(it->first);
+    it.ReallocIfNeeded(&page_usage);
+  }
+  // Check there are underutilized pages
+  CHECK_GT(underutilized, 0u);
+
+  total_wasted_memory = 0;
+  mi_heap_collect(mi_heap_get_backing(), true);
+  mi_heap_visit_blocks(mi_heap_get_backing(), false, count_waste, nullptr);
+  size_t wasted_after = total_wasted_memory;
+
+  // Check we waste significanlty less now
+  EXPECT_GT(wasted_before, wasted_after * 2);
+
+  EXPECT_EQ(sm_->UpperBoundSize(), 1000);
+  for (size_t i = 0; i < 1000; i++)
+    EXPECT_EQ(sm_->Find(build_str(i * 10))->second, build_str(i * 10 + 1));
+}
+
+TEST_F(StringMapTest, ExpiryChangesSize) {
+  sm_->AddOrUpdate("field", "value");
+  const size_t old_size = sm_->ObjMallocUsed();
+
+  auto it = sm_->Find("field");
+  it.SetExpiryTime(1);
+
+  const size_t new_size = sm_->ObjMallocUsed();
+  EXPECT_LT(old_size, new_size);
+
+  sm_->AddOrUpdate("field", "value", 1);
+  EXPECT_EQ(new_size, sm_->ObjMallocUsed());
+}
+
+TEST_F(StringMapTest, ExpiryWithMaxAndKeepTTL) {
+  sm_->AddOrUpdate("field", "value", 100);
+  auto k = sm_->Find("field");
+  EXPECT_TRUE(k.HasExpiry());
+  EXPECT_EQ(k.ExpiryTime(), 100);
+
+  // ttl is copied from prev. if max value is supplied
+  sm_->AddOrUpdate("field", "value", UINT32_MAX, true);
+  k = sm_->Find("field");
+  EXPECT_TRUE(k.HasExpiry());
+  EXPECT_EQ(k.ExpiryTime(), 100);
+
+  // max ttl value results in no expiry without keepttl
+  sm_->AddOrUpdate("field", "value", UINT32_MAX);
+  EXPECT_FALSE(sm_->Find("field").HasExpiry());
+
+  // No prev. expiry, supplied ttl_sec value is used
+  sm_->AddOrUpdate("field", "value", 10, true);
+  k = sm_->Find("field");
+  EXPECT_TRUE(k.HasExpiry());
+  EXPECT_EQ(k.ExpiryTime(), 10);
+
+  // object removed while adding due to expiry
+  sm_->set_time(11);
+  sm_->AddOrUpdate("field", "value", UINT32_MAX, true);
+  k = sm_->Find("field");
+  EXPECT_FALSE(k.HasExpiry());
+}
+
+TEST_F(StringMapTest, ExtractExisting) {
+  sm_->AddOrUpdate("f1", "v1");
+  sm_->AddOrUpdate("f2", "v2");
+  EXPECT_EQ(sm_->UpperBoundSize(), 2u);
+
+  auto entry = sm_->Extract("f1");
+  ASSERT_TRUE(entry);
+
+  // Verify the extracted entry has the correct value
+  sds val = StringMap::GetValue(static_cast<sds>(entry.get()));
+  EXPECT_EQ(string_view(val, sdslen(val)), "v1");
+
+  // Verify it was removed from the map
+  EXPECT_EQ(sm_->UpperBoundSize(), 1u);
+  EXPECT_FALSE(sm_->Contains("f1"));
+  EXPECT_TRUE(sm_->Contains("f2"));
+}
+
+TEST_F(StringMapTest, ExtractNonExisting) {
+  sm_->AddOrUpdate("f1", "v1");
+  auto entry = sm_->Extract("no_such_key");
+  EXPECT_FALSE(entry);
+  EXPECT_EQ(sm_->UpperBoundSize(), 1u);
+}
+
+TEST_F(StringMapTest, AddOrExchangeNew) {
+  // Adding a new field returns nullptr (no previous entry)
+  auto prev = sm_->AddOrExchange("f1", "v1");
+  EXPECT_FALSE(prev);
+  EXPECT_TRUE(sm_->Contains("f1"));
+  EXPECT_STREQ(sm_->Find("f1")->second, "v1");
+}
+
+TEST_F(StringMapTest, AddOrExchangeReplace) {
+  sm_->AddOrUpdate("f1", "old_value");
+  EXPECT_EQ(sm_->UpperBoundSize(), 1u);
+
+  auto prev = sm_->AddOrExchange("f1", "new_value");
+  ASSERT_TRUE(prev);
+
+  // Verify the returned entry has the old value
+  sds prev_key = static_cast<sds>(prev.get());
+  sds val = StringMap::GetValue(prev_key);
+  EXPECT_EQ(string_view(val, sdslen(val)), "old_value");
+
+  // Verify map now has the new value
+  EXPECT_STREQ(sm_->Find("f1")->second, "new_value");
+  EXPECT_EQ(sm_->UpperBoundSize(), 1u);
+}
+
+TEST_F(StringMapTest, AddOrExchangeWithTtl) {
+  sm_->AddOrUpdate("f1", "v1", 100);
+
+  auto prev = sm_->AddOrExchange("f1", "v2", 200);
+  ASSERT_TRUE(prev);
+
+  sds prev_key = static_cast<sds>(prev.get());
+  sds val = StringMap::GetValue(prev_key);
+  EXPECT_EQ(string_view(val, sdslen(val)), "v1");
+
+  // Make sure new entry has correct value and ttl
+  auto it = sm_->Find("f1");
+  EXPECT_STREQ(it->second, "v2");
+  EXPECT_TRUE(it.HasExpiry());
+  EXPECT_EQ(it.ExpiryTime(), 200u);
+}
+
+TEST_F(StringMapTest, RandomPairsUniqueAfterSetExpiryTime) {
+  sm_->Reserve(1024);
+  for (unsigned i = 0; i < 20; i++) {
+    EXPECT_TRUE(sm_->AddOrUpdate(to_string(i), "v"));
+  }
+  EXPECT_FALSE(sm_->ExpirationUsed());
+
+  for (unsigned i = 0; i < 10; i++) {
+    auto it = sm_->Find(to_string(i));
+    ASSERT_FALSE(it.HasExpiry());
+    it.SetExpiryTime(1);
+  }
+  // Validate the regression in all build types: DCHECK below is a no-op in
+  // release, so RandomPairsUnique could still return 10 keys by chance.
+  EXPECT_TRUE(sm_->ExpirationUsed());
+
+  sm_->set_time(2);
+
+  vector<sds> keys, vals;
+  sm_->RandomPairsUnique(20, keys, vals, false);
+  EXPECT_EQ(keys.size(), 10u);
+}
+
+TEST_F(StringMapTest, ExpireCollectChainUaf) {
+  // Iterating after SetExpiryTime'd chain-tail entries expire reads through
+  // a LinkKey freed by Delete in ExpireIfNeededInternal's loop. Reproduces
+  // probabilistically without ASAN; the 32-trial loop raises crash rate.
+  for (unsigned trial = 0; trial < 32; trial++) {
+    StringMap sm(&mi_alloc_);
+    for (unsigned i = 0; i < 20; i++) {
+      ASSERT_TRUE(sm.AddOrUpdate(absl::StrCat("t", trial, "_", i), "v"));
+    }
+    for (unsigned i = 0; i < 10; i++) {
+      sm.Find(absl::StrCat("t", trial, "_", i)).SetExpiryTime(1);
+    }
+    sm.set_time(2);
+
+    unsigned alive = 0;
+    for (auto it = sm.begin(); it != sm.end(); ++it) {
+      ++alive;
+    }
+    EXPECT_EQ(alive, 10u);
+  }
+}
+
+TEST_F(StringMapTest, FindAfterExpiredTailUaf) {
+  // Find() on a missing key walks the chain to the tail. If the tail Object
+  // has expired, ExpireIfNeeded inside Find2 frees prev's LinkKey, leaving
+  // `curr` dangling for the subsequent Equal / curr->Next() reads.
+  for (unsigned trial = 0; trial < 32; trial++) {
+    StringMap sm(&mi_alloc_);
+    for (unsigned i = 0; i < 20; i++) {
+      ASSERT_TRUE(sm.AddOrUpdate(absl::StrCat("t", trial, "_", i), "v"));
+    }
+    for (unsigned i = 0; i < 10; i++) {
+      sm.Find(absl::StrCat("t", trial, "_", i)).SetExpiryTime(1);
+    }
+    sm.set_time(2);
+
+    for (unsigned i = 0; i < 50; i++) {
+      sm.Find(absl::StrCat("missing", trial, "_", i));
+    }
+  }
+}
+
+TEST_F(StringMapTest, ExtractMultiple) {
+  for (unsigned i = 0; i < 20; i++) {
+    sm_->AddOrUpdate(to_string(i), "val" + to_string(i));
+  }
+  EXPECT_EQ(sm_->UpperBoundSize(), 20u);
+
+  // Extract every other entry
+  vector<StringMap::SdsEntry> extracted;
+  for (unsigned i = 0; i < 20; i += 2) {
+    auto entry = sm_->Extract(to_string(i));
+    ASSERT_TRUE(entry);
+    extracted.push_back(std::move(entry));
+  }
+
+  EXPECT_EQ(sm_->UpperBoundSize(), 10u);
+
+  // Verify remaining entries
+  for (unsigned i = 1; i < 20; i += 2) {
+    EXPECT_TRUE(sm_->Contains(to_string(i)));
+  }
+}
+
+}  // namespace dfly

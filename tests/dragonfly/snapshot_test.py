@@ -1,0 +1,1105 @@
+import asyncio
+import glob
+import logging
+import os
+from pathlib import Path
+
+from async_timeout import timeout
+import boto3
+import pytest
+import redis
+import random
+from pymemcache.client.base import Client as MCClient
+from redis import asyncio as aioredis
+
+from . import dfly_args
+from .instance import DflyInstanceFactory, RedisServer
+from .replication_test import compare_datasets
+from .seeder import DebugPopulateSeeder, Seeder
+from .utility import (
+    assert_eventually,
+    wait_available_async,
+    is_saving,
+    tmp_file_name,
+    wait_for_replicas_state,
+    check_all_replicas_finished,
+)
+
+BASIC_ARGS = {"dir": "{DRAGONFLY_TMP}/", "proactor_threads": 4}
+FILE_FORMATS = ["RDB", "DF"]
+
+# Should be used where text auxiliary mechanisms like filenames
+LIGHTWEIGHT_SEEDER_ARGS = dict(key_target=100, data_size=100, variance=1, samples=1)
+
+
+def find_main_file(path: Path, pattern):
+    return next(iter(glob.glob(str(path) + "/" + pattern)), None)
+
+
+async def get_metric_value(inst, metric_name, sample_index=0):
+    return (await inst.metrics())[metric_name].samples[sample_index].value
+
+
+async def assert_metric_value(inst, metric_name, expected_value):
+    actual_value = await get_metric_value(inst, metric_name)
+    assert (
+        actual_value == expected_value
+    ), f"Expected {metric_name} to be {expected_value}, got ${actual_value}"
+
+
+@pytest.mark.opt_only
+@pytest.mark.parametrize("format", FILE_FORMATS)
+@pytest.mark.parametrize(
+    "seeder_opts",
+    [
+        # Many small keys, high variance
+        dict(key_target=50_000, data_size=100, variance=10, samples=50),
+        # A few large keys, high variance
+        dict(key_target=1000, data_size=5_000, variance=10, samples=10),
+    ],
+)
+@dfly_args({**BASIC_ARGS})
+async def test_consistency(df_factory, format: str, seeder_opts: dict):
+    """
+    Test consistency over a large variety of data with different sizes
+    """
+    dbfilename = f"dump_{tmp_file_name()}"
+    instance = df_factory.create(dbfilename=dbfilename)
+    instance.start()
+    async_client = instance.client()
+    await DebugPopulateSeeder(**seeder_opts).run(async_client)
+
+    start_capture = await DebugPopulateSeeder.capture(async_client)
+
+    # save + flush + load
+    await async_client.execute_command("SAVE", format)
+    assert await async_client.flushall()
+    await async_client.execute_command(
+        "DFLY",
+        "LOAD",
+        f"{dbfilename}.rdb" if format == "RDB" else f"{dbfilename}-summary.dfs",
+    )
+
+    assert (await DebugPopulateSeeder.capture(async_client)) == start_capture
+
+
+@pytest.mark.parametrize("format", FILE_FORMATS)
+@dfly_args({**BASIC_ARGS})
+async def test_multidb(df_factory, format: str):
+    """
+    Test serialization of multiple logical databases
+    """
+    dbfilename = f"dump_{tmp_file_name()}"
+    instance = df_factory.create(dbfilename=dbfilename)
+    instance.start()
+    async_client = instance.client()
+    start_captures = []
+    for dbid in range(10):
+        db_client = instance.client(db=dbid)
+        await DebugPopulateSeeder(key_target=1000).run(db_client)
+        start_captures.append(await DebugPopulateSeeder.capture(db_client))
+
+    # save + flush + load
+    await async_client.execute_command("SAVE", format)
+    assert await async_client.flushall()
+    await async_client.execute_command(
+        "DFLY",
+        "LOAD",
+        f"{dbfilename}.rdb" if format == "RDB" else f"{dbfilename}-summary.dfs",
+    )
+
+    for dbid in range(10):
+        db_client = instance.client(db=dbid)
+        assert (await DebugPopulateSeeder.capture(db_client)) == start_captures[dbid]
+
+
+@pytest.mark.parametrize(
+    "save_type, dbfilename, pattern",
+    [
+        ("rdb", "test-autoload1-{{timestamp}}", "test-autoload1-*.rdb"),
+        ("df", "test-autoload2-{{timestamp}}", "test-autoload2-*-summary.dfs"),
+        ("rdb", "test-autoload3-{{timestamp}}.rdb", "test-autoload3-*.rdb"),
+        ("rdb", "test-autoload4", "test-autoload4.rdb"),
+        ("df", "test-autoload5", "test-autoload5-summary.dfs"),
+        ("rdb", "test-autoload6.rdb", "test-autoload6.rdb"),
+    ],
+)
+async def test_dbfilenames(
+    df_factory, tmp_dir: Path, save_type: str, dbfilename: str, pattern: str
+):
+    df_args = {**BASIC_ARGS, "dbfilename": dbfilename, "port": 1111}
+
+    if save_type == "rdb":
+        df_args["nodf_snapshot_format"] = None
+
+    start_capture = None
+
+    with df_factory.create(**df_args) as df_server:
+        async with df_server.client() as client:
+            await wait_available_async(client)
+
+            # We use the seeder just to check we don't loose any files (and thus keys)
+            await DebugPopulateSeeder(**LIGHTWEIGHT_SEEDER_ARGS).run(client)
+            start_capture = await DebugPopulateSeeder.capture(client)
+
+            await client.execute_command("SAVE " + save_type)
+
+    file = find_main_file(tmp_dir, pattern)
+    assert file is not None
+    assert os.path.basename(file).startswith(dbfilename.split("{{")[0])
+
+    with df_factory.create(**df_args) as df_server:
+        async with df_server.client() as client:
+            await wait_available_async(client)
+            assert await DebugPopulateSeeder.capture(client) == start_capture
+
+
+@dfly_args(
+    {
+        **BASIC_ARGS,
+        "dbfilename": "test-redis-load-rdb",
+    }
+)
+async def test_redis_load_snapshot(
+    async_client: aioredis.Redis, df_server, redis_local_server: RedisServer, tmp_dir: Path
+):
+    """
+    Test redis server loading dragonfly snapshot rdb format
+    """
+    await DebugPopulateSeeder(
+        **LIGHTWEIGHT_SEEDER_ARGS, types=["STRING", "LIST", "SET", "HASH", "ZSET", "STREAM"]
+    ).run(async_client)
+
+    await async_client.lpush("list", "A" * 10_000)
+
+    await async_client.execute_command("SAVE", "rdb")
+    dbsize = await async_client.dbsize()
+
+    await async_client.connection_pool.disconnect()
+    df_server.stop()
+
+    redis_local_server.start(dir=tmp_dir, redis7=True, dbfilename="test-redis-load-rdb.rdb")
+    await asyncio.sleep(1)
+    c_master = aioredis.Redis(port=redis_local_server.port)
+    await c_master.ping()
+
+    assert await c_master.dbsize() == dbsize
+
+
+@pytest.mark.large
+@dfly_args({**BASIC_ARGS, "dbfilename": "test-cron", "snapshot_cron": "* * * * *"})
+async def test_cron_snapshot(tmp_dir: Path, async_client: aioredis.Redis):
+    await DebugPopulateSeeder(**LIGHTWEIGHT_SEEDER_ARGS).run(async_client)
+
+    file = None
+    async with timeout(65):
+        while file is None:
+            await asyncio.sleep(1)
+            file = find_main_file(tmp_dir, "test-cron-summary.dfs")
+
+    assert file is not None, os.listdir(tmp_dir)
+
+
+@pytest.mark.skip("Fails and also causes all TLS tests to fail")
+@pytest.mark.large
+@dfly_args({**BASIC_ARGS, "dbfilename": "test-failed-saving", "snapshot_cron": "* * * * *"})
+async def test_cron_snapshot_failed_saving(df_server, tmp_dir: Path, async_client: aioredis.Redis):
+    await DebugPopulateSeeder(**LIGHTWEIGHT_SEEDER_ARGS).run(async_client)
+
+    backups_total = await get_metric_value(df_server, "dragonfly_backups")
+    failed_backups_total = await get_metric_value(df_server, "dragonfly_failed_backups")
+
+    file = None
+    async with timeout(65):
+        while file is None:
+            await asyncio.sleep(1)
+            file = find_main_file(tmp_dir, "test-failed-saving-summary.dfs")
+
+    assert file is not None, os.listdir(tmp_dir)
+
+    await assert_metric_value(df_server, "dragonfly_backups", backups_total + 1)
+    await assert_metric_value(df_server, "dragonfly_failed_backups", failed_backups_total)
+
+    # Remove all files from directory
+    for dir_file in tmp_dir.iterdir():
+        os.unlink(dir_file)
+
+    # Make directory read-only
+    os.chmod(tmp_dir, 0o555)
+
+    # Wait for the next SAVE command
+    await asyncio.sleep(65)
+    file = find_main_file(tmp_dir, "test-failed-saving-summary.dfs")
+
+    # Make directory writable again
+    os.chmod(tmp_dir, 0o777)
+
+    assert file is None, os.listdir(tmp_dir)
+
+    await assert_metric_value(df_server, "dragonfly_backups", backups_total + 2)
+    await assert_metric_value(df_server, "dragonfly_failed_backups", failed_backups_total + 1)
+
+
+@pytest.mark.large
+@dfly_args({**BASIC_ARGS, "dbfilename": "test-cron-set"})
+async def test_set_cron_snapshot(tmp_dir: Path, async_client: aioredis.Redis):
+    await DebugPopulateSeeder(**LIGHTWEIGHT_SEEDER_ARGS).run(async_client)
+
+    await async_client.config_set("snapshot_cron", "* * * * *")
+
+    file = None
+    async with timeout(65):
+        while file is None:
+            await asyncio.sleep(1)
+            file = find_main_file(tmp_dir, "test-cron-set-summary.dfs")
+
+    assert file is not None
+
+
+@pytest.mark.opt_only
+async def test_parallel_snapshot(async_client):
+    """Dragonfly does not allow simultaneous save operations, send 2 save operations and make sure one is rejected"""
+
+    await async_client.execute_command("debug", "populate", "1000000", "askldjh", "1000", "RAND")
+
+    async def save():
+        try:
+            await async_client.execute_command("save", "rdb", "dump")
+            return True
+        except Exception:
+            return False
+
+    save_successes = sum(await asyncio.gather(*(save() for _ in range(2))), 0)
+    assert save_successes == 1, "Only one SAVE must be successful"
+
+
+@pytest.mark.opt_only
+async def test_parallel_snapshot_race_condition(async_client):
+    await async_client.execute_command("debug", "populate", "300000", "racekey", "2000", "RAND")
+
+    async def save_operation(operation_id):
+        try:
+            await async_client.execute_command("save", "rdb", "dump")
+            return f"success_{operation_id}"
+        except Exception as e:
+            return f"failed_{operation_id}_{type(e).__name__}"
+
+    # Fire many concurrent operations to maximize collision probability
+    # The more concurrent operations, the higher chance of hitting the race window
+    num_concurrent = 3
+
+    # Multiple rounds to increase overall probability
+    for round_num in range(2):
+        tasks = [save_operation(f"r{round_num}_op{i}") for i in range(num_concurrent)]
+
+        # Execute all operations simultaneously to hit race condition
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        successes = [r for r in results if isinstance(r, str) and r.startswith("success_")]
+        failures = [r for r in results if isinstance(r, str) and r.startswith("failed_")]
+        exceptions = [r for r in results if not isinstance(r, str)]
+
+        # Exactly one should succeed, rest should fail gracefully
+        assert (
+            len(successes) == 1
+        ), f"Round {round_num}: Expected exactly 1 success, got {len(successes)} successes, {len(failures)} failures, {len(exceptions)} exceptions. Results: {results}"
+
+        # Short delay between rounds
+        await asyncio.sleep(0.05)
+
+
+async def test_path_escapes(df_factory):
+    """Test that we don't allow path escapes. We just check that df_server.start()
+    fails because we don't have a much better way to test that."""
+
+    df_server = df_factory.create(dbfilename="../../../../etc/passwd")
+    with pytest.raises(Exception):
+        df_server.start()
+
+
+@dfly_args({**BASIC_ARGS, "dbfilename": "test-info-persistence"})
+async def test_info_persistence_field(async_client):
+    """Test is_loading field on INFO PERSISTENCE during snapshot loading"""
+
+    await DebugPopulateSeeder(**LIGHTWEIGHT_SEEDER_ARGS).run(async_client)
+
+    # Wait for snapshot to finish loading and try INFO PERSISTENCE
+    await wait_available_async(async_client)
+    assert "loading:0" in (await async_client.execute_command("INFO PERSISTENCE"))
+
+
+def delete_s3_objects(bucket, prefix):
+    client = boto3.client("s3")
+    resp = client.list_objects_v2(
+        Bucket=bucket,
+        Prefix=prefix,
+    )
+    keys = []
+    for obj in resp["Contents"]:
+        keys.append({"Key": obj["Key"]})
+    client.delete_objects(
+        Bucket=bucket,
+        Delete={"Objects": keys},
+    )
+
+
+def _missing_s3_test_env():
+    return (
+        "DRAGONFLY_S3_BUCKET" not in os.environ
+        or os.environ["DRAGONFLY_S3_BUCKET"] == ""
+        or "AWS_ACCESS_KEY_ID" not in os.environ
+        or os.environ["AWS_ACCESS_KEY_ID"] == ""
+        or "AWS_SECRET_ACCESS_KEY" not in os.environ
+        or os.environ["AWS_SECRET_ACCESS_KEY"] == ""
+    )
+
+
+# If DRAGONFLY_S3_BUCKET is configured, AWS credentials must also be
+# configured.
+@pytest.mark.skipif(
+    _missing_s3_test_env(),
+    reason="AWS S3 snapshots bucket or credentials are not configured",
+)
+async def test_exit_on_s3_snapshot_load_err(df_factory):
+    invalid_s3_dir = "s3://{DRAGONFLY_S3_BUCKET}" + "_invalid_bucket_"
+    df_server = df_factory.create(dir=invalid_s3_dir, dbfilename="db")
+    with pytest.raises(Exception):
+        df_server.start()
+        df_server.stop()
+
+
+# If DRAGONFLY_S3_BUCKET is configured, AWS credentials must also be
+# configured.
+@pytest.mark.skipif(
+    _missing_s3_test_env(),
+    reason="AWS S3 snapshots bucket or credentials are not configured",
+)
+@dfly_args({**BASIC_ARGS})
+async def test_s3_snapshot(async_client, tmp_dir):
+    seeder = DebugPopulateSeeder(key_target=10_000)
+    await seeder.run(async_client)
+
+    start_capture = await DebugPopulateSeeder.capture(async_client)
+    s3_path = "s3://" + os.environ["DRAGONFLY_S3_BUCKET"] + str(tmp_dir)
+
+    try:
+        # save to S3 + flush + load from S3 (with local --dir)
+        await async_client.execute_command("SAVE", "DF", s3_path, "snapshot")
+        assert await async_client.flushall()
+        await async_client.execute_command("DFLY", "LOAD", s3_path + "/snapshot-summary.dfs")
+
+        assert await DebugPopulateSeeder.capture(async_client) == start_capture
+
+    finally:
+        delete_s3_objects(
+            os.environ["DRAGONFLY_S3_BUCKET"],
+            str(tmp_dir)[1:],
+        )
+
+
+# If DRAGONFLY_S3_BUCKET is configured, AWS credentials must also be
+# configured.
+@pytest.mark.skipif(
+    _missing_s3_test_env(),
+    reason="AWS S3 snapshots bucket or credentials are not configured",
+)
+@dfly_args(
+    {
+        **BASIC_ARGS,
+        "dir": "s3://{DRAGONFLY_S3_BUCKET}{DRAGONFLY_TMP}",
+        "dbfilename": "snapshot-{{Y}}{{m}}{{d}}-{{timestamp}}",
+    }
+)
+async def test_s3_reload_snapshot_after_restart(df_factory, tmp_dir):
+    # this test checks that after saving to s3, stopping the server and starting a new one
+    # we can load the snapshot from s3 correctly.
+    try:
+        instance = df_factory.create()
+        instance.start()
+        async_client = instance.client()
+        seeder = DebugPopulateSeeder(key_target=10_000)
+        await seeder.run(async_client)
+        start_capture = await DebugPopulateSeeder.capture(async_client)
+        # instance stop generates snapshot on exit
+        instance.stop()
+
+        new_instance = df_factory.create()
+        new_instance.start()
+        new_async_client = new_instance.client()
+
+        await wait_available_async(new_async_client)
+
+        assert await DebugPopulateSeeder.capture(new_async_client) == start_capture
+
+    finally:
+        new_instance.stop()
+        delete_s3_objects(
+            os.environ["DRAGONFLY_S3_BUCKET"],
+            str(tmp_dir)[1:],
+        )
+
+
+# If DRAGONFLY_S3_BUCKET is configured, AWS credentials must also be
+# configured.
+@pytest.mark.skipif(
+    _missing_s3_test_env(),
+    reason="AWS S3 snapshots bucket or credentials are not configured",
+)
+@dfly_args({**BASIC_ARGS})
+async def test_s3_save_local_dir(async_client, tmp_dir):
+    seeder = DebugPopulateSeeder(key_target=10_000)
+    await seeder.run(async_client)
+
+    try:
+        # SAVE to S3 bucket with `s3_dump` as filename prefix
+        await async_client.execute_command(
+            "SAVE", "DF", "s3://" + os.environ["DRAGONFLY_S3_BUCKET"] + str(tmp_dir), "s3_dump"
+        )
+
+    finally:
+        delete_s3_objects(
+            os.environ["DRAGONFLY_S3_BUCKET"],
+            str(tmp_dir)[1:] + "/s3_dump",
+        )
+
+
+def _missing_azure_test_env():
+    return (
+        "DRAGONFLY_AZURE_CONTAINER" not in os.environ
+        or os.environ["DRAGONFLY_AZURE_CONTAINER"] == ""
+        or "AZURE_STORAGE_CONNECTION_STRING" not in os.environ
+        or os.environ["AZURE_STORAGE_CONNECTION_STRING"] == ""
+    )
+
+
+def delete_azure_objects(container, prefix):
+    from azure.storage.blob import BlobServiceClient
+
+    conn_str = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+    blob_service = BlobServiceClient.from_connection_string(conn_str)
+    container_client = blob_service.get_container_client(container)
+    blobs = container_client.list_blobs(name_starts_with=prefix)
+    for blob in blobs:
+        container_client.delete_blob(blob.name)
+
+
+@pytest.mark.skipif(
+    _missing_azure_test_env(),
+    reason="Azure storage container or credentials are not configured",
+)
+@dfly_args({**BASIC_ARGS})
+async def test_azure_snapshot(async_client, tmp_dir):
+    seeder = DebugPopulateSeeder(key_target=10_000)
+    await seeder.run(async_client)
+
+    start_capture = await DebugPopulateSeeder.capture(async_client)
+    az_path = "az://" + os.environ["DRAGONFLY_AZURE_CONTAINER"] + str(tmp_dir)
+
+    try:
+        # save to Azure + flush + load from Azure
+        await async_client.execute_command("SAVE", "DF", az_path, "snapshot")
+        assert await async_client.flushall()
+        await async_client.execute_command("DFLY", "LOAD", az_path + "/snapshot-summary.dfs")
+
+        assert await DebugPopulateSeeder.capture(async_client) == start_capture
+
+    finally:
+        delete_azure_objects(
+            os.environ["DRAGONFLY_AZURE_CONTAINER"],
+            str(tmp_dir)[1:],
+        )
+
+
+@dfly_args({**BASIC_ARGS, "dbfilename": "test-shutdown"})
+class TestDflySnapshotOnShutdown:
+    SEEDER_ARGS = dict(key_target=10_000)
+
+    """Test multi file snapshot"""
+
+    async def _get_info_memory_fields(self, client):
+        res = await client.execute_command("INFO MEMORY")
+        fields = {}
+        for line in res.splitlines():
+            if line.startswith("#"):
+                continue
+            k, v = line.split(":")
+            if k == "object_used_memory" or k.startswith("type_used_memory_"):
+                fields.update({k: int(v)})
+        return fields
+
+    async def _delete_all_keys(self, client: aioredis.Redis):
+        while True:
+            keys = await client.keys()
+            if len(keys) == 0:
+                break
+            await client.delete(*keys)
+
+    async def test_memory_counters(self, async_client: aioredis.Redis):
+        memory_counters = await self._get_info_memory_fields(async_client)
+        assert memory_counters == {"object_used_memory": 0}
+
+        seeder = DebugPopulateSeeder(**self.SEEDER_ARGS)
+        await seeder.run(async_client)
+
+        memory_counters = await self._get_info_memory_fields(async_client)
+        assert all(value > 0 for value in memory_counters.values())
+
+        await self._delete_all_keys(async_client)
+        memory_counters = await self._get_info_memory_fields(async_client)
+        assert memory_counters == {"object_used_memory": 0}
+
+    async def test_snapshot(self, df_server, async_client):
+        """Checks that:
+        1. After reloading the snapshot file the data is the same
+        2. Memory counters after loading should be non zero
+        3. Memory counters after deleting all keys loaded by snapshot - this validates the memory
+           counting when loading from snapshot."""
+
+        seeder = DebugPopulateSeeder(**self.SEEDER_ARGS)
+        await seeder.run(async_client)
+        start_capture = await DebugPopulateSeeder.capture(async_client)
+
+        memory_before = await self._get_info_memory_fields(async_client)
+
+        await async_client.connection_pool.disconnect()
+        df_server.stop()
+        df_server.start()
+
+        async_client = df_server.client()
+        await wait_available_async(async_client)
+
+        assert await DebugPopulateSeeder.capture(async_client) == start_capture
+
+        memory_after = await self._get_info_memory_fields(async_client)
+        for counter, value in memory_before.items():
+            # Counters should be non zero.
+            assert memory_after[counter] > 0
+
+        await self._delete_all_keys(async_client)
+        memory_empty = await self._get_info_memory_fields(async_client)
+        assert memory_empty == {"object_used_memory": 0}
+
+
+@pytest.mark.parametrize("format", FILE_FORMATS)
+@dfly_args({**BASIC_ARGS, "dbfilename": "info-while-snapshot"})
+async def test_infomemory_while_snapshotting(df_factory, format: str):
+    instance = df_factory.create(dbfilename=f"dump_{tmp_file_name()}")
+    instance.start()
+    async_client = instance.client()
+    await async_client.execute_command("DEBUG POPULATE 10000 key 4048 RAND")
+
+    async def save():
+        await async_client.execute_command("SAVE", format)
+
+    save_finished = False
+
+    async def info_in_loop():
+        while not save_finished:
+            await async_client.execute_command("INFO MEMORY")
+            await asyncio.sleep(0.1)
+
+    save_task = asyncio.create_task(save())
+    info_task = asyncio.create_task(info_in_loop())
+
+    await save_task
+    save_finished = True
+    await info_task
+
+
+@dfly_args({**BASIC_ARGS, "dbfilename": "test-bgsave"})
+async def test_bgsave_and_save(async_client: aioredis.Redis):
+    await async_client.execute_command("DEBUG POPULATE 200000")
+
+    await async_client.execute_command("BGSAVE")
+    with pytest.raises(redis.exceptions.ResponseError):
+        await async_client.execute_command("BGSAVE")
+
+    while await is_saving(async_client):
+        await asyncio.sleep(0.1)
+    await async_client.execute_command("BGSAVE")
+    with pytest.raises(redis.exceptions.ResponseError):
+        await async_client.execute_command("SAVE")
+
+    while await is_saving(async_client):
+        await asyncio.sleep(0.1)
+    await async_client.execute_command("SAVE")
+
+
+@pytest.mark.asyncio
+@dfly_args({**BASIC_ARGS, "dbfilename": "test-objhist-crash"})
+async def test_debug_objhist_during_bgsave(df_factory: DflyInstanceFactory):
+    df = df_factory.create(proactor_threads=2)
+    df.start()
+    client = df.client()
+
+    await client.execute_command("DEBUG", "POPULATE", "50000")
+
+    await client.execute_command("SADDEX", "myset_crash", "1", "member_abc")
+
+    await asyncio.sleep(2)
+
+    await client.execute_command("SRANDMEMBER", "myset_crash", "0")
+
+    await client.execute_command("BGSAVE")
+
+    # Wait until the snapshot is confirmed running before issuing DEBUG OBJHIST.
+    # Without this, BGSAVE may finish before the traversal reaches myset_crash,
+    # leaving no active snapshot change listener and making the crash non-reproducible.
+    # Use a timeout in case BGSAVE finishes before we even reach this check.
+    try:
+        async with timeout(10):
+            while not await is_saving(client):
+                await asyncio.sleep(0.01)
+    except asyncio.TimeoutError:
+        pass  # BGSAVE already finished before we checked — that's fine
+
+    await client.execute_command("DEBUG", "OBJHIST")
+
+    # If we reach here the server did not crash — verify it is still responsive.
+    assert await client.ping()
+
+
+@pytest.mark.asyncio
+@dfly_args({**BASIC_ARGS})
+async def test_randomkey_during_bgsave(df_factory: DflyInstanceFactory):
+    """
+    Regression test for #7404. Before the fix, RANDOMKEY dispatched its per-shard
+    scan via RunBriefInParallel (dispatcher fiber, no preempt). The callback ran
+    OpScan -> DbSlice::WaitForUnblockedJournalWrites, which suspends on a CondVar
+    while a BGSAVE snapshot has buckets mid-serialization — tripping
+    "Should not preempt dispatcher" and aborting the process.
+    """
+    df = df_factory.create(
+        proactor_threads=4,
+        serialization_max_chunk_size=4096,
+        dbfilename=f"dump_{tmp_file_name()}",
+    )
+    df.start()
+    client = df.client()
+
+    # Big values + small chunk size force the snapshot serializer to yield mid-bucket,
+    # leaving deps_ non-empty so RANDOMKEY's scan callback hits WaitEmpty.
+    await client.execute_command("DEBUG", "POPULATE", "20000", "k", "8192", "RAND")
+
+    async def hammer_random(stop_evt):
+        c = df.client()
+        while not stop_evt.is_set():
+            try:
+                await c.execute_command("RANDOMKEY")
+            except Exception:
+                pass
+
+    stop = asyncio.Event()
+    workers = [asyncio.create_task(hammer_random(stop)) for _ in range(8)]
+
+    try:
+        async with timeout(100):
+            for _ in range(5):
+                await client.execute_command("BGSAVE")
+                while await is_saving(client):
+                    await asyncio.sleep(0.01)
+    finally:
+        stop.set()
+        await asyncio.gather(*workers, return_exceptions=True)
+
+    # If we get here the server did not crash — verify it is still responsive.
+    assert await client.ping()
+
+
+@dfly_args({"proactor_threads": 1, "dbfilename": "test-hsetex-save", "dir": "{DRAGONFLY_TMP}/"})
+async def test_save_hash_with_expired_fields(async_client: aioredis.Redis):
+    """
+    HSETEX creates a hash with field-level TTL.  After all fields
+    expire, the hash key remains in the DB with Size()==0.  SAVE then hits the
+    DFATAL check in SaveEntry because OBJ_HASH does not allow empty values.
+
+    Reproduction: HSETEX with short TTL -> SAVE (while field is alive) ->
+    wait for expiry -> second SAVE -> crash.
+    """
+
+    await async_client.execute_command("HSETEX", "mykey", "1", "f1", "v1")
+    await async_client.execute_command("SAVE")
+
+    await asyncio.sleep(1.5)
+
+    # Trigger lazy expiry of the field — the key remains but has 0 fields.
+    assert await async_client.execute_command("FIELDTTL", "mykey", "f1") == -3
+
+    # This SAVE crashes on unfixed code: SaveEntry sees empty hash → DFATAL.
+    await async_client.execute_command("SAVE")
+
+    # If we get here, the server survived.
+    assert await async_client.ping()
+
+
+@dfly_args({"proactor_threads": 1, "dbfilename": "test-hgetall-expiry-bgsave"})
+async def test_hgetall_lazy_expiry_during_bgsave(async_client: aioredis.Redis):
+    """HVALS lazily empties a hash and deletes it mid-BGSAVE; the snapshot then
+    serializes the now-empty hash. On unfixed code SaveEntry aborts on it.
+    """
+    client = async_client
+
+    # Filler so the snapshot stays in progress long enough to race the read below.
+    await client.execute_command("DEBUG", "POPULATE", "50000")
+    await client.execute_command("HSETEX", "KEEPTTL", "1", "field", "value")
+    await asyncio.sleep(2)  # field expires; key stays until a read touches it
+
+    await client.execute_command("BGSAVE")
+    try:
+        async with timeout(10):
+            while not await is_saving(client):
+                await asyncio.sleep(0.01)
+    except asyncio.TimeoutError:
+        pass  # snapshot already finished; race window missed but safe
+
+    await client.execute_command("HVALS", "KEEPTTL")
+
+    assert await client.ping()
+
+
+@dfly_args({"proactor_threads": 1, "dbfilename": "test-save-del-crash", "dir": "{DRAGONFLY_TMP}/"})
+async def test_save_with_concurrent_mutations(df_server):
+    """
+    Regression test: SIGABRT in OnChangeBlocking on a non-shard fiber.
+
+    With proactor_threads=1 the single shard and all connections live on the same
+    thread.  CanRunInlined() may let a write command execute directly on a
+    connection fiber while a concurrent SAVE has already registered snapshot change
+    listeners.  The write then fires OnChangeBlocking on the wrong fiber, hitting
+    the DFATAL assertion in serializer_base.cc.
+
+    We reproduce this by running SAVE and SET/DEL concurrently from separate
+    connections until the race manifests (typically < 5 s on a debug build).
+    """
+
+    client = df_server.client()
+    for i in range(10):
+        await client.set(f"k{i}", f"val{i}")
+
+    save_done = asyncio.Event()
+
+    async def save_loop():
+        """Issue SAVE in a tight loop on a dedicated connection."""
+        c = df_server.client()
+        while not save_done.is_set():
+            try:
+                await c.execute_command("SAVE")
+            except Exception:
+                pass
+        await c.close()
+
+    async def mutate_loop(worker_id):
+        """Issue SET/DEL on a dedicated connection to race with SAVE."""
+        c = df_server.client()
+        i = 0
+        while not save_done.is_set():
+            key = f"k{i % 10}"
+            try:
+                await c.set(key, "v")
+                await c.delete(key)
+                await c.set(key, "v")
+            except Exception:
+                pass
+            i += 1
+        await c.close()
+
+    tasks = [asyncio.create_task(save_loop())]
+    tasks += [asyncio.create_task(mutate_loop(i)) for i in range(3)]
+
+    await asyncio.sleep(5)
+    save_done.set()
+    await asyncio.gather(*tasks)
+
+    # If we get here the server survived — the bug is fixed.
+    assert await client.ping()
+    await client.close()
+
+
+@pytest.mark.exclude_epoll
+@dfly_args(
+    {
+        **BASIC_ARGS,
+        "dbfilename": "tiered-entries",
+        "tiered_prefix": "/tmp/tiered/backing",
+        "tiered_offload_threshold": "1.0",  # ask offloading loop to offload as much as possible
+    }
+)
+async def test_tiered_entries(async_client: aioredis.Redis):
+    """This test makes sure tieried entries are correctly persisted"""
+
+    # With variance 4: 512 - 8192 we include small and large values
+    await DebugPopulateSeeder(key_target=5000, data_size=1024, variance=4, types=["STRING"]).run(
+        async_client
+    )
+
+    # Compute the capture, this brings all items back to memory... so we'll wait for offloading
+    start_capture = await DebugPopulateSeeder.capture(async_client)
+
+    # Wait until the total_stashes counter stops increasing, meaning offloading finished
+    last_writes, current_writes = 0, -1
+    while last_writes != current_writes:
+        await asyncio.sleep(0.1)
+        last_writes = current_writes
+        current_writes = (await async_client.info("TIERED"))["tiered_total_stashes"]
+
+    # Save + flush + load
+    await async_client.execute_command("SAVE", "DF")
+    assert await async_client.flushall()
+    await async_client.execute_command(
+        "DFLY",
+        "LOAD",
+        "tiered-entries-summary.dfs",
+    )
+
+    # Compare captures
+    assert await DebugPopulateSeeder.capture(async_client) == start_capture
+
+
+@pytest.mark.skip
+@pytest.mark.large
+@pytest.mark.opt_only
+@dfly_args(
+    {
+        **BASIC_ARGS,
+        "maxmemory": "2G",
+        "dbfilename": "tiered-entries",
+        "tiered_prefix": "/tmp/tiered/backing",
+        "tiered_offload_threshold": "0.5",  # ask to keep below 0.5 * 2G
+        "tiered_max_pending_stash_bytes": "16MB",
+        "tiered_experimental_cooling": "false",
+    }
+)
+async def test_tiered_entries_throttle(async_client: aioredis.Redis):
+    """
+    This test ensures that tiered entries are correctly persisted and loaded back
+    when memory is limited and tiered storage throttling is enabled.
+    """
+
+    # Populate the database with a large number of string keys to exceed the in-memory threshold
+    # and trigger tiered storage offloading/throttling. Each key is 4KB, total ~3GB.
+    await DebugPopulateSeeder(
+        key_target=750_000, data_size=4096, samples=20, variance=1, types=["STRING"]
+    ).run(async_client)
+
+    # Capture the initial state of the database for later comparison
+    logging.info("Seeder completed, starting capture")
+    start_capture = await DebugPopulateSeeder.capture(async_client)
+
+    # Check memory usage after population. The peak memory should remain below the set limit (2.3GB).
+    # This validates that tiered storage throttling is working as expected.
+    # TODO: investigate why it sometimes exceeds the expected limit.
+    info = await async_client.info("ALL")
+    assert info["used_memory_peak"] < 2300e6
+
+    logging.info("Memory usage check completed, starting save and load")
+    await async_client.execute_command("SAVE", "DF")
+    assert await async_client.flushall()
+    await async_client.execute_command(
+        "DFLY",
+        "LOAD",
+        "tiered-entries-summary.dfs",
+    )
+
+    logging.info("Save and load completed, starting consistency checks after reload")
+    # After reload, check that memory usage is still within the expected bounds.
+    # This ensures that loading from tiered storage does not violate memory constraints.
+    # TODO: investigate high error margin.
+    info = await async_client.info("ALL")
+    assert info["used_memory_peak"] < 2300e6
+
+    assert await DebugPopulateSeeder.capture(async_client) == start_capture
+
+
+@pytest.mark.large
+async def test_rdb_load_with_tiering_6823(df_factory: DflyInstanceFactory):
+    """
+    Regression test for RDB load with tiering. Verifies that loading a snapshot
+    into a tiered instance produces correct memory accounting (no underflow)
+    and preserves data integrity. Covers #6823.
+    """
+    dbfilename = f"dump_{tmp_file_name()}"
+
+    # 1. Create a non-tiered instance, populate with DEBUG POPULATE and save a DF snapshot.
+    plain = df_factory.create(
+        proactor_threads=4,
+        dbfilename=dbfilename,
+    )
+    plain.start()
+    plain_client = plain.client()
+
+    # Around 400MB
+    await plain_client.execute_command("DEBUG POPULATE 50000 key 8192 RAND")
+    num_keys = await plain_client.dbsize()
+
+    await plain_client.execute_command("SAVE", "DF")
+    plain.stop()
+
+    # 2. Start a tiered instance and load the snapshot. Before the fix this would crash
+    #    with "Check failed: obj_memory_usage + size >= 0" in AccountObjectMemory.
+    tiered = df_factory.create(
+        proactor_threads=1,
+        dbfilename="",
+        maxmemory="256MB",
+        tiered_prefix="/tmp/tiered/rdb_load_test",
+        tiered_offload_threshold="0.9",
+        tiered_experimental_cooling="false",
+        tiered_max_pending_stash_bytes="100KB",
+    )
+    tiered.start()
+    tiered_client = tiered.client()
+
+    assert await tiered_client.execute_command("DFLY", "LOAD", f"{dbfilename}-summary.dfs") == "OK"
+
+    # Wait for tiering to stash entries
+    @assert_eventually(timeout=30)
+    async def assert_tiered_reached():
+        info = await tiered_client.info("TIERED")
+        assert info["tiered_entries"] > 40_000
+
+    await assert_tiered_reached()
+
+    info = await tiered_client.info("memory")
+    used_mem = info["used_memory"]
+    obj_mem = info["object_used_memory"]
+
+    assert used_mem < 50_000_000
+    assert obj_mem < 0.12 * 256_000_000  # 90% offloading target with 256mb maxmemory, 2% margin
+
+    assert info["num_entries"] == num_keys
+    keys = await tiered_client.keys()
+    for key in random.sample(keys, k=10):
+        assert (len(await tiered_client.get(key))) == 8192
+
+
+@dfly_args({"serialization_max_chunk_size": 4096, "proactor_threads": 1})
+@pytest.mark.parametrize(
+    "cont_type",
+    [("HASH"), ("SET"), ("ZSET"), ("LIST"), ("STREAM")],
+)
+@pytest.mark.large
+async def test_big_value_serialization_memory_limit(df_factory, cont_type):
+    dbfilename = f"dump_{tmp_file_name()}"
+    instance = df_factory.create(dbfilename=dbfilename)
+    instance.start()
+    client = instance.client()
+
+    one_gb = 1_000_000_000
+    elements = 1000
+    element_size = 1_000_000  # 1mb
+
+    await client.execute_command(
+        f"debug populate 1 prefix {element_size} TYPE {cont_type} RAND ELEMENTS {elements}"
+    )
+    await asyncio.sleep(1)
+
+    info = await client.info("ALL")
+    assert info["used_memory_peak_rss"] < (one_gb * 1.2)
+    # if we execute SAVE below without big value serialization we trigger the assertion below.
+    # note the peak would reach (one_gb * 3) without it.
+    await client.execute_command("SAVE")
+    info = await client.info("ALL")
+
+    assert info["used_memory_peak_rss"] < (one_gb * 1.3)
+
+    await client.execute_command("FLUSHALL")
+    await client.aclose()
+
+
+@dfly_args(
+    {
+        "dir": "{DRAGONFLY_TMP}/",
+        "memcached_port": 11211,
+        "proactor_threads": 4,
+        "dbfilename": "test-MC-flags",
+    }
+)
+async def test_mc_flags_saving(memcached_client: MCClient, async_client: aioredis.Redis):
+    async def check_flag(key, flag):
+        res = memcached_client.raw_command("get " + key, "END\r\n").split()
+        # workaround sometimes memcached_client.raw_command returns empty str
+        if len(res) > 2:
+            assert res[2].decode() == str(flag)
+
+    assert memcached_client.set("key1", "value1", noreply=True)
+    assert memcached_client.set("key2", "value1", noreply=True, expire=3600, flags=123456)
+    assert memcached_client.replace("key1", "value2", expire=4000, flags=2, noreply=True)
+
+    await check_flag("key1", 2)
+    await check_flag("key2", 123456)
+
+    await async_client.execute_command("SAVE", "DF")
+    assert await async_client.flushall()
+
+    await async_client.execute_command(
+        "DFLY",
+        "LOAD",
+        "test-MC-flags-summary.dfs",
+    )
+
+    await check_flag("key1", 2)
+    await check_flag("key2", 123456)
+
+
+@pytest.mark.parametrize("compression_mode", ["NONE", "MULTI_ENTRY_LZ4", "MULTI_ENTRY_ZSTD"])
+async def test_tagged_chunk_reload(df_factory, compression_mode: str):
+    instance = df_factory.create(
+        dbfilename=f"dump_{tmp_file_name()}",
+        serialization_tagged_chunks=True,
+        compression_mode=compression_mode,
+        proactor_threads=4,
+        serialization_max_chunk_size=4096,
+    )
+    instance.start()
+    cl = instance.client()
+
+    await DebugPopulateSeeder(key_target=5000, data_size=2000, variance=20, samples=20).run(cl)
+    start_capture = await DebugPopulateSeeder.capture(cl)
+    await cl.execute_command("DEBUG", "RELOAD")
+    preempts = (await cl.info())["big_value_preemptions"]
+    assert preempts > 10
+    res = await DebugPopulateSeeder.capture(cl)
+    assert res == start_capture
+
+
+@pytest.mark.parametrize("compression_mode", ["NONE", "MULTI_ENTRY_LZ4", "MULTI_ENTRY_ZSTD"])
+async def test_tagged_chunk_replication(df_factory, compression_mode: str):
+    master = df_factory.create(
+        proactor_threads=4,
+        serialization_tagged_chunks=True,
+        compression_mode=compression_mode,
+        serialization_max_chunk_size=4096,
+    )
+
+    replica = df_factory.create(proactor_threads=2)
+    df_factory.start_all([master, replica])
+
+    cm = master.client()
+    cr = replica.client()
+
+    seeder = Seeder(
+        key_target=3000,
+        data_size=200,
+        huge_value_size=20000,
+        huge_value_target=50,
+    )
+
+    await seeder.run(cm, target_deviation=0.1)
+
+    stream_task = asyncio.create_task(seeder.run(cm))
+    await asyncio.sleep(0.0)
+
+    await cr.execute_command(f"REPLICAOF localhost {master.port}")
+    async with timeout(120):
+        await wait_for_replicas_state(cr)
+
+    await seeder.stop(cm)
+    await stream_task
+
+    preempts = (await cm.info())["big_value_preemptions"]
+    assert preempts > 0
+
+    await check_all_replicas_finished([cr], cm)
+    hashes = await asyncio.gather(Seeder.capture(cm), Seeder.capture(cr))
+    if hashes[0] != hashes[1]:
+        await compare_datasets(cm, cr)
+        assert False, "replica does not match master after full sync"

@@ -1,0 +1,393 @@
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
+
+// Wrong warning reported when geometry.hpp is loaded
+#ifndef __clang__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
+#include <boost/geometry.hpp>
+#ifndef __clang__
+#pragma GCC diagnostic pop
+#endif
+
+#include <absl/functional/function_ref.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <vector>
+
+#include "base/pmr/memory_resource.h"
+#include "core/page_usage/page_usage_stats.h"
+#include "core/search/base.h"
+#include "core/search/block_list.h"
+#include "core/search/compressed_sorted_set.h"
+#include "core/search/range_tree.h"
+#include "core/search/rax_tree.h"
+#include "core/search/stemmer.h"
+
+// TODO: move core field definitions out of big header
+#include "common/string_or_view.h"
+#include "core/search/search.h"
+
+namespace dfly::search {
+
+// Per-token indexing payload. `positions` is sorted ascending (1-based per field value,
+// continuous across multi-value fields). Empty when the owning index doesn't store positions.
+struct TermInfo {
+  uint32_t freq = 0;
+  absl::InlinedVector<uint32_t, 4> positions;
+};
+
+// Index for integer fields.
+// Range bounds are queried in logarithmic time, iteration is constant.
+struct NumericIndex : public BaseIndex {
+  // Temporary base class for range tree.
+  // It is used to use two different range trees depending on the flag use_range_tree.
+  // If the flag is true, RangeTree is used, otherwise a simple implementation with btree_set.
+  struct RangeTreeBase {
+    virtual void Add(DocId id, absl::Span<double> values) = 0;
+    virtual void Remove(DocId id, absl::Span<double> values) = 0;
+
+    // Returns all DocIds that match the range [l, r].
+    virtual RangeResult Range(double l, double r) const = 0;
+
+    // Returns all DocIds that have non-null values in the index.
+    virtual std::vector<DocId> GetAllDocIds() const = 0;
+
+    virtual void FinalizeInitialization(){};
+
+    virtual ~RangeTreeBase() = default;
+  };
+
+  // max_range_block_size is the maximum number of entries in a single range block.
+  // It is used in RangeTree. Check RangeTree for details.
+  explicit NumericIndex(size_t max_range_block_size, PMR_NS::memory_resource* mr);
+
+  bool Add(DocId id, const DocumentAccessor& doc, std::string_view field) override;
+  void Remove(DocId id, const DocumentAccessor& doc, std::string_view field) override;
+
+  void FinalizeInitialization() override;
+
+  RangeResult Range(double l, double r) const;
+
+  std::vector<DocId> GetAllDocsWithNonNullValues() const override;
+
+ private:
+  std::unique_ptr<RangeTreeBase> range_tree_;
+};
+
+// Base index for string based indices.
+template <typename C> struct BaseStringIndex : public BaseIndex {
+  using Container = BlockList<C>;
+  using VecOrPtr = std::variant<std::vector<DocId>, const Container*>;
+
+  // TextIndex (CompressedSortedSet) supports TF storage and BM25 scoring; TagIndex does not.
+  static constexpr bool kIsScored = std::is_same_v<C, CompressedSortedSet>;
+
+  BaseStringIndex(PMR_NS::memory_resource* mr, bool case_sensitive, bool with_suffixtrie,
+                  bool with_offsets = false);
+
+  bool Add(DocId id, const DocumentAccessor& doc, std::string_view field) override;
+  void Remove(DocId id, const DocumentAccessor& doc, std::string_view field) override;
+
+  // Pointer is valid as long as index is not mutated. Nullptr if not found
+  const Container* Matching(std::string_view str, bool strip_whitespace = true) const;
+
+  // Like Matching, but never stems the query word — used by phrase queries which must hit
+  // the raw token form (stems live at the same positions but under a separate trie key).
+  const Container* MatchingNoStem(std::string_view str) const;
+
+  // Iterate over all nodes matching on prefix.
+  void MatchPrefix(std::string_view prefix, absl::FunctionRef<void(const Container*)> cb) const;
+
+  // Iterate over all nodes matching suffix query. Faster if suffix trie is built.
+  void MatchSuffix(std::string_view suffix, absl::FunctionRef<void(const Container*)> cb) const;
+
+  // Iterate over all nodes matching infix query. Faster if suffix trie is built.
+  void MatchInfix(std::string_view prefix, absl::FunctionRef<void(const Container*)> cb) const;
+
+  // Same as above but also pass the matched term string to the callback (for scoring).
+  void MatchPrefixWithTerm(
+      std::string_view prefix,
+      absl::FunctionRef<void(std::string_view term, const Container*)> cb) const;
+  void MatchSuffixWithTerm(
+      std::string_view suffix,
+      absl::FunctionRef<void(std::string_view term, const Container*)> cb) const;
+  void MatchInfixWithTerm(
+      std::string_view infix,
+      absl::FunctionRef<void(std::string_view term, const Container*)> cb) const;
+
+  // Iterate over all nodes whose term matches the glob pattern (`*` = any run of characters,
+  // `?` = exactly one, `\` escapes the next character). Scans entries_, narrowing the range by
+  // the pattern's literal prefix when present.
+  void MatchWildcard(std::string_view pattern, absl::FunctionRef<void(const Container*)> cb) const;
+  void MatchWildcardWithTerm(
+      std::string_view pattern,
+      absl::FunctionRef<void(std::string_view term, const Container*)> cb) const;
+
+  // Returns all the terms that appear as keys in the reverse index.
+  std::vector<std::string> GetTerms() const;
+
+  std::vector<DocId> GetAllDocsWithNonNullValues() const override;
+
+  // Per-field BM25 scoring support: document length in this specific field.
+  uint32_t GetFieldDocLength(DocId doc) const {
+    return doc < field_doc_lengths_.size() ? field_doc_lengths_[doc] : 0;
+  }
+
+  // Average document length for this field.
+  // Denominator is field_num_docs_ (docs with non-empty content in this field),
+  // not the total index doc count, so sparse fields get correct BM25 normalization.
+  double GetFieldAvgDocLen() const {
+    return field_num_docs_ > 0 ? static_cast<double>(field_total_docs_len_) / field_num_docs_ : 0.0;
+  }
+
+  // Number of documents that have content in this field.
+  size_t GetFieldNumDocs() const {
+    return field_num_docs_;
+  }
+
+  // Sum of per-doc field lengths. Pair with GetFieldNumDocs() to aggregate
+  // avg doc len across shards without going through the lossy ratio.
+  size_t GetFieldTotalDocsLen() const {
+    return field_total_docs_len_;
+  }
+
+  // Schema canonical identifier of this field. Set by FieldIndices after
+  // construction; empty when the index is built outside that path.
+  std::string_view field_ident() const {
+    return field_ident_;
+  }
+
+  void set_field_ident(std::string_view ident) {
+    field_ident_ = ident;
+  }
+
+ protected:
+  using StringList = DocumentAccessor::StringList;
+
+  // Used by Add & Remove to get strings from document
+  virtual std::optional<StringList> GetStrings(const DocumentAccessor& doc,
+                                               std::string_view field) const = 0;
+
+  // Used by Add & Remove to tokenize a single field value. Merges results into `out`,
+  // advancing `pos_counter` per non-stopword token so positions are continuous across
+  // multiple values of the same field. Tag indices ignore positions.
+  virtual void Tokenize(std::string_view value, uint32_t* pos_counter,
+                        absl::flat_hash_map<std::string, TermInfo>* out) const = 0;
+
+  cmn::StringOrView NormalizeQueryWord(std::string_view word) const;
+  cmn::StringOrView NormalizeForExactQuery(std::string_view word) const;
+  static Container* GetOrCreate(search::RaxTreeMap<Container>* map, std::string_view word,
+                                bool store_freq = false, bool store_positions = false);
+  static void Remove(search::RaxTreeMap<Container>* map, DocId id, std::string_view word);
+
+  bool case_sensitive_ = false;
+  bool unique_ids_ = true;  // If true, docs ids are unique in the index, otherwise they can repeat.
+  bool with_offsets_ = false;  // Whether posting lists store token positions (TextIndex only).
+  search::RaxTreeMap<Container> entries_;
+  std::optional<search::RaxTreeMap<Container>> suffix_trie_;
+
+  // Non-owning. mutable: Stem() touches libstemmer's internal buffer.
+  mutable Stemmer* stemmer_ = nullptr;
+
+  // Per-field BM25 scoring data (only meaningful for TextIndex / CompressedSortedSet).
+  // Note: field_doc_lengths_ only grows (like FlatVectorIndex::entries_). Slots are zeroed
+  // on Remove but the vector is not shrunk. DocIds are recycled via free_ids_, so slots
+  // get reused over time.
+  std::vector<uint32_t> field_doc_lengths_;  // DocId -> sum of TF in this field
+  size_t field_total_docs_len_ = 0;
+  size_t field_num_docs_ = 0;  // Number of docs with non-empty content in this field
+
+  // Borrows from owning Schema's field map; the schema outlives this index.
+  std::string_view field_ident_;
+};
+
+// Index for text fields.
+// Hashmap based lookup per word.
+struct TextIndex : public BaseStringIndex<CompressedSortedSet> {
+  using StopWords = absl::flat_hash_set<std::string>;
+
+  TextIndex(PMR_NS::memory_resource* mr, const StopWords* stopwords, const Synonyms* synonyms,
+            bool with_suffixtrie, bool no_stem, std::string_view language,
+            std::string_view language_field, bool with_offsets = true);
+
+  bool Add(DocId id, const DocumentAccessor& doc, std::string_view field) override;
+  void Remove(DocId id, const DocumentAccessor& doc, std::string_view field) override;
+
+  bool StoresPositions() const {
+    return with_offsets_;
+  }
+
+  // Stems are NOT applied to phrase queries; they match raw token positions only.
+  std::vector<std::string> TokenizePhraseQuery(std::string_view phrase) const;
+
+ protected:
+  std::optional<StringList> GetStrings(const DocumentAccessor& doc,
+                                       std::string_view field) const override;
+  void Tokenize(std::string_view value, uint32_t* pos_counter,
+                absl::flat_hash_map<std::string, TermInfo>* out) const override;
+
+ private:
+  // Reads language_field_ from doc; returns a per-doc stemmer or the default.
+  Stemmer* ResolveStemmer(const DocumentAccessor& doc) const;
+
+  const StopWords* stopwords_;
+  const Synonyms* synonyms_;
+  std::optional<Stemmer> default_stemmer_;
+  std::string language_field_;
+  mutable std::optional<StemmerPool> pool_;  // mutable: lazily filled in ResolveStemmer
+};
+
+// Index for text fields.
+// Hashmap based lookup per word.
+struct TagIndex : public BaseStringIndex<SortedVector<DocId>> {
+  TagIndex(PMR_NS::memory_resource* mr, SchemaField::TagParams params)
+      : BaseStringIndex(mr, params.case_sensitive, params.with_suffixtrie),
+        separator_{params.separator} {
+  }
+
+  DefragmentResult Defragment(PageUsage* page_usage) override;
+
+ protected:
+  std::optional<StringList> GetStrings(const DocumentAccessor& doc,
+                                       std::string_view field) const override;
+  void Tokenize(std::string_view value, uint32_t* pos_counter,
+                absl::flat_hash_map<std::string, TermInfo>* out) const override;
+
+ private:
+  char separator_;
+  std::string next_defrag_entry_;
+  std::string next_defrag_suffix_entry_;
+};
+
+struct VectorIndexInfo {
+  size_t dim = 0;
+  VectorSimilarity sim = VectorSimilarity::L2;
+  VectorDataType data_type = VectorDataType::FLOAT32;
+};
+
+struct BaseVectorIndex : public BaseIndex {
+  VectorIndexInfo Info() const;
+
+  bool Add(DocId id, const DocumentAccessor& doc, std::string_view field) override final;
+
+ protected:
+  BaseVectorIndex(size_t dim, VectorSimilarity sim, VectorDataType data_type);
+
+  virtual void AddVector(DocId id, const void* vector) = 0;
+
+  size_t dim_;
+  VectorSimilarity sim_;
+  VectorDataType data_type_;
+};
+
+// Index for vector fields.
+// Only supports lookup by id.
+struct FlatVectorIndex : public BaseVectorIndex {
+  FlatVectorIndex(const SchemaField::VectorParams& params, PMR_NS::memory_resource* mr);
+
+  void Remove(DocId id, const DocumentAccessor& doc, std::string_view field) override;
+
+  // Pointer to the stored native-width vector bytes, or nullptr if the slot is empty.
+  const void* Get(DocId doc) const;
+
+  // Return all documents that have vectors in this index
+  std::vector<DocId> GetAllDocsWithNonNullValues() const override;
+
+ protected:
+  void AddVector(DocId id, const void* vector) override;
+
+ private:
+  size_t stride_bytes_;                // dim_ * ElementSize(data_type_)
+  PMR_NS::vector<std::byte> entries_;  // contiguous native-width vectors
+  PMR_NS::vector<bool> present_;       // presence flag per doc (bit-packed)
+};
+
+struct GeoIndex : public BaseIndex {
+  using point =
+      boost::geometry::model::point<double, 2,
+                                    boost::geometry::cs::geographic<boost::geometry::degree>>;
+  using index_entry = std::pair<point, DocId>;
+
+  explicit GeoIndex(PMR_NS::memory_resource* mr);
+  ~GeoIndex();
+
+  bool Add(DocId id, const DocumentAccessor& doc, std::string_view field) override;
+  void Remove(DocId id, const DocumentAccessor& doc, std::string_view field) override;
+  std::vector<DocId> RadiusSearch(double lon, double lat, double radius, std::string_view arg);
+  std::vector<DocId> GetAllDocsWithNonNullValues() const override;
+
+ private:
+  using rtree = boost::geometry::index::rtree<index_entry, boost::geometry::index::linear<16>>;
+  std::unique_ptr<rtree> rtree_;
+};
+
+// Defragments a map like data structure. The values in the map must have a `Defragment` method.
+// Works with rax tree map and hash based maps
+template <typename Container> struct DefragmentMap {
+  using ValueType = Container::value_type;
+  using Iterator = Container::iterator;
+
+  DefragmentMap(Container& container, std::string* key) : key{key} {
+    if (key->empty()) {
+      it = container.end();
+    } else if constexpr (requires { container.lower_bound(*key); }) {
+      it = container.lower_bound(*key);
+    } else {
+      it = container.find(*key);
+    }
+
+    if (it == container.end()) {
+      it = container.begin();
+    }
+
+    end = container.end();
+  }
+
+  // The key is set if the defragmentation has to stop mid way due to depleted quota
+  DefragmentResult Defragment(PageUsage* page_usage) {
+    if (page_usage->QuotaDepleted()) {
+      return DefragmentResult{.quota_depleted = true, .objects_moved = 0};
+    }
+
+    DefragmentResult result;
+    for (; it != end; ++it) {
+      const auto& [k, map] = *it;
+      if (result.Merge(DefragmentIndex(map, page_usage)).quota_depleted) {
+        *key = k;
+        break;
+      }
+    }
+
+    if (it == end) {
+      key->clear();
+    }
+
+    return result;
+  }
+
+ private:
+  template <typename T> static auto DefragmentIndex(T& t, PageUsage* page_usage) {
+    if constexpr (requires { t->Defragment(page_usage); }) {
+      return t->Defragment(page_usage);
+    } else {
+      return t.Defragment(page_usage);
+    }
+  }
+
+  std::string* key;
+  Iterator it;
+  Iterator end;
+};
+
+}  // namespace dfly::search

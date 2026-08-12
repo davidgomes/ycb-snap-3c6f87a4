@@ -1,0 +1,307 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+#pragma once
+
+#include <absl/container/flat_hash_map.h>
+
+#include <boost/intrusive/list.hpp>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <type_traits>
+
+#include "common/borrowed_string.h"
+#include "facade/facade_stats.h"
+#include "facade/facade_types.h"
+#include "io/io.h"
+
+namespace cmn {
+class BorrowedString;
+}  // namespace cmn
+
+namespace facade {
+
+enum class RespVersion { kResp2, kResp3 };
+
+// Base class for all reply builders. Offer a simple high level interface for controlling output
+// modes and sending basic response types.
+// By default, pointer validity for reference types (string_view, const BorrowedString&) is only
+// assumed for the Send...() function call. Use ReplyScope if the lifetime is longer to avoid copies
+// and enable zero-copy vectorized IO.
+class SinkReplyBuilder {
+  struct GuardBase {
+    bool prev;
+    SinkReplyBuilder* rb;
+  };
+
+ public:
+  constexpr static size_t kMaxInlineSize = 32;
+  constexpr static size_t kMaxBufferSize = 8192;
+
+  struct PendingPin : public boost::intrusive::list_base_hook<
+                          ::boost::intrusive::link_mode<::boost::intrusive::normal_link>> {
+    uint64_t timestamp_cycles;  // base::CycleClock::Now() value
+
+    PendingPin(uint64_t v = 0) : timestamp_cycles(v) {
+    }
+  };
+
+  using PendingList =
+      boost::intrusive::list<PendingPin, boost::intrusive::constant_time_size<false>,
+                             boost::intrusive::cache_last<false>>;
+
+  static thread_local PendingList pending_list;
+
+  explicit SinkReplyBuilder(io::Sink* sink) : sink_(sink) {
+  }
+
+  virtual ~SinkReplyBuilder() = default;
+
+  // USE WITH CARE! ReplyScope assumes that all string views in Send calls keep valid for the scopes
+  // lifetime. This allows the builder to avoid copies by enqueueing long strings directly for
+  // vectorized io.
+  struct ReplyScope : GuardBase {
+    explicit ReplyScope(SinkReplyBuilder* rb) : GuardBase{std::exchange(rb->scoped_, true), rb} {
+    }
+
+    ~ReplyScope();
+  };
+
+  // Temporarily pauses an active ReplyScope. While paused, Send calls copy data as usual
+  // (no zero-copy refs). Restores the previous scoped_ state on destruction.
+  struct ScopePause : GuardBase {
+    explicit ScopePause(SinkReplyBuilder* rb) : GuardBase{std::exchange(rb->scoped_, false), rb} {
+    }
+
+    ~ScopePause() {
+      rb->scoped_ = prev;
+    }
+  };
+
+  // Aggregator reduces the number of raw send calls by copying data in an intermediate buffer.
+  // Prefer ReplyScope if possible to additionally reduce the number of copies.
+  struct ReplyAggregator : GuardBase {
+    explicit ReplyAggregator(SinkReplyBuilder* rb)
+        : GuardBase{std::exchange(rb->batched_, true), rb} {
+    }
+
+    ~ReplyAggregator();
+  };
+
+  // Send all accumulated data and reset to clear state
+  // `additional_bytes` hints how many bytes did not fit into the buffer to possibly grow it
+  void Flush(size_t additional_bytes = 0);
+
+  std::error_code GetError() const {
+    return ec_;
+  }
+
+  size_t UsedMemory() const {
+    return buffer_.Capacity();
+  }
+
+  size_t RepliesRecorded() const {
+    return replies_recorded_;
+  }
+
+  bool IsSendActive() const {
+    return send_time_cycles_ > 0;
+  }
+
+  void SetBatchMode(bool b) {
+    batched_ = b;
+  }
+
+  bool IsBatchMode() const {
+    return batched_;
+  }
+
+  bool IsScoped() const {
+    return scoped_;
+  }
+
+  void CloseConnection();
+
+  static const ReplyStats& GetThreadLocalStats() {
+    return tl_facade_stats->reply_stats;
+  }
+
+ public:  // High level interface
+  virtual Protocol GetProtocol() const = 0;
+
+  virtual void SendLong(long val) = 0;
+  virtual void SendSimpleString(std::string_view str) = 0;
+
+  void SendOk() {
+    SendSimpleString("OK");
+  }
+
+  virtual void SendError(std::string_view str, std::string_view type = {}) = 0;  // MC and Redis
+  void SendError(OpStatus status);
+  void SendError(ErrorReply error);
+  virtual void SendProtocolError(std::string_view str) = 0;
+
+  std::string ConsumeLastError() {
+    return std::exchange(last_error_, {});
+  }
+
+  uint64_t GetLastSendTimeCycles() const;
+
+ protected:
+  template <typename... Ts>
+  void WritePieces(Ts&&... pieces);     // Copy pieces into buffer and reference buffer
+  void WriteRef(std::string_view str);  // Add iovec bypassing buffer
+
+  // Chunk-decode `bs` (a packed source) directly into scratch. Used by
+  // SendBulkStringBorrowed for encoded variants.
+  void WriteDecodedAscii(const cmn::BorrowedString& bs);
+
+  void FinishScope();  // Called when scope ends to flush buffer if needed
+  void Send();
+
+ protected:
+  size_t replies_recorded_ = 0;
+  std::string last_error_;
+
+ private:
+  io::Sink* sink_;
+  std::error_code ec_;
+
+  bool scoped_ = false, batched_ = false;
+
+  size_t total_size_ = 0;  // sum of vec_ lengths
+  base::IoBuf buffer_;     // backing buffer for pieces
+
+  // Stores iovecs for a single writev call. Can reference either the buffer (WritePiece) or
+  // external data (WriteRef). Validity is ensured by FinishScope that either flushes before ref
+  // lifetime ends or copies refs to the buffer.
+  absl::InlinedVector<iovec, 16> vecs_;
+  size_t guaranteed_pieces_ = 0;   // length of prefix of vecs_ that are guaranteed to be pieces
+  uint64_t send_time_cycles_ = 0;  // base::CycleClock::Now() at Send() entry, 0 when idle
+};
+
+class MCReplyBuilder : public SinkReplyBuilder {
+ public:
+  explicit MCReplyBuilder(::io::Sink* sink);
+
+  ~MCReplyBuilder() override = default;
+
+  Protocol GetProtocol() const final {
+    return Protocol::MEMCACHE;
+  }
+
+  void SendError(std::string_view str, std::string_view type = std::string_view{}) final;
+
+  void SendLong(long val) final;
+
+  void SendClientError(std::string_view str);
+  void SendValue(MemcacheCmdFlags cmd_flags, std::string_view key, std::string_view value,
+                 uint64_t mc_token, uint32_t mc_flag, uint32_t ttl_sec);
+  void SendSimpleString(std::string_view str) final;
+  void SendProtocolError(std::string_view str) final;
+
+  void SendRaw(std::string_view str);
+};
+
+// Redis reply builder interface for sending RESP data.
+class RedisReplyBuilderBase : public SinkReplyBuilder {
+ public:
+  enum VerbatimFormat : uint8_t { TXT, MARKDOWN };
+
+  explicit RedisReplyBuilderBase(io::Sink* sink) : SinkReplyBuilder(sink) {
+  }
+
+  ~RedisReplyBuilderBase() override = default;
+
+  Protocol GetProtocol() const final {
+    return Protocol::REDIS;
+  }
+
+  virtual void SendNull();
+
+  void SendSimpleString(std::string_view str) override;
+  virtual void SendBulkString(std::string_view str);  // RESP: Blob String
+
+  // Forward a temporary std::string to the string_view overload. Sending a temporary under a
+  // ReplyScope would enqueue it by reference and read it after destruction (use-after-free), so the
+  // implementation DCHECKs that the builder is not scoped (when unscoped the value is copied
+  // immediately). Constrained to std::string rvalues, so string literals / string_view / lvalue
+  // strings are unaffected (a plain `std::string&&` overload would make `SendBulkString("literal")`
+  // ambiguous). Defined in the .cc and explicitly instantiated to keep base/logging.h out of here.
+  template <typename T>
+  requires std::is_same_v<T, std::string>
+  void SendBulkString(T&& str);
+
+  void SendBulkStringBorrowed(const cmn::BorrowedString& bs);
+
+  // The interface exposes only the rvalue function to allow squashing to "steal" the value,
+  // the real builder implementation forwards it to the constref version
+  virtual void SendBulkStringBorrowed(cmn::BorrowedString&& bs);
+
+  void SendLong(long val) override;
+  virtual void SendDouble(double val);  // RESP: Number
+
+  virtual void SendNullArray();
+  virtual void StartCollection(unsigned len, CollectionType ct);
+
+  using SinkReplyBuilder::SendError;
+  void SendError(std::string_view str, std::string_view type = {}) override;
+  void SendProtocolError(std::string_view str) override;
+
+  virtual void SendVerbatimString(std::string_view str, VerbatimFormat format = TXT);
+
+  static char* FormatDouble(double d, char* dest, unsigned len);
+  static std::string SerializeCommand(std::string_view command);
+
+  bool IsResp3() const {
+    return resp_ == RespVersion::kResp3;
+  }
+
+  void SetRespVersion(RespVersion resp_version) {
+    resp_ = resp_version;
+  }
+
+  RespVersion GetRespVersion() {
+    return resp_;
+  }
+
+ private:
+  RespVersion resp_ = RespVersion::kResp2;
+};
+
+// Non essential redis reply builder functions implemented on top of the base resp protocol
+class RedisReplyBuilder : public RedisReplyBuilderBase {
+ public:
+  using ScoredArray = absl::Span<const std::pair<std::string, double>>;
+
+  RedisReplyBuilder(io::Sink* sink) : RedisReplyBuilderBase(sink) {
+  }
+
+  ~RedisReplyBuilder() override = default;
+
+  // One-liner for ReplyScope + StartArray
+  struct ArrayScope : ReplyScope {
+    ArrayScope(RedisReplyBuilder* rb, size_t len) : ReplyScope(rb) {
+      rb->StartArray(len);
+    }
+  };
+
+  void SendSimpleStrArr(const facade::ArgRange& strs);
+  void SendBulkStrArr(const facade::ArgRange& strs, CollectionType ct = CollectionType::ARRAY);
+  template <typename I> void SendLongArr(absl::Span<const I> longs);
+
+  void SendScoredArray(ScoredArray arr, bool with_scores);
+  void SendLabeledScoredArray(std::string_view arr_label, ScoredArray arr);
+  void StartArray(unsigned len);
+  void SendEmptyArray();
+};
+
+#define RETURN_ON_PARSE_ERROR(parser, rb)       \
+  do {                                          \
+    if (auto err = (parser).TakeError(); err) { \
+      return (rb)->SendError(err.MakeReply());  \
+    }                                           \
+  } while (0)
+
+}  // namespace facade

@@ -1,0 +1,411 @@
+// Copyright 2025, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+#include "base/gtest.h"
+#include "base/logging.h"
+#include "facade/facade_test.h"
+#include "server/test_utils.h"
+
+using namespace testing;
+using namespace std;
+using namespace util;
+
+namespace dfly {
+
+class GeoFamilyTest : public BaseFamilyTest {
+ protected:
+};
+
+TEST_F(GeoFamilyTest, GeoAdd) {
+  EXPECT_EQ(2, CheckedInt({"geoadd", "Sicily", "13.361389", "38.115556", "Palermo", "15.087269",
+                           "37.502669", "Catania"}));
+  EXPECT_EQ(0, CheckedInt({"geoadd", "Sicily", "13.361389", "38.115556", "Palermo", "15.087269",
+                           "37.502669", "Catania"}));
+  auto resp = Run({"geohash", "Sicily", "Palermo", "Catania"});
+  EXPECT_THAT(resp, RespArray(ElementsAre("sqc8b49rny0", "sqdtr74hyu0")));
+}
+
+TEST_F(GeoFamilyTest, GeoAddOptions) {
+  EXPECT_EQ(2, CheckedInt({"geoadd", "Sicily", "13.361389", "38.115556", "Palermo", "15.087269",
+                           "37.502669", "Catania"}));
+
+  // add 1 + update 1 + XX
+  EXPECT_EQ(0, CheckedInt({"geoadd", "Sicily", "XX", "15.361389", "38.115556", "Palermo",
+                           "15.554167", "38.193611", "Messina"}));
+  auto resp = Run({"geopos", "Sicily", "Palermo", "Messina"});
+  EXPECT_THAT(
+      resp, RespArray(ElementsAre(RespArray(ElementsAre("15.361389219760895", "38.1155563954963")),
+                                  ArgType(RespExpr::NIL))));
+
+  // add 1 + update 1 + NX
+  EXPECT_EQ(1, CheckedInt({"geoadd", "Sicily", "NX", "18.361389", "38.115556", "Palermo", "15.2875",
+                           "37.069167", "Syracuse"}));
+  resp = Run({"geopos", "Sicily", "Palermo", "Syracuse"});
+  EXPECT_THAT(resp, RespArray(ElementsAre(
+                        RespArray(ElementsAre("15.361389219760895", "38.1155563954963")),
+                        RespArray(ElementsAre("15.287499725818634", "37.06916773705567")))));
+
+  // add 1 + update 1 CH
+  EXPECT_EQ(2, CheckedInt({"geoadd", "Sicily", "CH", "18.361389", "38.115556", "Palermo",
+                           "12.434167", "37.798056", "Marsala"}));
+  resp = Run({"geopos", "Sicily", "Palermo", "Marsala"});
+  EXPECT_THAT(resp, RespArray(ElementsAre(
+                        RespArray(ElementsAre("18.361386358737946", "38.1155563954963")),
+                        RespArray(ElementsAre("12.43416577577591", "37.7980572230775")))));
+
+  // update 1 + CH + XX
+  EXPECT_EQ(1, CheckedInt({"geoadd", "Sicily", "CH", "XX", "10.361389", "38.115556", "Palermo"}));
+  resp = Run({"geopos", "Sicily", "Palermo"});
+  EXPECT_THAT(resp,
+              RespElementsAre(RespArray(ElementsAre(DoubleArg(10.361389), DoubleArg(38.115556)))));
+
+  // add 1 + CH + NX
+  EXPECT_EQ(1, CheckedInt({"geoadd", "Sicily", "CH", "NX", "14.25", "37.066667", "Gela"}));
+  resp = Run({"geopos", "Sicily", "Gela"});
+  EXPECT_THAT(resp,
+              RespElementsAre(RespArray(ElementsAre(DoubleArg(14.25), DoubleArg(37.066667)))));
+
+  // add 1 + XX + NX
+  resp = Run({"geoadd", "Sicily", "XX", "NX", "14.75", "36.933333", "Ragusa"});
+  EXPECT_THAT(resp, ErrArg("XX and NX options at the same time are not compatible"));
+
+  // incorrect number of args
+  resp = Run({"geoadd", "Sicily", "14.75", "36.933333", "Ragusa", "10.23"});
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+}
+
+TEST_F(GeoFamilyTest, GeoPos) {
+  EXPECT_EQ(1, CheckedInt({"geoadd", "Sicily", "13.361389", "38.115556", "Palermo"}));
+  auto resp = Run({"geopos", "Sicily", "Palermo", "NonExisting"});
+  EXPECT_THAT(
+      resp, RespArray(ElementsAre(RespArray(ElementsAre("13.361389338970184", "38.1155563954963")),
+                                  ArgType(RespExpr::NIL))));
+}
+
+TEST_F(GeoFamilyTest, GeoPosWrongType) {
+  Run({"set", "x", "value"});
+  EXPECT_THAT(Run({"geopos", "x", "Sicily", "Palermo"}), ErrArg("WRONGTYPE"));
+}
+
+TEST_F(GeoFamilyTest, GeoDist) {
+  EXPECT_EQ(2, CheckedInt({"geoadd", "Sicily", "13.361389", "38.115556", "Palermo", "15.087269",
+                           "37.502669", "Catania"}));
+  auto resp = Run({"geodist", "Sicily", "Palermo", "Catania"});
+  // Haswell+ CPUs use FMA instructions, yielding higher precision that breaks exact string
+  // matching. DoubleArg handles parsing safely and applies standard floating-point tolerance.
+  EXPECT_THAT(resp, DoubleArg(166274.15156960033));
+
+  resp = Run({"geodist", "Sicily", "Palermo", "Catania", "km"});
+  EXPECT_THAT(resp, DoubleArg(166.27415156960032));
+
+  resp = Run({"geodist", "Sicily", "Palermo", "Catania", "MI"});
+  EXPECT_THAT(resp, DoubleArg(103.31822459492733));
+
+  resp = Run({"geodist", "Sicily", "Palermo", "Catania", "FT"});
+  EXPECT_THAT(resp, DoubleArg(545518.8699790037));
+
+  resp = Run({"geodist", "Sicily", "Foo", "Bar"});
+  EXPECT_THAT(resp, ArgType(RespExpr::NIL));
+}
+
+TEST_F(GeoFamilyTest, GeoSearch) {
+  EXPECT_EQ(10, CheckedInt({"geoadd",  "Europe",    "13.4050", "52.5200", "Berlin",   "3.7038",
+                            "40.4168", "Madrid",    "9.1427",  "38.7369", "Lisbon",   "2.3522",
+                            "48.8566", "Paris",     "16.3738", "48.2082", "Vienna",   "4.8952",
+                            "52.3702", "Amsterdam", "10.7522", "59.9139", "Oslo",     "23.7275",
+                            "37.9838", "Athens",    "19.0402", "47.4979", "Budapest", "6.2603",
+                            "53.3498", "Dublin"}));
+
+  auto resp = Run({"GEOSEARCH", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYRADIUS", "500",
+                   "KM", "WITHCOORD", "WITHDIST", "WITHHASH"});
+  EXPECT_THAT(
+      resp,
+      RespArray(ElementsAre(
+          RespArray(ElementsAre("Berlin", DoubleArg(0.00017343178521311378), "3673983950397063",
+                                RespArray(ElementsAre(DoubleArg(13.4050), DoubleArg(52.5200))))),
+          RespArray(ElementsAre("Dublin", DoubleArg(487.5619030644293), "3678981558208417",
+                                RespArray(ElementsAre(DoubleArg(6.2603), DoubleArg(53.3498))))))));
+
+  resp = Run({"GEOSEARCH", "invalid_key", "FROMMEMBER", "Madrid", "BYRADIUS", "700", "KM",
+              "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(resp.GetVec().empty(), true);
+
+  resp = Run({"GEOSEARCH", "Europe", "FROMMEMBER", "invalid_member", "BYRADIUS", "700", "KM",
+              "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(resp, ErrArg("could not decode requested zset member"));
+
+  resp = Run({"GEOSEARCH", "America", "FROMLONLAT", "13.4050", "52.5200", "BYBOX", "1000", "1000",
+              "KM", "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(resp.GetVec().empty(), true);
+
+  resp = Run({"GEOSEARCH", "Europe", "FROMLONLAT", "130.4050", "52.5200", "BYBOX", "10", "10", "KM",
+              "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(resp.GetVec().empty(), true);
+
+  resp = Run({"GEOSEARCH", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYBOX", "1000", "1000",
+              "KM", "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(
+      resp,
+      RespArray(ElementsAre(
+          RespArray(ElementsAre("Vienna", DoubleArg(523.6926930553866),
+                                RespArray(ElementsAre(DoubleArg(16.3738), DoubleArg(48.2082))))),
+          RespArray(ElementsAre("Berlin", DoubleArg(0.00017343178521311378),
+                                RespArray(ElementsAre(DoubleArg(13.4050), DoubleArg(52.5200))))),
+          RespArray(ElementsAre("Dublin", DoubleArg(487.5619030644293),
+                                RespArray(ElementsAre(DoubleArg(6.2603), DoubleArg(53.3498))))))));
+
+  resp = Run({"GEOSEARCH", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYRADIUS", "500", "KM",
+              "COUNT", "3", "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(
+      resp,
+      RespArray(ElementsAre(
+          RespArray(ElementsAre("Berlin", DoubleArg(0.00017343178521311378),
+                                RespArray(ElementsAre(DoubleArg(13.4050), DoubleArg(52.5200))))),
+          RespArray(ElementsAre("Dublin", DoubleArg(487.5619030644293),
+                                RespArray(ElementsAre(DoubleArg(6.2603), DoubleArg(53.3498))))))));
+
+  resp = Run({"GEOSEARCH", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYRADIUS", "500", "KM",
+              "DESC", "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(
+      resp,
+      RespArray(ElementsAre(
+          RespArray(ElementsAre("Dublin", DoubleArg(487.5619030644293),
+                                RespArray(ElementsAre(DoubleArg(6.2603), DoubleArg(53.3498))))),
+          RespArray(ElementsAre("Berlin", DoubleArg(0.00017343178521311378),
+                                RespArray(ElementsAre(DoubleArg(13.4050), DoubleArg(52.5200))))))));
+
+  resp = Run({"GEOSEARCH", "Europe", "FROMMEMBER", "Madrid", "BYRADIUS", "700", "KM", "WITHCOORD",
+              "WITHDIST"});
+  EXPECT_THAT(
+      resp,
+      RespArray(ElementsAre(
+          // Use DoubleArg to tolerate floating-point precision differences on Haswell+ CPUs (e.g.,
+          // 0 becoming 5.7e-15 due to FMA).
+          RespArray(ElementsAre("Madrid", DoubleArg(0),
+                                RespArray(ElementsAre(DoubleArg(3.7038), DoubleArg(40.4168))))),
+          RespArray(ElementsAre("Lisbon", DoubleArg(502.20769462704106),
+                                RespArray(ElementsAre(DoubleArg(9.1427), DoubleArg(38.7369))))))));
+
+  resp = Run({"GEOSEARCH", "Europe", "FROMMEMBER", "Madrid", "BYRADIUS", "700", "KM"});
+  EXPECT_THAT(resp, RespArray(ElementsAre("Madrid", "Lisbon")));
+}
+
+// Regression test: GEOSEARCH FROMLONLAT with NaN latitude passes ValidateLongLat
+// (NaN comparisons always return false) and then crashes on DCHECK.
+TEST_F(GeoFamilyTest, GeoSearchNaNCoord) {
+  Run("GEOADD cities 13.361 38.115 Palermo 15.087 37.502 Catania");
+  auto resp = Run("GEOSEARCH cities FROMLONLAT 15 NaN BYRADIUS 200 km");
+  EXPECT_THAT(resp, ErrArg("invalid longitude,latitude pair"));
+}
+
+TEST_F(GeoFamilyTest, GeoRadiusByMember) {
+  EXPECT_EQ(10, CheckedInt({"geoadd",  "Europe",    "13.4050", "52.5200", "Berlin",   "3.7038",
+                            "40.4168", "Madrid",    "9.1427",  "38.7369", "Lisbon",   "2.3522",
+                            "48.8566", "Paris",     "16.3738", "48.2082", "Vienna",   "4.8952",
+                            "52.3702", "Amsterdam", "10.7522", "59.9139", "Oslo",     "23.7275",
+                            "37.9838", "Athens",    "19.0402", "47.4979", "Budapest", "6.2603",
+                            "53.3498", "Dublin"}));
+
+  auto resp = Run({"GEORADIUSBYMEMBER", "invalid_key", "Madrid", "900", "KM"});
+  EXPECT_THAT(resp.GetVec().empty(), true);
+
+  resp = Run({"GEORADIUSBYMEMBER", "invalid_key", "Madrid", "900", "KM", "STORE", "store_key"});
+  EXPECT_THAT(resp.GetVec().empty(), true);
+
+  resp = Run({"GEORADIUSBYMEMBER", "Europe", "invalid_mem", "900", "KM", "STORE", "store_key"});
+  EXPECT_THAT(resp, ErrArg("could not decode requested zset member"));
+
+  resp = Run({"GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "KM", "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(
+      resp,
+      RespArray(ElementsAre(
+          RespArray(ElementsAre("Madrid", DoubleArg(0),
+                                RespArray(ElementsAre(DoubleArg(3.703801), DoubleArg(40.416799))))),
+          RespArray(
+              ElementsAre("Lisbon", DoubleArg(502.207695),
+                          RespArray(ElementsAre(DoubleArg(9.142698), DoubleArg(38.736900))))))));
+
+  EXPECT_EQ(
+      2, CheckedInt({"GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "KM", "STORE", "store_key"}));
+  resp = Run({"ZRANGE", "store_key", "0", "-1"});
+  EXPECT_THAT(resp, RespArray(ElementsAre("Madrid", "Lisbon")));
+  resp = Run({"ZRANGE", "store_key", "0", "-1", "WITHSCORES"});
+  EXPECT_THAT(resp,
+              RespArray(ElementsAre("Madrid", "3471766229222696", "Lisbon", "3473121093062745")));
+
+  EXPECT_EQ(2, CheckedInt({"GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "KM", "STOREDIST",
+                           "store_dist_key"}));
+  resp = Run({"ZRANGE", "store_dist_key", "0", "-1", "WITHSCORES"});
+  EXPECT_THAT(resp,
+              RespArray(ElementsAre("Madrid", DoubleArg(0), "Lisbon", DoubleArg(502.207695))));
+
+  resp = Run(
+      {"GEORADIUSBYMEMBER", "Europe", "Madrid", "900", "KM", "STORE", "store_key", "WITHCOORD"});
+  EXPECT_THAT(resp, ErrArg("ERR STORE option in GEORADIUSBYMEMBER is not compatible with WITHDIST, "
+                           "WITHHASH and WITHCOORDS options"));
+
+  // Do not remove this test case, it's not redundant.
+  // It's different from the one above because the arguments have
+  // different permutation which our code did not handle.
+  auto err =
+      "ERR STORE option in GEORADIUSBYMEMBER is not compatible with WITHDIST, WITHHASH and WITHCOORDS options"sv;
+  resp = Run("GEORADIUSBYMEMBER Sicily Agrigento 100 km WITHHASH store tmp");
+  EXPECT_THAT(resp, ErrArg(err));
+
+  resp = Run("GEOADD t 13.361389 38.115556 a 13.3619 38.1159 b 13.3608 38.1152 c");
+  resp = Run("GEOSEARCH t FROMLONLAT 13.361389 38.115556 BYRADIUS 1 KM COUNT 0");
+  EXPECT_THAT(resp, ErrArg("ERR COUNT must be > 0"));
+
+  // A non-numeric COUNT must report a syntax error, not be misrendered as an invalid lon/lat pair
+  // (the geo-specific error codes alias CmdArgParser::CUSTOM_ERROR).
+  resp = Run("GEORADIUSBYMEMBER Sicily Agrigento 100 km COUNT notanumber");
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+
+  resp = Run("GEORADIUSBYMEMBER Sicily Agrigento 100 badunit");
+  EXPECT_THAT(resp, ErrArg("unsupported unit provided. please use M, KM, FT, MI"));
+}
+
+TEST_F(GeoFamilyTest, GeoRadiusByMemberRO) {
+  EXPECT_EQ(10, CheckedInt({"geoadd",  "Europe",    "13.4050", "52.5200", "Berlin",   "3.7038",
+                            "40.4168", "Madrid",    "9.1427",  "38.7369", "Lisbon",   "2.3522",
+                            "48.8566", "Paris",     "16.3738", "48.2082", "Vienna",   "4.8952",
+                            "52.3702", "Amsterdam", "10.7522", "59.9139", "Oslo",     "23.7275",
+                            "37.9838", "Athens",    "19.0402", "47.4979", "Budapest", "6.2603",
+                            "53.3498", "Dublin"}));
+
+  auto resp =
+      Run({"GEORADIUSBYMEMBER_RO", "Europe", "Madrid", "700", "KM", "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(
+      resp,
+      RespArray(ElementsAre(
+          RespArray(ElementsAre("Madrid", DoubleArg(0),
+                                RespArray(ElementsAre(DoubleArg(3.703801), DoubleArg(40.416799))))),
+          RespArray(
+              ElementsAre("Lisbon", DoubleArg(502.207695),
+                          RespArray(ElementsAre(DoubleArg(9.142698), DoubleArg(38.736900))))))));
+
+  // GEORADIUSBYMEMBER_RO should not accept arguments for storing (writing data)
+  resp =
+      Run({"GEORADIUSBYMEMBER_RO", "Europe", "Madrid", "700", "KM", "STOREDIST", "store_dist_key"});
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+
+  resp = Run({"GEORADIUSBYMEMBER_RO", "Europe", "Madrid", "700", "KM", "STORE", "store_key"});
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+}
+
+TEST_F(GeoFamilyTest, GeoRadius) {
+  EXPECT_EQ(10, CheckedInt({"geoadd",  "Europe",    "13.4050", "52.5200", "Berlin",   "3.7038",
+                            "40.4168", "Madrid",    "9.1427",  "38.7369", "Lisbon",   "2.3522",
+                            "48.8566", "Paris",     "16.3738", "48.2082", "Vienna",   "4.8952",
+                            "52.3702", "Amsterdam", "10.7522", "59.9139", "Oslo",     "23.7275",
+                            "37.9838", "Athens",    "19.0402", "47.4979", "Budapest", "6.2603",
+                            "53.3498", "Dublin"}));
+
+  auto resp = Run({"GEORADIUS", "invalid_key", "16.3738", "48.2082", "900", "KM"});
+  EXPECT_THAT(resp.GetVec().empty(), true);
+
+  resp = Run({"GEORADIUS", "America", "13.4050", "52.5200", "500", "KM", "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(resp.GetVec().empty(), true);
+
+  resp = Run({"GEORADIUS", "Europe", "130.4050", "52.5200", "10", "KM", "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(resp.GetVec().empty(), true);
+
+  resp = Run({"GEORADIUS", "Europe", "13.4050", "52.5200", "500", "KM", "COUNT", "3", "WITHCOORD",
+              "WITHDIST"});
+  EXPECT_THAT(
+      resp,
+      RespArray(ElementsAre(
+          RespArray(ElementsAre("Berlin", DoubleArg(0.00017343178521311378),
+                                RespArray(ElementsAre(DoubleArg(13.4050), DoubleArg(52.5200))))),
+          RespArray(ElementsAre("Dublin", DoubleArg(487.5619030644293),
+                                RespArray(ElementsAre(DoubleArg(6.2603), DoubleArg(53.3498))))))));
+
+  resp = Run(
+      {"GEORADIUS", "Europe", "13.4050", "52.5200", "500", "KM", "DESC", "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(
+      resp,
+      RespArray(ElementsAre(
+          RespArray(ElementsAre("Dublin", DoubleArg(487.5619030644293),
+                                RespArray(ElementsAre(DoubleArg(6.2603), DoubleArg(53.3498))))),
+          RespArray(ElementsAre("Berlin", DoubleArg(0.00017343178521311378),
+                                RespArray(ElementsAre(DoubleArg(13.4050), DoubleArg(52.5200))))))));
+
+  EXPECT_EQ(2, CheckedInt({"GEORADIUS", "Europe", "3.7038", "40.4168", "700", "KM", "STORE",
+                           "store_key"}));
+  resp = Run({"ZRANGE", "store_key", "0", "-1"});
+
+  EXPECT_THAT(resp, RespArray(ElementsAre("Madrid", "Lisbon")));
+  resp = Run({"ZRANGE", "store_key", "0", "-1", "WITHSCORES"});
+  EXPECT_THAT(resp,
+              RespArray(ElementsAre("Madrid", "3471766229222696", "Lisbon", "3473121093062745")));
+
+  EXPECT_EQ(2, CheckedInt({"GEORADIUS", "Europe", "3.7038", "40.4168", "700", "KM", "STOREDIST",
+                           "store_dist_key"}));
+  resp = Run({"ZRANGE", "store_dist_key", "0", "-1", "WITHSCORES"});
+  EXPECT_THAT(resp,
+              RespArray(ElementsAre("Madrid", DoubleArg(0), "Lisbon", DoubleArg(502.207694))));
+
+  // Test with STORE and other options
+  resp = Run({"GEORADIUS", "key:poq6moq\\r", "111.38360132204588", "-71.17374967857494",
+              "69.77510489600115", "ft", "key", "WITHDIST", "COUNT", "key", "WITHCOORD", "count",
+              "WITHHASH", "STORE"});
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+
+  Run("GEOADD Sicily 13.361389 38.115556 Palermo 15.087269 37.502669 Catania");
+  resp = Run("GEORADIUS SICILY 15 37 200 KM COUNT 0");
+  EXPECT_THAT(resp, ErrArg("ERR COUNT must be > 0"));
+
+  Run("GEOADD Sicily 13.583333 37.316667 Agrigento");
+  resp = Run("GEORADIUSBYMEMBER Sicily Agrigento 100 km COUNT 0");
+  EXPECT_THAT(resp, ErrArg("ERR COUNT must be > 0"));
+
+  resp = Run("GEORADIUS Sicily 15 37 200 km COUNT 1");
+  EXPECT_THAT(resp, RespElementsAre("Agrigento"));
+
+  auto err =
+      "ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORDS options"sv;
+  resp = Run("GEORADIUS Sicily 15 37 200 km WITHDIST STORE result");
+  EXPECT_THAT(resp, ErrArg(err));
+}
+
+TEST_F(GeoFamilyTest, GeoRadiusRO) {
+  EXPECT_EQ(10, CheckedInt({"geoadd",  "Europe",    "13.4050", "52.5200", "Berlin",   "3.7038",
+                            "40.4168", "Madrid",    "9.1427",  "38.7369", "Lisbon",   "2.3522",
+                            "48.8566", "Paris",     "16.3738", "48.2082", "Vienna",   "4.8952",
+                            "52.3702", "Amsterdam", "10.7522", "59.9139", "Oslo",     "23.7275",
+                            "37.9838", "Athens",    "19.0402", "47.4979", "Budapest", "6.2603",
+                            "53.3498", "Dublin"}));
+
+  // GEORADIUS_RO should not accept arguments for storing (writing data)
+  auto resp =
+      Run({"GEORADIUS_RO", "Europe", "13.4050", "52.5200", "900", "KM", "STORE_DIST", "store_key"});
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+
+  resp = Run({"GEORADIUS_RO", "Europe", "13.4050", "52.5200", "900", "KM", "STORE", "store_key"});
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+
+  resp = Run({"GEORADIUS_RO", "Europe", "13.4050", "52.5200", "500", "KM", "COUNT", "3",
+              "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(
+      resp,
+      RespArray(ElementsAre(
+          RespArray(ElementsAre("Berlin", DoubleArg(0.00017343178521311378),
+                                RespArray(ElementsAre(DoubleArg(13.4050), DoubleArg(52.5200))))),
+          RespArray(ElementsAre("Dublin", DoubleArg(487.5619030644293),
+                                RespArray(ElementsAre(DoubleArg(6.2603), DoubleArg(53.3498))))))));
+}
+
+TEST_F(GeoFamilyTest, GeoRadiusByMemberUb) {
+  Run({"GEOADD", "geo", "-118.2437", "34.0522", "972"});
+  Run({"GEOADD", "geo", "-73.935242", "40.730610", "973"});
+  Run({"GEOADD", "geo", "-122.4194", "37.7749", "971"});
+
+  auto resp = Run({"GEORADIUSBYMEMBER", "geo", "971", "200", "mi", "WITHCOORD", "WITHDIST", "COUNT",
+                   "40", "ASC"});
+  // Use DoubleArg(0) to tolerate tiny floating-point residuals (e.g. 5e-15) on AVX/FMA builds.
+  EXPECT_THAT(resp, RespElementsAre(RespArray(ElementsAre(
+                        "971", DoubleArg(0),
+                        RespArray(ElementsAre("-122.41940170526505", "37.77490001056578"))))));
+}
+
+}  // namespace dfly

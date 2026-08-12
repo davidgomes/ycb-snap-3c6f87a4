@@ -1,0 +1,143 @@
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <string>
+
+#include "facade/cmd_arg_parser.h"
+#include "facade/conn_context.h"
+#include "facade/facade_types.h"
+#include "server/cluster/cluster_config.h"
+#include "server/cluster/incoming_slot_migration.h"
+#include "server/cluster/outgoing_slot_migration.h"
+
+namespace facade {
+class SinkReplyBuilder;
+}  // namespace facade
+
+namespace dfly {
+class ServerFamily;
+class CommandRegistry;
+class ConnectionContext;
+class CommandContext;
+using facade::CmdArgParser;
+}  // namespace dfly
+
+namespace dfly::cluster {
+
+class ClusterFamily {
+ public:
+  explicit ClusterFamily(ServerFamily* server_family);
+
+  void Register(CommandRegistry* registry);
+
+  void Shutdown() ABSL_LOCKS_EXCLUDED(set_config_mu);
+
+  void ApplyMigrationSlotRangeToConfig(std::string_view node_id, const SlotRanges& slots,
+                                       bool is_outgoing);
+
+  const std::string& MyID() const {
+    return id_;
+  }
+
+  // Only for debug purpose. Pause/Resume all incoming migrations
+  void PauseAllIncomingMigrations(bool pause) ABSL_LOCKS_EXCLUDED(migration_mu_);
+
+  size_t MigrationsErrorsCount() const ABSL_LOCKS_EXCLUDED(migration_mu_);
+
+  // Helper functions to be used during takeover from both nodes (master and replica).
+  // It reconciles the cluster configuration for both nodes to reflect the node
+  // role changes after the takeover.
+  // For the taking over node it's called at the end of the ReplTakeOver flow
+  // and for the taken over node it's called at the end of the dflycmd::TakeOver
+  void ReconcileMasterSlots(std::string_view repl_id)
+      ABSL_LOCKS_EXCLUDED(set_config_mu, migration_mu_);
+
+  void ReconcileReplicaSlots() ABSL_LOCKS_EXCLUDED(set_config_mu, migration_mu_);
+
+ private:
+  using SinkReplyBuilder = facade::SinkReplyBuilder;
+
+  // Cluster commands compatible with Redis
+  void Cluster(CmdArgParser parser, CommandContext* cmd_cntx);
+  void ClusterHelp(SinkReplyBuilder* builder);
+  void ClusterShards(SinkReplyBuilder* builder, ConnectionContext* cntx);
+  void ClusterSlots(SinkReplyBuilder* builder, ConnectionContext* cntx);
+  void ClusterNodes(SinkReplyBuilder* builder, ConnectionContext* cntx);
+  void ClusterInfo(SinkReplyBuilder* builder, ConnectionContext* cntx);
+  void ClusterMyId(SinkReplyBuilder* builder);
+
+  void KeySlot(facade::ParsedArgs args, SinkReplyBuilder* builder);
+
+  void ReadOnly(CmdArgParser parser, CommandContext* cmd_cntx);
+  void ReadWrite(CmdArgParser parser, CommandContext* cmd_cntx);
+
+  // Custom Dragonfly commands for cluster management
+  void DflyCluster(CmdArgParser parser, CommandContext* cmd_cntx);
+  void DflyClusterConfig(CmdArgParser parser, CommandContext* cmd_cntx);
+
+  void DflyClusterGetSlotInfo(CmdArgParser parser, CommandContext* cmd_cntx)
+      ABSL_LOCKS_EXCLUDED(migration_mu_);
+  void DflyClusterFlushSlots(CmdArgParser parser, CommandContext* cmd_cntx);
+  void DflySlotMigrationStatus(CmdArgParser parser, CommandContext* cmd_cntx)
+      ABSL_LOCKS_EXCLUDED(migration_mu_);
+
+  // DFLYMIGRATE is internal command defines several steps in slots migrations process
+  void DflyMigrate(CmdArgParser parser, CommandContext* cmd_cntx);
+
+  // DFLYMIGRATE INIT is internal command to create incoming migration object
+  void InitMigration(CmdArgParser parser, CommandContext* cmd_cntx)
+      ABSL_LOCKS_EXCLUDED(migration_mu_);
+
+  // DFLYMIGRATE FLOW initiate second step in slots migration procedure
+  // this request should be done for every shard on the target node
+  // this method assocciate connection and shard that will be the data
+  // source for migration
+  void DflyMigrateFlow(CmdArgParser parser, CommandContext* cmd_cntx);
+
+  void DflyMigrateAck(CmdArgParser parser, CommandContext* cmd_cntx);
+
+  std::shared_ptr<IncomingSlotMigration> GetIncomingMigration(std::string_view source_id)
+      ABSL_LOCKS_EXCLUDED(migration_mu_);
+
+  void StartNewSlotMigrations(const ClusterConfig& new_config,
+                              const std::shared_ptr<ClusterConfig>& prev_config);
+
+  // must be destroyed excluded set_config_mu and migration_mu_ locks
+  struct PreparedToRemoveOutgoingMigrations {
+    std::vector<std::shared_ptr<OutgoingMigration>> migrations;
+    SlotRanges slot_ranges;
+    ~PreparedToRemoveOutgoingMigrations() ABSL_LOCKS_EXCLUDED(migration_mu_, set_config_mu);
+  };
+
+  [[nodiscard]] PreparedToRemoveOutgoingMigrations TakeOutOutgoingMigrations(
+      std::shared_ptr<ClusterConfig> new_config, std::shared_ptr<ClusterConfig> old_config)
+      ABSL_LOCKS_EXCLUDED(migration_mu_);
+  // Returns non-owned slot ranges from removed migrations for the caller to flush.
+  SlotRanges RemoveIncomingMigrations(const std::vector<MigrationInfo>& migrations)
+      ABSL_LOCKS_EXCLUDED(migration_mu_);
+
+  mutable util::fb2::Mutex migration_mu_;  // guard migrations operations
+  // holds all incoming slots migrations that are currently in progress.
+  std::vector<std::shared_ptr<IncomingSlotMigration>> incoming_migrations_jobs_
+      ABSL_GUARDED_BY(migration_mu_);
+
+  // holds all outgoing slots migrations that are currently in progress
+  std::vector<std::shared_ptr<OutgoingMigration>> outgoing_migration_jobs_
+      ABSL_GUARDED_BY(migration_mu_);
+
+  std::optional<ClusterShardInfos> GetShardInfos(ConnectionContext* cntx) const;
+
+  ClusterShardInfo GetEmulatedShardInfo(ConnectionContext* cntx) const;
+
+  // Guards set configuration, so that we won't handle 2 in parallel.
+  mutable util::fb2::Mutex set_config_mu;
+
+  std::string id_;
+
+  ServerFamily* server_family_ = nullptr;
+};
+
+}  // namespace dfly::cluster

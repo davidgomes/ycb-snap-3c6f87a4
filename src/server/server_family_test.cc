@@ -1,0 +1,885 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "server/server_family.h"
+
+#include <absl/strings/match.h>
+
+#include "absl/strings/str_cat.h"
+#include "base/flags.h"
+#include "base/gtest.h"
+#include "base/logging.h"
+#include "facade/facade_test.h"
+#include "facade/socket_utils.h"
+#include "server/test_utils.h"
+
+using namespace testing;
+using namespace std;
+using namespace util;
+using namespace boost;
+
+ABSL_DECLARE_FLAG(string, cluster_mode);
+
+namespace dfly {
+
+class ServerFamilyTest : public BaseFamilyTest {
+ protected:
+};
+
+#ifdef __linux__
+TEST_F(ServerFamilyTest, ReadTcpInfo) {
+  // Create a TCP socket
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GT(sockfd, 0) << "Failed to create socket";
+
+  // We'll create a socket in LISTEN state
+  struct sockaddr_in server_addr;
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_addr.s_addr = INADDR_ANY;
+  server_addr.sin_port = 0;  // Let the system choose a free port
+
+  // Bind to the port
+  ASSERT_EQ(::bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)), 0)
+      << "Failed to bind socket: " << strerror(errno);
+
+  // Start listening
+  ASSERT_EQ(listen(sockfd, 1), 0) << "Failed to listen on socket: " << strerror(errno);
+
+  // Get socket info
+  std::string socket_info = GetSocketInfo(sockfd);
+  std::cout << "Socket info for valid socket: " << socket_info << std::endl;
+  EXPECT_FALSE(socket_info.empty()) << "Socket info should not be empty";
+
+  // The socket info should contain some recognizable patterns
+  // For a listening socket, it should contain information about the local address
+  EXPECT_NE(socket_info.find("State: LISTEN"), std::string::npos)
+      << "Socket info doesn't contain expected local address pattern";
+
+  // Close the socket
+  close(sockfd);
+
+  // Test invalid socket
+  socket_info = GetSocketInfo(-1);
+  EXPECT_EQ(socket_info, "invalid socket");
+}
+
+TEST_F(ServerFamilyTest, GetTcpSocketInfoIPv6) {
+  // Create an IPv6 TCP socket
+  int sockfd = socket(AF_INET6, SOCK_STREAM, 0);
+  ASSERT_GT(sockfd, 0) << "Failed to create IPv6 socket";
+
+  // We'll create a socket in LISTEN state
+  struct sockaddr_in6 server_addr;
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sin6_family = AF_INET6;
+  server_addr.sin6_addr = in6addr_any;
+  server_addr.sin6_port = 0;  // Let the system choose a free port
+
+  // Bind to the port
+  ASSERT_EQ(::bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)), 0)
+      << "Failed to bind IPv6 socket: " << strerror(errno);
+
+  // Start listening
+  ASSERT_EQ(listen(sockfd, 1), 0) << "Failed to listen on IPv6 socket: " << strerror(errno);
+
+  // Get socket info
+  std::string socket_info = GetSocketInfo(sockfd);
+  std::cout << "Socket info for valid IPv6 socket: " << socket_info << std::endl;
+  EXPECT_FALSE(socket_info.empty()) << "IPv6 socket info should not be empty";
+
+  // The socket info should contain some recognizable patterns
+  // For a listening IPv6 socket, it should contain information about the local address
+  EXPECT_NE(socket_info.find("State: LISTEN"), std::string::npos)
+      << "IPv6 socket info doesn't contain expected LISTEN state";
+
+  // If IPv6 support works correctly, the socket info should indicate an IPv6 address format
+  EXPECT_NE(socket_info.find("Local: ["), std::string::npos)
+      << "IPv6 socket info doesn't use IPv6 address format";
+
+  // Close the socket
+  close(sockfd);
+}
+#endif
+
+TEST_F(ServerFamilyTest, SlowLogTruncation) {
+  auto resp = Run({"config", "set", "slowlog_max_len", "3"});
+  EXPECT_THAT(resp.GetString(), "OK");
+  resp = Run({"config", "set", "slowlog_log_slower_than", "0"});
+  EXPECT_THAT(resp.GetString(), "OK");
+
+  // Test args count truncation: 32 args (no truncation) vs 33 args (truncated)
+  std::vector<std::string> cmd_args = {"LPUSH", "mykey"};
+  for (int i = 1; i <= 30; ++i) {
+    cmd_args.push_back(std::to_string(i));
+  }
+  resp = Run(absl::Span<std::string>(cmd_args));
+  EXPECT_THAT(resp.GetInt(), 30);
+  resp = Run({"slowlog", "get"});
+  auto slowlog = resp.GetVec();
+  EXPECT_THAT(slowlog[0].GetVec()[3].GetVec(), ElementsAreArray(cmd_args));
+
+  cmd_args.push_back("31");
+  resp = Run(absl::Span<std::string>(cmd_args));
+  EXPECT_THAT(resp.GetInt(), 61);
+  resp = Run({"slowlog", "get"});
+  slowlog = resp.GetVec();
+  auto commands = slowlog[0].GetVec()[3].GetVec();
+  EXPECT_THAT(commands.size(), 32);
+  EXPECT_THAT(commands[31].GetString(), "... (2 more arguments)");
+
+  // Test args length truncation: 128 bytes (no truncation) vs 129 bytes (truncated)
+  std::string at_limit = std::string(128, 'A');
+  resp = Run({"lpush", "key1", at_limit});
+  resp = Run({"slowlog", "get"});
+  slowlog = resp.GetVec();
+  EXPECT_THAT(slowlog[0].GetVec()[3].GetVec()[2].GetString(), at_limit);
+
+  std::string over_limit = std::string(129, 'A');
+  resp = Run({"lpush", "key2", over_limit});
+  resp = Run({"slowlog", "get"});
+  slowlog = resp.GetVec();
+  auto truncated = slowlog[0].GetVec()[3].GetVec()[2].GetString();
+  EXPECT_THAT(truncated, std::string(110, 'A') + "... (1 more bytes)");
+}
+
+TEST_F(ServerFamilyTest, SlowLogMaxLengthZero) {
+  auto resp = Run({"config", "set", "slowlog_max_len", "0"});
+  EXPECT_THAT(resp.GetString(), "OK");
+  resp = Run({"config", "set", "slowlog_log_slower_than", "0"});
+  EXPECT_THAT(resp.GetString(), "OK");
+  Run({"slowlog", "reset"});
+
+  // issue an arbitrary command
+  resp = Run({"set", "foo", "bar"});
+  EXPECT_THAT(resp.GetString(), "OK");
+  resp = Run({"slowlog", "get"});
+
+  // slowlog should be empty since max_len is 0
+  EXPECT_THAT(resp.GetVec().size(), 0);
+}
+
+TEST_F(ServerFamilyTest, SlowLogGetLen) {
+  auto resp = Run({"config", "set", "slowlog_max_len", "3"});
+  EXPECT_THAT(resp.GetString(), "OK");
+  resp = Run({"config", "set", "slowlog_log_slower_than", "0"});
+  EXPECT_THAT(resp.GetString(), "OK");
+
+  for (int i = 1; i <= 3; ++i) {
+    resp = Run({"lpush", "mykey", std::to_string(i)});
+    EXPECT_THAT(resp.GetInt(), i);
+  }
+
+  // Test GET 0 - returns empty
+  resp = Run({"slowlog", "get", "0"});
+  EXPECT_THAT(resp.GetVec().size(), 0);
+
+  // Test GET -1 - returns all entries
+  resp = Run({"slowlog", "get", "-1"});
+  EXPECT_THAT(resp.GetVec().size(), 3);
+
+  // Test GET < -1 - returns error
+  resp = Run({"slowlog", "get", "-2"});
+  EXPECT_THAT(resp.GetString(), "ERR count should be greater than or equal to -1");
+}
+
+TEST_F(ServerFamilyTest, SlowLogLen) {
+  auto resp = Run({"config", "set", "slowlog_max_len", "3"});
+  EXPECT_THAT(resp.GetString(), "OK");
+  resp = Run({"config", "set", "slowlog_log_slower_than", "0"});
+  EXPECT_THAT(resp.GetString(), "OK");
+  Run({"slowlog", "reset"});
+
+  for (int i = 1; i < 4; ++i) {
+    resp = Run({"lpush", "mykey", std::to_string(i)});
+    EXPECT_THAT(resp.GetInt(), i);
+  }
+
+  resp = Run({"slowlog", "len"});
+  EXPECT_THAT(resp.GetInt(), 3);
+}
+
+TEST_F(ServerFamilyTest, SlowLogMinusOneDisabled) {
+  auto resp = Run({"config", "set", "slowlog_max_len", "3"});
+  EXPECT_THAT(resp.GetString(), "OK");
+  resp = Run({"config", "set", "slowlog_log_slower_than", "-1"});
+  EXPECT_THAT(resp.GetString(), "OK");
+  Run({"slowlog", "reset"});
+
+  // issue some commands
+  for (int i = 1; i < 4; ++i) {
+    resp = Run({"lpush", "mykey", std::to_string(i)});
+    EXPECT_THAT(resp.GetInt(), i);
+  }
+
+  // slowlog is still empty
+  resp = Run({"slowlog", "get"});
+  EXPECT_THAT(resp.GetVec().size(), 0);
+  resp = Run({"slowlog", "len"});
+  EXPECT_THAT(resp.GetInt(), 0);
+}
+
+// Test how slowlog captures additional information about heavy commands
+TEST_F(ServerFamilyTest, SlowLogExecEval) {
+  Run({"config", "set", "slowlog_max_len", "20"});
+  Run({"config", "set", "slowlog_log_slower_than", "0"});
+
+  // Run EXEC
+  {
+    Run({"multi"});
+    Run({"set", "first", "ok"});
+    Run({"set", "second2", "ok"});
+    Run({"get", "third3"});
+    Run({"exec"});
+  }
+
+  // Run EVAL
+  {
+    const std::string_view script = R"(
+for i, key in ipairs(KEYS) do
+  redis.call('GET', key)
+end
+for i, key in ipairs(KEYS) do
+  redis.call('SET', key, 'some-data')
+end
+return 'OK';
+    )";
+    auto resp = Run({"EVAL", script, "3", "first", "second2", "third3", "second2"});
+    EXPECT_EQ(resp, "OK");
+  }
+
+  size_t found = 0;
+  auto resp = Run({"slowlog", "get"});
+  for (const auto& entry : resp.GetVec()) {
+    const auto& args = entry.GetVec()[3].GetVec();
+    if (args[0] == "EXEC") {
+      EXPECT_THAT(args, ElementsAreArray({"EXEC", "num_cmds: 3", "is_write: 1"}));
+      found++;
+    } else if (args[0] == "EVAL") {
+      const auto sha = "41e84cf7973712deda6c1737a69bd1365eeb060f";
+      EXPECT_THAT(args, ElementsAreArray({"EVAL", sha, "num_cmds: 6", "slow_cmds: 6", "tx_mode: 2",
+                                          "tx_shards: 2", "is_write: 1", "lock_tags: 3", "3",
+                                          "first", "second2", "third3", "second2"}));
+      found++;
+    }
+  }
+
+  EXPECT_EQ(found, 2);
+}
+
+TEST_F(ServerFamilyTest, ClientPause) {
+  auto start = absl::Now();
+  Run({"CLIENT", "PAUSE", "50"});
+
+  Run({"get", "key"});
+  EXPECT_GT((absl::Now() - start), absl::Milliseconds(50));
+
+  start = absl::Now();
+
+  Run({"CLIENT", "PAUSE", "50", "WRITE"});
+
+  auto get_start = absl::Now();
+  Run({"get", "key"});
+  EXPECT_LT((absl::Now() - get_start), absl::Milliseconds(50));
+  Run({"set", "key", "value2"});
+  EXPECT_GT((absl::Now() - start), absl::Milliseconds(50));
+}
+
+TEST_F(ServerFamilyTest, ClientListAccepted) {
+  const std::vector<std::vector<std::string>> ok = {
+      {"CLIENT", "LIST"},
+      {"CLIENT", "LIST", "TYPE", "normal"},
+      {"CLIENT", "LIST", "TYPE", "master"},
+      {"CLIENT", "LIST", "TYPE", "replica"},
+      {"CLIENT", "LIST", "TYPE", "slave"},
+      {"CLIENT", "LIST", "TYPE", "pubsub"},
+      {"CLIENT", "LIST", "ID", "1"},
+      {"CLIENT", "LIST", "ID", "1", "2", "3"},
+  };
+  for (const auto& args : ok) {
+    EXPECT_THAT(Run(args).GetString(), "") << absl::StrJoin(args, " ");
+  }
+}
+
+TEST_F(ServerFamilyTest, ClientListRejected) {
+  const std::vector<std::pair<std::vector<std::string>, std::string>> bad = {
+      {{"CLIENT", "LIST", "TYPE", "bogus"}, "Unknown client type 'bogus'"},
+      {{"CLIENT", "LIST", "TYPE"}, "syntax error"},
+      {{"CLIENT", "LIST", "ID"}, "syntax error"},
+      {{"CLIENT", "LIST", "ID", "abc"}, "Invalid client ID"},
+      {{"CLIENT", "LIST", "TYPE", "normal", "ID", "1"}, "syntax error"},
+      {{"CLIENT", "LIST", "FOO"}, "syntax error"},
+  };
+  for (const auto& [args, msg] : bad) {
+    EXPECT_THAT(Run(args), ErrArg(msg)) << absl::StrJoin(args, " ");
+  }
+}
+
+TEST_F(ServerFamilyTest, ClientInfoSingleDbField) {
+  const string info = Run({"CLIENT", "INFO"}).GetString();
+  // Regression: "db=" used to be emitted twice (FormatClientInfo + a redundant append).
+  size_t count = 0;
+  for (size_t pos = info.find(" db="); pos != string::npos; pos = info.find(" db=", pos + 1))
+    ++count;
+  EXPECT_EQ(count, 1u) << info;
+  // CLIENT INFO returns a single line with no trailing newline (unlike CLIENT LIST).
+  EXPECT_FALSE(absl::EndsWith(info, "\r\n")) << info;
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingOnAndOff) {
+  // case 1. can't use the feature for resp2
+  auto resp = Run({"CLIENT", "TRACKING", "ON"});
+  EXPECT_THAT(resp.GetString(),
+              "ERR Client tracking is currently not supported for RESP2. Please use RESP3.");
+
+  // case 2. allows when resp3 is used
+  Run({"HELLO", "3"});
+  resp = Run({"CLIENT", "TRACKING", "ON"});
+  EXPECT_THAT(resp.GetString(), "OK");
+
+  resp = Run({"CLIENT", "CACHING", "YES"});
+  EXPECT_THAT(
+      resp, ErrArg("ERR CLIENT CACHING YES is only valid when tracking is enabled in OPTIN mode"));
+
+  resp = Run({"CLIENT", "CACHING", "NO"});
+  EXPECT_THAT(
+      resp, ErrArg("ERR CLIENT CACHING NO is only valid when tracking is enabled in OPTOUT mode"));
+
+  // case 3. turn off client tracking
+  resp = Run({"CLIENT", "TRACKING", "OFF"});
+  EXPECT_THAT(resp.GetString(), "OK");
+
+  resp = Run({"CLIENT", "CACHING", "YES"});
+  EXPECT_THAT(
+      resp,
+      ErrArg("CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or "
+             "OPTOUT mode enabled"));
+}
+
+TEST_F(ServerFamilyTest, ToggleTrackingOnAndOff) {
+  Run("HELLO 3");
+  // seq = 0
+  auto resp = Run("CLIENT TRACKING ON OPTIN");
+  // seq = 1
+  EXPECT_THAT(resp.GetString(), "OK");
+
+  resp = Run("CLIENT CACHING YES");
+  // seq = 2, caching = 1
+  EXPECT_THAT(resp.GetString(), "OK");
+
+  resp = Run("CLIENT TRACKING OFF");
+  resp = Run("CLIENT TRACKING ON OPTIN");
+  // seq = 3, caching = 1
+  EXPECT_THAT(resp.GetString(), "OK");
+  // seq(3) != (caching(1) + 1)
+  resp = Run("GET foo");
+  resp = Run("SET foo tmp");
+  EXPECT_THAT(resp.GetString(), "OK");
+
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 0);
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingReadKey) {
+  // case 1. only read the keys doesn't trigger any notification.
+  Run({"HELLO", "3"});
+  Run({"CLIENT", "TRACKING", "ON"});
+
+  Run({"SET", "FOO", "10"});
+  Run({"GET", "FOO"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 0);
+
+  Run({"GET", "BAR"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 0);
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingOptin) {
+  Run({"HELLO", "3"});
+  Run({"CLIENT", "TRACKING", "ON", "OPTIN"});
+
+  Run({"GET", "FOO"});
+  Run({"SET", "FOO", "10"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 0);
+  Run({"GET", "FOO"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 0);
+
+  Run({"CLIENT", "CACHING", "YES"});
+  // Start tracking once
+  Run({"GET", "FOO"});
+  Run({"SET", "FOO", "20"});
+  Run({"GET", "FOO"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 1);
+
+  Run({"GET", "BAR"});
+  Run({"SET", "BAR", "20"});
+  Run({"GET", "BAR"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 1);
+
+  // Start tracking once
+  Run({"CLIENT", "CACHING", "YES"});
+  Run({"GET", "BAR"});
+  Run({"SET", "BAR", "20"});
+  Run({"GET", "BAR"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 2);
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingMulti) {
+  Run({"HELLO", "3"});
+  Run({"CLIENT", "TRACKING", "ON"});
+  Run({"MULTI"});
+  Run({"GET", "FOO"});
+  Run({"SET", "TMP", "10"});
+  Run({"GET", "FOOBAR"});
+  Run({"EXEC"});
+
+  Run({"SET", "FOO", "10"});
+  Run({"SET", "FOOBAR", "10"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 2);
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingCompatibilityMulti) {
+  // Compatibility Test, all CLIENT commands should be allowed in MULTI
+  Run({"HELLO", "3"});
+  Run({"MULTI"});
+  auto resp = Run({"CLIENT", "TRACKING", "ON"});
+  EXPECT_THAT(resp.GetString(), "QUEUED");
+  // Used by sentinel in MULTI/EXEC blocks
+  resp = Run({"CLIENT", "KILL", "127.0.0.1:6380"});
+  EXPECT_THAT(resp.GetString(), "QUEUED");
+  resp = Run({"CLIENT", "SETNAME", "YO"});
+  EXPECT_THAT(resp.GetString(), "QUEUED");
+  resp = Run({"CLIENT", "GETNAME"});
+  EXPECT_THAT(resp.GetString(), "QUEUED");
+  Run({"EXEC"});
+
+  Run({"GET", "FOO"});
+  Run({"SET", "FOO", "10"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 1);
+
+  Run({"MULTI"});
+  resp = Run({"CLIENT", "PAUSE", "0", "WRITE"});
+  EXPECT_THAT(resp.GetString(), "QUEUED");
+  Run({"EXEC"});
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingMultiOptin) {
+  Run({"HELLO", "3"});
+  // Check stickiness
+  Run({"CLIENT", "TRACKING", "ON", "OPTIN"});
+  Run({"CLIENT", "CACHING", "YES"});
+  Run({"MULTI"});
+  Run({"GET", "FOO"});
+  Run({"SET", "TMP", "10"});
+  Run({"GET", "FOOBAR"});
+  Run({"DISCARD"});
+
+  Run({"SET", "FOO", "10"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 0);
+
+  Run({"CLIENT", "CACHING", "YES"});
+  Run({"MULTI"});
+  Run({"GET", "FOO"});
+  Run({"SET", "TMP", "10"});
+  Run({"GET", "FOOBAR"});
+  Run({"EXEC"});
+
+  Run({"SET", "FOO", "10"});
+  Run({"SET", "FOOBAR", "10"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 2);
+
+  // CACHING enclosed in MULTI
+  Run({"MULTI"});
+  Run({"GET", "TMP"});
+  Run({"GET", "TMP_TMP"});
+  Run({"SET", "TMP", "10"});
+  Run({"CLIENT", "CACHING", "YES"});
+  Run({"GET", "FOO"});
+  Run({"GET", "FOOBAR"});
+  Run({"EXEC"});
+
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 2);
+  Run({"SET", "TMP", "10"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 2);
+  Run({"SET", "FOO", "10"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 3);
+  Run({"SET", "FOOBAR", "10"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 4);
+
+  // CACHING enclosed in MULTI, ON/OFF
+  Run({"MULTI"});
+  Run({"GET", "TMP"});
+  Run({"SET", "TMP", "10"});
+  Run({"CLIENT", "CACHING", "YES"});
+  Run({"GET", "FOO"});
+  Run({"GET", "BAR"});
+  Run({"EXEC"});
+
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 4);
+  Run({"SET", "FOO", "10"});
+  Run({"GET", "FOO"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 5);
+  Run({"SET", "BAR", "10"});
+  Run({"GET", "BAR"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 6);
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingOptout) {
+  Run({"HELLO", "3"});
+  // Check stickiness
+  Run({"CLIENT", "TRACKING", "ON", "OPTOUT"});
+  Run({"GET", "FOO"});
+  Run({"SET", "FOO", "BAR"});
+  Run({"GET", "BAR"});
+  Run({"SET", "BAR", "FOO"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 2);
+
+  // Switch off tracking for a single command
+  Run({"CLIENT", "CACHING", "NO"});
+  Run({"GET", "FOO"});
+  Run({"SET", "FOO", "BAR"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 2);
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingMultiOptout) {
+  Run({"HELLO", "3"});
+  // Check stickiness
+  Run({"CLIENT", "TRACKING", "ON", "OPTOUT"});
+
+  Run({"MULTI"});
+  Run({"GET", "FOO"});
+  Run({"SET", "TMP", "10"});
+  Run({"GET", "FOOBAR"});
+  Run({"EXEC"});
+
+  Run({"SET", "FOO", "10"});
+  Run({"SET", "FOOBAR", "10"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 2);
+
+  // CACHING enclosed in MULTI
+  Run({"MULTI"});
+  Run({"CLIENT", "CACHING", "NO"});
+  Run({"GET", "TMP"});
+  Run({"GET", "TMP_TMP"});
+  Run({"SET", "TMP", "10"});
+  Run({"SET", "TMP_TMP", "10"});
+  Run({"EXEC"});
+
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 2);
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingUpdateKey) {
+  Run({"HELLO", "3"});
+  Run({"CLIENT", "TRACKING", "ON"});
+
+  Run({"GET", "FOO"});
+  Run({"SET", "FOO", "10"});
+  const auto& msg = GetInvalidationMessage("IO0", 0);
+  EXPECT_EQ(msg.key, "FOO");
+
+  // make sure invalidation message only gets sent once.
+  Run({"GET", "FOO"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 1);
+
+  // update string from another connection
+  // need to do another read to re-initialize the tracking of the key.
+  Run({"GET", "FOO"});
+  pp_->at(1)->Await([&] { return Run({"SET", "FOO", "30"}); });
+  pp_->AwaitFiberOnAll([](ProactorBase* pb) {});
+  const auto& msg2 = GetInvalidationMessage("IO0", 1);
+  EXPECT_EQ(msg2.key, "FOO");
+
+  // case 4. test multi command
+  Run({"MGET", "X1", "X2", "X3", "X4", "Y1", "Y2", "Y3", "Y4", "Z1", "Z2", "Z3", "Z4"});
+  pp_->at(1)->Await([&] { return Run({"MSET", "X1", "1", "Y3", "2", "Z2", "3", "Z4", "5"}); });
+  pp_->AwaitFiberOnAll([](ProactorBase* pb) {});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 6);
+  std::vector<std::string_view> keys_invalidated;
+  for (unsigned int i = 2; i < 6; ++i)
+    keys_invalidated.push_back(GetInvalidationMessage("IO0", i).key);
+  ASSERT_THAT(keys_invalidated, UnorderedElementsAre("X1", "Y3", "Z2", "Z4"));
+
+  Run({"FLUSHDB"});
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingDeleteKey) {
+  Run({"HELLO", "3"});
+  Run({"CLIENT", "TRACKING", "ON"});
+  Run({"SET", "FOO", "10"});
+  Run({"GET", "FOO"});
+  pp_->at(1)->Await([&] { return Run({"DEL", "FOO"}); });
+  pp_->AwaitFiberOnAll([](ProactorBase* pb) {});
+  EXPECT_EQ(GetInvalidationMessage("IO0", 0).key, "FOO");
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingRenameKey) {
+  Run({"HELLO", "3"});
+  Run({"CLIENT", "TRACKING", "ON"});
+  Run({"SET", "FOO", "10"});
+  Run({"GET", "FOO"});
+  pp_->at(1)->Await([&] { return Run({"RENAME", "FOO", "BAR"}); });
+  pp_->AwaitFiberOnAll([](ProactorBase* pb) {});
+  EXPECT_EQ(GetInvalidationMessage("IO0", 0).key, "FOO");
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingExpireKey) {
+  Run({"HELLO", "3"});
+  Run({"CLIENT", "TRACKING", "ON"});
+  Run({"SET", "C", "10"});
+  Run({"GET", "C"});
+  Run({"EXPIRE", "C", "1"});
+  AdvanceTime(1000);
+  auto resp = Run({"GET", "C"});
+  EXPECT_THAT(resp, ArgType(RespExpr::NIL));
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 1);
+  EXPECT_EQ(GetInvalidationMessage("IO0", 0).key, "C");
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingSelectDB) {
+  Run({"HELLO", "3"});
+  Run({"CLIENT", "TRACKING", "ON"});
+  Run({"SET", "C", "10"});
+  Run({"GET", "C"});
+  pp_->at(1)->Await([&] { return Run({"SELECT", "2"}); });
+  pp_->at(1)->Await([&] { return Run({"SET", "C", "1000"}); });
+  pp_->AwaitFiberOnAll([](ProactorBase* pb) {});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 1);
+  EXPECT_EQ(GetInvalidationMessage("IO0", 0).key, "C");
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingNonTransactionalBug) {
+  Run({"HELLO", "3"});
+  Run({"CLIENT", "TRACKING", "ON"});
+
+  Run({"CLUSTER", "SLOTS"});
+}
+
+TEST_F(ServerFamilyTest, ClientTrackingLuaBug) {
+  Run({"HELLO", "3"});
+  // Check stickiness
+  Run({"CLIENT", "TRACKING", "ON"});
+  using namespace std::string_literals;
+  std::string eval = R"(redis.call('get', 'foo'); redis.call('set', 'foo', 'bar'); )";
+  Run({"EVAL", absl::StrCat(eval, "return 1"), "1", "foo"});
+  Run({"PING"});
+
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 1);
+  absl::StrAppend(&eval, R"(redis.call('get', 'oof'); redis.call('set', 'oof', 'bar'); return 1)");
+  Run({"EVAL", eval, "2", "foo", "oof"});
+  Run({"PING"});
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 3);
+}
+
+TEST_F(ServerFamilyTest, ConfigNormalization) {
+  // TODO: Ideally we'd also test that INFO REPLICATION returns the value set in the config, but
+  // there is no way currently to setup a mock replica in unit tests.
+
+  absl::FlagSaver fs;  // Restores the flag to default value after test finishes
+
+  // Default value
+  EXPECT_THAT(Run({"config", "get", "replica-priority"}),
+              RespArray(ElementsAre("replica_priority", "100")));
+  EXPECT_THAT(Run({"config", "get", "replica_priority"}),
+              RespArray(ElementsAre("replica_priority", "100")));
+
+  // Set with dash
+  EXPECT_THAT(Run({"config", "set", "replica-priority", "7"}), "OK");
+
+  EXPECT_THAT(Run({"config", "get", "replica-priority"}),
+              RespArray(ElementsAre("replica_priority", "7")));
+  EXPECT_THAT(Run({"config", "get", "replica_priority"}),
+              RespArray(ElementsAre("replica_priority", "7")));
+
+  // Set with underscore
+  EXPECT_THAT(Run({"config", "set", "replica_priority", "13"}), "OK");
+
+  EXPECT_THAT(Run({"config", "get", "replica-priority"}),
+              RespArray(ElementsAre("replica_priority", "13")));
+  EXPECT_THAT(Run({"config", "get", "replica_priority"}),
+              RespArray(ElementsAre("replica_priority", "13")));
+}
+
+// Verify CONFIG GET returns numeric bytes for memory configs (Redis/Valkey compatibility).
+TEST_F(ServerFamilyTest, ConfigGetMemoryBytes) {
+  absl::FlagSaver fs;
+
+  // Set maxmemory using human-readable format
+  EXPECT_THAT(Run({"config", "set", "maxmemory", "1GB"}), "OK");
+
+  // CONFIG GET should return numeric bytes, not human-readable format
+  EXPECT_THAT(Run({"config", "get", "maxmemory"}),
+              RespArray(ElementsAre("maxmemory", "1073741824")));
+
+  // Test another value
+  EXPECT_THAT(Run({"config", "set", "maxmemory", "512MB"}), "OK");
+  EXPECT_THAT(Run({"config", "get", "maxmemory"}),
+              RespArray(ElementsAre("maxmemory", "536870912")));
+}
+
+TEST_F(ServerFamilyTest, CommandDocsOk) {
+  EXPECT_THAT(Run({"command", "docs"}), ErrArg("COMMAND DOCS Not Implemented"));
+}
+
+TEST_F(ServerFamilyTest, PubSubCommandErr) {
+  // Check conditions only in non cluster mode
+  if (auto cluster_mode = absl::GetFlag(FLAGS_cluster_mode); cluster_mode == "") {
+    EXPECT_THAT(Run({"PUBSUB", "SHARDCHANNELS"}),
+                ErrArg("PUBSUB SHARDCHANNELS is not supported in non cluster mode"));
+    EXPECT_THAT(Run({"PUBSUB", "SHARDNUMSUB"}),
+                ErrArg("PUBSUB SHARDNUMSUB is not supported in non cluster mode"));
+  }
+  EXPECT_THAT(Run({"PUBSUB", "INVALIDSUBCOMMAND"}),
+              ErrArg("Unknown subcommand or wrong number of arguments for 'INVALIDSUBCOMMAND'. Try "
+                     "PUBSUB HELP."));
+}
+
+TEST_F(ServerFamilyTest, InfoMultipleSections) {
+  // Check that when querying multiple valid sections, both are returned non empty.
+  Run({"set", "foo", "bar"});  // set some data
+  auto resp = Run({"info", "replication", "persistence"});
+  auto info = resp.GetString();
+  EXPECT_NE(info.find("# Replication"), std::string::npos);
+  EXPECT_NE(info.find("# Persistence"), std::string::npos);
+}
+
+TEST_F(ServerFamilyTest, InfoMultipleSectionsInvalid) {
+  // Check that when querying a valid and an invalid section, only the valid section is returned.
+  Run({"set", "foo", "bar"});  // set some data
+  auto resp = Run({"info", "replication", "invalidsection"});
+  auto info = resp.GetString();
+  EXPECT_NE(info.find("# Replication"), std::string::npos);
+  EXPECT_EQ(info.find("# invalidsection"), std::string::npos);
+}
+
+// DEBUG POPULATE with val_size=0 caused SIGFPE (division by zero) in DoPopulateBatch.
+TEST_F(ServerFamilyTest, DebugPopulateZeroValSize) {
+  // val_size=0 with the default element count (1) must not crash the server.
+  auto resp = Run({"DEBUG", "POPULATE", "1", "key", "0"});
+  EXPECT_THAT(resp, ErrArg("val_size must be positive"));
+}
+
+TEST_F(ServerFamilyTest, MemoryArenaSummary) {
+  auto resp = Run({"MEMORY", "ARENA", "SUMMARY"});
+  const auto response = resp.GetString();
+
+  EXPECT_THAT(response, HasSubstr("BlockSize"));
+
+  for (const auto shard_id : std::views::iota(0UL, shard_set->size())) {
+    EXPECT_THAT(response, HasSubstr("Arena statistics for thread " + std::to_string(shard_id)));
+  }
+
+  EXPECT_THAT(response, HasSubstr("Arena statistics for machine"));
+
+  resp = Run({"MEMORY", "ARENA", "SUMMARY", "0"});
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+
+  resp = Run({"MEMORY", "ARENA", "SUMMARY", "X"});
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+
+  resp = Run({"MEMORY", "ARENA", "SUMMARY", "BACKING"});
+  EXPECT_THAT(resp.GetString(), HasSubstr("BlockSize"));
+
+  resp = Run({"MEMORY", "ARENA", "SUMMARY", "BACKING", "0"});
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+
+  resp = Run({"MEMORY", "ARENA"});
+  EXPECT_THAT(resp.GetString(), HasSubstr("Count"));
+}
+
+TEST_F(ServerFamilyTest, MemoryParserErrorHandling) {
+  EXPECT_THAT(Run({"MEMORY", "DEFRAGMENT", "not-a-float"}), ErrArg("not a valid float"));
+}
+
+TEST_F(ServerFamilyTest, InfoReplicationMemoryNoReplicas) {
+  auto resp = Run({"INFO", "MEMORY"});
+  auto info = resp.GetString();
+  EXPECT_THAT(info, HasSubstr("replication_streaming_buffer_bytes:0"));
+  EXPECT_THAT(info, HasSubstr("replication_full_sync_buffer_bytes:0"));
+}
+
+TEST_F(ServerFamilyTest, InfoReplicationMemoryOnlyInMemorySection) {
+  EXPECT_THAT(Run({"INFO", "REPLICATION"}).GetString(),
+              Not(HasSubstr("replication_streaming_buffer_bytes")));
+  EXPECT_THAT(Run({"INFO", "MEMORY"}).GetString(), HasSubstr("replication_streaming_buffer_bytes"));
+  EXPECT_THAT(Run({"INFO"}).GetString(), HasSubstr("replication_streaming_buffer_bytes"));
+  EXPECT_THAT(Run({"INFO", "ALL"}).GetString(), HasSubstr("replication_streaming_buffer_bytes"));
+}
+
+// COMMANDSTATS is a hidden section (rendered only for an explicit name or ALL), while
+// LATENCYSTATS is rendered for the default no-arg INFO as well. This pins the gating
+// behavior that lets GetMetrics skip command-stat aggregation for common INFO calls while
+// still collecting latency data whenever the LATENCYSTATS section is emitted.
+TEST_F(ServerFamilyTest, InfoCommandAndLatencyStatsGating) {
+  // Generate command activity across the connections / proactors.
+  for (int i = 0; i < 5; ++i) {
+    Run({"set", absl::StrCat("k", i), "v"});
+    Run({"get", absl::StrCat("k", i)});
+  }
+  Run({"ping"});
+
+  // Default INFO: COMMANDSTATS is hidden, but LATENCYSTATS is emitted.
+  const string def = Run({"INFO"}).GetString();
+  EXPECT_THAT(def, Not(HasSubstr("# Commandstats")));
+  EXPECT_THAT(def, Not(HasSubstr("cmdstat_")));
+  EXPECT_THAT(def, HasSubstr("# Latencystats"));
+
+  // INFO STATS renders neither hidden COMMANDSTATS nor LATENCYSTATS.
+  const string stats = Run({"INFO", "STATS"}).GetString();
+  EXPECT_THAT(stats, Not(HasSubstr("cmdstat_")));
+  EXPECT_THAT(stats, Not(HasSubstr("# Latencystats")));
+  EXPECT_THAT(stats, Not(HasSubstr("latency_percentiles_usec_")));
+
+  // Explicit sections and ALL render them.
+  EXPECT_THAT(Run({"INFO", "COMMANDSTATS"}).GetString(), HasSubstr("# Commandstats"));
+  EXPECT_THAT(Run({"INFO", "LATENCYSTATS"}).GetString(), HasSubstr("# Latencystats"));
+  const string all = Run({"INFO", "ALL"}).GetString();
+  EXPECT_THAT(all, HasSubstr("# Commandstats"));
+  EXPECT_THAT(all, HasSubstr("# Latencystats"));
+}
+
+// Command stats are aggregated across all proactor threads. Exercising commands on the IO
+// threads and then summing per-thread counters on the caller must yield the correct totals
+// (regression guard for moving aggregation out of the fan-out callback).
+TEST_F(ServerFamilyTest, InfoCommandStatsAggregation) {
+  Run({"config", "resetstat"});
+
+  const int kGets = 17;
+  for (int i = 0; i < kGets; ++i) {
+    Run({"get", "nonexistent"});
+  }
+
+  auto extract_calls = [](std::string_view info, std::string_view stat) -> int {
+    // looks for "<stat>:calls=<n>,..."
+    size_t pos = info.find(stat);
+    if (pos == std::string_view::npos)
+      return -1;
+    std::string_view rest = info.substr(pos);
+    const string needle = "calls=";
+    size_t cpos = rest.find(needle);
+    if (cpos == std::string_view::npos)
+      return -1;
+    rest = rest.substr(cpos + needle.size());
+    int value = 0;
+    for (char c : rest) {
+      if (c < '0' || c > '9')
+        break;
+      value = value * 10 + (c - '0');
+    }
+    return value;
+  };
+
+  const string cmdstats = Run({"INFO", "COMMANDSTATS"}).GetString();
+  EXPECT_EQ(extract_calls(cmdstats, "cmdstat_get:"), kGets);
+
+  // A command never invoked must not appear at all (zero-call commands are skipped).
+  EXPECT_THAT(cmdstats, Not(HasSubstr("cmdstat_getex:")));
+
+  // The aggregated value is also visible in INFO ALL.
+  const string all = Run({"INFO", "ALL"}).GetString();
+  EXPECT_GE(extract_calls(all, "cmdstat_get:"), kGets);
+}
+
+TEST_F(ServerFamilyTest, InfoClusterMigrationErrors) {
+  EXPECT_THAT(Run({"INFO", "CLUSTER"}).GetString(), HasSubstr("migration_errors_total:0"));
+}
+
+}  // namespace dfly

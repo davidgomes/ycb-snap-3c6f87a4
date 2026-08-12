@@ -1,0 +1,110 @@
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "core/search/ast_expr.h"
+
+#include <absl/strings/numbers.h>
+#include <absl/strings/str_cat.h>
+
+#include <algorithm>
+#include <cmath>
+#include <regex>
+
+#include "base/logging.h"
+
+using namespace std;
+
+namespace dfly::search {
+
+AstRangeNode::AstRangeNode(double lo, bool lo_excl, double hi, bool hi_excl)
+    : lo{lo_excl ? nextafter(lo, hi) : lo}, hi{hi_excl ? nextafter(hi, lo) : hi} {
+}
+
+AstGeoNode::AstGeoNode(double lon, double lat, double radius, std::string unit)
+    : lon(lon), lat(lat), radius(radius), unit(std::move(unit)) {
+}
+
+AstOptionalNode::AstOptionalNode(AstNode&& node) : node{make_unique<AstNode>(std::move(node))} {
+}
+
+AstNegateNode::AstNegateNode(AstNode&& node) : node{make_unique<AstNode>(std::move(node))} {
+}
+
+AstAttributeNode::AstAttributeNode(AstNode&& node, double weight)
+    : node{make_unique<AstNode>(std::move(node))}, weight{weight} {
+}
+
+AstLogicalNode::AstLogicalNode(AstNode&& l, AstNode&& r, LogicOp op) : op{op}, nodes{} {
+  // If either node is already a logical node with the same op,
+  // we can re-use it, as logical ops are associative.
+  for (auto* node : {&l, &r}) {
+    if (auto* ln = get_if<AstLogicalNode>(node); ln && ln->op == op) {
+      *this = std::move(*ln);
+      nodes.emplace_back(std::move(*(node == &l ? &r : &l)));
+      return;
+    }
+  }
+
+  nodes.emplace_back(std::move(l));
+  nodes.emplace_back(std::move(r));
+}
+
+AstFieldNode::AstFieldNode(string field, AstNode&& node)
+    : field{field.substr(1)}, node{make_unique<AstNode>(std::move(node))} {
+}
+
+AstTagsNode::AstTagsNode(TagValue tag) {
+  tags = {std::move(tag)};
+}
+
+AstTagsNode::AstTagsNode(AstExpr&& l, TagValue tag) {
+  DCHECK(holds_alternative<AstTagsNode>(l));
+  auto& tags_node = get<AstTagsNode>(l);
+
+  tags = std::move(tags_node.tags);
+  tags.push_back(std::move(tag));
+}
+
+AstKnnNode::AstKnnNode(uint32_t limit, std::string_view field, std::string blob,
+                       std::string_view score_alias, std::optional<uint32_t> ef_runtime)
+    : filter{nullptr},
+      limit{limit},
+      field{field.substr(1)},
+      blob{std::move(blob)},
+      score_alias{score_alias.empty() ? absl::StrCat("__", field.substr(1), "_score")
+                                      : std::string{score_alias}},
+      ef_runtime{ef_runtime} {
+}
+
+AstKnnNode::AstKnnNode(AstNode&& filter, AstKnnNode&& self) {
+  *this = std::move(self);
+  this->filter = make_unique<AstNode>(std::move(filter));
+}
+
+AstVectorRangeNode::AstVectorRangeNode(std::string field, double radius, std::string blob,
+                                       std::string score_alias, std::optional<double> epsilon)
+    : field{field.substr(1)},
+      radius{radius},
+      blob{std::move(blob)},
+      score_alias{std::move(score_alias)},
+      epsilon{epsilon} {
+}
+
+bool AstKnnNode::HasPreFilter() const {
+  // If we have pre filter knn query should not hold filter variable. It will be
+  // moved to SearchAlgorithm::query_ variable.
+  return filter == nullptr;
+}
+
+}  // namespace dfly::search
+
+namespace std {
+ostream& operator<<(ostream& os, optional<uint32_t> o) {
+  return os;
+}
+
+ostream& operator<<(ostream& os, dfly::search::AstTagsNode::TagValueProxy o) {
+  return os;
+}
+}  // namespace std

@@ -1,0 +1,245 @@
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <algorithm>
+#include <iosfwd>
+#include <memory>
+#include <optional>
+#include <variant>
+#include <vector>
+
+#include "core/search/base.h"
+#include "core/search/tag_types.h"
+
+namespace dfly {
+
+namespace search {
+
+struct AstNode;
+
+// Matches all documents
+struct AstStarNode {};
+
+// Matches all documents where this field has a non-null value
+struct AstStarFieldNode {};
+
+template <TagType T> struct AstAffixNode {
+  explicit AstAffixNode(std::string affix) : affix{std::move(affix)} {
+  }
+
+  std::string affix;
+};
+
+using AstTermNode = AstAffixNode<TagType::REGULAR>;
+using AstPrefixNode = AstAffixNode<TagType::PREFIX>;
+using AstSuffixNode = AstAffixNode<TagType::SUFFIX>;
+using AstInfixNode = AstAffixNode<TagType::INFIX>;
+
+// Glob pattern from `w'...'` syntax. `affix` holds the verbatim pattern: `*` matches any run of
+// characters, `?` matches exactly one, `\` escapes the next character to a literal.
+using AstWildcardNode = AstAffixNode<TagType::WILDCARD>;
+
+// Quoted multi-word phrase. `raw` is the verbatim content between quotes; the
+// executor runs the shared text tokenizer over it and matches the resulting
+// tokens against posting-list positions.
+// `slop` = max intervening tokens allowed between consecutive phrase terms
+// (in order). slop=0 = exact adjacency; slop>0 comes from `"..."~N` syntax.
+struct AstPhraseNode {
+  explicit AstPhraseNode(std::string raw, uint32_t slop = 0) : raw{std::move(raw)}, slop{slop} {
+  }
+
+  std::string raw;
+  uint32_t slop = 0;
+};
+
+// Matches numeric range
+struct AstRangeNode {
+  AstRangeNode(double lo, bool lo_excl, double hi, bool hi_excl);
+
+  double lo, hi;
+};
+
+struct AstGeoNode {
+  AstGeoNode(double lon, double lat, double radius, std::string unit);
+  double lon, lat;
+  double radius;
+  std::string unit;
+};
+
+// ~subquery: returns all docs, boosts score of those matched by subquery
+struct AstOptionalNode {
+  explicit AstOptionalNode(AstNode&& node);
+
+  AstOptionalNode(const AstOptionalNode&) = delete;
+  AstOptionalNode& operator=(const AstOptionalNode&) = delete;
+
+  AstOptionalNode(AstOptionalNode&&) noexcept = default;
+  AstOptionalNode& operator=(AstOptionalNode&&) noexcept = default;
+
+  std::unique_ptr<AstNode> node;
+};
+
+// Negates subtree
+struct AstNegateNode {
+  explicit AstNegateNode(AstNode&& node);
+
+  AstNegateNode(const AstNegateNode&) = delete;
+  AstNegateNode& operator=(const AstNegateNode&) = delete;
+
+  AstNegateNode(AstNegateNode&&) noexcept = default;
+  AstNegateNode& operator=(AstNegateNode&&) noexcept = default;
+
+  std::unique_ptr<AstNode> node;
+};
+
+// Applies query attributes to a subtree.
+struct AstAttributeNode {
+  AstAttributeNode(AstNode&& node, double weight);
+
+  AstAttributeNode(const AstAttributeNode&) = delete;
+  AstAttributeNode& operator=(const AstAttributeNode&) = delete;
+
+  AstAttributeNode(AstAttributeNode&&) noexcept = default;
+  AstAttributeNode& operator=(AstAttributeNode&&) noexcept = default;
+
+  std::unique_ptr<AstNode> node;
+  double weight = 1.0;
+};
+
+// Applies logical operation to results of all sub-nodes
+struct AstLogicalNode {
+  enum LogicOp { AND, OR };
+
+  // If either node is already a logical node with the same op, it'll be re-used.
+  AstLogicalNode(AstNode&& l, AstNode&& r, LogicOp op);
+
+  AstLogicalNode(const AstLogicalNode&) = delete;
+  AstLogicalNode& operator=(const AstLogicalNode&) = delete;
+
+  AstLogicalNode(AstLogicalNode&&) noexcept = default;
+  AstLogicalNode& operator=(AstLogicalNode&&) noexcept = default;
+
+  LogicOp op;
+  std::vector<AstNode> nodes;
+};
+
+// Selects specific field for subtree
+struct AstFieldNode {
+  AstFieldNode(std::string field, AstNode&& node);
+
+  AstFieldNode(const AstFieldNode&) = delete;
+  AstFieldNode& operator=(const AstFieldNode&) = delete;
+
+  AstFieldNode(AstFieldNode&&) noexcept = default;
+  AstFieldNode& operator=(AstFieldNode&&) noexcept = default;
+
+  std::string field;
+  std::unique_ptr<AstNode> node;
+};
+
+// Stores a list of tags for a tag query
+struct AstTagsNode {
+  using TagValue =
+      std::variant<AstTermNode, AstPrefixNode, AstSuffixNode, AstInfixNode, AstWildcardNode>;
+
+  struct TagValueProxy
+      : public AstTagsNode::TagValue {  // bison needs it to be default constructible
+    TagValueProxy() : AstTagsNode::TagValue(AstTermNode("")) {
+    }
+    template <TagType T> TagValueProxy(AstAffixNode<T> tv) : AstTagsNode::TagValue(std::move(tv)) {
+    }
+  };
+
+  explicit AstTagsNode(TagValue);
+  AstTagsNode(AstNode&& l, TagValue);
+
+  std::vector<TagValue> tags;
+};
+
+// Applies nearest neighbor search to the final result set
+struct AstKnnNode {
+  AstKnnNode() = default;
+  AstKnnNode(uint32_t limit, std::string_view field, std::string blob, std::string_view score_alias,
+             std::optional<uint32_t> ef_runtime);
+
+  AstKnnNode(AstNode&& sub, AstKnnNode&& self);
+
+  AstKnnNode(const AstKnnNode&) = delete;
+  AstKnnNode& operator=(const AstKnnNode&) = delete;
+
+  AstKnnNode(AstKnnNode&&) noexcept = default;
+  AstKnnNode& operator=(AstKnnNode&&) noexcept = default;
+
+  friend std::ostream& operator<<(std::ostream& stream, const AstKnnNode& matrix) {
+    return stream;
+  }
+
+  std::unique_ptr<AstNode> filter;
+  size_t limit;
+  std::string field;
+  std::string blob;  // raw query-vector bytes, decoded at search time using the field dtype
+  std::string score_alias;
+  std::optional<uint32_t> ef_runtime;
+
+  bool HasPreFilter() const;
+};
+
+// Applies vector range search: returns all docs with distance(vec, doc_vec) <= radius
+struct AstVectorRangeNode {
+  AstVectorRangeNode() = default;
+  AstVectorRangeNode(std::string field, double radius, std::string blob, std::string score_alias,
+                     std::optional<double> epsilon);
+
+  AstVectorRangeNode(const AstVectorRangeNode&) = delete;
+  AstVectorRangeNode& operator=(const AstVectorRangeNode&) = delete;
+
+  AstVectorRangeNode(AstVectorRangeNode&&) noexcept = default;
+  AstVectorRangeNode& operator=(AstVectorRangeNode&&) noexcept = default;
+
+  friend std::ostream& operator<<(std::ostream& stream, const AstVectorRangeNode& /*node*/) {
+    return stream;
+  }
+
+  std::string field;
+  double radius;
+  std::string blob;  // raw query-vector bytes, decoded at search time using the field dtype
+  std::string score_alias;
+  std::optional<double> epsilon;
+};
+
+using NodeVariants =
+    std::variant<std::monostate, AstStarNode, AstStarFieldNode, AstTermNode, AstPrefixNode,
+                 AstSuffixNode, AstInfixNode, AstWildcardNode, AstPhraseNode, AstRangeNode,
+                 AstNegateNode, AstOptionalNode, AstAttributeNode, AstLogicalNode, AstFieldNode,
+                 AstTagsNode, AstKnnNode, AstGeoNode, AstVectorRangeNode>;
+
+struct AstNode : public NodeVariants {
+  using variant::variant;
+
+  AstNode(const AstNode&) = delete;
+  AstNode& operator=(const AstNode&) = delete;
+
+  AstNode(AstNode&&) noexcept = default;
+  AstNode& operator=(AstNode&&) noexcept = default;
+
+  friend std::ostream& operator<<(std::ostream& stream, const AstNode& matrix) {
+    return stream;
+  }
+
+  const NodeVariants& Variant() const& {
+    return *this;
+  }
+};
+
+using AstExpr = AstNode;
+
+}  // namespace search
+}  // namespace dfly
+
+namespace std {
+ostream& operator<<(ostream& os, optional<uint32_t> o);
+ostream& operator<<(ostream& os, dfly::search::AstTagsNode::TagValueProxy o);
+}  // namespace std

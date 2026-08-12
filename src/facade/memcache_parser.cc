@@ -1,0 +1,535 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+#include "facade/memcache_parser.h"
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/inlined_vector.h>
+#include <absl/strings/ascii.h>
+#include <absl/strings/escaping.h>
+#include <absl/strings/numbers.h>
+#include <absl/strings/str_split.h>
+#include <absl/types/span.h>
+
+#include "base/logging.h"
+#include "base/stl_util.h"
+#include "facade/facade_types.h"
+
+namespace facade {
+using namespace std;
+using MP = MemcacheParser;
+
+namespace {
+
+int64_t ToAbsolute(uint32_t ts, uint64_t now) {
+  // if expire_ts is greater than month it's a unix timestamp
+  // https://github.com/memcached/memcached/blob/master/doc/protocol.txt#L139
+  constexpr uint32_t kExpireLimit = 60 * 60 * 24 * 30;
+  int64_t expire_ts = ts && ts <= kExpireLimit ? ts + now : ts;
+  return expire_ts;
+}
+
+MP::CmdType From(string_view token) {
+  static absl::flat_hash_map<string_view, MP::CmdType> cmd_map{
+      {"set", MP::SET},       {"add", MP::ADD},         {"replace", MP::REPLACE},
+      {"append", MP::APPEND}, {"prepend", MP::PREPEND}, {"cas", MP::CAS},
+      {"get", MP::GET},       {"gets", MP::GETS},       {"gat", MP::GAT},
+      {"gats", MP::GATS},     {"stats", MP::STATS},     {"incr", MP::INCR},
+      {"decr", MP::DECR},     {"delete", MP::DELETE},   {"flush_all", MP::FLUSHALL},
+      {"quit", MP::QUIT},     {"version", MP::VERSION},
+  };
+
+  if (token.size() == 2) {
+    // META_COMMANDS
+    if (token[0] != 'm')
+      return MP::INVALID;
+    switch (token[1]) {
+      case 's':
+        return MP::META_SET;
+      case 'g':
+        return MP::META_GET;
+      case 'd':
+        return MP::META_DEL;
+      case 'a':
+        return MP::META_ARITHM;
+      case 'n':
+        return MP::META_NOOP;
+      case 'e':
+        return MP::META_DEBUG;
+    }
+    return MP::INVALID;
+  }
+
+  if (token.size() > 2) {
+    auto it = cmd_map.find(token);
+    if (it == cmd_map.end())
+      return MP::INVALID;
+    return it->second;
+  }
+  return MP::INVALID;
+}
+
+MP::Result ParseStore(ArgSlice tokens, int64_t now, MP::Command* res, uint32_t max_value_len) {
+  DCHECK_EQ(res->size(), 0u);
+
+  const size_t num_tokens = tokens.size();
+  unsigned opt_pos = 4;
+  if (res->type == MP::CAS) {
+    if (num_tokens <= opt_pos)
+      return MP::PARSE_ERROR;
+    ++opt_pos;
+  }
+
+  // tokens[0] is key
+  uint32_t bytes_len = 0;
+  uint32_t flags;
+  uint32_t expire_ts;
+  if (!absl::SimpleAtoi(tokens[1], &flags) || !absl::SimpleAtoi(tokens[2], &expire_ts) ||
+      !absl::SimpleAtoi(tokens[3], &bytes_len))
+    return MP::BAD_INT;
+
+  if (bytes_len > max_value_len) {
+    LOG_EVERY_T(WARNING, 1) << "Memcache value size " << bytes_len << " exceeds max_bulk_len "
+                            << max_value_len;
+    return MP::PARSE_ERROR;
+  }
+
+  res->raw_expire_ts = expire_ts;
+  res->expire_ts = ToAbsolute(expire_ts, now);
+
+  if (res->type == MP::CAS && !absl::SimpleAtoi(tokens[4], &res->cas_unique)) {
+    return MP::BAD_INT;
+  }
+
+  res->flags = flags;
+  if (num_tokens == opt_pos + 1) {
+    if (tokens[opt_pos] == "noreply") {
+      res->cmd_flags.no_reply = true;
+    } else {
+      return MP::PARSE_ERROR;
+    }
+  } else if (num_tokens > opt_pos + 1) {
+    return MP::PARSE_ERROR;
+  }
+
+  string_view key = tokens[0];
+  res->backed_args->PushArg(key);
+  res->backed_args->PushArg(bytes_len);
+
+  return MP::OK;
+}
+
+MP::Result ParseValueless(ArgSlice tokens, int64_t now, MP::Command* res) {
+  const size_t num_tokens = tokens.size();
+  size_t key_pos = 0;
+  uint32_t expire_ts;
+  if (res->type == MP::GAT || res->type == MP::GATS) {
+    if (!absl::SimpleAtoi(tokens[0], &expire_ts)) {
+      return MP::BAD_INT;
+    }
+    res->raw_expire_ts = expire_ts;
+    res->expire_ts = ToAbsolute(expire_ts, now);
+    ++key_pos;
+  }
+
+  // We support only `flushall` or `flushall 0`
+  if (key_pos < num_tokens && res->type == MP::FLUSHALL) {
+    DCHECK_EQ(res->size(), 0u);
+
+    int delay = 0;
+    if (key_pos + 1 == num_tokens && absl::SimpleAtoi(tokens[key_pos], &delay) && delay == 0)
+      return MP::OK;
+    return MP::PARSE_ERROR;
+  }
+
+  if (key_pos >= num_tokens)
+    return MP::PARSE_ERROR;
+
+  res->cmd_flags.return_cas = (res->type == MP::GETS || res->type == MP::GATS);
+  res->cmd_flags.return_value = true;
+  res->cmd_flags.return_flags = true;
+
+  res->backed_args->PushArg(tokens[key_pos++]);
+
+  if (key_pos < num_tokens && res->type == MP::STATS)
+    return MP::PARSE_ERROR;  // we don't support additional arguments to stats for now
+
+  if (res->type == MP::INCR || res->type == MP::DECR) {
+    if (key_pos == num_tokens)
+      return MP::PARSE_ERROR;
+
+    if (!absl::SimpleAtoi(tokens[key_pos], &res->delta))
+      return MP::BAD_DELTA;
+    ++key_pos;
+  }
+
+  while (key_pos < num_tokens) {
+    res->backed_args->PushArg(tokens[key_pos++]);
+  }
+
+  if (res->type >= MP::DELETE) {  // write commands
+    if (res->size() > 1 && res->backed_args->back() == "noreply") {
+      res->cmd_flags.no_reply = true;
+      res->backed_args->PopArg();
+    }
+  }
+
+  return MP::OK;
+}
+
+bool ParseMetaMode(char m, MP::Command* res) {
+  if (res->type == MP::SET) {
+    switch (m) {
+      case 'E':
+        res->type = MP::ADD;
+        break;
+      case 'A':
+        res->type = MP::APPEND;
+        break;
+      case 'R':
+        res->type = MP::REPLACE;
+        break;
+      case 'P':
+        res->type = MP::PREPEND;
+        break;
+      case 'S':
+        break;
+      default:
+        return false;
+    }
+    return true;
+  }
+
+  if (res->type == MP::INCR) {
+    switch (m) {
+      case 'I':
+      case '+':
+        break;
+      case 'D':
+      case '-':
+        res->type = MP::DECR;
+        break;
+      default:
+        return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+// See https://raw.githubusercontent.com/memcached/memcached/refs/heads/master/doc/protocol.txt
+MP::Result ParseMeta(ArgSlice tokens, int64_t now, MP::Command* res, uint32_t max_value_len) {
+  DCHECK(!tokens.empty());
+
+  if (res->type == MP::META_DEBUG) {
+    LOG(ERROR) << "meta debug not yet implemented";
+    return MP::PARSE_ERROR;
+  }
+
+  if (tokens[0].size() > 250)
+    return MP::PARSE_ERROR;
+
+  res->cmd_flags.meta = true;
+  res->flags = 0;
+  res->expire_ts = 0;
+
+  string_view arg0 = tokens[0];
+  tokens.remove_prefix(1);
+  uint32_t bytes_len = 0;
+
+  // We emulate the behavior by returning the high level commands.
+  // TODO: we should reverse the interface in the future, so that a high level command
+  // will be represented in MemcacheParser::Command by a meta command with flags.
+  // high level commands should not be part of the interface in the future.
+  switch (res->type) {
+    case MP::META_GET:
+      res->type = MP::GET;
+      break;
+    case MP::META_DEL:
+      res->type = MP::DELETE;
+      break;
+    case MP::META_SET:
+      if (tokens.empty())
+        return MP::PARSE_ERROR;
+      if (!absl::SimpleAtoi(tokens[0], &bytes_len))
+        return MP::BAD_INT;
+      if (bytes_len > max_value_len) {
+        LOG_EVERY_T(WARNING, 1) << "Memcache value size " << bytes_len << " exceeds max_bulk_len "
+                                << max_value_len;
+        return MP::PARSE_ERROR;
+      }
+
+      res->type = MP::SET;
+      tokens.remove_prefix(1);
+      break;
+    case MP::META_ARITHM:
+      res->type = MP::INCR;
+      res->delta = 1;
+      break;
+    default:
+      return MP::PARSE_ERROR;
+  }
+
+  string blob;
+  uint32_t expire_ts;
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    string_view token = tokens[i];
+
+    switch (token[0]) {
+      case 'T':
+        if (!absl::SimpleAtoi(token.substr(1), &expire_ts))
+          return MP::BAD_INT;
+        res->raw_expire_ts = expire_ts;
+        res->expire_ts = ToAbsolute(expire_ts, now);
+        if (res->type == MP::GET)
+          res->type = MP::GAT;
+        break;
+      case 'b':
+        if (token.size() != 1)
+          return MP::PARSE_ERROR;
+        if (!absl::Base64Unescape(arg0, &blob))
+          return MP::PARSE_ERROR;
+        arg0 = blob;
+        res->cmd_flags.base64 = true;
+        break;
+      case 'F':
+        if (!absl::SimpleAtoi(token.substr(1), &res->flags))
+          return MP::BAD_INT;
+        break;
+      case 'M':
+        if (token.size() != 2 || !ParseMetaMode(token[1], res))
+          return MP::PARSE_ERROR;
+        break;
+      case 'D':
+        if (!absl::SimpleAtoi(token.substr(1), &res->delta))
+          return MP::BAD_INT;
+        break;
+      case 'q':
+        res->cmd_flags.no_reply = true;
+        break;
+      case 'f':
+        res->cmd_flags.return_flags = true;
+        break;
+      case 'v':
+        res->cmd_flags.return_value = true;
+        break;
+      case 't':
+        res->cmd_flags.return_ttl = true;
+        break;
+      case 'l':
+        res->cmd_flags.return_access_time = true;
+        break;
+      case 'h':
+        res->cmd_flags.return_hit = true;
+        break;
+      case 'c':
+        res->cmd_flags.return_cas = true;
+        break;
+      default:
+        LOG(WARNING) << "unknown meta flag: " << token;  // not yet implemented
+        return MP::PARSE_ERROR;
+    }
+  }
+  res->backed_args->PushArg(arg0);
+  if (MP::IsStoreCmd(res->type)) {
+    res->backed_args->PushArg(bytes_len);
+  }
+  return MP::OK;
+}
+
+}  // namespace
+
+auto MP::Parse(string_view str, uint32_t* consumed, Command* cmd) -> Result {
+  DVLOG(1) << "Parsing memcache input: [" << str << "]";
+
+  *consumed = 0;
+
+  if (val_len_to_read_ > 0) {
+    return ConsumeValue(str, consumed, cmd);
+  }
+
+  cmd->cmd_flags.raw = 0;  // re-initialize
+
+  size_t pos = str.find('\n');
+  if (pos == string_view::npos) {
+    // We need more data to parse the command. For get/gets commands this line can be very long.
+    // we limit maximum buffer capacity in the higher levels using max_client_iobuf_len.
+    tmp_buf_.append(str);
+    *consumed = str.size();
+    return INPUT_PENDING;
+  }
+
+  *consumed = pos + 1;
+  string_view main_cmd;
+
+  if (tmp_buf_.empty()) {
+    main_cmd = str.substr(0, pos);
+  } else {
+    tmp_buf_.append(str.substr(0, pos));
+    main_cmd = tmp_buf_;
+  }
+
+  // main_cmd is \n stripped, so it should end with \r.
+  if (main_cmd.empty() || main_cmd.back() != '\r') {
+    return PARSE_ERROR;
+  }
+  main_cmd.remove_suffix(1);  // remove trailing \r
+
+  // cas <key> <flags> <exptime> <bytes> <cas unique> [noreply]\r\n
+  // get <key>*\r\n
+  // ms <key> <datalen> <flags>*\r\n
+  absl::InlinedVector<string_view, 32> tokens =
+      absl::StrSplit(main_cmd, ' ', absl::SkipWhitespace());
+
+  Result res = ParseInternal(absl::MakeSpan(tokens), cmd);
+  tmp_buf_.clear();
+  if (val_len_to_read_ > 0)
+    return ConsumeValue(str.substr(pos + 1), consumed, cmd);
+  return res;
+};
+
+auto MP::ParseInternal(ArgSlice tokens_view, Command* cmd) -> Result {
+  if (tokens_view.empty())
+    return PARSE_ERROR;
+
+  cmd->type = From(tokens_view[0]);
+  if (cmd->type == INVALID) {
+    return UNKNOWN_CMD;
+  }
+
+  tokens_view.remove_prefix(1);
+  cmd->backed_args->clear();
+
+  if (cmd->type <= CAS) {                                         // Store command
+    if (tokens_view.size() < 4 || tokens_view[0].size() > 250) {  // key length limit
+      return MP::PARSE_ERROR;
+    }
+
+    auto res = ParseStore(tokens_view, last_unix_time_, cmd, max_value_len_);
+    if (res != MP::OK)
+      return res;
+    val_len_to_read_ = cmd->value().size() + 2;
+    return MP::OK;
+  }
+
+  if (cmd->type >= META_SET) {
+    if (tokens_view.empty())
+      return MP::PARSE_ERROR;
+
+    auto res = ParseMeta(tokens_view, last_unix_time_, cmd, max_value_len_);
+    if (res != MP::OK)
+      return res;
+
+    if (IsStoreCmd(cmd->type)) {
+      val_len_to_read_ = cmd->value().size() + 2;
+      res = MP::OK;
+    }
+    return res;
+  }
+
+  if (tokens_view.empty()) {
+    if (base::_in(cmd->type, {MP::STATS, MP::FLUSHALL, MP::QUIT, MP::VERSION, MP::META_NOOP})) {
+      return MP::OK;
+    }
+    return MP::PARSE_ERROR;
+  }
+
+  return ParseValueless(tokens_view, last_unix_time_, cmd);
+}
+
+auto MP::ConsumeValue(std::string_view str, uint32_t* consumed, Command* dest) -> Result {
+  DCHECK_EQ(dest->size(), 2u);  // key and value
+  DCHECK_GT(val_len_to_read_, 0u);
+
+  if (val_len_to_read_ > 2) {
+    uint32_t need_copy = val_len_to_read_ - 2;
+    uint32_t dest_len = dest->backed_args->elem_len(1);
+    DCHECK_GE(dest_len, need_copy);  // should be ensured during parsing
+
+    char* start = dest->value_ptr() + (dest_len - need_copy);
+    uint32_t to_fill = std::min<uint32_t>(need_copy, str.size());
+    if (to_fill) {
+      memcpy(start, str.data(), to_fill);
+      val_len_to_read_ -= to_fill;
+      *consumed += to_fill;
+      str.remove_prefix(to_fill);
+    }
+  }
+
+  if (str.empty()) {
+    return MP::INPUT_PENDING;
+  }
+
+  DCHECK(val_len_to_read_ <= 2u && val_len_to_read_ > 0);
+  // consume \r\n
+  char end[] = "\r\n";
+
+  do {
+    if (str.front() != end[2 - val_len_to_read_])  // val_len_to_read_ 2 -> '\r', 1 -> '\n'
+      return MP::PARSE_ERROR;
+
+    ++(*consumed);
+    --val_len_to_read_;
+    str.remove_prefix(1);
+  } while (val_len_to_read_ && !str.empty());
+
+  return val_len_to_read_ > 0 ? MP::INPUT_PENDING : MP::OK;
+}
+
+// Inverse of the token map in From(): enum -> wire token. Only used by the
+// traffic logger, which is off most of the time, so a switch is plenty.
+string_view MP::CmdName(CmdType type) {
+  switch (type) {
+    case MP::SET:
+      return "set"sv;
+    case MP::ADD:
+      return "add"sv;
+    case MP::REPLACE:
+      return "replace"sv;
+    case MP::APPEND:
+      return "append"sv;
+    case MP::PREPEND:
+      return "prepend"sv;
+    case MP::CAS:
+      return "cas"sv;
+    case MP::GET:
+      return "get"sv;
+    case MP::GETS:
+      return "gets"sv;
+    case MP::GAT:
+      return "gat"sv;
+    case MP::GATS:
+      return "gats"sv;
+    case MP::STATS:
+      return "stats"sv;
+    case MP::INCR:
+      return "incr"sv;
+    case MP::DECR:
+      return "decr"sv;
+    case MP::DELETE:
+      return "delete"sv;
+    case MP::FLUSHALL:
+      return "flush_all"sv;
+    case MP::QUIT:
+      return "quit"sv;
+    case MP::VERSION:
+      return "version"sv;
+    case MP::META_NOOP:
+      return "mn"sv;
+    case MP::META_SET:
+      return "ms"sv;
+    case MP::META_DEL:
+      return "md"sv;
+    case MP::META_ARITHM:
+      return "ma"sv;
+    case MP::META_GET:
+      return "mg"sv;
+    case MP::META_DEBUG:
+      return "me"sv;
+    case MP::INVALID:
+      return ""sv;
+  }
+  return ""sv;
+}
+
+}  // namespace facade

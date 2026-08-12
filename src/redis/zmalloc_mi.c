@@ -1,0 +1,242 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include <assert.h>
+#include <mimalloc.h>
+
+#define MI_BUILD_RELEASE 1
+#include <mimalloc/types.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "zmalloc.h"
+
+__thread ssize_t zmalloc_used_memory_tl = 0;
+__thread mi_heap_t* zmalloc_heap = NULL;
+
+mi_page_usage_stats_t mi_heap_page_is_underutilized(mi_heap_t* heap, void* p, float ratio,
+                                                    bool collect_stats);
+
+/* Allocate memory or panic */
+void* zmalloc(size_t size) {
+  assert(zmalloc_heap);
+  void* res = mi_heap_malloc(zmalloc_heap, size);
+  size_t usable = mi_usable_size(res);
+
+  // assertion does not hold. Basically mi_good_size is not a good function for
+  // doing accounting.
+  // assert(usable == mi_good_size(size));
+  zmalloc_used_memory_tl += usable;
+
+  return res;
+}
+
+void* ztrymalloc_usable(size_t size, size_t* usable) {
+  return zmalloc_usable(size, usable);
+}
+
+size_t zmalloc_usable_size(const void* p) {
+  return mi_usable_size(p);
+}
+
+void zfree(void* ptr) {
+  size_t usable = mi_usable_size(ptr);
+
+  // assert(zmalloc_used_memory_tl >= (ssize_t)usable);
+  zmalloc_used_memory_tl -= usable;
+
+  mi_free_size(ptr, usable);
+}
+
+void* zrealloc(void* ptr, size_t size) {
+  size_t usable;
+  return zrealloc_usable(ptr, size, &usable);
+}
+
+void* zcalloc(size_t size) {
+  // mi_good_size(size) is not working. try for example, size=690557.
+
+  void* res = mi_heap_calloc(zmalloc_heap, 1, size);
+  size_t usable = mi_usable_size(res);
+  zmalloc_used_memory_tl += usable;
+
+  return res;
+}
+
+void* zmalloc_usable(size_t size, size_t* usable) {
+  assert(zmalloc_heap);
+  void* res = mi_heap_malloc(zmalloc_heap, size);
+  size_t uss = mi_usable_size(res);
+  *usable = uss;
+
+  zmalloc_used_memory_tl += uss;
+
+  return res;
+}
+
+void* zrealloc_usable(void* ptr, size_t size, size_t* usable) {
+  ssize_t prev = mi_usable_size(ptr);
+
+  void* res = mi_heap_realloc(zmalloc_heap, ptr, size);
+  ssize_t uss = mi_usable_size(res);
+  *usable = uss;
+  zmalloc_used_memory_tl += (uss - prev);
+
+  return res;
+}
+
+size_t znallocx(size_t size) {
+  return mi_good_size(size);
+}
+
+void zfree_size(void* ptr, size_t size) {
+  ssize_t uss = mi_usable_size(ptr);
+  zmalloc_used_memory_tl -= uss;
+  mi_free_size(ptr, uss);
+}
+
+void* ztrymalloc(size_t size) {
+  size_t usable;
+  return zmalloc_usable(size, &usable);
+}
+
+void* ztrycalloc(size_t size) {
+  size_t g = mi_good_size(size);
+  zmalloc_used_memory_tl += g;
+  void* ptr = mi_heap_calloc(zmalloc_heap, 1, size);
+  assert(mi_usable_size(ptr) == g);
+  return ptr;
+}
+
+typedef struct Sum_s {
+  size_t allocated;
+  size_t comitted;
+} Sum_t;
+
+typedef struct {
+  size_t allocated;
+  size_t comitted;
+  size_t wasted;
+  float ratio;
+} MemUtilized_t;
+
+bool heap_visit_cb(const mi_heap_t* heap, const mi_heap_area_t* area, void* block,
+                   size_t block_size, void* arg) {
+  assert(area->used < (1u << 31));
+
+  Sum_t* sum = (Sum_t*)arg;
+
+  // mimalloc mistakenly exports used in blocks instead of bytes.
+  sum->allocated += block_size * area->used;
+  sum->comitted += area->committed;
+  return true;  // continue iteration
+};
+
+bool heap_count_wasted_blocks(const mi_heap_t* heap, const mi_heap_area_t* area, void* block,
+                              size_t block_size, void* arg) {
+  assert(area->used < (1u << 31));
+
+  MemUtilized_t* sum = (MemUtilized_t*)arg;
+
+  // mimalloc mistakenly exports used in blocks instead of bytes.
+  size_t used = block_size * area->used;
+  sum->allocated += used;
+  sum->comitted += area->committed;
+
+  if (used < area->committed * sum->ratio) {
+    sum->wasted += (area->committed - used);
+  }
+  return true;  // continue iteration
+};
+
+int zmalloc_get_allocator_info(size_t* allocated, size_t* active, size_t* resident) {
+  Sum_t sum = {0};
+
+  mi_heap_visit_blocks(zmalloc_heap, false /* visit all blocks*/, heap_visit_cb, &sum);
+  *allocated = sum.allocated;
+  *resident = sum.comitted;
+  *active = 0;
+
+  return 1;
+}
+
+int zmalloc_get_allocator_wasted_blocks(float ratio, size_t* allocated, size_t* commited,
+                                        size_t* wasted) {
+  MemUtilized_t sum = {.allocated = 0, .comitted = 0, .wasted = 0, .ratio = ratio};
+
+  mi_heap_visit_blocks(zmalloc_heap, false /* visit all blocks*/, heap_count_wasted_blocks, &sum);
+  *allocated = sum.allocated;
+  *commited = sum.comitted;
+  *wasted = sum.wasted;
+  return 1;
+}
+
+// Implemented based on this mimalloc code:
+// https://github.com/microsoft/mimalloc/blob/main/src/heap.c#L27
+int zmalloc_get_allocator_fragmentation_step(float ratio, struct fragmentation_info* info) {
+  if (zmalloc_heap->page_count == 0 || info->bin >= MI_BIN_FULL) {
+    // We avoid iterating over full pages since they are fully utilized.
+    return 0;
+  }
+
+  mi_page_queue_t* pq = &zmalloc_heap->pages[info->bin];
+  const mi_page_t* page = pq->first;
+  while (page != NULL) {
+    const mi_page_t* next = page->next;
+
+    const size_t bsize = page->block_size;
+
+    size_t committed = page->capacity * bsize;
+    info->committed += committed;
+    if (page->used < page->capacity) {
+      size_t used = page->used * bsize;
+
+      size_t threshold = (double)committed * ratio;
+      if (used < threshold) {
+        info->wasted += (committed - used);
+      }
+    }
+    page = next;
+  }
+
+  info->bin++;
+  if (info->bin == MI_BIN_FULL) {  // reached end of bins, reset state
+    info->committed_golden = info->committed;
+    // Add total comitted size of MI_BIN_FULL that we do not traverse
+    // as its tracked by zmalloc_heap->full_page_size variable.
+    info->committed += zmalloc_heap->full_page_size;
+
+    // TODO: it's a test code that makes sure `full_page_size` is correct.
+    // Remove it once we are confident with the implementation.
+    mi_page_queue_t* pq = &zmalloc_heap->pages[MI_BIN_FULL];
+    const mi_page_t* page = pq->first;
+    while (page != NULL) {
+      info->committed_golden += page->capacity * page->block_size;
+      page = page->next;
+    }
+    info->bin = 0;
+    return 0;
+  }
+
+  return -1;
+}
+
+void init_zmalloc_threadlocal(void* heap) {
+  if (zmalloc_heap)
+    return;
+  zmalloc_heap = heap;
+}
+
+void zmalloc_page_is_underutilized(void* ptr, float ratio, int collect_stats,
+                                   mi_page_usage_stats_t* result) {
+  *result = mi_heap_page_is_underutilized(zmalloc_heap, ptr, ratio, collect_stats);
+}
+
+char* zstrdup(const char* s) {
+  size_t l = strlen(s) + 1;
+  char* p = zmalloc(l);
+
+  memcpy(p, s, l);
+  return p;
+}

@@ -1,0 +1,370 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "server/server_state.h"
+
+#include <mimalloc.h>
+
+extern "C" {
+#include "redis/zmalloc.h"
+}
+
+#include "base/flag_utils.h"
+#include "base/flags.h"
+#include "base/logging.h"
+#include "facade/conn_context.h"
+#include "facade/dragonfly_connection.h"
+#include "facade/facade_stats.h"
+#include "server/common.h"
+#include "server/journal/journal.h"
+#include "util/listener_interface.h"
+
+namespace rng = std::ranges;
+
+using facade::operator""_KB;
+
+ABSL_FLAG(uint32_t, interpreter_per_thread, 10, "Lua interpreters per thread");
+ABSL_FLAG(uint32_t, timeout, 0,
+          "Close the connection after it is idle for N seconds (0 to disable)");
+ABSL_FLAG(uint32_t, send_timeout, 0,
+          "Close the connection after it is stuck on send for N seconds (0 to disable)");
+
+ABSL_FLAG(double, rss_oom_deny_ratio, 1.25,
+          "When the ratio between maxmemory and RSS memory exceeds this value, commands marked as "
+          "DENYOOM will fail with OOM error and new connections to non-admin port will be "
+          "rejected. Negative value disables this feature.");
+
+ABSL_FLAG(size_t, serialization_max_chunk_size, 64_KB,
+          "Maximum size of a value that may be serialized at once during snapshotting or full "
+          "sync. Values bigger than this threshold will be serialized using streaming "
+          "serialization. 0 - to disable streaming mode");
+ABSL_FLAG(uint32_t, max_squashed_cmd_num, 100,
+          "Max number of commands squashed in a single shard during squash optimizaiton");
+
+namespace dfly {
+
+using namespace std;
+using namespace std::chrono_literals;
+
+__thread ServerState* ServerState::state_ = nullptr;
+
+facade::ConnectionStats* ServerState::tl_connection_stats() {
+  return &facade::tl_facade_stats->conn_stats;
+}
+
+ServerState::Stats::Stats(unsigned num_shards)
+    : tx_width_freq_arr(num_shards), squash_width_freq_arr(num_shards) {
+}
+
+ServerState::Stats& ServerState::Stats::Add(const ServerState::Stats& other) {
+  static_assert(sizeof(Stats) == 30 * 8, "Stats size mismatch");
+
+#define ADD(x) this->x += (other.x)
+
+  ADD(eval_io_coordination_cnt);
+
+  ADD(eval_shardlocal_coordination_cnt);
+  ADD(eval_squashed_flushes);
+
+  ADD(tx_global_cnt);
+  ADD(tx_normal_cnt);
+  ADD(tx_inline_runs);
+  ADD(tx_schedule_cancel_cnt);
+
+  ADD(multi_squash_hops);
+  ADD(multi_squash_exec_hop_usec);
+  ADD(multi_squash_exec_reply_usec);
+  ADD(squashed_commands);
+  ADD(blocking_commands_in_pipelines);
+  ADD(blocked_on_interpreter);
+  ADD(rdb_save_usec);
+  ADD(rdb_save_count);
+
+  ADD(big_value_preemptions);
+  ADD(compressed_blobs);
+
+  ADD(oom_error_cmd_cnt);
+  ADD(conn_timeout_events);
+  ADD(psync_requests_total);
+
+  ADD(batch_write_commands_total);
+  ADD(batch_read_commands_total);
+  ADD(batch_read_commands_bytes);
+  ADD(batch_write_commands_bytes);
+  ADD(rw_throttle_batches_total);
+
+  if (this->tx_width_freq_arr.size() > 0) {
+    DCHECK_EQ(this->tx_width_freq_arr.size(), other.tx_width_freq_arr.size());
+    this->tx_width_freq_arr += other.tx_width_freq_arr;
+  } else {
+    this->tx_width_freq_arr = other.tx_width_freq_arr;
+  }
+  if (this->squash_width_freq_arr.size() > 0) {
+    DCHECK_EQ(this->squash_width_freq_arr.size(), other.squash_width_freq_arr.size());
+    this->squash_width_freq_arr += other.squash_width_freq_arr;
+  } else {
+    this->squash_width_freq_arr = other.squash_width_freq_arr;
+  }
+
+  ADD(stored_cmd_bytes);
+  return *this;
+#undef ADD
+}
+
+void MonitorsRepo::Add(facade::Connection* connection) {
+  VLOG(1) << "register connection "
+          << " at address 0x" << std::hex << (const void*)connection << " for thread "
+          << util::ProactorBase::me()->GetPoolIndex();
+
+  monitors_.push_back(connection);
+}
+
+void MonitorsRepo::Remove(const facade::Connection* conn) {
+  auto it = rng::find_if(monitors_, [&conn](const auto& val) { return val == conn; });
+  if (it != monitors_.end()) {
+    VLOG(1) << "removing connection 0x" << std::hex << conn << " releasing token";
+    monitors_.erase(it);
+  } else {
+    VLOG(1) << "no connection 0x" << std::hex << conn << " found in the registered list here";
+  }
+}
+
+void MonitorsRepo::NotifyChangeCount(bool added) {
+  if (added) {
+    ++global_count_;
+  } else {
+    DCHECK(global_count_ > 0);
+    --global_count_;
+  }
+}
+
+ServerState::ServerState() : interpreter_mgr_{absl::GetFlag(FLAGS_interpreter_per_thread)} {
+  CHECK(mi_heap_get_backing() == mi_heap_get_default());
+
+  mi_heap_t* tlh = mi_heap_new();
+  init_zmalloc_threadlocal(tlh);
+  data_heap_ = tlh;
+
+  UpdateFromFlags();
+}
+
+ServerState::~ServerState() {
+  watcher_fiber_.JoinIfNeeded();
+}
+
+void ServerState::Init(uint32_t thread_index, uint32_t num_shards,
+                       util::ListenerInterface* main_listener, acl::UserRegistry* registry) {
+  state_ = new ServerState();
+  state_->gstate_ = GlobalState::ACTIVE;
+  state_->thread_index_ = thread_index;
+  state_->user_registry = registry;
+  state_->stats = Stats(num_shards);
+  if (main_listener) {
+    state_->watcher_fiber_ = util::fb2::Fiber(
+        util::fb2::Launch::post, "ConnectionsWatcher",
+        [state = state_, main_listener] { state->ConnectionsWatcherFb(main_listener); });
+  }
+}
+
+void ServerState::Destroy() {
+  delete state_;
+  state_ = nullptr;
+}
+
+void ServerState::EnterLameDuck() {
+  gstate_ = GlobalState::SHUTTING_DOWN;
+  watcher_cv_.notify_all();
+}
+
+ServerState::MemoryUsageStats ServerState::GetMemoryUsage(uint64_t now_usec) const {
+  if (now_usec != used_mem_last_read_usec_) {
+    used_mem_last_read_usec_ = now_usec;
+    memory_stats_cached_.used_mem = used_mem_current.load(std::memory_order_relaxed);
+    memory_stats_cached_.rss_mem = rss_mem_current.load(std::memory_order_relaxed);
+  }
+  return memory_stats_cached_;
+}
+
+bool ServerState::ShouldDenyOnOOM(uint64_t now_usec) {
+  DCHECK_NE(now_usec, 0u);
+  if (is_master) {
+    auto memory_stats = GetMemoryUsage(now_usec);
+
+    size_t limit = max_memory_limit.load(memory_order_relaxed);
+    if (memory_stats.used_mem > limit ||
+        (rss_oom_deny_ratio > 0 && memory_stats.rss_mem > (limit * rss_oom_deny_ratio))) {
+      DLOG(WARNING) << "Out of memory, used " << memory_stats.used_mem << " ,rss "
+                    << memory_stats.rss_mem << " ,limit " << limit;
+      stats.oom_error_cmd_cnt++;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ServerState::AllowInlineScheduling() const {
+  // We can't allow inline scheduling during a full sync, because then journaling transactions
+  // will be scheduled before RdbLoader::LoadItemsBuffer is finished. We can't use the regular
+  // locking mechanism because RdbLoader is not using transactions.
+  if (gstate_ == GlobalState::LOADING)
+    return false;
+
+  return true;
+}
+
+void ServerState::SetPauseState(ClientPause state, bool start) {
+  client_pauses_[int(state)] += (start ? 1 : -1);
+  if (!client_pauses_[int(state)]) {
+    client_pause_ec_.notifyAll();
+  }
+}
+
+void ServerState::AwaitPauseState(bool is_write) {
+  client_pause_ec_.await([is_write, this]() {
+    return client_pauses_[int(ClientPause::ALL)] == 0 &&
+           (!is_write || client_pauses_[int(ClientPause::WRITE)] == 0);
+  });
+}
+
+void ServerState::DecommitMemory(uint8_t flags) {
+  if (flags & kDataHeap) {
+    mi_heap_collect(data_heap(), true);
+  }
+  if (flags & kBackingHeap) {
+    mi_heap_collect(mi_heap_get_backing(), true);
+  }
+
+  if (flags & kGlibcmalloc) {
+    // trims the memory (reduces RSS usage) from the malloc allocator. Does not present in
+    // MUSL lib.
+#ifdef __GLIBC__
+// There is an issue with malloc_trim and sanitizers because the asan replace malloc but is not
+// aware of malloc_trim which causes malloc_trim to segfault because it's not initialized properly
+#ifndef ABSL_HAVE_ADDRESS_SANITIZER
+    malloc_trim(0);
+#endif
+#endif
+  }
+}
+
+void ServerState::UpdateFromFlags() {
+  rss_oom_deny_ratio = absl::GetFlag(FLAGS_rss_oom_deny_ratio);
+  serialization_max_chunk_size = absl::GetFlag(FLAGS_serialization_max_chunk_size);
+  max_squash_cmd_num = absl::GetFlag(FLAGS_max_squashed_cmd_num);
+}
+
+vector<string> ServerState::GetMutableFlagNames() {
+  return base::GetFlagNames(FLAGS_rss_oom_deny_ratio, FLAGS_serialization_max_chunk_size,
+                            FLAGS_max_squashed_cmd_num);
+}
+
+Interpreter* ServerState::BorrowInterpreter() {
+  stats.blocked_on_interpreter++;
+  auto* ptr = interpreter_mgr_.Get();
+  stats.blocked_on_interpreter--;
+  return ptr;
+}
+
+void ServerState::ReturnInterpreter(Interpreter* ir) {
+  interpreter_mgr_.Return(ir);
+}
+
+void ServerState::FlushScriptCache() {
+  cached_script_params_.clear();
+  interpreter_mgr_.Reset();
+}
+
+void ServerState::AlterInterpreters(std::function<void(Interpreter*)> modf) {
+  interpreter_mgr_.Alter(std::move(modf));
+}
+
+ServerState* ServerState::SafeTLocal() {
+  // https://stackoverflow.com/a/75622732
+  asm volatile("");
+  return state_;
+}
+
+bool ServerState::ShouldLogSlowCmd(unsigned latency_usec) const {
+  return slow_log_shard_.IsEnabled() && latency_usec >= log_slower_than_usec;
+}
+
+void ServerState::ConnectionsWatcherFb(util::ListenerInterface* main) {
+  optional<facade::Connection::WeakRef> last_reference;
+
+  while (true) {
+    util::fb2::NoOpLock noop;
+    if (watcher_cv_.wait_for(noop, 1s, [this] { return gstate_ == GlobalState::SHUTTING_DOWN; })) {
+      break;
+    }
+
+    const uint32_t timeout = absl::GetFlag(FLAGS_timeout);
+    const uint32_t send_timeout = absl::GetFlag(FLAGS_send_timeout);
+    VLOG(1) << "ConnectionsWatcherFb: timeout=" << timeout << ", send_timeout=" << send_timeout;
+
+    if (timeout == 0 && send_timeout == 0) {
+      continue;
+    }
+
+    facade::Connection* from = nullptr;
+    if (last_reference && !last_reference->IsExpired()) {
+      from = last_reference->Get();
+    }
+
+    // We use weak refs, because ShutdownSelf below can potentially block the fiber,
+    // and during this time some of the connections might be destroyed. Weak refs allow checking
+    // validity of each connection.
+    vector<facade::Connection::WeakRef> conn_refs;
+
+    auto cb = [&](unsigned thread_index, util::Connection* conn) {
+      facade::Connection* dfly_conn = static_cast<facade::Connection*>(conn);
+      using Phase = facade::Connection::Phase;
+      auto phase = dfly_conn->phase();
+      bool is_replica = true;
+      if (dfly_conn->cntx()) {
+        is_replica = dfly_conn->cntx()->replica_conn;
+      }
+
+      bool idle_read = timeout != 0 && !is_replica && phase == Phase::READ_SOCKET &&
+                       dfly_conn->idle_time() > timeout;
+      bool stuck_sending = send_timeout != 0 && !is_replica && dfly_conn->IsSending() &&
+                           dfly_conn->GetSendWaitTimeSec() > send_timeout;
+
+      VLOG(2) << "Connection check: " << dfly_conn->GetClientInfo()
+              << ", phase=" << static_cast<int>(phase) << ", idle_time=" << dfly_conn->idle_time()
+              << ", is_replica=" << is_replica << ", is_sending=" << dfly_conn->IsSending()
+              << ", idle_read=" << idle_read << ", stuck_sending=" << stuck_sending;
+
+      if (idle_read || stuck_sending) {
+        conn_refs.push_back(dfly_conn->Borrow());
+      }
+    };
+
+    util::Connection* next = main->TraverseConnectionsOnThread(cb, 100, from);
+    if (next) {
+      last_reference = static_cast<facade::Connection*>(next)->Borrow();
+    } else {
+      last_reference.reset();
+    }
+
+    VLOG(1) << "Found " << conn_refs.size() << " connections to close due to timeout";
+    for (auto& ref : conn_refs) {
+      facade::Connection* conn = ref.Get();
+      if (conn) {
+        VLOG(1) << "Closing connection due to timeout: " << conn->GetClientInfo();
+        conn->ShutdownSelfBlocking();
+        stats.conn_timeout_events++;
+      }
+    }
+  }
+}
+
+void ServerState::RecordCmd(bool is_main_conn) {
+  if (is_main_conn) {
+    ++tl_connection_stats()->command_cnt_main;
+  } else {
+    ++tl_connection_stats()->command_cnt_other;
+  }
+  qps_.Inc();
+}
+}  // end of namespace dfly

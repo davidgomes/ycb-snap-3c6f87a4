@@ -1,0 +1,19 @@
+*3
+$8
+FUNCTION
+$4
+LOAD
+$16
+#!lua name=mylib
+*2
+$8
+FUNCTION
+$4
+LIST
+*3
+$8
+FUNCTION
+$6
+DELETE
+$5
+mylib

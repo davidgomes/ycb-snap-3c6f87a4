@@ -1,0 +1,161 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "server/journal/journal_slice.h"
+
+#include <absl/container/inlined_vector.h>
+#include <absl/flags/flag.h>
+#include <absl/strings/escaping.h>
+#include <absl/strings/str_cat.h>
+#include <fcntl.h>
+
+#include <filesystem>
+
+#include "base/function2.hpp"
+#include "base/logging.h"
+#include "server/journal/serializer.h"
+#include "util/fibers/fibers.h"
+
+ABSL_FLAG(uint32_t, shard_repl_backlog_len, 8192,
+          "The length of the circular replication log per shard");
+
+namespace dfly {
+namespace journal {
+using namespace std;
+using namespace util;
+
+JournalSlice::JournalSlice() {
+}
+
+JournalSlice::~JournalSlice() {
+}
+
+void JournalSlice::Init() {
+  // calling this function multiple times is allowed and it's a no-op.
+  if (ring_buffer_.capacity() > 0)
+    return;
+
+  ring_buffer_.set_capacity(absl::GetFlag(FLAGS_shard_repl_backlog_len));
+  ring_buffer_bytes_ = ring_buffer_.capacity() * sizeof(JournalItem);
+}
+
+bool JournalSlice::IsLSNInBuffer(LSN lsn) const {
+  DCHECK(ring_buffer_.capacity() > 0);
+
+  if (ring_buffer_.empty()) {
+    return false;
+  }
+
+  if (ring_buffer_.size() == 1) {
+    return ring_buffer_.front().lsn == lsn;
+  }
+
+  return ring_buffer_.front().lsn <= lsn && lsn <= ring_buffer_.back().lsn;
+}
+
+std::string_view JournalSlice::GetEntry(LSN lsn) const {
+  DCHECK(ring_buffer_.capacity() > 0 && IsLSNInBuffer(lsn));
+
+  auto start = ring_buffer_.front().lsn;
+  DCHECK(ring_buffer_[lsn - start].lsn == lsn);
+  return ring_buffer_[lsn - start].data;
+}
+
+void JournalSlice::SetFlushMode(bool allow_flush) {
+  DCHECK(allow_flush != enable_journal_flush_);
+  enable_journal_flush_ = allow_flush;
+  if (allow_flush) {
+    // This lock is never blocking because it contends with UnregisterOnChange, which is cpu only.
+    // Hence this lock prevents the UnregisterOnChange to start running in the middle of
+    // SetFlushMode.
+    std::shared_lock lk(cb_mu_);
+    for (auto k_v : journal_consumers_arr_) {
+      k_v.second->ThrottleIfNeeded();
+    }
+  }
+}
+
+void JournalSlice::AddLogRecord(const Entry& entry) {
+  DCHECK(ring_buffer_.capacity() > 0);
+
+  JournalChangeItem item;
+
+  {
+    FiberAtomicGuard fg;
+    item.journal_item.lsn = lsn_++;
+
+    // only used by RestoreStreamer
+    item.cmd = entry.payload.cmd;
+    item.slot = entry.slot;
+
+    io::StringSink sink;
+    JournalWriter writer{&sink};
+    writer.Write(entry);
+
+    std::move(sink).str().swap(item.journal_item.data);
+
+    if (item.journal_item.data.size() > 32) {
+      // for non-SSO strings capacity should not be much higher than size.
+      DCHECK_LE(item.journal_item.data.capacity(), item.journal_item.data.size() * 2);
+    }
+    VLOG(2) << "Writing item [" << item.journal_item.lsn << "]: " << entry.ToString();
+  }
+
+  CallOnChange(&item);
+}
+
+void JournalSlice::CallOnChange(JournalChangeItem* change_item) {
+  // This lock is never blocking because it contends with UnregisterOnChange, which is cpu only.
+  // Hence this lock prevents the UnregisterOnChange to start running in the middle of CallOnChange.
+  // CallOnChange is atomic if JournalSlice::SetFlushMode(false) is called before.
+  std::shared_lock lk(cb_mu_);
+  for (auto k_v : journal_consumers_arr_) {
+    k_v.second->ConsumeJournalChange(*change_item);
+  }
+  auto& item = change_item->journal_item;
+
+  // We preserve order here. After ConsumeJournalChange there can reordering
+  if (ring_buffer_.size() == ring_buffer_.capacity()) {
+    const size_t bytes_removed = ring_buffer_.front().data.capacity();
+    DCHECK_GE(ring_buffer_bytes_, bytes_removed);
+    ring_buffer_bytes_ -= bytes_removed;
+  }
+  if (!ring_buffer_.empty()) {
+    DCHECK(item.lsn == ring_buffer_.back().lsn + 1);
+  }
+  ring_buffer_.push_back(std::move(item));
+  auto& data = ring_buffer_.back().data;
+
+  // Small strings assignment keep the existing capacity intact due to SSO.
+  // Shrink strings in this case to prevent excessive memory usage.
+  if (data.size() < 32 && data.capacity() > 64) {
+    data.shrink_to_fit();
+  }
+  ring_buffer_bytes_ += data.capacity();
+
+  if (enable_journal_flush_) {
+    for (auto k_v : journal_consumers_arr_) {
+      k_v.second->ThrottleIfNeeded();
+    }
+  }
+}
+
+uint32_t JournalSlice::RegisterOnChange(JournalConsumerInterface* consumer) {
+  // mutex lock isn't needed due to iterators are not invalidated
+  uint32_t id = next_cb_id_++;
+  journal_consumers_arr_.emplace_back(id, consumer);
+  return id;
+}
+
+void JournalSlice::UnregisterOnChange(uint32_t id) {
+  // we need to wait until callback is finished before remove it
+  lock_guard lk(cb_mu_);
+  auto it = find_if(journal_consumers_arr_.begin(), journal_consumers_arr_.end(),
+                    [id](const auto& e) { return e.first == id; });
+  CHECK(it != journal_consumers_arr_.end());
+  journal_consumers_arr_.erase(it);
+}
+
+}  // namespace journal
+}  // namespace dfly

@@ -1,0 +1,1243 @@
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "server/cluster/cluster_family.h"
+
+#include <absl/cleanup/cleanup.h>
+#include <absl/strings/ascii.h>
+#include <absl/strings/str_cat.h>
+
+#include <memory>
+#include <mutex>
+#include <string>
+
+#include "base/flags.h"
+#include "base/logging.h"
+#include "facade/cmd_arg_parser.h"
+#include "facade/dragonfly_connection.h"
+#include "facade/dragonfly_listener.h"
+#include "facade/error.h"
+#include "facade/reply_builder.h"
+#include "server/acl/acl_commands_def.h"
+#include "server/channel_store.h"
+#include "server/cluster/coordinator.h"
+#include "server/command_registry.h"
+#include "server/conn_context.h"
+#include "server/dflycmd.h"
+#include "server/error.h"
+#include "server/journal/journal.h"
+#include "server/main_service.h"
+#include "server/namespaces.h"
+#include "server/server_family.h"
+#include "server/server_state.h"
+#include "server/transaction.h"
+#include "util/fibers/synchronization.h"
+
+namespace rng = std::ranges;
+
+ABSL_FLAG(std::string, cluster_announce_ip, "",
+          "IP address that Dragonfly announces to cluster clients");
+
+ABSL_FLAG(std::string, cluster_node_id, "",
+          "ID within a cluster, used for slot assignment. MUST be unique. If empty, uses master "
+          "replication ID (random string)");
+
+ABSL_DECLARE_FLAG(int32_t, port);
+ABSL_DECLARE_FLAG(uint16_t, announce_port);
+ABSL_DECLARE_FLAG(bool, managed_service_info);
+
+namespace dfly {
+namespace acl {
+constexpr uint32_t kCluster = SLOW;
+// Reconsider to maybe more sensible defaults
+constexpr uint32_t kDflyCluster = ADMIN | SLOW;
+constexpr uint32_t kReadOnly = FAST | CONNECTION;
+constexpr uint32_t kReadWrite = FAST | CONNECTION;
+constexpr uint32_t kDflyMigrate = ADMIN | SLOW | DANGEROUS;
+}  // namespace acl
+}  // namespace dfly
+
+namespace dfly::cluster {
+namespace {
+
+using namespace std;
+using namespace facade;
+using namespace util;
+using Payload = journal::Entry::Payload;
+using CI = CommandId;
+
+constexpr char kIdNotFound[] = "syncid not found";
+
+constexpr string_view kClusterDisabled =
+    "Cluster is disabled. Enabled via passing --cluster_mode=emulated|yes";
+
+}  // namespace
+
+ClusterFamily::ClusterFamily(ServerFamily* server_family) : server_family_(server_family) {
+  CHECK_NOTNULL(server_family_);
+
+  config_registry.RegisterMutable("cluster_announce_ip");
+  config_registry.RegisterMutable("announce_port");
+
+  InitializeCluster();
+
+  id_ = absl::GetFlag(FLAGS_cluster_node_id);
+  if (id_.empty()) {
+    id_ = server_family_->master_replid();
+  } else if (IsClusterEmulated()) {
+    LOG(ERROR) << "Setting --cluster_node_id in emulated mode is unsupported";
+    exit(1);
+  }
+}
+
+void ClusterFamily::Shutdown() {
+  Coordinator::Current().Shutdown();
+  shard_set->pool()->at(0)->Await([this]() ABSL_LOCKS_EXCLUDED(set_config_mu) {
+    PreparedToRemoveOutgoingMigrations outgoing_migrations;  // should be removed without mutex lock
+    {
+      util::fb2::LockGuard lk(set_config_mu);
+      if (!ClusterConfig::Current())
+        return;
+
+      auto empty_config = ClusterConfig::Current()->CloneWithoutMigrations();
+      outgoing_migrations = TakeOutOutgoingMigrations(empty_config, ClusterConfig::Current());
+      RemoveIncomingMigrations(
+          empty_config->GetFinishedIncomingMigrations(ClusterConfig::Current()));
+
+      util::fb2::LockGuard migration_lk(migration_mu_);
+      DCHECK(outgoing_migration_jobs_.empty());
+      DCHECK(incoming_migrations_jobs_.empty());
+    }
+  });
+}
+
+std::optional<ClusterShardInfos> ClusterFamily::GetShardInfos(ConnectionContext* cntx) const {
+  if (IsClusterEmulated()) {
+    return {GetEmulatedShardInfo(cntx)};
+  }
+
+  if (ClusterConfig::Current() != nullptr) {
+    return ClusterConfig::Current()->GetConfig();
+  }
+  return nullopt;
+}
+
+ClusterShardInfo ClusterFamily::GetEmulatedShardInfo(ConnectionContext* cntx) const {
+  ClusterShardInfo info{.slot_ranges = SlotRanges({{.start = 0, .end = kMaxSlotNum}}),
+                        .master = {},
+                        .replicas = {},
+                        .migrations = {}};
+
+  optional<Metrics::ReplicaInfo> repl_info = server_family_->GetReplicaSummary();
+  ServerState& etl = *ServerState::tlocal();
+  if (!repl_info) {
+    DCHECK(etl.is_master);
+    std::string cluster_announce_ip = absl::GetFlag(FLAGS_cluster_announce_ip);
+    std::string preferred_endpoint =
+        cluster_announce_ip.empty() ? cntx->conn()->LocalBindAddress() : cluster_announce_ip;
+    uint16_t cluster_announce_port = absl::GetFlag(FLAGS_announce_port);
+    uint16_t preferred_port = cluster_announce_port == 0
+                                  ? static_cast<uint16_t>(absl::GetFlag(FLAGS_port))
+                                  : cluster_announce_port;
+
+    info.master = {{.id = id_, .ip = preferred_endpoint, .port = preferred_port},
+                   NodeHealth::ONLINE};
+
+    if (cntx->conn()->IsPrivileged() || !absl::GetFlag(FLAGS_managed_service_info)) {
+      for (const auto& replica : server_family_->GetDflyCmd()->GetReplicasRoleInfo()) {
+        info.replicas.push_back({{.id = replica.id,
+                                  .ip = replica.address,
+                                  .port = static_cast<uint16_t>(replica.listening_port)},
+                                 NodeHealth::ONLINE});
+      }
+    }
+  } else {
+    // TODO: We currently don't save the master's ID in the replica
+    info.master = {{.id = "", .ip = repl_info->summary.host, .port = repl_info->summary.port},
+                   NodeHealth::ONLINE};
+    info.replicas.push_back({{.id = id_,
+                              .ip = cntx->conn()->LocalBindAddress(),
+                              .port = static_cast<uint16_t>(absl::GetFlag(FLAGS_port))},
+                             NodeHealth::ONLINE});
+  }
+
+  return info;
+}
+
+void ClusterFamily::ClusterHelp(SinkReplyBuilder* builder) {
+  string_view help_arr[] = {
+      "CLUSTER <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+      "SLOTS",
+      "   Return information about slots range mappings. Each range is made of:",
+      "   start, end, master and replicas IP addresses, ports and ids.",
+      "NODES",
+      "   Return cluster configuration seen by node. Output format:",
+      "   <id> <ip:port> <flags> <master> <pings> <pongs> <epoch> <link> <slot> ...",
+      "INFO",
+      "  Return information about the cluster",
+      "HELP",
+      "    Prints this help.",
+  };
+  auto* rb = static_cast<RedisReplyBuilder*>(builder);
+  return rb->SendSimpleStrArr(help_arr);
+}
+
+namespace {
+void ClusterShardsImpl(const ClusterShardInfos& config, SinkReplyBuilder* builder) {
+  // For more details https://redis.io/commands/cluster-shards/
+  constexpr unsigned int kEntrySize = 4;
+  auto* rb = static_cast<RedisReplyBuilder*>(builder);
+
+  auto WriteNode = [&](const ClusterExtendedNodeInfo& node, string_view role) {
+    constexpr unsigned int kNodeSize = 14;
+    rb->StartArray(kNodeSize);
+    rb->SendBulkString("id");
+    rb->SendBulkString(node.id);
+    rb->SendBulkString("endpoint");
+    rb->SendBulkString(node.ip);
+    rb->SendBulkString("ip");
+    rb->SendBulkString(node.ip);
+    rb->SendBulkString("port");
+    rb->SendLong(node.port);
+    rb->SendBulkString("role");
+    rb->SendBulkString(role);
+    rb->SendBulkString("replication-offset");
+    rb->SendLong(0);
+    rb->SendBulkString("health");
+    rb->SendBulkString(ToString(node.health));
+  };
+
+  rb->StartArray(config.size());
+  for (const auto& shard : config) {
+    rb->StartArray(kEntrySize);
+    rb->SendBulkString("slots");
+
+    rb->StartArray(shard.slot_ranges.Size() * 2);
+    for (const auto& slot_range : shard.slot_ranges) {
+      rb->SendLong(slot_range.start);
+      rb->SendLong(slot_range.end);
+    }
+
+    rb->SendBulkString("nodes");
+    rb->StartArray(1 + shard.replicas.size());
+    WriteNode(shard.master, "master");
+    for (const auto& replica : shard.replicas) {
+      WriteNode(replica, "replica");
+    }
+  }
+}
+}  // namespace
+
+void ClusterFamily::ClusterShards(SinkReplyBuilder* builder, ConnectionContext* cntx) {
+  auto config = GetShardInfos(cntx);
+  if (config) {
+    // we need to remove hiden replicas
+    auto shards_info = config->Unwrap();
+    for (auto& shard : shards_info) {
+      std::erase_if(shard.replicas, [](const auto& r) { return r.health == NodeHealth::HIDDEN; });
+    }
+    return ClusterShardsImpl({shards_info}, builder);
+  }
+  return builder->SendError(kClusterNotConfigured);
+}
+
+namespace {
+void ClusterSlotsImpl(ClusterShardInfos config, SinkReplyBuilder* builder) {
+  // For more details https://redis.io/commands/cluster-slots/
+  auto* rb = static_cast<RedisReplyBuilder*>(builder);
+
+  auto WriteNode = [&](const ClusterNodeInfo& node) {
+    constexpr unsigned int kNodeSize = 3;
+    rb->StartArray(kNodeSize);
+    rb->SendBulkString(node.ip);
+    rb->SendLong(node.port);
+    rb->SendBulkString(node.id);
+  };
+
+  unsigned int slot_ranges = 0;
+
+  // we need to remove hiden and fail replicas
+  auto shards_info = config.Unwrap();
+  for (auto& shard : shards_info) {
+    slot_ranges += shard.slot_ranges.Size();
+    std::erase_if(shard.replicas, [](const auto& r) {
+      return r.health == NodeHealth::HIDDEN || r.health == NodeHealth::FAIL ||
+             r.health == NodeHealth::LOADING;
+    });
+  }
+
+  config = {shards_info};
+
+  rb->StartArray(slot_ranges);
+  for (const auto& shard : config) {
+    for (const auto& slot_range : shard.slot_ranges) {
+      const unsigned int array_size =
+          /* slot-start, slot-end */ 2 + /* master */ 1 + /* replicas */ shard.replicas.size();
+      rb->StartArray(array_size);
+      rb->SendLong(slot_range.start);
+      rb->SendLong(slot_range.end);
+      WriteNode(shard.master);
+      for (const auto& replica : shard.replicas) {
+        WriteNode(replica);
+      }
+    }
+  }
+}
+}  // namespace
+
+void ClusterFamily::ClusterSlots(SinkReplyBuilder* builder, ConnectionContext* cntx) {
+  auto shard_infos = GetShardInfos(cntx);
+  if (shard_infos) {
+    return ClusterSlotsImpl(*shard_infos, builder);
+  }
+  return builder->SendError(kClusterNotConfigured);
+}
+
+namespace {
+void ClusterNodesImpl(const ClusterShardInfos& config, string_view my_id,
+                      SinkReplyBuilder* builder) {
+  // For more details https://redis.io/commands/cluster-nodes/
+
+  string result;
+
+  auto WriteNode = [&](const ClusterExtendedNodeInfo& node, string_view role, string_view master_id,
+                       const SlotRanges& ranges) {
+    absl::StrAppend(&result, node.id, " ");
+
+    absl::StrAppend(&result, node.ip, ":", node.port, "@", node.port, " ");
+
+    if (my_id == node.id) {
+      absl::StrAppend(&result, "myself,");
+    }
+    absl::StrAppend(&result, role, " ");
+
+    absl::StrAppend(&result, master_id, " ");
+
+    absl::StrAppend(&result,
+                    node.health != NodeHealth::FAIL ? "0 0 0 connected" : "0 0 0 disconnected");
+
+    for (const auto& range : ranges) {
+      absl::StrAppend(&result, " ", range.start);
+      if (range.start != range.end) {
+        absl::StrAppend(&result, "-", range.end);
+      }
+    }
+
+    // Separate lines with only \n, not \r\n, see #2726
+    absl::StrAppend(&result, "\n");
+  };
+
+  for (const auto& shard : config) {
+    WriteNode(shard.master, "master", "-", shard.slot_ranges);
+    for (const auto& replica : shard.replicas) {
+      // Only the master prints ranges, so we send an empty set for replicas.
+      if (replica.health != NodeHealth::HIDDEN) {
+        WriteNode(replica, "slave", shard.master.id, {});
+      }
+    }
+  }
+
+  auto* rb = static_cast<RedisReplyBuilder*>(builder);
+  return rb->SendBulkString(result);
+}
+}  // namespace
+
+void ClusterFamily::ClusterNodes(SinkReplyBuilder* builder, ConnectionContext* cntx) {
+  auto shard_infos = GetShardInfos(cntx);
+  if (shard_infos) {
+    return ClusterNodesImpl(*shard_infos, id_, builder);
+  }
+  return builder->SendError(kClusterNotConfigured);
+}
+
+namespace {
+void ClusterInfoImpl(const ClusterShardInfos& config, SinkReplyBuilder* builder) {
+  std::string msg;
+  auto append = [&msg](absl::AlphaNum a1, absl::AlphaNum a2) {
+    // Separate lines with \r\n, not \n, see #2726
+    absl::StrAppend(&msg, a1, ":", a2, "\r\n");
+  };
+
+  // Initialize response variables to emulated mode.
+  string_view state = "ok"sv;
+  SlotId slots_assigned = kMaxSlotNum + 1;
+  size_t known_nodes = 1;
+  long epoch = 1;
+  size_t cluster_size = 1;
+
+  if (config.empty()) {
+    state = "fail"sv;
+    slots_assigned = 0;
+    cluster_size = 0;
+    known_nodes = 0;
+  } else {
+    known_nodes = 0;
+    cluster_size = 0;
+    for (const auto& shard_config : config) {
+      known_nodes += 1;  // For master
+      known_nodes += shard_config.replicas.size();
+
+      if (!shard_config.slot_ranges.Empty()) {
+        ++cluster_size;
+      }
+    }
+  }
+
+  append("cluster_state", state);
+  append("cluster_slots_assigned", slots_assigned);
+  append("cluster_slots_ok", slots_assigned);  // We do not support other failed nodes.
+  append("cluster_slots_pfail", 0);
+  append("cluster_slots_fail", 0);
+  append("cluster_known_nodes", known_nodes);
+  append("cluster_size", cluster_size);
+  append("cluster_current_epoch", epoch);
+  append("cluster_my_epoch", 1);
+  append("cluster_stats_messages_ping_sent", 1);
+  append("cluster_stats_messages_pong_sent", 1);
+  append("cluster_stats_messages_sent", 1);
+  append("cluster_stats_messages_ping_received", 1);
+  append("cluster_stats_messages_pong_received", 1);
+  append("cluster_stats_messages_meet_received", 0);
+  append("cluster_stats_messages_received", 1);
+  auto* rb = static_cast<RedisReplyBuilder*>(builder);
+  rb->SendBulkString(msg);
+}
+}  // namespace
+
+void ClusterFamily::ClusterInfo(SinkReplyBuilder* builder, ConnectionContext* cntx) {
+  auto shard_infos = GetShardInfos(cntx);
+  return ClusterInfoImpl(shard_infos.value_or(ClusterShardInfos{}), builder);
+}
+
+void ClusterFamily::KeySlot(facade::ParsedArgs args, SinkReplyBuilder* builder) {
+  if (args.size() != 2) {
+    return builder->SendError(WrongNumArgsError("CLUSTER KEYSLOT"));
+  }
+
+  SlotId id = dfly::KeySlot(args[1]);
+  return builder->SendLong(id);
+}
+
+void ClusterFamily::Cluster(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // In emulated cluster mode, all slots are mapped to the same host, and number of cluster
+  // instances is thus 1.
+  ParsedArgs full_args = parser.UnparsedArgs();
+  string sub_cmd = absl::AsciiStrToUpper(parser.Next());
+
+  auto* builder = cmd_cntx->rb();
+  if (!IsClusterEnabledOrEmulated()) {
+    return builder->SendError(kClusterDisabled);
+  }
+
+  if (sub_cmd == "KEYSLOT") {
+    return KeySlot(full_args, builder);
+  }
+
+  if (parser.HasNext()) {
+    return builder->SendError(WrongNumArgsError(absl::StrCat("CLUSTER ", sub_cmd)));
+  }
+
+  auto* cntx = cmd_cntx->server_conn_cntx();
+  if (sub_cmd == "HELP") {
+    return ClusterHelp(builder);
+  } else if (sub_cmd == "MYID") {
+    return ClusterMyId(builder);
+  } else if (sub_cmd == "SHARDS") {
+    return ClusterShards(builder, cntx);
+  } else if (sub_cmd == "SLOTS") {
+    return ClusterSlots(builder, cntx);
+  } else if (sub_cmd == "NODES") {
+    return ClusterNodes(builder, cntx);
+  } else if (sub_cmd == "INFO") {
+    return ClusterInfo(builder, cntx);
+  } else {
+    return builder->SendError(facade::UnknownSubCmd(sub_cmd, "CLUSTER"), facade::kSyntaxErrType);
+  }
+}
+
+void ClusterFamily::ReadOnly(CmdArgParser parser, CommandContext* cmd_cntx) {
+  cmd_cntx->rb()->SendOk();
+}
+
+void ClusterFamily::ReadWrite(CmdArgParser parser, CommandContext* cmd_cntx) {
+  if (!IsClusterEmulated()) {
+    return cmd_cntx->SendError(kClusterDisabled);
+  }
+  cmd_cntx->rb()->SendOk();
+}
+
+void ClusterFamily::DflyCluster(CmdArgParser parser, CommandContext* cmd_cntx) {
+  auto* builder = cmd_cntx->rb();
+  auto* cntx = cmd_cntx->server_conn_cntx();
+  if (!(IsClusterEnabled() || (IsClusterEmulated() && cntx->journal_emulated))) {
+    return builder->SendError("Cluster is disabled. Use --cluster_mode=yes to enable.");
+  }
+
+  string sub_cmd = absl::AsciiStrToUpper(parser.Next());  // remove subcommand name
+  if (sub_cmd == "GETSLOTINFO") {
+    return DflyClusterGetSlotInfo(parser, cmd_cntx);
+  } else if (sub_cmd == "CONFIG") {
+    return DflyClusterConfig(parser, cmd_cntx);
+  } else if (sub_cmd == "FLUSHSLOTS") {
+    return DflyClusterFlushSlots(parser, cmd_cntx);
+  } else if (sub_cmd == "SLOT-MIGRATION-STATUS") {
+    return DflySlotMigrationStatus(parser, cmd_cntx);
+  }
+
+  return builder->SendError(UnknownSubCmd(sub_cmd, "DFLYCLUSTER"), kSyntaxErrType);
+}
+
+void ClusterFamily::ClusterMyId(SinkReplyBuilder* builder) {
+  builder->SendSimpleString(id_);
+}
+
+namespace {
+
+// FlushSlots calls RegisterOnChange which requires the shard lock to be held (see #7153).
+// Execute under a global transaction so the shard lock is acquired properly.
+void DeleteSlots(Transaction* trans, const SlotRanges& slots_ranges) {
+  if (slots_ranges.Empty()) {
+    return;
+  }
+
+  trans->Execute(
+      [&slots_ranges](Transaction* t, EngineShard* shard) {
+        namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id()).FlushSlots(slots_ranges);
+        return OpStatus::OK;
+      },
+      true);
+
+  auto deleted = SlotSet(slots_ranges);
+  channel_store->UnsubscribeAfterClusterSlotMigration(deleted);
+}
+
+void WriteFlushSlotsToJournal(const SlotRanges& slot_ranges) {
+  if (slot_ranges.Empty()) {
+    return;
+  }
+
+  // Build args
+  vector<string> args;
+  args.reserve(slot_ranges.Size() + 1);
+  args.push_back("FLUSHSLOTS");
+  for (SlotRange range : slot_ranges) {
+    args.push_back(absl::StrCat(range.start));
+    args.push_back(absl::StrCat(range.end));
+  }
+
+  // Build view
+  vector<string_view> args_view(args.size());
+  for (size_t i = 0; i < args.size(); ++i) {
+    args_view[i] = args[i];
+  }
+
+  auto cb = [&](auto*) {
+    EngineShard* shard = EngineShard::tlocal();
+    if (shard == nullptr) {
+      return;
+    }
+
+    if (!shard->journal()) {
+      return;
+    }
+
+    // Send journal entry
+    // TODO: Break slot migration upon FLUSHSLOTS
+    journal::RecordEntry(/* txid= */ 0, journal::Op::COMMAND, /* dbid= */ 0, nullopt,
+                         Payload("DFLYCLUSTER", args_view));
+  };
+  shard_set->pool()->AwaitFiberOnAll(std::move(cb));
+}
+}  // namespace
+
+void ClusterFamily::DflyClusterConfig(CmdArgParser parser, CommandContext* cmd_cntx) {
+  if (parser.UnparsedArgs().size() != 1) {
+    return cmd_cntx->SendError(WrongNumArgsError("DFLYCLUSTER CONFIG"));
+  }
+
+  string_view json_str = parser.Next();
+  shared_ptr<ClusterConfig> new_config = ClusterConfig::CreateFromConfig(id_, json_str);
+  if (new_config == nullptr) {
+    LOG(WARNING) << "Can't set cluster config";
+    return cmd_cntx->SendError("Invalid cluster configuration.");
+  } else if (ClusterConfig::Current() &&
+             ClusterConfig::Current()->GetConfig() == new_config->GetConfig()) {
+    return cmd_cntx->SendOk();
+  }
+
+  PreparedToRemoveOutgoingMigrations outgoing_migrations;  // should be removed without mutex lock
+
+  {
+    VLOG(1) << "Setting new cluster config: " << json_str;
+    util::fb2::LockGuard gu(set_config_mu);
+
+    outgoing_migrations = TakeOutOutgoingMigrations(new_config, ClusterConfig::Current());
+    auto incoming_slots_to_flush = RemoveIncomingMigrations(
+        new_config->GetFinishedIncomingMigrations(ClusterConfig::Current()));
+
+    SlotRanges enable_slots, disable_slots;
+
+    {
+      util::fb2::LockGuard lk(migration_mu_);
+      // If migration state is changed simultaneously, the changes to config will be applied after
+      // set_config_mu is unlocked and even if we apply the same changes 2 times it's not a problem
+      for (const auto& m : incoming_migrations_jobs_) {
+        if (m->GetState() == MigrationState::C_FINISHED) {
+          enable_slots.Merge(m->GetSlots());
+        }
+      }
+      for (const auto& m : outgoing_migration_jobs_) {
+        if (m->GetState() == MigrationState::C_FINISHED) {
+          disable_slots.Merge(m->GetSlots());
+        }
+      }
+    }
+
+    new_config = new_config->CloneWithChanges(enable_slots, disable_slots);
+
+    // Capture prev config before SetCurrent so StartNewSlotMigrations can diff correctly.
+    auto prev_config = ClusterConfig::Current();
+
+    SlotSet before =
+        ClusterConfig::Current() ? ClusterConfig::Current()->GetOwnedSlots() : SlotSet(true);
+
+    auto* conn = cmd_cntx->conn();
+    // Ignore blocked commands because we filter them with CancelBlockingOnThread
+    DispatchTracker tracker{server_family_->GetNonPriviligedListeners(), conn,
+                            true /* ignore paused */, true /* ignore blocked */};
+
+    auto blocking_filter = [&new_config](ArgSlice keys) {
+      bool moved =
+          any_of(keys.begin(), keys.end(), [&](auto k) { return !new_config->IsMySlot(k); });
+      return moved ? OpStatus::KEY_MOVED : OpStatus::OK;
+    };
+
+    auto cb = [this, &tracker, &new_config, blocking_filter](util::ProactorBase*) {
+      server_family_->CancelBlockingOnThread(blocking_filter);
+      ClusterConfig::SetCurrent(new_config);
+      tracker.TrackOnThread();
+    };
+
+    server_family_->service().proactor_pool().AwaitFiberOnAll(std::move(cb));
+    DCHECK(ClusterConfig::Current() != nullptr);
+
+    if (!tracker.Wait(absl::Seconds(1))) {
+      LOG(WARNING) << "Cluster config change timed for: " << MyID();
+    }
+
+    SlotSet after = ClusterConfig::Current()->GetOwnedSlots();
+    if (ServerState::tlocal()->is_master) {
+      auto deleted_slots = (before.GetRemovedSlots(after)).ToSlotRanges();
+      deleted_slots.Merge(outgoing_migrations.slot_ranges);
+      deleted_slots.Merge(incoming_slots_to_flush);
+      DeleteSlots(cmd_cntx->tx(), deleted_slots);
+      LOG_IF(INFO, !deleted_slots.Empty())
+          << "Flushing newly unowned slots: " << deleted_slots.ToString();
+      WriteFlushSlotsToJournal(deleted_slots);
+    }
+
+    // Start new migrations only after stale data is flushed. This ensures DFLYMIGRATE FLOW
+    // cannot write data that is immediately wiped by DeleteSlots above.
+    StartNewSlotMigrations(*new_config, prev_config);
+  }
+
+  return cmd_cntx->SendOk();
+}
+
+void ClusterFamily::DflyClusterGetSlotInfo(CmdArgParser parser, CommandContext* cmd_cntx) {
+  parser.ExpectTag("SLOTS");
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
+
+  RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
+
+  vector<std::pair<SlotId, SlotStats>> slots_stats;
+  while (parser.HasNext()) {
+    auto arg = parser.Next<std::string_view>();
+    // Check if argument contains a dash for range notation (e.g., "1-100")
+    size_t dash_pos = arg.find('-');
+    if (dash_pos != std::string_view::npos && dash_pos > 0) {
+      // Parse as range: start-end
+      std::string_view start_str = arg.substr(0, dash_pos);
+      std::string_view end_str = arg.substr(dash_pos + 1);
+
+      uint32_t start_slot, end_slot;
+      if (!absl::SimpleAtoi(start_str, &start_slot) || !absl::SimpleAtoi(end_str, &end_slot)) {
+        return cmd_cntx->SendError("Invalid slot range format");
+      }
+
+      if (start_slot > kMaxSlotNum || end_slot > kMaxSlotNum) {
+        return cmd_cntx->SendError("Invalid slot id");
+      }
+
+      // Swap if range is specified in reverse order (e.g., "100-0")
+      if (start_slot > end_slot) {
+        std::swap(start_slot, end_slot);
+      }
+
+      for (uint32_t sid = start_slot; sid <= end_slot; ++sid) {
+        slots_stats.emplace_back(sid, SlotStats{});
+      }
+    } else {
+      // Parse as single slot id
+      uint32_t sid;
+      if (!absl::SimpleAtoi(arg, &sid)) {
+        return cmd_cntx->SendError(kInvalidIntErr);
+      }
+      if (sid > kMaxSlotNum) {
+        return cmd_cntx->SendError("Invalid slot id");
+      }
+      slots_stats.emplace_back(sid, SlotStats{});
+    }
+  }
+
+  if (slots_stats.empty()) {
+    return cmd_cntx->SendError(kSyntaxErr);
+  }
+
+  fb2::Mutex mu;
+
+  auto cb = [&](auto*) ABSL_LOCKS_EXCLUDED(mu) {
+    EngineShard* shard = EngineShard::tlocal();
+    if (shard == nullptr)
+      return;
+
+    util::fb2::LockGuard lk(mu);
+    for (auto& [slot, data] : slots_stats) {
+      data += namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id()).GetSlotStats(slot);
+    }
+  };
+
+  shard_set->pool()->AwaitFiberOnAll(std::move(cb));
+
+  rb->StartArray(slots_stats.size());
+
+  for (const auto& slot_data : slots_stats) {
+    rb->StartArray(9);
+    rb->SendLong(slot_data.first);
+    rb->SendBulkString("key_count");
+    rb->SendLong(slot_data.second.key_count);
+    rb->SendBulkString("total_reads");
+    rb->SendLong(slot_data.second.total_reads);
+    rb->SendBulkString("total_writes");
+    rb->SendLong(slot_data.second.total_writes);
+
+    // Account for both the values and the table space of the entries.
+    // Each entry is comprised from CompactObj for key and CompactObj for value.
+    // Sometimes the values are very small and table space becomes significant.
+    rb->SendBulkString("memory_bytes");
+    rb->SendLong(slot_data.second.memory_bytes +
+                 slot_data.second.key_count * sizeof(CompactObj) * 2);
+  }
+}
+
+void ClusterFamily::DflyClusterFlushSlots(CmdArgParser parser, CommandContext* cmd_cntx) {
+  LOG(INFO) << "Got DFLYCLUSTER FLUSHSLOTS " << parser.UnparsedArgs();
+
+  std::vector<SlotRange> slot_ranges;
+
+  do {
+    auto [slot_start, slot_end] = parser.Next<ParsedSlotId, ParsedSlotId>();
+    RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
+    if (slot_start > slot_end) {
+      return cmd_cntx->SendError("Invalid slot range");
+    }
+    slot_ranges.emplace_back(SlotRange{slot_start, slot_end});
+  } while (parser.HasNext());
+
+  DeleteSlots(cmd_cntx->tx(), SlotRanges(std::move(slot_ranges)));
+
+  return cmd_cntx->SendOk();
+}
+
+void ClusterFamily::StartNewSlotMigrations(const ClusterConfig& new_config,
+                                           const std::shared_ptr<ClusterConfig>& prev_config) {
+  // TODO Add validating and error processing
+  auto out_migrations = new_config.GetNewOutgoingMigrations(prev_config);
+  auto in_migrations = new_config.GetNewIncomingMigrations(prev_config);
+
+  util::fb2::LockGuard lk(migration_mu_);
+
+  for (auto& m : out_migrations) {
+    auto migration = make_shared<OutgoingMigration>(std::move(m), this, server_family_);
+    outgoing_migration_jobs_.emplace_back(migration);
+    migration->Start();
+  }
+
+  for (auto& m : in_migrations) {
+    auto migration = make_shared<IncomingSlotMigration>(m.node_info.id, &server_family_->service(),
+                                                        m.slot_ranges);
+    incoming_migrations_jobs_.emplace_back(migration);
+  }
+}
+
+static string_view StateToStr(MigrationState state) {
+  switch (state) {
+    case MigrationState::C_CONNECTING:
+      return "CONNECTING"sv;
+    case MigrationState::C_SYNC:
+      return "SYNC"sv;
+    case MigrationState::C_ERROR:
+      return "ERROR"sv;
+    case MigrationState::C_FINISHED:
+      return "FINISHED"sv;
+    case MigrationState::C_FATAL:
+      return "FATAL"sv;
+  }
+  DCHECK(false) << "Unknown State value " << static_cast<underlying_type_t<MigrationState>>(state);
+  return "UNDEFINED_STATE"sv;
+}
+
+void ClusterFamily::DflySlotMigrationStatus(CmdArgParser parser, CommandContext* cmd_cntx) {
+  util::fb2::LockGuard lk(migration_mu_);
+
+  string_view node_id;
+  if (parser.HasNext()) {
+    node_id = parser.Next<std::string_view>();
+    RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
+  }
+
+  struct Reply {
+    string_view direction;
+    string node_id;
+    string_view state;
+    size_t keys_number;
+    string error;
+  };
+  vector<Reply> reply;
+  reply.reserve(incoming_migrations_jobs_.size() + outgoing_migration_jobs_.size());
+
+  auto append_answer = [&reply](string_view direction, string node_id, string_view filter,
+                                MigrationState state, size_t keys_number, string error) {
+    if (filter.empty() || filter == node_id) {
+      error = error.empty() ? "0" : error;
+      reply.emplace_back(
+          Reply{direction, std::move(node_id), StateToStr(state), keys_number, std::move(error)});
+    }
+  };
+
+  for (const auto& m : incoming_migrations_jobs_) {
+    append_answer("in", m->GetSourceID(), node_id, m->GetState(), m->GetKeyCount(),
+                  m->GetErrorStr());
+  }
+  for (const auto& m : outgoing_migration_jobs_) {
+    append_answer("out", m->GetMigrationInfo().node_info.id, node_id, m->GetState(),
+                  m->GetKeyCount(), m->GetErrorStr());
+  }
+
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
+  rb->StartArray(reply.size());
+  for (const auto& r : reply) {
+    rb->StartArray(5);
+    rb->SendBulkString(r.direction);
+    rb->SendBulkString(r.node_id);
+    rb->SendBulkString(r.state);
+    rb->SendLong(r.keys_number);
+    rb->SendBulkString(r.error);
+  }
+}
+
+void ClusterFamily::DflyMigrate(CmdArgParser parser, CommandContext* cmd_cntx) {
+  string sub_cmd = absl::AsciiStrToUpper(parser.Next());
+
+  if (sub_cmd == "INIT") {
+    InitMigration(parser, cmd_cntx);
+  } else if (sub_cmd == "FLOW") {
+    DflyMigrateFlow(parser, cmd_cntx);
+  } else if (sub_cmd == "ACK") {
+    DflyMigrateAck(parser, cmd_cntx);
+  } else {
+    cmd_cntx->SendError(facade::UnknownSubCmd(sub_cmd, "DFLYMIGRATE"), facade::kSyntaxErrType);
+  }
+}
+
+std::shared_ptr<IncomingSlotMigration> ClusterFamily::GetIncomingMigration(
+    std::string_view source_id) {
+  util::fb2::LockGuard lk(migration_mu_);
+  for (const auto& mj : incoming_migrations_jobs_) {
+    if (mj->GetSourceID() == source_id) {
+      return mj;
+    }
+  }
+  return nullptr;
+}
+
+ClusterFamily::PreparedToRemoveOutgoingMigrations::~PreparedToRemoveOutgoingMigrations() = default;
+
+[[nodiscard]] ClusterFamily::PreparedToRemoveOutgoingMigrations
+ClusterFamily::TakeOutOutgoingMigrations(shared_ptr<ClusterConfig> new_config,
+                                         shared_ptr<ClusterConfig> old_config) {
+  auto migrations = new_config->GetFinishedOutgoingMigrations(old_config);
+  util::fb2::LockGuard lk(migration_mu_);
+  SlotRanges removed_slots;
+  PreparedToRemoveOutgoingMigrations res;
+  for (const auto& m : migrations) {
+    auto it = std::find_if(outgoing_migration_jobs_.begin(), outgoing_migration_jobs_.end(),
+                           [&m](const auto& om) {
+                             // we can have only one migration per target-source pair
+                             return m.node_info.id == om->GetMigrationInfo().node_info.id;
+                           });
+    DCHECK(it != outgoing_migration_jobs_.end());
+    DCHECK(it->get() != nullptr);
+    OutgoingMigration& migration = *it->get();
+    const auto& slots = migration.GetSlots();
+    removed_slots.Merge(slots);
+    LOG(INFO) << "Outgoing migration cancelled: slots " << slots.ToString() << " to "
+              << migration.GetHostIp() << ":" << migration.GetPort();
+    migration.Finish();
+    res.migrations.push_back(std::move(*it));
+    outgoing_migration_jobs_.erase(it);
+  }
+
+  // Flush non-owned migrations
+  SlotSet migration_slots(removed_slots);
+  res.slot_ranges = migration_slots.GetRemovedSlots(new_config->GetOwnedSlots()).ToSlotRanges();
+
+  // Flushing of removed slots is done outside this function.
+  return res;
+}
+
+namespace {
+
+// Removes an incoming migration and returns non-owned slot ranges that need flushing.
+// Flushing is done by the caller together with other slot deletions.
+SlotRanges RemoveIncomingMigrationImpl(std::vector<std::shared_ptr<IncomingSlotMigration>>& jobs,
+                                       string_view source_id) {
+  auto it = rng::find_if(jobs, [source_id](const auto& im) {
+    // we can have only one migration per target-source pair
+    return source_id == im->GetSourceID();
+  });
+  if (it == jobs.end()) {
+    return {};
+  }
+  DCHECK(it->get() != nullptr);
+  std::shared_ptr<IncomingSlotMigration> migration = *it;
+
+  // Compute non-owned migration slots that need flushing.
+  SlotSet migration_slots(migration->GetSlots());
+  SlotSet removed = migration_slots.GetRemovedSlots(ClusterConfig::Current()->GetOwnedSlots());
+
+  migration->Stop();
+  // all migration fibers has migration shared_ptr so the object can be removed later
+  jobs.erase(it);
+
+  if (!removed.Empty()) {
+    auto removed_ranges = removed.ToSlotRanges();
+    LOG_IF(WARNING, migration->GetState() == MigrationState::C_FINISHED)
+        << "Flushing slots of removed FINISHED migration " << migration->GetSourceID()
+        << ", slots: " << removed_ranges.ToString();
+    return removed_ranges;
+  }
+
+  return {};
+}
+}  // namespace
+
+SlotRanges ClusterFamily::RemoveIncomingMigrations(const std::vector<MigrationInfo>& migrations) {
+  util::fb2::LockGuard lk(migration_mu_);
+  SlotRanges removed_slots;
+  for (const auto& m : migrations) {
+    removed_slots.Merge(RemoveIncomingMigrationImpl(incoming_migrations_jobs_, m.node_info.id));
+    VLOG(1) << "Migration was canceled from: " << m.node_info.id;
+  }
+  return removed_slots;
+}
+
+void ClusterFamily::InitMigration(CmdArgParser parser, CommandContext* cmd_cntx) {
+  VLOG(1) << "Create incoming migration, args: " << parser.UnparsedArgs();
+
+  auto [source_id, flows_num] = parser.Next<string_view, uint32_t>();
+
+  std::vector<SlotRange> slots;
+  do {
+    auto [slot_start, slot_end] = parser.Next<SlotId, SlotId>();
+    slots.emplace_back(SlotRange{slot_start, slot_end});
+  } while (parser.HasNext());
+
+  RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
+
+  SlotRanges slot_ranges(std::move(slots));
+
+  std::shared_ptr<IncomingSlotMigration> migration;
+  {
+    util::fb2::LockGuard lk(migration_mu_);
+
+    auto it = find_if(incoming_migrations_jobs_.begin(), incoming_migrations_jobs_.end(),
+                      [source_id = source_id, &slot_ranges](const auto& migration) {
+                        return migration->GetSourceID() == source_id &&
+                               migration->GetSlots() == slot_ranges;
+                      });
+
+    if (it != incoming_migrations_jobs_.end()) {
+      migration = *it;
+    }
+  }
+
+  if (!migration) {
+    VLOG(1) << "Unrecognized incoming migration from " << source_id;
+    return cmd_cntx->SendSimpleString(kUnknownMigration);
+  }
+
+  if (migration->GetState() != MigrationState::C_CONNECTING) {
+    migration->Stop();
+    auto slots = migration->GetSlots();
+    LOG(INFO) << "Flushing slots during migration reinitialization " << migration->GetSourceID()
+              << ", slots: " << slots.ToString();
+    // DFLYMIGRATE is not a global-trans command, so create a temporary transaction
+    // to hold the shard lock during FlushSlots (see #7153).
+    boost::intrusive_ptr<Transaction> flush_tx(
+        new Transaction{server_family_->service().FindCmd("DFLYCLUSTER")});
+    flush_tx->InitByArgs(&namespaces->GetDefaultNamespace(), 0, {});
+    DeleteSlots(flush_tx.get(), slots);
+    WriteFlushSlotsToJournal(slots);
+  }
+
+  if (migration->GetState() == MigrationState::C_FATAL) {
+    return cmd_cntx->SendError(absl::StrCat("-", kIncomingMigrationOOM));
+  }
+
+  migration->Init(flows_num);
+
+  return cmd_cntx->SendOk();
+}
+
+void ClusterFamily::DflyMigrateFlow(CmdArgParser parser, CommandContext* cmd_cntx) {
+  auto [source_id, shard_id] = parser.Next<std::string_view, uint32_t>();
+
+  RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
+
+  VLOG(1) << "Create flow " << source_id << " shard_id: " << shard_id;
+
+  cmd_cntx->conn()->SetName(absl::StrCat("migration_flow_", source_id));
+
+  auto migration = GetIncomingMigration(source_id);
+
+  if (!migration) {
+    return cmd_cntx->SendError(kIdNotFound);
+  }
+
+  auto* conn_cntx = cmd_cntx->server_conn_cntx();
+  DCHECK(conn_cntx->sync_dispatch);
+  // we do this to be ignored by the dispatch tracker
+  // TODO provide a more clear approach
+  conn_cntx->sync_dispatch = false;
+
+  cmd_cntx->SendOk();
+
+  // Try migrating the connection if we have the same shard configuration
+  if (migration->ShardNum() == shard_set->size() &&
+      int32_t(shard_id) != fb2::ProactorBase::me()->GetPoolIndex()) {
+    DCHECK_LT(shard_id, shard_set->size());
+    if (bool success = conn_cntx->conn()->Migrate(shard_set->pool()->at(shard_id)); !success) {
+      cmd_cntx->SendError("invalid state");
+      return;
+    }
+  }
+
+  migration->StartFlow(shard_id, conn_cntx->conn()->socket());
+}
+
+void ClusterFamily::ApplyMigrationSlotRangeToConfig(std::string_view node_id,
+                                                    const SlotRanges& slots, bool is_incoming) {
+  VLOG(1) << "Update config for slots ranges: " << slots.ToString() << " for " << MyID() << " : "
+          << node_id;
+  util::fb2::LockGuard gu(set_config_mu);
+  util::fb2::LockGuard lk(migration_mu_);
+
+  bool is_migration_valid = false;
+  if (is_incoming) {
+    for (const auto& mj : incoming_migrations_jobs_) {
+      if (mj->GetSourceID() == node_id && slots == mj->GetSlots()) {
+        is_migration_valid = true;
+        break;
+      }
+    }
+  } else {
+    for (const auto& mj : outgoing_migration_jobs_) {
+      if (mj->GetMigrationInfo().node_info.id == node_id &&
+          mj->GetMigrationInfo().slot_ranges == slots) {
+        is_migration_valid = true;
+        break;
+      }
+    }
+  }
+  if (!is_migration_valid) {
+    LOG(WARNING) << "Config wasn't updated for slots ranges: " << slots.ToString() << " for "
+                 << MyID() << " : " << node_id;
+    return;
+  }
+
+  auto new_config = is_incoming ? ClusterConfig::Current()->CloneWithChanges(slots, {})
+                                : ClusterConfig::Current()->CloneWithChanges({}, slots);
+
+  auto blocking_filter = [&new_config](ArgSlice keys) {
+    bool moved = any_of(keys.begin(), keys.end(), [&](auto k) { return !new_config->IsMySlot(k); });
+    return moved ? OpStatus::KEY_MOVED : OpStatus::OK;
+  };
+  // we don't need to use DispatchTracker here because for IncomingMingration we don't have
+  // connectionas that should be tracked and for Outgoing migration we do it under Pause
+  server_family_->service().proactor_pool().AwaitFiberOnAll(
+      [this, &new_config, &blocking_filter](util::ProactorBase*) {
+        server_family_->CancelBlockingOnThread(blocking_filter);
+        ClusterConfig::SetCurrent(new_config);
+      });
+  DCHECK(ClusterConfig::Current() != nullptr);
+  VLOG(1) << "Config is updated for slots ranges: " << slots.ToString() << " for " << MyID()
+          << " : " << node_id;
+}
+
+void ClusterFamily::DflyMigrateAck(CmdArgParser parser, CommandContext* cmd_cntx) {
+  ParsedArgs ack_args = parser.UnparsedArgs();
+  auto [source_id, attempt] = parser.Next<std::string_view, long>();
+
+  RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
+
+  VLOG(1) << "DFLYMIGRATE ACK" << ack_args;
+  auto in_migrations = ClusterConfig::Current()->GetIncomingMigrations();
+  auto m_it = rng::find_if(in_migrations, [source_id = source_id](const auto& m) {
+    return m.node_info.id == source_id;
+  });
+  if (m_it == in_migrations.end()) {
+    LOG(WARNING) << "migration isn't in config";
+    return cmd_cntx->SendSimpleString(kUnknownMigration);
+  }
+
+  auto migration = GetIncomingMigration(source_id);
+  if (!migration)
+    return cmd_cntx->SendError(kIdNotFound);
+
+  if (!migration->Join(attempt)) {
+    if (migration->GetState() == MigrationState::C_FATAL) {
+      return cmd_cntx->SendError(absl::StrCat("-", kIncomingMigrationOOM));
+    } else {
+      return cmd_cntx->SendError("Join timeout happened");
+    }
+  }
+
+  ApplyMigrationSlotRangeToConfig(migration->GetSourceID(), migration->GetSlots(), true);
+
+  return cmd_cntx->rb()->SendLong(attempt);
+}
+
+void ClusterFamily::PauseAllIncomingMigrations(bool pause) {
+  util::fb2::LockGuard lk(migration_mu_);
+  LOG_IF(ERROR, incoming_migrations_jobs_.empty()) << "No incoming migrations!";
+  for (auto& im : incoming_migrations_jobs_) {
+    im->Pause(pause);
+  }
+}
+
+size_t ClusterFamily::MigrationsErrorsCount() const {
+  util::fb2::LockGuard lk(migration_mu_);
+
+  size_t error_num = 0;
+
+  for (const auto& mj : incoming_migrations_jobs_) {
+    error_num += mj->GetErrorsCount();
+  }
+
+  for (const auto& mj : outgoing_migration_jobs_) {
+    error_num += mj->GetErrorsCount();
+  }
+
+  return error_num;
+}
+
+void ClusterFamily::ReconcileMasterSlots(std::string_view repl_id) {
+  util::fb2::LockGuard gu(set_config_mu);
+  util::fb2::LockGuard lk(migration_mu_);
+
+  auto config = ClusterConfig::Current();
+
+  // Sanity -- we should not reach there
+  if (!config) {
+    LOG(ERROR) << "Cluster config after takeover is empty";
+    return;
+  }
+
+  for (auto& info : config->GetMutableConfig()) {
+    // we are updating the old config
+    if (info.master.id == id_) {
+      if (!info.replicas.empty()) {
+        auto target =
+            rng::find_if(info.replicas, [repl_id](const auto& e) { return e.id == repl_id; });
+
+        if (target == info.replicas.end()) {
+          auto topology =
+              absl::StrCat("[",
+                           absl::StrJoin(info.replicas, ",",
+                                         [](std::string* out, const auto& r) { *out = r.id; }),
+                           "]");
+          LOG(ERROR) << "info.master.id=" << id_ << ". Missing repl_id=" << repl_id
+                     << " from cluster topology " << topology
+                     << ". Slot redirection after takeover corrupted.";
+
+          return;
+        }
+
+        info.master = *target;
+        info.replicas.clear();
+      }
+      return;
+    }
+  }
+}
+
+void ClusterFamily::ReconcileReplicaSlots() {
+  util::fb2::LockGuard gu(set_config_mu);
+  util::fb2::LockGuard lk(migration_mu_);
+
+  auto config = ClusterConfig::Current();
+
+  // Sanity -- we should not reach there
+  if (!config) {
+    LOG(ERROR) << "Cluster config after takeover is empty";
+    return;
+  }
+
+  auto new_config = ClusterConfig::Current()->CloneWithChanges({}, {});
+  // Replace master with replica in shard config.
+  bool found = false;
+  for (ClusterShardInfo& info : new_config->GetMutableConfig()) {
+    for (const auto& replica : info.replicas) {
+      if (replica.id == id_) {
+        info.master = replica;
+        // New master has no replicas
+        info.replicas.clear();
+        found = true;
+        break;
+      }
+    }
+    if (found)
+      break;
+  }
+
+  LOG_IF(ERROR, !found) << "Did not find replica in the cluster map";
+
+  server_family_->service().proactor_pool().AwaitFiberOnAll(
+      [&new_config](util::ProactorBase*) { ClusterConfig::SetCurrent(new_config); });
+}
+
+using EngineFunc = void (ClusterFamily::*)(CmdArgParser args, CommandContext* cmd_cntx);
+
+inline CommandId::Handler HandlerFunc(ClusterFamily* se, EngineFunc f) {
+  return [=](CmdArgParser parser, CommandContext* cmd_cntx) {
+    return (se->*f)(std::move(parser), cmd_cntx);
+  };
+}
+
+#define HFUNC(x) SetHandler(HandlerFunc(this, &ClusterFamily::x))
+
+void ClusterFamily::Register(CommandRegistry* registry) {
+  registry->StartFamily();
+  *registry << CI{"CLUSTER", CO::READONLY | CO::LOADING, -2, 0, 0, acl::kCluster}.HFUNC(Cluster)
+            << CI{"DFLYCLUSTER",    CO::ADMIN | CO::GLOBAL_TRANS | CO::HIDDEN, -2, 0, 0,
+                  acl::kDflyCluster}
+                   .HFUNC(DflyCluster)
+            << CI{"READONLY", CO::READONLY, 1, 0, 0, acl::kReadOnly}.HFUNC(ReadOnly)
+            << CI{"READWRITE", CO::READONLY, 1, 0, 0, acl::kReadWrite}.HFUNC(ReadWrite)
+            << CI{"DFLYMIGRATE", CO::ADMIN | CO::HIDDEN, -1, 0, 0, acl::kDflyMigrate}.HFUNC(
+                   DflyMigrate);
+}
+
+}  // namespace dfly::cluster

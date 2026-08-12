@@ -1,0 +1,210 @@
+// Copyright 2023, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+#include "facade/reply_capture.h"
+
+#include "absl/types/span.h"
+#include "base/logging.h"
+#include "facade/reply_payload.h"
+#include "reply_capture.h"
+
+#define SKIP_LESS(needed)     \
+  replies_recorded_++;        \
+  if (reply_mode_ < needed) { \
+    current_ = monostate{};   \
+    return;                   \
+  }
+namespace facade {
+
+using namespace std;
+using namespace payload;
+
+void CapturingReplyBuilder::SendError(std::string_view str, std::string_view type) {
+  last_error_ = str;
+  SKIP_LESS(ReplyMode::ONLY_ERR);
+  Capture(make_error(str, type));
+}
+
+void CapturingReplyBuilder::SendNullArray() {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(unique_ptr<CollectionPayload>{nullptr});
+}
+
+void CapturingReplyBuilder::SendNull() {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(nullptr_t{});
+}
+
+void CapturingReplyBuilder::SendLong(long val) {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(val);
+}
+
+void CapturingReplyBuilder::SendDouble(double val) {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(val);
+}
+
+void CapturingReplyBuilder::SendSimpleString(std::string_view str) {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(SimpleString{string{str}});
+}
+
+void CapturingReplyBuilder::SendBulkString(std::string_view str) {
+  SKIP_LESS(ReplyMode::FULL);
+  if (str.size() < 12 || str.size() > inline_buffer_.size())
+    return Capture(BulkString{std::string{str}});
+
+  memcpy(inline_buffer_.data(), str.data(), str.size());
+  Capture(BulkStringRef{std::string_view{inline_buffer_.data(), str.size()}});
+  inline_buffer_ = inline_buffer_.subspan(str.size());
+}
+
+void CapturingReplyBuilder::SendVerbatimString(std::string_view str, VerbatimFormat format) {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(make_unique<VerbatimString>(string{str}, static_cast<uint8_t>(format)));
+}
+
+// Capture the borrow into the payload, extending the pin's lifetime until
+// replay moves it into the real sink where it is parked across the writev.
+void CapturingReplyBuilder::SendBulkStringBorrowed(cmn::BorrowedString&& bs) {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(std::move(bs));
+}
+
+void CapturingReplyBuilder::StartCollection(unsigned len, CollectionType type) {
+  SKIP_LESS(ReplyMode::FULL);
+  stack_.emplace(make_unique<CollectionPayload>(len, type),
+                 type == CollectionType::MAP ? len * 2 : len);
+
+  // If we added an empty collection, it must be collapsed immediately.
+  CollapseFilledCollections();
+}
+
+CapturingReplyBuilder::Payload CapturingReplyBuilder::Take() {
+  CHECK(stack_.empty());
+  Payload pl = std::move(current_);
+  current_ = monostate{};
+  return pl;
+}
+
+void CapturingReplyBuilder::SendDirect(Payload&& val) {
+  replies_recorded_ += !holds_alternative<monostate>(val);
+  bool is_err = holds_alternative<Error>(val);
+  ReplyMode min_mode = is_err ? ReplyMode::ONLY_ERR : ReplyMode::FULL;
+  if (reply_mode_ >= min_mode) {
+    // Capture() appends to an open collection if one exists, otherwise stores into current_.
+    Capture(std::move(val));
+  } else {
+    current_ = monostate{};
+  }
+}
+
+void CapturingReplyBuilder::Capture(Payload val, bool collapse_if_needed) {
+  if (!stack_.empty()) {
+    auto& last = stack_.top();
+    last.first->arr.push_back(std::move(val));
+    if (last.second-- == 1 && collapse_if_needed) {
+      CollapseFilledCollections();
+    }
+  } else {
+    DCHECK_EQ(current_.index(), 0u);
+    current_ = std::move(val);
+  }
+}
+
+void CapturingReplyBuilder::CollapseFilledCollections() {
+  while (!stack_.empty() && stack_.top().second == 0) {
+    auto pl = std::move(stack_.top());
+    stack_.pop();
+    Capture(std::move(pl.first), false);
+  }
+}
+
+struct CaptureVisitor {
+  void operator()(monostate) {
+  }
+
+  void operator()(long v) {
+    rb->SendLong(v);
+  }
+
+  void operator()(double v) {
+    static_cast<RedisReplyBuilder*>(rb)->SendDouble(v);
+  }
+
+  void operator()(const payload::SimpleString& ss) {
+    rb->SendSimpleString(ss);
+  }
+
+  void operator()(const payload::BulkString& bs) {
+    static_cast<RedisReplyBuilder*>(rb)->SendBulkString(bs);
+  }
+
+  void operator()(const unique_ptr<payload::VerbatimString>& vs) {
+    using VF = RedisReplyBuilder::VerbatimFormat;
+    static_cast<RedisReplyBuilder*>(rb)->SendVerbatimString(vs->str, static_cast<VF>(vs->format));
+  }
+
+  void operator()(const cmn::BorrowedString& bs) {
+    static_cast<RedisReplyBuilder*>(rb)->SendBulkStringBorrowed(bs);
+  }
+
+  void operator()(const payload::BulkStringRef& bs) {
+    static_cast<RedisReplyBuilder*>(rb)->SendBulkString(bs);
+  }
+
+  void operator()(payload::Null) {
+    static_cast<RedisReplyBuilder*>(rb)->SendNull();
+  }
+
+  void operator()(const payload::Error& err) {
+    rb->SendError(err->first, err->second);
+  }
+
+  void operator()(const unique_ptr<payload::CollectionPayload>& cp) {
+    auto* builder = static_cast<RedisReplyBuilder*>(rb);
+    if (!cp) {
+      builder->SendNullArray();
+      return;
+    }
+    if (cp->len == 0 && cp->type == CollectionType::ARRAY) {
+      builder->SendEmptyArray();
+      return;
+    }
+    builder->StartCollection(cp->len, cp->type);
+    for (auto& pl : cp->arr)
+      visit(*this, pl);
+  }
+
+  SinkReplyBuilder* rb;
+};
+
+void CapturingReplyBuilder::Apply(Payload&& pl, SinkReplyBuilder* rb) {
+  if (auto* crb = dynamic_cast<CapturingReplyBuilder*>(rb); crb != nullptr) {
+    crb->SendDirect(std::move(pl));
+    return;
+  }
+
+  Apply(static_cast<const Payload&>(pl), rb);
+}
+
+void CapturingReplyBuilder::Apply(const Payload& pl, SinkReplyBuilder* rb) {
+  CaptureVisitor cv{rb};
+  visit(cv, pl);
+}
+
+void CapturingReplyBuilder::SetReplyMode(ReplyMode mode) {
+  reply_mode_ = mode;
+  current_ = monostate{};
+}
+
+optional<CapturingReplyBuilder::ErrorRef> CapturingReplyBuilder::TryExtractError(
+    const Payload& pl) {
+  if (auto* err = get_if<Error>(&pl); err != nullptr) {
+    return ErrorRef{(*err)->first, (*err)->second};
+  }
+  return nullopt;
+}
+
+}  // namespace facade

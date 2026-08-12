@@ -1,0 +1,194 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <memory>
+#include <optional>
+#include <string_view>
+
+#include "core/dense_set.h"
+
+extern "C" {
+#include "redis/sds.h"
+}
+
+namespace dfly {
+
+class PageUsage;
+
+namespace detail {
+
+class SdsPair {
+ public:
+  SdsPair(sds k, sds v) : first(k), second(v) {
+  }
+
+  SdsPair* operator->() {
+    return this;
+  }
+
+  const SdsPair* operator->() const {
+    return this;
+  }
+
+  operator std::pair<std::string_view, std::string_view>() const {
+    return {{first, sdslen(first)}, {second, sdslen(second)}};
+  }
+
+  const sds first;
+  const sds second;
+};
+
+};  // namespace detail
+
+class StringMap : public DenseSet {
+ public:
+  explicit StringMap(void* unused = nullptr) {
+  }
+
+  ~StringMap();
+
+  class iterator : private DenseSet::IteratorBase {
+    static detail::SdsPair BreakToPair(void* obj);
+
+   public:
+    iterator() : IteratorBase() {
+    }
+
+    explicit iterator(const IteratorBase& o) : IteratorBase(o) {
+    }
+
+    iterator(DenseSet* owner) : IteratorBase(owner, false) {
+    }
+
+    detail::SdsPair operator->() const {
+      void* ptr = curr_entry_->GetObject();
+      return BreakToPair(ptr);
+    }
+
+    detail::SdsPair operator*() const {
+      void* ptr = curr_entry_->GetObject();
+      return BreakToPair(ptr);
+    }
+
+    // Try reducing memory fragmentation of the value by re-allocating. Returns true if
+    // re-allocation happened.
+    bool ReallocIfNeeded(PageUsage* page_usage);
+
+    iterator& operator++() {
+      Advance();
+      return *this;
+    }
+
+    // Advances at most `n` steps, but stops at end.
+    iterator& operator+=(unsigned int n) {
+      for (unsigned int i = 0; i < n; ++i) {
+        if (curr_entry_ == nullptr) {
+          break;
+        }
+
+        Advance();
+      }
+      return *this;
+    }
+
+    bool operator==(const iterator& b) const {
+      if (owner_ == nullptr && b.owner_ == nullptr) {  // to allow comparison with end()
+        return true;
+      }
+      return owner_ == b.owner_ && curr_entry_ == b.curr_entry_;
+    }
+
+    bool operator!=(const iterator& b) const {
+      return !(*this == b);
+    }
+
+    using IteratorBase::ExpiryTime;
+    using IteratorBase::HasExpiry;
+    using IteratorBase::SetExpiryTime;
+  };
+
+  // Adds a new field or updates its value. Returns true if added, false if updated.
+  bool AddOrUpdate(std::string_view field, std::string_view value, uint32_t ttl_sec = UINT32_MAX,
+                   bool keepttl = false);
+
+  using SdsEntry = std::unique_ptr<void, void (*)(void*)>;
+
+  // Like AddOrUpdate but on update returns the previous entry wrapped in SdsEntry
+  // instead of deleting it. The returned SdsEntry automatically frees the entry on destruction.
+  // Returns nullptr if a new field was added.
+  SdsEntry AddOrExchange(std::string_view field, std::string_view value,
+                         uint32_t ttl_sec = UINT32_MAX, bool keepttl = false);
+
+  // Returns true if field was added
+  // false, if already exists. In that case no update is done.
+  bool AddOrSkip(std::string_view field, std::string_view value, uint32_t ttl_sec = UINT32_MAX);
+
+  bool Erase(std::string_view s1);
+
+  // Removes and returns the sds entry for the given key without freeing it.
+  // Returns nullptr if the key was not found.
+  SdsEntry Extract(std::string_view s1);
+
+  // Frees a StringMap sds entry (key + embedded value).
+  static void DeleteEntry(void* entry);
+
+  bool Contains(std::string_view s1) const;
+
+  /// @brief  Returns value of the key or an empty iterator if key not found.
+  /// @param key
+  /// @return sds
+  iterator Find(std::string_view member) {
+    return iterator{FindIt(&member, 1)};
+  }
+
+  iterator begin() {
+    return iterator{this};
+  }
+
+  iterator end() {
+    return iterator{};
+  }
+
+  // Returns a random key value pair.
+  // Returns key only if value is a nullptr.
+  std::optional<std::pair<sds, sds>> RandomPair();
+
+  // Randomly selects count of key value pairs. The selections are unique.
+  // if count is larger than the total number of key value pairs, returns
+  // every pair.
+  // Executes at O(n) (i.e. slow for large sets).
+  void RandomPairsUnique(unsigned int count, std::vector<sds>& keys, std::vector<sds>& vals,
+                         bool with_value);
+
+  // Randomly selects count of key value pairs. The select key value pairs
+  // are allowed to have duplications.
+  // Executes at O(n) (i.e. slow for large sets).
+  void RandomPairs(unsigned int count, std::vector<sds>& keys, std::vector<sds>& vals,
+                   bool with_value);
+
+  static sds GetValue(sds key);
+
+ private:
+  // If keepttl is specified, performs a lookup for given field and computes ttl by comparing
+  // existing expiry against time_now(). If keepttl is false, or field is not found, or it expires,
+  // or the field has no ttl, returns ttl_sec. set_time() must have been called before computing
+  // ttl.
+  uint32_t ComputeTtl(std::string_view field, uint32_t ttl_sec, bool keepttl) const;
+
+  // Reallocate key and/or value if their pages are underutilized.
+  // Returns new pointer (stays same if key utilization is enough) and if reallocation happened.
+  std::pair<sds, bool> ReallocIfNeeded(void* obj, PageUsage* page_usage);
+
+  uint64_t Hash(const void* obj, uint32_t cookie) const final;
+  bool ObjEqual(const void* left, const void* right, uint32_t right_cookie) const final;
+  size_t ObjectAllocSize(const void* obj) const final;
+  uint32_t ObjExpireTime(const void* obj) const final;
+  void ObjUpdateExpireTime(const void* obj, uint32_t ttl_sec) final;
+  void ObjDelete(void* obj) const final;
+  void* ObjectClone(const void* obj, bool has_ttl, bool add_ttl) const final;
+};
+
+}  // namespace dfly

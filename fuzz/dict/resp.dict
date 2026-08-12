@@ -1,0 +1,515 @@
+# AFL++ dictionary for RESP protocol
+# Dragonfly command keywords and common patterns
+
+# RESP protocol markers
+"*"
+"$"
+"+"
+"-"
+":"
+"\x0d\x0a"
+
+# Common commands - String operations
+"GET"
+"SET"
+"MGET"
+"MSET"
+"INCR"
+"DECR"
+"APPEND"
+"STRLEN"
+"SETEX"
+"SETNX"
+"GETSET"
+"GETRANGE"
+"SETRANGE"
+
+# List operations
+"LPUSH"
+"RPUSH"
+"LPOP"
+"RPOP"
+"LLEN"
+"LRANGE"
+"LINDEX"
+"LSET"
+"LTRIM"
+
+# Hash operations
+"HSET"
+"HGET"
+"HMSET"
+"HMGET"
+"HGETALL"
+"HDEL"
+"HEXISTS"
+"HLEN"
+"HKEYS"
+"HVALS"
+"HINCRBY"
+
+# Set operations
+"SADD"
+"SREM"
+"SMEMBERS"
+"SISMEMBER"
+"SCARD"
+"SINTER"
+"SUNION"
+"SDIFF"
+"SPOP"
+
+# Sorted set operations
+"ZADD"
+"ZREM"
+"ZRANGE"
+"ZRANGEBYSCORE"
+"ZRANK"
+"ZSCORE"
+"ZCARD"
+"ZCOUNT"
+"ZINCRBY"
+
+# Key operations
+"DEL"
+"EXISTS"
+"EXPIRE"
+"TTL"
+"PERSIST"
+"KEYS"
+"SCAN"
+"TYPE"
+"RENAME"
+"RENAMENX"
+
+# Transaction commands
+"MULTI"
+"EXEC"
+"DISCARD"
+"WATCH"
+"UNWATCH"
+
+# Pub/Sub commands
+"PUBLISH"
+"SUBSCRIBE"
+"UNSUBSCRIBE"
+"PSUBSCRIBE"
+"PUNSUBSCRIBE"
+
+# Stream commands
+"XADD"
+"XREAD"
+"XRANGE"
+"XLEN"
+"XDEL"
+"XTRIM"
+"XGROUP"
+"XREADGROUP"
+
+# JSON commands
+"JSON.SET"
+"JSON.GET"
+"JSON.DEL"
+"JSON.TYPE"
+"JSON.NUMINCRBY"
+"JSON.ARRAPPEND"
+"JSON.ARRLEN"
+
+# Bloom filter commands
+"BF.ADD"
+"BF.EXISTS"
+"BF.RESERVE"
+"BF.MADD"
+"BF.MEXISTS"
+"BF.SCANDUMP"
+"BF.LOADCHUNK"
+
+# Cuckoo filter commands
+"CF.RESERVE"
+"CF.ADD"
+"CF.ADDNX"
+"CF.EXISTS"
+"CF.MEXISTS"
+"CF.INFO"
+"CF.COUNT"
+"CF.DEL"
+"CF.INSERT"
+"CF.INSERTNX"
+"CF.COMPACT"
+"NOCREATE"
+"CAPACITY"
+"ITEMS"
+"BUCKETSIZE"
+"MAXITERATIONS"
+"EXPANSION"
+
+# Count-Min Sketch commands
+"CMS.INITBYDIM"
+"CMS.INITBYPROB"
+"CMS.INCRBY"
+"CMS.QUERY"
+"CMS.INFO"
+"CMS.MERGE"
+
+# Top-K commands
+"TOPK.RESERVE"
+"TOPK.ADD"
+"TOPK.INCRBY"
+"TOPK.QUERY"
+"TOPK.COUNT"
+"TOPK.LIST"
+"TOPK.INFO"
+"WITHCOUNT"
+
+# HyperLogLog commands
+"PFADD"
+"PFCOUNT"
+"PFMERGE"
+
+# Geo commands
+"GEOADD"
+"GEODIST"
+"GEORADIUS"
+"GEOSEARCH"
+
+# Server commands
+"PING"
+"ECHO"
+"INFO"
+"DBSIZE"
+"SELECT"
+
+# Cluster commands
+"CLUSTER"
+"READONLY"
+"READWRITE"
+
+# Common keys for testing
+"key"
+"mykey"
+"key1"
+"key2"
+"test"
+"foo"
+"bar"
+"user:1"
+"session:123"
+
+# Common values
+"value"
+"hello"
+"world"
+"123"
+"0"
+"1"
+"-1"
+
+# Number patterns (0, 1, -1 already above)
+"100"
+"1000"
+"-100"
+
+# Special arguments
+"NX"
+"XX"
+"EX"
+"PX"
+"GT"
+"LT"
+"WITHSCORES"
+"LIMIT"
+"COUNT"
+"MATCH"
+
+# Small RESP framing patterns (larger patterns removed — AFL++ warned about >33B tokens)
+"*1\x0d\x0a$"
+"*2\x0d\x0a$"
+"*3\x0d\x0a$"
+
+# Scripting commands
+"EVAL"
+"EVALSHA"
+"EVAL_RO"
+"EVALSHA_RO"
+"SCRIPT"
+
+# Bitfield commands
+"BITFIELD"
+"BITFIELD_RO"
+"BITOP"
+"BITCOUNT"
+"BITPOS"
+"GETBIT"
+"SETBIT"
+
+# More sorted set operations
+"ZINTER"
+"ZUNION"
+"ZINTERSTORE"
+"ZUNIONSTORE"
+"ZPOPMIN"
+"ZPOPMAX"
+"ZMPOP"
+
+# Edge case numbers
+"9223372036854775807"
+"-9223372036854775808"
+"2147483647"
+"-2147483648"
+"0.0"
+"-0.0"
+"inf"
+"-inf"
+"+inf"
+"nan"
+
+# Stream IDs and patterns
+"0-0"
+"0-*"
+"$"
+">"
+"*"
+"MAXLEN"
+"MINID"
+
+# JSON paths
+"$.."
+"$[*]"
+"$[-1]"
+"$.name"
+"$..name"
+
+# RESP protocol edge cases
+"*-1\x0d\x0a"
+"$-1\x0d\x0a"
+"*0\x0d\x0a"
+"$0\x0d\x0a\x0d\x0a"
+
+# Lua scripting patterns
+"return redis.call"
+"redis.pcall"
+"KEYS[1]"
+"ARGV[1]"
+
+# Bitfield subcommands
+"OVERFLOW"
+"WRAP"
+"SAT"
+"FAIL"
+
+# Aggregate options
+"AGGREGATE"
+"SUM"
+"MIN"
+"MAX"
+"WEIGHTS"
+
+# Binary edge cases
+"\x00"
+"\xff"
+"\x00\x00\x00\x00"
+
+# --- Additional commands for broader coverage ---
+
+# Missing key operations
+"COPY"
+"SORT"
+"SORT_RO"
+"UNLINK"
+"TOUCH"
+"OBJECT"
+"RANDOMKEY"
+"DUMP"
+"RESTORE"
+"WAIT"
+"EXPIREAT"
+"PEXPIRE"
+"PEXPIREAT"
+"PEXPIRETIME"
+"EXPIRETIME"
+"PTTL"
+
+# String commands
+"GETDEL"
+"GETEX"
+"INCRBYFLOAT"
+"DECRBY"
+"INCRBY"
+"MSETNX"
+"PSETEX"
+"SUBSTR"
+
+# List commands
+"LPOS"
+"LMPOP"
+"LMOVE"
+"BLMOVE"
+"BLMPOP"
+"BLPOP"
+"BRPOP"
+"LPUSHX"
+"RPUSHX"
+"RPOPLPUSH"
+
+# Set commands
+"SRANDMEMBER"
+"SMOVE"
+"SMISMEMBER"
+"SINTERCARD"
+"SDIFFSTORE"
+"SINTERSTORE"
+"SUNIONSTORE"
+
+# Sorted set commands
+"ZDIFF"
+"ZDIFFSTORE"
+"ZLEXCOUNT"
+"ZRANGEBYLEX"
+"ZRANGESTORE"
+"ZRANDMEMBER"
+"ZREVRANGE"
+"ZREVRANGEBYLEX"
+"ZREVRANGEBYSCORE"
+"ZREVRANK"
+"ZMSCORE"
+"ZREMRANGEBYLEX"
+"ZREMRANGEBYRANK"
+"ZREMRANGEBYSCORE"
+"BZMPOP"
+"BZPOPMIN"
+"BZPOPMAX"
+
+# Hash commands
+"HRANDFIELD"
+"HSCAN"
+"HSETEX"
+"HSETNX"
+"HSTRLEN"
+"HINCRBYFLOAT"
+"HEXPIRE"
+
+# Server/client commands
+"CLIENT"
+"CONFIG"
+"MEMORY"
+"ACL"
+"HELLO"
+"COMMAND"
+"LATENCY"
+"SLOWLOG"
+"SAVE"
+"BGSAVE"
+"LASTSAVE"
+"ROLE"
+
+# Subcommands
+"OBJECT ENCODING"
+"OBJECT HELP"
+"OBJECT FREQ"
+"OBJECT IDLETIME"
+"CLIENT SETNAME"
+"CLIENT GETNAME"
+"CLIENT LIST"
+"CLIENT ID"
+"CLIENT INFO"
+"CONFIG GET"
+"CONFIG SET"
+"MEMORY USAGE"
+"MEMORY DOCTOR"
+"ACL LIST"
+"ACL WHOAMI"
+"ACL SETUSER"
+"COMMAND COUNT"
+"COMMAND INFO"
+
+# Scan operations (HSCAN already above)
+"SSCAN"
+"ZSCAN"
+
+# Function/script commands
+"FUNCTION"
+"FUNCTION LOAD"
+"FUNCTION LIST"
+"FUNCTION DELETE"
+
+# More JSON commands
+"JSON.ARRINSERT"
+"JSON.ARRTRIM"
+"JSON.ARRPOP"
+"JSON.ARRINDEX"
+"JSON.OBJKEYS"
+"JSON.OBJLEN"
+"JSON.STRAPPEND"
+"JSON.STRLEN"
+"JSON.TOGGLE"
+"JSON.CLEAR"
+"JSON.MERGE"
+"JSON.MGET"
+"JSON.MSET"
+"JSON.DEBUG"
+"JSON.RESP"
+
+# More Geo commands
+"GEOPOS"
+"GEOHASH"
+"GEOSEARCHSTORE"
+"GEORADIUSBYMEMBER"
+
+# Search commands
+"FT.CREATE"
+"FT.SEARCH"
+"FT.DROPINDEX"
+"FT.INFO"
+"FT.ALTER"
+
+# Additional arguments
+"REPLACE"
+"ABSTTL"
+"IDLETIME"
+"FREQ"
+"LEFT"
+"RIGHT"
+"BEFORE"
+"AFTER"
+"BY"
+"ASC"
+"DESC"
+"ALPHA"
+"STORE"
+"REV"
+"BYSCORE"
+"BYLEX"
+"CH"
+"KEEPTTL"
+"EXAT"
+"PXAT"
+"ENCODING"
+"REFCOUNT"
+
+# Malformed RESP for edge-case testing
+"*-2\x0d\x0a"
+"*999999\x0d\x0a"
+"$-2\x0d\x0a"
+"$999999999\x0d\x0a"
+"*\x0d\x0a"
+"$\x0d\x0a"
+"+\x0d\x0a"
+"-\x0d\x0a"
+":\x0d\x0a"
+
+# Inline commands (no RESP framing)
+"PING\x0d\x0a"
+"PING\x0a"
+"SET key value\x0d\x0a"
+"GET key\x0a"
+"QUIT\x0d\x0a"
+
+# More binary patterns
+"\xfe\xff\x00\x01"
+"\x0d\x0a\x0d\x0a"
+"\x0d\x0d\x0a\x0a"
+"\x00\x01\x02\x03"
+
+# RESP edge cases (small fragments only)
+"$0\x0d\x0a\x0d\x0a"
+"$-1\x0d\x0a"

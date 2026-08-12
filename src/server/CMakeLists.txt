@@ -1,0 +1,187 @@
+option(DF_ENABLE_MEMORY_TRACKING "Adds memory tracking debugging via MEMORY TRACK command" OFF)
+option(PRINT_STACKTRACES_ON_SIGNAL "Enables DF to print all fiber stacktraces on SIGUSR1" OFF)
+
+option(WITH_COLLECTION_CMDS "Compile SET/HASH/ZSET/STREAM commands" ON)
+option(WITH_EXTENSION_CMDS "Compile BLOOM/BITOPS/GEO/HLL/JSON commands" ON)
+
+option(WITH_TIERING "Compile for macos" ON)
+if(APPLE)
+    message(STATUS "Macos detected. Set WITH_TIERING=off")
+    set(WITH_TIERING OFF CACHE BOOL "Compile for macos" FORCE)
+endif()
+
+add_executable(dragonfly dfly_main.cc version_monitor.cc)
+add_custom_target(check_dfly WORKING_DIRECTORY .. COMMAND ctest -L DFLY)
+cxx_link(dragonfly base dragonfly_lib)
+
+if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" AND CMAKE_BUILD_TYPE STREQUAL "Release")
+  # Add core2 only to this file, thus avoiding instructions in this object file that
+  # can cause SIGILL.
+  set_source_files_properties(dfly_main.cc PROPERTIES COMPILE_FLAGS "-march=core2")
+endif()
+
+set_property(SOURCE dfly_main.cc APPEND PROPERTY COMPILE_DEFINITIONS
+             SOURCE_PATH_FROM_BUILD_ENV=${CMAKE_SOURCE_DIR})
+
+add_executable(dfly_bench dfly_bench.cc)
+cxx_link(dfly_bench dfly_parser_lib fibers2 absl::random_random redis_lib)
+
+# Include journal sources (not separate target for now)
+add_subdirectory(journal)
+if(NOT DEFINED DF_JOURNAL_SRCS)
+  message(FATAL_ERROR "Journal source files not exported via DF_JOURNAL_SRCS")
+endif()
+
+# Define transaction library
+add_library(dfly_transaction db_slice.cc blocking_controller.cc
+            cluster_support.cc common.cc command_registry.cc
+            execution_state.cc stats.cc synchronization.cc
+            ${DF_JOURNAL_SRCS}
+            server_state.cc table.cc  transaction.cc tx_base.cc
+            serializer_commons.cc
+            acl/acl_log.cc slowlog.cc channel_store.cc)
+cxx_link(dfly_transaction dfly_core strings_lib TRDP::fast_float TRDP::hdr_histogram)
+
+# Include search module
+add_subdirectory(search)
+if(NOT DEFINED DF_SEARCH_SRCS)
+  message(FATAL_ERROR "Search source files not exported via DF_SEARCH_SRCS")
+endif()
+
+if (WITH_SEARCH)
+  add_definitions(-DWITH_SEARCH)
+endif()
+
+# Include tiering module
+add_subdirectory(tiering)
+if (WITH_TIERING)
+  add_definitions(-DWITH_TIERING)
+  SET(DF_TIERING_SRCS tiered_storage.cc)
+  helio_cxx_test(tiered_storage_test dfly_test_lib LABELS DFLY)
+endif()
+
+# Include cluster sources definitons (not separate target for now)
+add_subdirectory(cluster)
+if (NOT DEFINED DF_CLUSTER_SRCS)
+  message(FATAL_ERROR "Cluster source files not exported via DF_CLUSTER_SRCS")
+endif()
+
+# Optionally compile collection commands
+if (WITH_COLLECTION_CMDS)
+  set(DF_FAMILY_SRCS set_family.cc hset_family.cc zset_family.cc stream_family.cc)
+  add_definitions(-DWITH_COLLECTION_CMDS)
+else()
+  set(DF_FAMILY_SRCS collection_family_fallback.cc)
+endif()
+
+# Optionally compile extension commands
+if (WITH_EXTENSION_CMDS)
+  list(APPEND DF_FAMILY_SRCS geo_family.cc hll_family.cc bitops_family.cc bloom_family.cc topk_family.cc cms_family.cc cuckoo_filter_family.cc json_family.cc)
+  add_definitions(-DWITH_EXTENSION_CMDS)
+endif()
+
+# Optionally include tiered_storage which interfaces with tiering_module
+add_library(dragonfly_lib
+            engine_shard.cc engine_shard_set.cc
+            config_registry.cc conn_context.cc
+            debugcmd.cc dflycmd.cc error.cc family_utils.cc metrics.cc string_stats.cc ${DF_SEARCH_SRCS}
+            server_family.cc string_family.cc list_family.cc generic_family.cc
+            ${DF_FAMILY_SRCS}
+            main_service.cc memory_cmd.cc rdb_load.cc rdb_load_context.cc rdb_save.cc replica.cc http_api.cc
+            protocol_client.cc serializer_base.cc snapshot.cc script_mgr.cc
+            detail/compressor.cc detail/decompress.cc detail/save_stages_controller.cc detail/snapshot_storage.cc detail/egress_throttle.cc
+            version.cc container_utils.cc
+            multi_command_squasher.cc
+            ${DF_TIERING_SRCS}
+            ${DF_CLUSTER_SRCS}
+            acl/user.cc acl/user_registry.cc acl/acl_family.cc
+            acl/validator.cc
+            sharding.cc cmd_support.cc)
+
+if (DF_ENABLE_MEMORY_TRACKING)
+  target_compile_definitions(dragonfly_lib PRIVATE DFLY_ENABLE_MEMORY_TRACKING)
+  target_compile_definitions(dragonfly PRIVATE DFLY_ENABLE_MEMORY_TRACKING)
+endif()
+
+if (PRINT_STACKTRACES_ON_SIGNAL)
+  target_compile_definitions(dragonfly_lib PRIVATE PRINT_STACKTRACES_ON_SIGNAL)
+endif()
+
+if (WITH_AWS)
+  SET(AWS_LIB awsv2_lib)
+  add_definitions(-DWITH_AWS)
+endif()
+
+if (WITH_AWS_CLOUD)
+  SET(AWS_LIB ${AWS_LIB} aws_cloud_lib)
+  add_definitions(-DWITH_AWS_CLOUD)
+endif()
+
+if (WITH_GCP)
+  SET(GCP_LIB gcp_lib)
+  add_definitions(-DWITH_GCP)
+endif()
+
+cxx_link(dragonfly_lib dfly_transaction dfly_facade dfly_tiering
+         redis_lib ${AWS_LIB} ${GCP_LIB} azure_lib jsonpath ${DF_FILTER_LIB}
+         strings_lib html_lib
+         http_client_lib absl::random_random TRDP::jsoncons TRDP::zstd TRDP::lz4
+         TRDP::croncpp TRDP::flatbuffers)
+
+if (DF_USE_SSL)
+  set(TLS_LIB tls_lib)
+  target_compile_definitions(dragonfly_lib PRIVATE DFLY_USE_SSL)
+endif()
+
+add_library(dfly_test_lib test_utils.cc)
+cxx_link(dfly_test_lib dragonfly_lib facade_test gtest_main_ext)
+
+helio_cxx_test(dragonfly_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(multi_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(generic_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(hset_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(list_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(server_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(set_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(stream_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(string_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(bitops_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(rdb_test dfly_test_lib DATA testdata/empty.rdb testdata/redis6_small.rdb
+         testdata/redis6_stream.rdb testdata/hll.rdb testdata/redis7_small.rdb
+         testdata/redis_json.rdb testdata/RDB_TYPE_STREAM_LISTPACKS_2.rdb
+         testdata/RDB_TYPE_STREAM_LISTPACKS_3.rdb testdata/ignore_expiry.rdb LABELS DFLY)
+helio_cxx_test(zset_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(geo_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(blocking_controller_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(transaction_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(json_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(json_family_memory_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(journal/journal_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(hll_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(string_stats_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(bloom_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(topk_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(cms_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(cuckoo_filter_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(cluster/cluster_config_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(cluster/cluster_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(acl/acl_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(engine_shard_set_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(serializer_base_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(detail/egress_throttle_test dfly_test_lib LABELS DFLY)
+
+add_dependencies(check_dfly dragonfly_test json_family_test list_family_test
+                 generic_family_test memcache_parser_test rdb_test journal_test
+                 redis_parser_test stream_family_test string_family_test
+                 bitops_family_test set_family_test zset_family_test geo_family_test
+                 hll_family_test cluster_config_test cluster_family_test acl_family_test
+                 json_family_memory_test)
+
+if (WITH_SEARCH)
+  helio_cxx_test(search/search_family_test dfly_test_lib LABELS DFLY)
+  helio_cxx_test(search/aggregator_test dfly_test_lib LABELS DFLY)
+  helio_cxx_test(search/filter_expr_test dfly_test_lib LABELS DFLY)
+  helio_cxx_test(search/index_join_test dfly_test_lib LABELS DFLY)
+
+  add_dependencies(check_dfly search_family_test aggregator_test filter_expr_test index_join_test)
+endif()

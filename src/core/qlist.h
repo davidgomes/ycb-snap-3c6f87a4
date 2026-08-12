@@ -1,0 +1,413 @@
+// Copyright 2024, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <absl/functional/function_ref.h>
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+
+#include "core/collection_entry.h"
+#include "server/common_types.h"
+
+#define QL_COMP_BITS 16
+#define QL_BM_BITS 4
+
+/* quicklist node encodings */
+#define QUICKLIST_NODE_ENCODING_RAW 1
+#define QUICKLIST_NODE_ENCODING_LZF 2
+#define QLIST_NODE_ENCODING_ZSTD 3
+
+/* quicklist node container formats */
+#define QUICKLIST_NODE_CONTAINER_PLAIN 1
+#define QUICKLIST_NODE_CONTAINER_PACKED 2
+
+namespace dfly {
+
+class PageUsage;
+
+// Heuristic: for values smaller than 2 KiB we prefer the compact listpack
+// representation. 2048 was chosen as a conservative threshold that matches
+// common quicklist usage patterns and avoids creating very large listpacks
+// that are costly to reallocate or compress.
+inline bool ShouldStoreAsListPack(size_t size) {
+  return size < 2048;
+}
+
+class QList {
+ public:
+  enum Where : uint8_t { TAIL, HEAD };
+
+  /* Node is a 40 byte struct describing a listpack for a quicklist.
+   * We use bit fields keep the Node at 40 bytes.
+   * count: 16 bits, max 65536 (max lp bytes is 65k, so max count actually < 32k).
+   * encoding: 2 bits, RAW=1, LZF=2.
+   * container: 2 bits, PLAIN=1 (a single item as char array), PACKED=2 (listpack with multiple
+   * items). recompress: 1 bit, bool, true if node is temporary decompressed for usage.
+   * attempted_compress: 1 bit, boolean, used for verifying during testing.
+   * dont_compress: 1 bit, boolean, used for preventing compression of entry.
+   * */
+
+  struct Node {
+    Node* prev;
+    Node* next;
+
+    union {
+      unsigned char* entry;  // Pointer to the memory value of the node.
+      size_t ext_offset;     // Offset in tiered storage
+    };
+
+    // For offloaded nodes, we store the offset of the value in colder storage
+    // instead of a pointer to the data in memory.
+    size_t sz : 48;    /* entry size in bytes */
+    size_t count : 16; /* count of items in listpack */
+
+    uint16_t encoding : 2;           /* RAW==1, LZF==2, ZSTD==3 */
+    uint16_t container : 2;          /* PLAIN==1 or PACKED==2 */
+    uint16_t recompress : 1;         /* was this node previous compressed? */
+    uint16_t attempted_compress : 1; /* node can't compress; too small */
+    uint16_t dont_compress : 1;      /* prevent compression of entry that will be used later */
+    uint16_t offloaded : 1;          /* node is offloaded to colder storage */
+    uint16_t io_pending : 1;         /* node has pending io operation */
+    uint16_t reserved1 : 7;          /* reserved for future use */
+
+    uint16_t reserved2; /* more bits to steal for future usage */
+
+    uint32_t ext_size; /* Offloaded size */
+
+    bool IsCompressed() const {
+      return encoding != QUICKLIST_NODE_ENCODING_RAW;
+    }
+
+    bool IsStashPending() const {
+      return io_pending && !offloaded;
+    }
+
+    bool IsLoadPending() const {
+      return io_pending && offloaded;
+    }
+
+    size_t GetLZF(void** data) const;
+
+    void SetExternal(size_t offset, uint32_t sz);
+    void Upload(QList* ql, std::string_view val);
+    std::pair<size_t, size_t> GetExternalSlice() const {
+      return std::make_pair(size_t(ext_offset), size_t(ext_size));
+    }
+  };
+
+  using Entry = CollectionEntry;
+  class Iterator {
+   public:
+    // Returns true if the iterator is valid (points to an element).
+    bool Valid() const {
+      return zi_ != nullptr;
+    }
+
+    Entry Get() const;
+
+    // Advances to the next/prev element. Returns false if no more entries.
+    bool Next();
+
+   private:
+    const QList* owner_ = nullptr;
+    Node* current_ = nullptr;
+    unsigned char* zi_ = nullptr; /* points to the current element */
+    int32_t offset_ = 0;          /* offset in current listpack */
+    int32_t node_id_ = 0;         /* node index in the list, 0 is head */
+    uint8_t direction_ = 1;
+
+    friend class QList;
+  };
+
+  using IterateFunc = absl::FunctionRef<bool(Entry)>;
+  enum InsertOpt : uint8_t { BEFORE, AFTER };
+
+  void AdjustMallocSize(ssize_t delta) {
+    malloc_size_ += delta;
+  }
+
+  // Add to the number of offloaded nodes by one.
+  void AdjustOffloadNodeCount(int delta) {
+    if (tiering_enabled_) {
+      tiering_params_->num_offloaded_nodes += delta;
+    }
+  }
+
+  DbIndex GetDbIndex() const {
+    return db_id_;
+  }
+  struct TieringParams {
+    uint32_t num_offloaded_nodes = 0;
+    uint32_t node_depth_threshold = 0;
+    void (*offload)(QList* ql, Node* node) = nullptr;
+    void (*load)(QList* ql, Node* node) = nullptr;
+    void (*cleanup)(QList* ql, Node* node) = nullptr;
+  };
+
+  /**
+   * fill: The number of entries allowed per internal list node can be specified
+   * as a fixed maximum size or a maximum number of elements.
+   * For a fixed maximum size, use -5 through -1, meaning:
+   * -5: max size: 64 Kb  <-- not recommended for normal workloads
+   * -4: max size: 32 Kb  <-- not recommended
+   * -3: max size: 16 Kb  <-- probably not recommended
+   * -2: max size: 8 Kb   <-- good
+   * -1: max size: 4 Kb   <-- good
+   * Positive numbers mean store up to _exactly_ that number of elements
+   * per list node.
+   * The highest performing option is usually -2 (8 Kb size) or -1 (4 Kb size),
+   * but if your use case is unique, adjust the settings as necessary.
+   *
+   *
+   * Lists may also be compressed.
+   * "compress" is the number of quicklist listpack nodes from *each* side of
+   * the list to *exclude* from compression.  The head and tail of the list
+   * are always uncompressed for fast push/pop operations.  Settings are:
+   * 0: disable all list compression
+   * 1: depth 1 means "don't start compressing until after 1 node into the list,
+   *    going from either the head or tail"
+   *    So: [head]->node->node->...->node->[tail]
+   *    [head], [tail] will always be uncompressed; inner nodes will compress.
+   * 2: [head]->[next]->node->node->...->node->[prev]->[tail]
+   *    2 here means: don't compress head or head->next or tail->prev or tail,
+   *    but compress all nodes between them.
+   * 3: [head]->[next]->[next]->node->node->...->node->[prev]->[prev]->[tail]
+   * etc.
+   *
+   */
+  explicit QList(int fill = -2, int compress = 0);
+
+  QList(QList&&) noexcept;
+  QList(const QList&) = delete;
+  ~QList();
+
+  QList& operator=(const QList&) = delete;
+  QList& operator=(QList&&) noexcept;
+
+  size_t Size() const {
+    return count_;
+  }
+
+  void Clear() noexcept;
+
+  void Push(std::string_view value, Where where);
+
+  // Returns the popped value. Precondition: list is not empty.
+  std::string Pop(Where where);
+
+  void AppendListpack(uint8_t* zl);
+  void AppendPlain(uint8_t* zl, size_t sz);
+
+  // Returns true if pivot found and elem inserted, false otherwise.
+  bool Insert(std::string_view pivot, std::string_view elem, InsertOpt opt);
+
+  void Insert(Iterator it, std::string_view elem, InsertOpt opt);
+
+  // Returns true if item was replaced, false if index is out of range.
+  bool Replace(long index, std::string_view elem);
+
+  size_t MallocUsed(bool slow) const;
+
+  // Iterates over entries from start to end (inclusive).
+  void Iterate(IterateFunc cb, long start, long end) const;
+
+  // Returns an iterator to tail or the head of the list.
+  // result.Valid() is true if the list is not empty.
+  Iterator GetIterator(Where where) const;
+
+  // Returns an iterator at a specific index 'idx',
+  // or Invalid iterator if index is out of range.
+  // negative index - means counting from the tail.
+  // result.Valid() is true if the index is within range.
+  Iterator GetIterator(long idx) const;
+
+  uint32_t node_count() const {
+    return len_;
+  }
+
+  unsigned compress_param() const {
+    return compress_;
+  }
+
+  Iterator Erase(Iterator it);
+
+  // Returns true if elements were deleted, false if list has not changed.
+  // Negative start index is allowed.
+  bool Erase(long start, unsigned count);
+
+  // Needed by tests and the rdb code.
+  const Node* Head() const {
+    return head_;
+  }
+
+  const Node* Tail() const {
+    return _Tail();
+  }
+
+  // Materializes a node that was offloaded to tiered storage back into memory.
+  // No-op if the node is already in memory. Does not decompress the node.
+  void Materialize(Node* node);
+
+  // Returns nullptr if quicklist does not fit the necessary requirements
+  // to be converted to listpack, and listpack otherwise. The ownership over the listpack
+  // blob is moved to the caller.
+  uint8_t* TryExtractListpack();
+
+  void set_fill(int fill) {
+    fill_ = fill;
+  }
+
+  static void SetPackedThreshold(unsigned threshold);
+
+  // Frees the thread-local ZSTD dictionary state. Must be called once per thread
+  // during service shutdown.
+  static void ShutdownThread();
+
+  // Decompresses a ZSTD-encoded node into dest using the thread-local dict.
+  // Returns false if the node is not ZSTD-encoded or decompression fails.
+  // Used during RDB save to avoid persisting ZSTD bytes as LZF.
+  static bool DecompressZstdNode(const Node* node, std::string* dest);
+
+  // Moves nodes away from underused pages by reallocating if the underlying page usage is low.
+  // Returns count of nodes reallocated to help in testing.
+  size_t DefragIfNeeded(PageUsage* page_usage);
+
+  // Sets the malloc_size_ threshold at which ZSTD dictionary training is triggered.
+  // 0 disables ZSTD dictionary compression.
+  void set_compr_threshold(uint32_t threshold) {
+    zstd_threshold_ = threshold;
+  }
+
+  // Trains a thread-local ZSTD dictionary (if not yet trained) and bulk-compresses
+  // the list's interior nodes. Intended to be called once after a list has been
+  // bulk-populated via AppendListpack/AppendPlain (e.g. during RDB/replication load),
+  // where the per-push CoolOff() compression hook does not run. No-op unless
+  // set_compr_threshold() was given a non-zero value and LZF depth-compression is
+  // disabled.
+  void CompressAfterLoad();
+
+  // Enable tiered storage.
+  void EnableTiering(const TieringParams& params) {
+    tiering_enabled_ = 1;
+    tiering_params_ = std::make_unique<TieringParams>(params);
+  }
+
+  // Updates the db index associated with this list.
+  void SetDbIndex(DbIndex db_id);
+
+  struct Stats {
+    uint64_t compression_attempts = 0;
+
+    // compression attempts with compression ratio that was not good enough to keep.
+    // Subset of compression_attempts.
+    uint64_t bad_compression_attempts = 0;
+
+    uint64_t decompression_calls = 0;
+
+    // How many bytes we currently keep compressed.
+    size_t compressed_bytes = 0;
+
+    // how many bytes we compressed from.
+    // Compressed savings are calculated as raw_compressed_bytes - compressed_bytes.
+    size_t raw_compressed_bytes = 0;
+    uint64_t interior_node_reads = 0;
+    uint64_t total_node_reads = 0;
+    uint64_t offload_requests = 0;
+    uint64_t onload_requests = 0;
+
+    uint64_t zstd_dict_compressions = 0;
+
+    Stats& operator+=(const Stats& other);
+  };
+  static __thread Stats stats;
+
+ private:
+  bool AllowLZFCompression() const {
+    return compress_ != 0;
+  }
+
+  bool IsZstdDictMode() const {
+    return zstd_threshold_ > 0 && !AllowLZFCompression();
+  }
+
+  bool IsInterior(const Node* node) const {
+    return node && node != head_ && node->next != nullptr;
+  }
+
+  bool CanCompressWithZstdDict(const Node* node) const {
+    return !dict_bulk_failed_ && IsInterior(node);
+  }
+
+  Node* _Tail() const {
+    return head_ ? head_->prev : nullptr;
+  }
+
+  // Returns newly created plain node.
+  Node* InsertPlainNode(Node* old_node, std::string_view elem, uint32_t old_node_id,
+                        InsertOpt insert_opt);
+  void InsertNode(Node* old_node, Node* new_node, uint32_t old_node_id, InsertOpt insert_opt);
+
+  // Reduces the "warmth" of the node. Current implementation can decide on
+  // compressing the node based on its position in the list.
+  void CoolOff(Node* node, uint32_t node_id);
+
+  // Like the RecompressOnly free function, but also handles ZSTD dict mode.
+  // Returns the size delta (negative means compression reduced memory usage).
+  ssize_t RecompressNode(Node* node);
+
+  void Replace(Iterator it, std::string_view elem);
+  void CompressByDepth(Node* node);
+  void MoveFrom(QList&& other);
+
+  // Trains a ZSTD dictionary from all node data and stores it in thread-local state.
+  // Returns true if a dictionary was successfully trained (or already exists).
+  // Sets dict_learning_failed_ on failure.
+  bool TrainZstdDict();
+
+  // Bulk-compresses all interior nodes using the thread-local ZSTD dictionary.
+  // A completed walk always sets a terminal flag: dict_bulk_failed_ when real nodes were tried
+  // but none compressed (dict useless for this list), otherwise dict_bulk_finished_.
+  void BackfillCompressWithZstdDict();
+
+  // Compresses a single node using the thread-local ZSTD dictionary.
+  bool CompressNodeWithDict(Node* node);
+
+  // Prepares the node for read access.
+  void AccessForReads(bool recompress, Node* node);
+
+  Node* MergeNodes(Node* node);
+
+  // Deletes one of the nodes and returns the other.
+  Node* ListpackMerge(Node* a, Node* b);
+
+  void DelNode(Node* node);
+  bool DelPackedIndex(Node* node, uint8_t* p);
+
+  // Initializes iterator's zi_ to point to the element at offset_.
+  // Decompresses the node if needed. Assumes current_ is not null.
+  void InitIteratorEntry(Iterator* it) const;
+
+  Node* head_ = nullptr;
+  size_t malloc_size_ = 0;            // size of the quicklist struct
+  uint32_t count_ = 0;                /* total count of all entries in all listpacks */
+  uint32_t len_ = 0;                  /* number of quicklistNodes */
+  int16_t fill_;                      /* fill factor for individual nodes */
+  uint16_t dict_learning_failed_ : 1; /* thread-local dict training failed for this list's data */
+  uint16_t dict_bulk_failed_ : 1;     /* compression with thread-local dict failed for this list */
+  uint16_t dict_bulk_finished_ : 1;   /* bulk compression done, per-node compression active */
+  uint16_t tiering_enabled_ : 1;      /* tiering storage enabled */
+  uint16_t reserved1_ : 12;
+  unsigned compress_ : QL_COMP_BITS; /* depth of end nodes not to compress;0=off */
+  unsigned bookmark_count_ : QL_BM_BITS;
+  unsigned reserved2_ : 12;
+  uint16_t db_id_ = kInvalidDbId;
+  uint32_t zstd_threshold_ = 0;  // 0 = disabled
+  std::unique_ptr<TieringParams> tiering_params_;
+};
+
+}  // namespace dfly
