@@ -413,13 +413,21 @@ func (c *CustomFuncs) foldOIDFamilyCast(
 					c.f.evalCtx.SessionData().PgDumpCompatibility,
 				),
 			)
-			cDatum, err := eval.PerformCast(
-				c.f.ctx, c.f.evalCtx, tree.NewDOid(resolvedOid), types.RegClass,
+			displayName := tree.MakeUnqualifiedTableName(resName.ObjectName)
+			unqualifiedName := displayName
+			visibleDS, _, visibleErr := c.f.catalog.ResolveDataSource(
+				c.f.ctx, flags, &unqualifiedName,
 			)
-			if err != nil {
-				return nil, false, err
+			if visibleErr != nil || visibleDS.ID() != ds.ID() {
+				displayName = tree.MakeTableNameFromPrefix(
+					tree.ObjectNamePrefix{
+						SchemaName:     resName.SchemaName,
+						ExplicitSchema: true,
+					},
+					resName.ObjectName,
+				)
 			}
-			dOid = tree.MustBeDOid(cDatum)
+			dOid = tree.NewDOidWithTypeAndName(resolvedOid, types.RegClass, displayName.String())
 
 		default:
 			return nil, false, nil
