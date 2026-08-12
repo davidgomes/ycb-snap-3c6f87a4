@@ -18,6 +18,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"reflect"
@@ -220,6 +221,66 @@ func TestSnapshotterWithRef(t *testing.T) {
 	if !leased3(key2) {
 		t.Errorf("no lease for %q", key2)
 	}
+}
+
+func TestSnapshotterAlreadyStaged(t *testing.T) {
+	ctx, db := testDB(t, withSnapshotter("tmp", func(string) (snapshots.Snapshotter, error) {
+		return &alreadyStagedSnapshotter{Snapshotter: NewTmpSnapshotter()}, nil
+	}))
+	snapshotter := "tmp"
+	ctx, leased := snapshotLease(ctx, t, db, snapshotter)
+	sn := db.Snapshotter(snapshotter)
+
+	key := "extract-1"
+	name := "chain-1"
+	_, err := sn.Prepare(ctx, key, "")
+	if err == nil {
+		t.Fatal("expected already staged error")
+	} else if !errors.Is(err, snapshots.ErrAlreadyStaged) {
+		t.Fatalf("expected ErrAlreadyStaged, got %v", err)
+	}
+	if errdefs.IsAlreadyExists(err) {
+		t.Fatal("ErrAlreadyStaged must not be treated as AlreadyExists")
+	}
+	if !leased(key) {
+		t.Errorf("no lease for active snapshot %q", key)
+	}
+
+	info, err := sn.Stat(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Kind != snapshots.KindActive {
+		t.Fatalf("expected active snapshot, got %s", info.Kind)
+	}
+
+	if err := sn.Commit(ctx, name, key); err != nil {
+		t.Fatal(err)
+	}
+	info, err = sn.Stat(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Kind != snapshots.KindCommitted {
+		t.Fatalf("expected committed snapshot, got %s", info.Kind)
+	}
+	if leased(key) {
+		t.Errorf("lease should be removed for %q after commit", key)
+	}
+	if !leased(name) {
+		t.Errorf("no lease for committed snapshot %q", name)
+	}
+}
+
+type alreadyStagedSnapshotter struct {
+	snapshots.Snapshotter
+}
+
+func (s *alreadyStagedSnapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+	if _, err := s.Snapshotter.Prepare(ctx, key, parent, opts...); err != nil {
+		return nil, err
+	}
+	return nil, snapshots.ErrAlreadyStaged
 }
 
 func TestFilterInheritedLabels(t *testing.T) {

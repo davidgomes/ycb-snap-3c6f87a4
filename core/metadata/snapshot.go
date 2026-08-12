@@ -18,6 +18,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"strings"
@@ -273,20 +274,23 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	mounts, err := s.createSnapshot(ctx, key, parent, false, opts)
-	if err != nil {
+	if err != nil && !errors.Is(err, snapshots.ErrAlreadyStaged) {
 		return nil, err
 	}
 
 	if publisher := s.db.Publisher(ctx); publisher != nil {
-		if err := publisher.Publish(ctx, "/snapshot/prepare", &eventstypes.SnapshotPrepare{
+		if perr := publisher.Publish(ctx, "/snapshot/prepare", &eventstypes.SnapshotPrepare{
 			Key:         key,
 			Parent:      parent,
 			Snapshotter: s.name,
-		}); err != nil {
-			return nil, err
+		}); perr != nil {
+			return nil, perr
 		}
 	}
 
+	if err != nil {
+		return nil, err
+	}
 	return mounts, nil
 }
 
@@ -375,6 +379,7 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 	var (
 		m       []mount.Mount
 		created string
+		staged  bool
 	)
 	if readonly {
 		m, err = s.Snapshotter.View(ctx, bkey, bparent, bopts...)
@@ -433,6 +438,15 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 			// to avoid confusing callers handling already exists.
 			return nil, fmt.Errorf("unexpected error from snapshotter: %v: %w", err, errdefs.ErrUnknown)
 		}
+	} else if errors.Is(err, snapshots.ErrAlreadyStaged) {
+		// Backend staged content into an active snapshot. Record it like a
+		// successful Prepare, then propagate the sentinel so the caller skips
+		// fetch/apply but still Commits.
+		ts := time.Now().UTC()
+		base.Created = ts
+		base.Updated = ts
+		created = bkey
+		staged = true
 	} else if err != nil {
 		return nil, err
 	} else {
@@ -512,6 +526,10 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 			}
 		}
 		return nil, rerr
+	}
+
+	if staged {
+		return nil, fmt.Errorf("snapshot %q: %w", key, snapshots.ErrAlreadyStaged)
 	}
 
 	return m, nil

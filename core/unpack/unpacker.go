@@ -405,6 +405,7 @@ func (u *Unpacker) unpack(
 			key    string
 			mounts []mount.Mount
 			opts   = append(unpack.SnapshotOpts, snapshots.WithLabels(snapshotLabels))
+			staged bool
 		)
 
 		for try := 1; try <= 3; try++ {
@@ -412,7 +413,15 @@ func (u *Unpacker) unpack(
 			key = fmt.Sprintf(snapshots.UnpackKeyFormat, uniquePart(), chainID)
 			mounts, err = sn.Prepare(ctx, key, parent, opts...)
 			if err != nil {
-				if errdefs.IsAlreadyExists(err) {
+				if errors.Is(err, snapshots.ErrAlreadyStaged) {
+					// Content is already in the active snapshot. Skip fetch/apply
+					// but still Commit so parallel unpack can rebase the parent.
+					log.G(ctx).WithField("key", key).WithField("chainid", chainID).
+						Debug("extraction snapshot already staged, skipping fetch and apply")
+					staged = true
+					err = nil
+					break
+				} else if errdefs.IsAlreadyExists(err) {
 					if snInfo, err := sn.Stat(ctx, chainID); err != nil {
 						if !errdefs.IsNotFound(err) {
 							return nil, fmt.Errorf("failed to stat snapshot %s: %w", chainID, err)
@@ -442,7 +451,7 @@ func (u *Unpacker) unpack(
 			}
 		}
 
-		if fetchErr == nil {
+		if !staged && fetchErr == nil {
 			fetchOffset = i
 			n := len(layers) - fetchOffset
 			fetchErr = make([]chan error, n)
@@ -497,6 +506,12 @@ func (u *Unpacker) unpack(
 						return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
 					}
 
+					if staged {
+						// Nothing was fetched or applied, so the uncompressed
+						// digest was not verified against content store data.
+						return nil
+					}
+
 					// Set the uncompressed label after the uncompressed
 					// digest has been verified through apply.
 					cinfo := content.Info{
@@ -510,6 +525,11 @@ func (u *Unpacker) unpack(
 					}
 					return nil
 				},
+			}
+
+			if staged {
+				resCh <- status
+				return
 			}
 
 			select {
@@ -746,7 +766,7 @@ func (u *Unpacker) supportParallel(unpack *Platform) bool {
 	if u.unpackLimiter == nil {
 		return false
 	}
-	if !slices.Contains(unpack.SnapshotterCapabilities, "rebase") {
+	if !slices.Contains(unpack.SnapshotterCapabilities, snapshots.RebaseCap) {
 		log.L.Infof("snapshotter does not support rebase capability, unpacking will be sequential")
 		return false
 	}

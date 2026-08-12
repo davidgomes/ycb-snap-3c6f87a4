@@ -19,6 +19,7 @@ package snapshots
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"strings"
 	"time"
@@ -58,6 +59,23 @@ const (
 	// Ignoring is not a failure — callers that require enforcement must
 	// pick a snapshotter that supports it.
 	LabelSnapshotMaxSize = "containerd.io/snapshot/max-size"
+
+	// RebaseCap is advertised by snapshotters that can apply a snapshot's
+	// parent at Commit rather than Prepare. The unpacker uses this to unpack
+	// layers in parallel: Prepare is called with an empty parent and the
+	// real parent is supplied via WithParent at Commit.
+	RebaseCap = "rebase"
+)
+
+var (
+	// ErrAlreadyStaged is returned by Snapshotter.Prepare when the
+	// snapshotter has already staged the layer content into an active
+	// (uncommitted) snapshot. Callers should skip fetching and applying
+	// the layer but must still Commit so the parent can be applied.
+	// Unlike a committed already-exists result, this does not end the
+	// snapshot's lifecycle: the active snapshot identified by key remains
+	// and must be committed or removed.
+	ErrAlreadyStaged = errors.New("already staged")
 )
 
 // Kind identifies the kind of snapshot.
@@ -316,6 +334,10 @@ type Snapshotter interface {
 	// one is done with the transaction, Remove should be called on the key.
 	//
 	// Multiple calls to Prepare or View with the same key should fail.
+	//
+	// A snapshotter that has already populated the active snapshot (for
+	// example from a layer content cache) may return ErrAlreadyStaged to
+	// tell the caller to skip fetch/apply and still Commit.
 	Prepare(ctx context.Context, key, parent string, opts ...Opt) ([]mount.Mount, error)
 
 	// View behaves identically to Prepare except the result may not be
