@@ -480,7 +480,7 @@ PhyJsonContainsFilterExpr::ExecJsonContains(EvalCtx& context) {
             processed_cursor += size;
             return;
         }
-        auto executor = [&](size_t i) {
+        auto executor = [&](size_t i) -> std::optional<bool> {
             auto doc = data[i].doc();
             auto array = doc.at_pointer(pointer).get_array();
             if (array.error()) {
