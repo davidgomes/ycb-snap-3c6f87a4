@@ -139,6 +139,28 @@ TEST_F(ExtractQueryShapeDistinctTest, ExtractFromDistinctHint) {
     ASSERT_BSONOBJ_EQ(shape, expectedShape);
 }
 
+TEST_F(ExtractQueryShapeDistinctTest, ExtractFromDistinctRawDataTrue) {
+    auto expectedShape = fromjson(
+        R"({ cmdNs: { db: "testdb", coll: "testcoll" }, command: "distinct", key: "name", rawData: true })");
+    auto distinct = R"({ distinct: "testcoll", $db: "testdb", key: "name", rawData: true })";
+
+    auto shape = distinctJsonToShapeBSON(distinct, opts, expCtx);
+
+    ASSERT_BSONOBJ_EQ(shape, expectedShape);
+}
+
+// 'rawData: false' must be normalized like an absent 'rawData' - it must not show up in the
+// shape.
+TEST_F(ExtractQueryShapeDistinctTest, ExtractFromDistinctRawDataFalse) {
+    auto expectedShape = fromjson(
+        R"({ cmdNs: { db: "testdb", coll: "testcoll" }, command: "distinct", key: "name" })");
+    auto distinct = R"({ distinct: "testcoll", $db: "testdb", key: "name", rawData: false })";
+
+    auto shape = distinctJsonToShapeBSON(distinct, opts, expCtx);
+
+    ASSERT_BSONOBJ_EQ(shape, expectedShape);
+}
+
 TEST_F(ExtractQueryShapeDistinctTest, CompareShapeHashes) {
     auto distinct1 =
         R"({
@@ -170,6 +192,24 @@ TEST_F(ExtractQueryShapeDistinctTest, CompareShapeHashes) {
 
     ASSERT_EQ(hash1, hash2);
     ASSERT_NOT_EQUALS(hash1, hash3);
+}
+
+// Verifies that a 'rawData: true' distinct command produces a different query shape hash from the
+// same command without 'rawData' (or with 'rawData: false'), and that 'rawData: false' is
+// normalized to hash identically to an absent 'rawData'.
+TEST_F(ExtractQueryShapeDistinctTest, CompareShapeHashesRawData) {
+    auto distinctNoRawData = R"({ distinct: "testcoll", $db: "testdb", key: "name" })";
+    auto distinctRawDataFalse =
+        R"({ distinct: "testcoll", $db: "testdb", key: "name", rawData: false })";
+    auto distinctRawDataTrue =
+        R"({ distinct: "testcoll", $db: "testdb", key: "name", rawData: true })";
+
+    auto hashNoRawData = distinctQueryShapeHash(distinctNoRawData, expCtx);
+    auto hashRawDataFalse = distinctQueryShapeHash(distinctRawDataFalse, expCtx);
+    auto hashRawDataTrue = distinctQueryShapeHash(distinctRawDataTrue, expCtx);
+
+    ASSERT_EQ(hashNoRawData, hashRawDataFalse);
+    ASSERT_NOT_EQUALS(hashNoRawData, hashRawDataTrue);
 }
 
 // Verifies that "distinct" command shape hash value is stable (does not change between the versions
@@ -237,7 +277,7 @@ TEST_F(DistinctShapeSizeTest, SizeOfShapeComponents) {
         expCtx, std::move(distinctCommand), ExtensionsCallbackNoop(), {});
     auto components = std::make_unique<DistinctCmdShapeComponents>(*pd, expCtx);
     const auto minimumSize = sizeof(CmdSpecificShapeComponents) + sizeof(BSONObj) +
-        sizeof(std::string) + components->key.size() +
+        sizeof(std::string) + sizeof(OptionalBool) + components->key.size() +
         static_cast<size_t>(components->representativeQuery.objsize());
 
     ASSERT_GTE(components->size(), minimumSize);

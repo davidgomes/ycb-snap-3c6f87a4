@@ -30,6 +30,12 @@ struct DistinctCmdShapeComponents : public CmdSpecificShapeComponents {
 
     std::string key;
     BSONObj representativeQuery;
+
+    // Normalized so that only an explicit value of 'true' is tracked as part of the shape - both
+    // an absent 'rawData' and an explicit 'false' are treated identically (i.e. not present), so
+    // that they continue to share a query shape (and hash) with commands that never mention
+    // 'rawData' at all.
+    OptionalBool rawData;
 };
 
 class DistinctCmdShape final : public Shape {

@@ -12,10 +12,12 @@ DistinctCmdShapeComponents::DistinctCmdShapeComponents(
     const ParsedDistinctCommand& request, const boost::intrusive_ptr<ExpressionContext>& expCtx)
     : key(std::string{request.distinctCommandRequest->getKey()}),
       representativeQuery(request.query->serialize(
-          query_shape::SerializationOptions::kRepresentativeQueryShapeSerializeOptions)) {}
+          query_shape::SerializationOptions::kRepresentativeQueryShapeSerializeOptions)),
+      rawData(bool(request.distinctCommandRequest->getRawData()) ? OptionalBool(true)
+                                                                  : OptionalBool()) {}
 
 void DistinctCmdShapeComponents::HashValue(absl::HashState state) const {
-    absl::HashState::combine(std::move(state), key, simpleHash(representativeQuery));
+    absl::HashState::combine(std::move(state), key, simpleHash(representativeQuery), rawData);
 }
 
 size_t DistinctCmdShapeComponents::size() const {
@@ -58,6 +60,11 @@ void DistinctCmdShape::appendCmdSpecificShapeComponents(
             bob.append(DistinctCommandRequest::kQueryFieldName, matchExpr->serialize(opts));
         }
     }
+
+    // rawData.
+    if (components.rawData.has_value()) {
+        bob.append(DistinctCommandRequest::kRawDataFieldName, bool(components.rawData));
+    }
 }
 
 QueryShapeHash DistinctCmdShape::sha256Hash(OperationContext*, const SerializationContext&) const {
@@ -81,6 +88,15 @@ QueryShapeHash DistinctCmdShape::sha256Hash(OperationContext*, const Serializati
     distinctCommandShapeBuffer.appendChar(0);
     distinctCommandShapeBuffer.appendCStr(components.key);
     distinctCommandShapeBuffer.appendBuf(collation.objdata(), collation.objsize());
+
+    // Only append an extra byte to the buffer when 'rawData' is explicitly true. This way,
+    // distinct commands which never mention 'rawData' (the common case) produce the exact same
+    // byte sequence - and therefore the exact same hash - as before 'rawData' was considered part
+    // of the shape.
+    if (components.rawData) {
+        distinctCommandShapeBuffer.appendChar(1);
+    }
+
     return SHA256Block::computeHash({
         ConstDataRange{distinctCommandShapeBuffer.buf(),
                        static_cast<std::size_t>(distinctCommandShapeBuffer.len())},
