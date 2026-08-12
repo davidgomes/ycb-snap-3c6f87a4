@@ -389,6 +389,7 @@ TEST_F(ServerFamilyTest, ResetClearsConnectionState) {
   EXPECT_EQ(NumSubscriptions("IO0"), 1u);
   Run({"GET", "tracked-before-reset"});
   EXPECT_THAT(Run({"SELECT", "2"}), "OK");
+  EXPECT_THAT(Run({"SET", "db-before-reset", "value"}), "OK");
   EXPECT_THAT(Run({"CLIENT", "SETNAME", "needs-reset"}), "OK");
   EXPECT_THAT(Run({"WATCH", "watched"}), "OK");
   EXPECT_THAT(Run({"MULTI"}), "OK");
@@ -401,6 +402,10 @@ TEST_F(ServerFamilyTest, ResetClearsConnectionState) {
   EXPECT_THAT(Run({"CLIENT", "TRACKING", "ON"}),
               ErrArg("Client tracking is currently not supported for RESP2"));
   EXPECT_THAT(Run({"GET", "discarded"}), ArgType(RespExpr::NIL));
+  EXPECT_THAT(Run({"GET", "db-before-reset"}), ArgType(RespExpr::NIL));
+  EXPECT_THAT(Run({"SELECT", "2"}), "OK");
+  EXPECT_THAT(Run({"GET", "db-before-reset"}), "value");
+  EXPECT_THAT(Run({"SELECT", "0"}), "OK");
 
   // The WATCH from DB 2 must not affect a new transaction after RESET.
   EXPECT_THAT(Run("watch-mutator", {"SELECT", "2"}), "OK");
