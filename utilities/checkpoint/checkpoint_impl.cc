@@ -18,9 +18,13 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/db_impl/db_impl.h"
+#include "db/log_writer.h"
+#include "db/version_edit.h"
 #include "db/wal_manager.h"
 #include "file/file_util.h"
 #include "file/filename.h"
+#include "file/writable_file_writer.h"
 #include "logging/logging.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
@@ -254,6 +258,47 @@ class ParallelFileMover : public CheckpointFileMover {
   std::vector<std::future<WorkItemResult>> copy_futures_;
   std::vector<PendingLink> link_pendings_;
 };
+
+Status CreateFilteredManifest(
+    FileSystem* fs, const std::string& source, const std::string& destination,
+    uint64_t source_size,
+    const std::vector<uint32_t>& excluded_column_family_ids, bool use_fsync) {
+  FileOptions file_options;
+  std::unique_ptr<FSWritableFile> destination_file;
+  IOStatus io_s = fs->NewWritableFile(destination, file_options,
+                                      &destination_file, nullptr);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+
+  auto destination_writer = std::make_unique<WritableFileWriter>(
+      std::move(destination_file), destination, file_options);
+  io_s = CopyFile(fs, source, Temperature::kUnknown, destination_writer,
+                  source_size, use_fsync, /*io_tracer=*/nullptr);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+
+  log::Writer manifest_writer(
+      std::move(destination_writer), /*log_number=*/0,
+      /*recycle_log_files=*/false, /*manual_flush=*/false, kNoCompression,
+      /*track_and_verify_wals=*/false, source_size % log::kBlockSize);
+  const WriteOptions write_options;
+  for (uint32_t column_family_id : excluded_column_family_ids) {
+    VersionEdit edit;
+    edit.DropColumnFamily();
+    edit.SetColumnFamily(column_family_id);
+    std::string record;
+    if (!edit.EncodeTo(&record)) {
+      return Status::Corruption("Unable to encode column family drop");
+    }
+    io_s = manifest_writer.AddRecord(write_options, record);
+    if (!io_s.ok()) {
+      return io_s;
+    }
+  }
+  return manifest_writer.file()->Sync(IOOptions(), use_fsync);
+}
 }  // namespace
 
 Status CheckpointEngine::Open(
@@ -271,6 +316,13 @@ Status CheckpointEngine::Open(
 Status Checkpoint::CreateCheckpoint(const std::string& /*checkpoint_dir*/,
                                     uint64_t /*log_size_for_flush*/,
                                     uint64_t* /*sequence_number_ptr*/) {
+  return Status::NotSupported("");
+}
+
+Status Checkpoint::CreateCheckpoint(
+    const std::string& /*checkpoint_dir*/,
+    const std::vector<ColumnFamilyHandle*>& /*column_families*/,
+    uint64_t /*log_size_for_flush*/, uint64_t* /*sequence_number_ptr*/) {
   return Status::NotSupported("");
 }
 
@@ -326,11 +378,25 @@ Status CheckpointImpl::CreateCheckpoint(const std::string& checkpoint_dir,
                               /*use_link=*/true, /*copy_rate_limiter=*/nullptr);
 }
 
-Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
-                                            uint64_t log_size_for_flush,
-                                            uint64_t* sequence_number_ptr,
-                                            CopyEngine* engine, bool use_link,
-                                            RateLimiter* copy_rate_limiter) {
+Status CheckpointImpl::CreateCheckpoint(
+    const std::string& checkpoint_dir,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    uint64_t log_size_for_flush, uint64_t* sequence_number_ptr) {
+  if (column_families.empty()) {
+    return CreateCheckpoint(checkpoint_dir, log_size_for_flush,
+                            sequence_number_ptr);
+  }
+  return CreateCheckpointImpl(checkpoint_dir, log_size_for_flush,
+                              sequence_number_ptr, /*engine=*/nullptr,
+                              /*use_link=*/true, /*copy_rate_limiter=*/nullptr,
+                              &column_families);
+}
+
+Status CheckpointImpl::CreateCheckpointImpl(
+    const std::string& checkpoint_dir, uint64_t log_size_for_flush,
+    uint64_t* sequence_number_ptr, CopyEngine* engine, bool use_link,
+    RateLimiter* copy_rate_limiter,
+    const std::vector<ColumnFamilyHandle*>* column_families) {
   DBOptions db_options = db_->GetDBOptions();
   Env* env = db_->GetEnv();
   const auto& fs = db_->GetFileSystem();
@@ -413,7 +479,19 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
             return CreateFile(fs, full_private_path + "/" + fname, contents,
                               db_options.use_fsync);
           } /* create_file_cb */,
-          &sequence_number, log_size_for_flush);
+          &sequence_number, log_size_for_flush,
+          /*get_live_table_checksum=*/false, /*atomic_flush=*/false,
+          column_families,
+          [&](const std::string& src_dirname, const std::string& fname,
+              uint64_t size_limit_bytes,
+              const std::vector<uint32_t>& excluded_column_family_ids) {
+            ROCKS_LOG_INFO(db_options.info_log, "Creating filtered %s",
+                           fname.c_str());
+            return CreateFilteredManifest(
+                fs, src_dirname + "/" + fname, full_private_path + "/" + fname,
+                size_limit_bytes, excluded_column_family_ids,
+                db_options.use_fsync);
+          } /* create_filtered_manifest_cb */);
 
       // Await any deferred work and fold in the first error before committing.
       Status finish_s = mover->Finish();
@@ -492,7 +570,13 @@ Status CheckpointImpl::CreateCustomCheckpoint(
                          FileType type)>
         create_file_cb,
     uint64_t* sequence_number, uint64_t log_size_for_flush,
-    bool get_live_table_checksum, bool atomic_flush) {
+    bool get_live_table_checksum, bool atomic_flush,
+    const std::vector<ColumnFamilyHandle*>* column_families,
+    std::function<
+        Status(const std::string& src_dirname, const std::string& fname,
+               uint64_t size_limit_bytes,
+               const std::vector<uint32_t>& excluded_column_family_ids)>
+        create_filtered_manifest_cb) {
   *sequence_number = db_->GetLatestSequenceNumber();
 
   LiveFilesStorageInfoOptions opts;
@@ -501,8 +585,16 @@ Status CheckpointImpl::CreateCustomCheckpoint(
   opts.atomic_flush = atomic_flush;
 
   std::vector<LiveFileStorageInfo> infos;
+  std::vector<uint32_t> excluded_column_family_ids;
   {
-    Status s = db_->GetLiveFilesStorageInfo(opts, &infos);
+    Status s;
+    if (column_families == nullptr) {
+      s = db_->GetLiveFilesStorageInfo(opts, &infos);
+    } else {
+      auto* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+      s = db_impl->GetLiveFilesStorageInfoForColumnFamilies(
+          opts, *column_families, &infos, &excluded_column_family_ids);
+    }
     if (!s.ok()) {
       return s;
     }
@@ -525,7 +617,15 @@ Status CheckpointImpl::CreateCustomCheckpoint(
 
   for (auto& info : infos) {
     Status s;
-    if (!info.replacement_contents.empty()) {
+    if (info.file_type == kDescriptorFile &&
+        !excluded_column_family_ids.empty()) {
+      if (!create_filtered_manifest_cb) {
+        return Status::InvalidArgument(
+            "Filtered MANIFEST callback is not configured");
+      }
+      s = create_filtered_manifest_cb(info.directory, info.relative_filename,
+                                      info.size, excluded_column_family_ids);
+    } else if (!info.replacement_contents.empty()) {
       // Currently should only be used for CURRENT file.
       assert(info.file_type == kCurrentFile);
 

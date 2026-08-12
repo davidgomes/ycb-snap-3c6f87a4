@@ -589,6 +589,15 @@ class DBImpl : public DB {
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override;
 
+  // Internal checkpoint helper. Returns the live files for the selected column
+  // families (always including default) and the IDs of other live column
+  // families that must be dropped from the checkpoint's MANIFEST.
+  Status GetLiveFilesStorageInfoForColumnFamilies(
+      const LiveFilesStorageInfoOptions& opts,
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      std::vector<LiveFileStorageInfo>* files,
+      std::vector<uint32_t>* excluded_column_family_ids);
+
   Status GetPreparedFileInfoForExternalSstIngestion(
       const std::string& file_path,
       std::shared_ptr<const PreparedFileInfo>* file_info) override;
@@ -1603,6 +1612,12 @@ class DBImpl : public DB {
                                 FlushReason flush_reason);
 
   virtual Status FlushForGetLiveFiles(bool force_atomic_flush = false);
+
+  Status GetLiveFilesStorageInfoImpl(
+      const LiveFilesStorageInfoOptions& opts,
+      const std::vector<ColumnFamilyHandle*>* column_families,
+      std::vector<LiveFileStorageInfo>* files,
+      std::vector<uint32_t>* excluded_column_family_ids);
 
   void NewThreadStatusCfInfo(ColumnFamilyData* cfd) const;
 

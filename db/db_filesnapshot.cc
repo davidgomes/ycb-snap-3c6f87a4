@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
@@ -23,6 +24,7 @@
 #include "rocksdb/transaction_log.h"
 #include "rocksdb/types.h"
 #include "test_util/sync_point.h"
+#include "util/cast_util.h"
 #include "util/file_checksum_helper.h"
 #include "util/mutexlock.h"
 
@@ -198,10 +200,53 @@ Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
+  return GetLiveFilesStorageInfoImpl(opts, /*column_families=*/nullptr, files,
+                                     /*excluded_column_family_ids=*/nullptr);
+}
+
+Status DBImpl::GetLiveFilesStorageInfoForColumnFamilies(
+    const LiveFilesStorageInfoOptions& opts,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    std::vector<LiveFileStorageInfo>* files,
+    std::vector<uint32_t>* excluded_column_family_ids) {
+  assert(excluded_column_family_ids);
+  return GetLiveFilesStorageInfoImpl(opts, &column_families, files,
+                                     excluded_column_family_ids);
+}
+
+Status DBImpl::GetLiveFilesStorageInfoImpl(
+    const LiveFilesStorageInfoOptions& opts,
+    const std::vector<ColumnFamilyHandle*>* column_families,
+    std::vector<LiveFileStorageInfo>* files,
+    std::vector<uint32_t>* excluded_column_family_ids) {
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
+  if (excluded_column_family_ids != nullptr) {
+    excluded_column_family_ids->clear();
+  }
   std::vector<LiveFileStorageInfo> results;
+  std::vector<uint32_t> excluded_results;
+
+  std::unordered_set<uint32_t> included_column_family_ids;
+  if (column_families != nullptr) {
+    included_column_family_ids.insert(0);
+    InstrumentedMutexLock l(&mutex_);
+    for (ColumnFamilyHandle* handle : *column_families) {
+      if (handle == nullptr) {
+        return Status::InvalidArgument("Column family handle must not be null");
+      }
+      auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(handle);
+      if (cfh->db() != this) {
+        return Status::InvalidArgument(
+            "Column family handle does not belong to this DB");
+      }
+      if (cfh->cfd()->IsDropped()) {
+        return Status::InvalidArgument("Column family is already dropped");
+      }
+      included_column_family_ids.insert(cfh->GetID());
+    }
+  }
 
   // NOTE: This implementation was largely migrated from Checkpoint.
 
@@ -277,9 +322,24 @@ Status DBImpl::GetLiveFilesStorageInfo(
     }
   }
 
+  if (column_families != nullptr) {
+    for (ColumnFamilyHandle* handle : *column_families) {
+      auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(handle);
+      if (cfh->cfd()->IsDropped()) {
+        mutex_.Unlock();
+        return Status::InvalidArgument("Column family is already dropped");
+      }
+    }
+  }
+
   // Make a set of all of the live table and blob files
   for (auto cfd : *versions_->GetColumnFamilySet()) {
     if (cfd->IsDropped()) {
+      continue;
+    }
+    if (column_families != nullptr &&
+        included_column_family_ids.count(cfd->GetID()) == 0) {
+      excluded_results.push_back(cfd->GetID());
       continue;
     }
     VersionStorageInfo& vsi = *cfd->current()->storage_info();
@@ -512,6 +572,9 @@ Status DBImpl::GetLiveFilesStorageInfo(
   if (s.ok()) {
     // Only move results to output on success.
     *files = std::move(results);
+    if (excluded_column_family_ids != nullptr) {
+      *excluded_column_family_ids = std::move(excluded_results);
+    }
   }
   return s;
 }
