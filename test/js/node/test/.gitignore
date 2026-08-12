@@ -1,0 +1,11 @@
+fixtures/wpt
+fixtures/tools
+fixtures/v8-coverage
+fixtures/test-runner/*
+!fixtures/test-runner/index.js
+!fixtures/test-runner/tagged.js
+fixtures/source-map
+fixtures/snapshot
+fixtures/repl*
+.tmp.*
+**/fails.txt
