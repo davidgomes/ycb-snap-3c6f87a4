@@ -1,0 +1,146 @@
+-- This file and its contents are licensed under the Timescale License.
+-- Please see the included NOTICE for copyright information and
+-- LICENSE-TIMESCALE for a copy of the license.
+
+\c :TEST_DBNAME :ROLE_SUPERUSER
+
+-- We have different collation names such as en_US, en-US-x-icu and so on,
+-- that are available on different platforms.
+with encodings as (
+  select -1
+  union all
+  select encoding from pg_database where datname = current_database()
+)
+, pattern(pattern, priority) as (
+    values ('en_us%',  2), ('en_us_utf%8%', 1)
+)
+, collations as (
+    select priority, collname
+    from pg_collation join pattern
+    on collname ilike pattern
+    where collencoding in (select * from encodings)
+    order by priority, collencoding, collname
+)
+select * from (
+    select 3 priority, 'C' "COLLATION"
+    union all select * from collations
+) c
+order by priority limit 1 \gset
+
+create table compressed_collation_ht(time timestamp, name text collate :"COLLATION",
+    value float);
+
+select create_hypertable('compressed_collation_ht', 'time');
+
+alter table compressed_collation_ht set (timescaledb.compress,
+    timescaledb.compress_segmentby = 'name', timescaledb.compress_orderby = 'time');
+
+insert into compressed_collation_ht values ('2021-01-01 01:01:01', 'á', '1'),
+    ('2021-01-01 01:01:02', 'b', '2'), ('2021-01-01 01:01:03', 'ç', '2');
+
+SELECT count(compress_chunk(ch)) FROM show_chunks('compressed_collation_ht') ch;
+
+vacuum analyze compressed_collation_ht;
+
+SELECT cs.compress_relid::text AS "CHUNK"
+FROM _timescaledb_catalog.hypertable ht
+    INNER JOIN _timescaledb_catalog.chunk ch
+    ON ch.hypertable_id = ht.id
+    INNER JOIN _timescaledb_catalog.compression_settings cs
+    ON cs.relid = ch.relid
+WHERE ht.table_name = 'compressed_collation_ht' \gset
+
+create index on :CHUNK (name);
+
+set enable_seqscan to off;
+
+explain (buffers off, costs off)
+select * from compressed_collation_ht order by name;
+
+select * from compressed_collation_ht order by name;
+
+reset enable_seqscan;
+
+
+-- Test vectorized aggregation with collations. Need multiple chunks for partial
+-- aggregation, which is where VectorAgg is used.
+create table collation_agg(time int, name text collate :"COLLATION");
+select create_hypertable('collation_agg', 'time', chunk_time_interval => 10);
+alter table collation_agg set (timescaledb.compress, timescaledb.compress_orderby = 'time');
+
+insert into collation_agg select x, case x % 3 when 0 then 'á' when 1 then 'b' else 'ç' end
+from generate_series(1, 30) x;
+select count(compress_chunk(ch)) from show_chunks('collation_agg') ch;
+vacuum analyze collation_agg;
+
+-- Vectorized aggregation is not used for non-C collations.
+set timescaledb.debug_require_vector_agg = 'forbid';
+set enable_sort = false;
+
+select min(name), max(name) from collation_agg;
+
+reset enable_sort;
+reset timescaledb.debug_require_vector_agg;
+
+
+-- Vectorized aggregation is used when the column has C collation.
+-- At the moment we don't support the 'min(name collate "C")' form that is
+-- represented by CollateExpr node.
+create table collation_agg_c(time int, name text collate "C");
+select create_hypertable('collation_agg_c', 'time', chunk_time_interval => 10);
+alter table collation_agg_c set (timescaledb.compress, timescaledb.compress_orderby = 'time');
+
+insert into collation_agg_c select x, case x % 3 when 0 then 'á' when 1 then 'b' else 'ç' end
+from generate_series(1, 30) x;
+select count(compress_chunk(ch)) from show_chunks('collation_agg_c') ch;
+vacuum analyze collation_agg_c;
+
+set enable_sort = false;
+set timescaledb.debug_require_vector_agg = 'require';
+
+select min(name), max(name) from collation_agg_c;
+
+reset enable_sort;
+reset timescaledb.debug_require_vector_agg;
+
+-- Test #9998: should not match query sort key with a different collation to compressed index sort key
+create table t9998 (
+    ts   timestamptz not null,
+    name text collate :"COLLATION"
+);
+select table_name from create_hypertable('t9998', 'ts');
+insert into t9998 values
+    ('2024-01-01', 'B'),
+    ('2024-01-01', 'a');
+alter table t9998 set (
+    timescaledb.compress,
+    timescaledb.compress_orderby = 'name'
+);
+select count(compress_chunk(ch)) from show_chunks('t9998') ch;
+
+-- C collation sorts capital before lowercase: expected order is 'B', 'a'.
+select name from t9998 order by name collate "C";
+
+drop table t9998 cascade;
+
+-- Test issue #9997: batch filtering for compressed DML should respect collation
+create table t9997 (
+    ts    timestamptz not null,
+    actor text collate :"COLLATION",
+    note  int
+);
+select count(*) from create_hypertable('t9997', 'ts');
+alter table t9997 set (timescaledb.compress);
+
+insert into t9997 values ('2024-01-01', 'alice', 1);
+
+SELECT count(compress_chunk(chunk_name)) FROM show_chunks('t9997') chunk_name;
+
+-- SELECT respects different collation, returns 1 row
+select note from t9997 where actor = 'alice' collate "C";
+
+-- UPDATE respects different collation, updates 1 row
+update t9997 set note = 99 where actor = 'alice' collate "C";
+select note from t9997 where actor = 'alice' collate "C";
+
+drop table t9997 cascade;
