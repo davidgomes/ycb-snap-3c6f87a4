@@ -221,22 +221,8 @@ func canFoldInNotEqualTautologyToTrue(col *planpb.ColumnInfo) bool {
 	return !hasNullableFieldSemantics(col) && !hasMissingPathSemantics(col)
 }
 
-func hasMissingPathNotEqualSemantics(col *planpb.ColumnInfo, values ...*planpb.GenericValue) bool {
-	if !hasMissingPathSemantics(col) {
-		return false
-	}
-	if col.GetDataType() != schemapb.DataType_JSON {
-		return true
-	}
-	for _, value := range values {
-		if value == nil || value.GetVal() == nil {
-			continue
-		}
-		if _, ok := value.GetVal().(*planpb.GenericValue_ArrayVal); ok {
-			return true
-		}
-	}
-	return false
+func hasMissingPathNotEqualSemantics(col *planpb.ColumnInfo, _ ...*planpb.GenericValue) bool {
+	return hasMissingPathSemantics(col)
 }
 
 func newAlwaysFalseExpr() *planpb.Expr {

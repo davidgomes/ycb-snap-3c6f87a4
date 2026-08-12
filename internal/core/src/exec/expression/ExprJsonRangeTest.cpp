@@ -493,6 +493,86 @@ GetValueFromProto(const milvus::proto::plan::GenericValue& value_proto) {
     }
 };
 
+TEST_P(ExprTest, JsonPathErrorsRemainUnknownUnderNot) {
+    auto schema = std::make_shared<Schema>();
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    auto segment = segcore::CreateSealedSegment(schema);
+
+    std::vector<std::string> json_strings{
+        R"({"a": "x", "arr": [1, 2]})",
+        R"({"a": "y", "arr": [2]})",
+        R"({"b": "x"})",
+        R"({"a": null, "arr": null})",
+        R"({"a": 1, "arr": "bad"})",
+        R"({"a": ["x"], "arr": [1]})",
+        R"({"a": "z", "arr": []})",
+        R"({"a": "x", "arr": [1, 3]})",
+    };
+    std::vector<milvus::Json> jsons;
+    for (const auto& value : json_strings) {
+        jsons.emplace_back(simdjson::padded_string(value));
+    }
+    auto json_field =
+        std::make_shared<FieldData<milvus::Json>>(DataType::JSON, false);
+    json_field->add_json_data(jsons);
+    auto cm = milvus::storage::RemoteChunkManagerSingleton::GetInstance()
+                  .GetRemoteChunkManager();
+    auto load_info = PrepareSingleFieldInsertBinlog(
+        1, 1, 1, json_fid.get(), {json_field}, cm);
+    segment->LoadFieldData(load_info);
+
+    proto::plan::GenericValue string_value;
+    string_value.set_string_val("x");
+    auto equal = std::make_shared<milvus::expr::UnaryRangeFilterExpr>(
+        milvus::expr::ColumnInfo(json_fid, DataType::JSON, {"a"}),
+        OpType::Equal,
+        string_value,
+        std::vector<proto::plan::GenericValue>{});
+    auto not_equal = std::make_shared<milvus::expr::UnaryRangeFilterExpr>(
+        milvus::expr::ColumnInfo(json_fid, DataType::JSON, {"a"}),
+        OpType::NotEqual,
+        string_value,
+        std::vector<proto::plan::GenericValue>{});
+    auto regex_match = std::make_shared<milvus::expr::UnaryRangeFilterExpr>(
+        milvus::expr::ColumnInfo(json_fid, DataType::JSON, {"a"}),
+        OpType::RegexMatch,
+        string_value,
+        std::vector<proto::plan::GenericValue>{});
+    auto term = std::make_shared<milvus::expr::TermFilterExpr>(
+        milvus::expr::ColumnInfo(json_fid, DataType::JSON, {"a"}),
+        std::vector<proto::plan::GenericValue>{string_value},
+        false);
+
+    proto::plan::GenericValue contains_value;
+    contains_value.set_int64_val(1);
+    auto contains = std::make_shared<milvus::expr::JsonContainsExpr>(
+        milvus::expr::ColumnInfo(json_fid, DataType::JSON, {"arr"}),
+        proto::plan::JSONContainsExpr_JSONOp_Contains,
+        true,
+        std::vector<proto::plan::GenericValue>{contains_value});
+
+    auto logical_not = [](const std::shared_ptr<expr::ITypeFilterExpr>& child) {
+        return std::make_shared<milvus::expr::LogicalUnaryExpr>(
+            milvus::expr::LogicalUnaryExpr::OpType::LogicalNot, child);
+    };
+    std::vector<std::shared_ptr<expr::ITypeFilterExpr>> expressions{
+        not_equal,
+        logical_not(equal),
+        logical_not(regex_match),
+        logical_not(term),
+        logical_not(contains),
+    };
+    for (const auto& expression : expressions) {
+        auto plan = std::make_shared<plan::FilterBitsNode>(
+            DEFAULT_PLANNODE_ID, expression);
+        auto result = ExecuteQueryExpr(
+            plan, segment.get(), json_strings.size(), MAX_TIMESTAMP);
+        ASSERT_EQ(result.count(), 2);
+        EXPECT_TRUE(result[1]);
+        EXPECT_TRUE(result[6]);
+    }
+}
+
 TEST_P(ExprTest, TestUnaryRangeJson) {
     struct Testcase {
         int64_t val;

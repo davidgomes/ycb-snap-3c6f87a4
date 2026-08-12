@@ -52,6 +52,23 @@ class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
         return bitset;
     }
 
+    TargetBitmap
+    IsNotNull() override {
+        TargetBitmap bitset(this->Count());
+        if constexpr ((std::is_integral_v<T> && !std::is_same_v<T, bool>) ||
+                      std::is_floating_point_v<T>) {
+            this->wrapper_->json_range_query(
+                json_path_, int64_t{}, int64_t{}, true, true, true, true, &bitset);
+            this->wrapper_->json_range_query(
+                json_path_, double{}, double{}, true, true, true, true, &bitset);
+        } else {
+            this->wrapper_->json_range_query(
+                json_path_, T{}, T{}, true, true, true, true, &bitset);
+        }
+        bitset &= InvertedIndexTantivy<T>::IsNotNull();
+        return bitset;
+    }
+
     const TargetBitmap
     InApplyFilter(
         size_t n,
