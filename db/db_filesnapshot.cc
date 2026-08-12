@@ -16,6 +16,7 @@
 #include "db/version_set.h"
 #include "file/file_util.h"
 #include "file/filename.h"
+#include "file/writable_file_writer.h"
 #include "logging/logging.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
@@ -557,31 +558,31 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   return s;
 }
 
-Status DBImpl::AppendManifestRecords(
-    const std::string& manifest_path,
+Status DBImpl::CreateManifestWithRecords(
+    const std::string& source_path, const std::string& destination_path,
+    uint64_t source_size, Temperature source_temperature,
     const std::vector<std::string>& records) {
-  if (records.empty()) {
-    return Status::OK();
-  }
-
   FileOptions file_options = versions_->GetFileOptionsForManifestWrite();
-  uint64_t manifest_size = 0;
-  IOStatus io_s = fs_->GetFileSize(manifest_path, IOOptions(), &manifest_size,
-                                   /*dbg=*/nullptr);
-  if (!io_s.ok()) {
-    return io_s;
-  }
-
   std::unique_ptr<FSWritableFile> manifest_file;
-  io_s = fs_->ReopenWritableFile(manifest_path, file_options, &manifest_file,
-                                 /*dbg=*/nullptr);
+  IOStatus io_s =
+      fs_->NewWritableFile(destination_path, file_options, &manifest_file,
+                           /*dbg=*/nullptr);
   if (!io_s.ok()) {
     return io_s;
   }
 
-  std::unique_ptr<log::Writer> manifest_log = versions_->CreateManifestWriter(
-      std::move(manifest_file), manifest_path, file_options,
-      /*preallocation_size=*/0, manifest_size);
+  auto manifest_writer = std::make_unique<WritableFileWriter>(
+      std::move(manifest_file), destination_path, file_options);
+  io_s = CopyFile(fs_.get(), source_path, source_temperature, manifest_writer,
+                  source_size, /*use_fsync=*/false, io_tracer_);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+
+  std::unique_ptr<log::Writer> manifest_log = std::make_unique<log::Writer>(
+      std::move(manifest_writer), /*log_number=*/0,
+      /*recycle_log_files=*/false, /*manual_flush=*/false, kNoCompression,
+      /*track_and_verify_wals=*/false, source_size % log::kBlockSize);
   const WriteOptions write_options;
   Status s;
   for (const std::string& record : records) {

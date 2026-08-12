@@ -595,8 +595,10 @@ class DBImpl : public DB {
       std::vector<LiveFileStorageInfo>* files,
       std::vector<uint32_t>* excluded_column_family_ids);
 
-  Status AppendManifestRecords(const std::string& manifest_path,
-                               const std::vector<std::string>& records);
+  Status CreateManifestWithRecords(
+      const std::string& source_path, const std::string& destination_path,
+      uint64_t source_size, Temperature source_temperature,
+      const std::vector<std::string>& records);
 
   Status GetLiveFilesStorageInfoImpl(
       const LiveFilesStorageInfoOptions& opts,

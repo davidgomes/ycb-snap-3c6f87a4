@@ -570,28 +570,47 @@ TEST_F(CheckpointTest, CheckpointSelectedColumnFamilies) {
     ASSERT_OK(Flush(cf));
   }
 
-  auto get_data_files = [&](ColumnFamilyHandle* handle) {
+  auto get_data_files = [&](ColumnFamilyHandle* handle,
+                            size_t* blob_file_count) {
+    auto basename = [](const std::string& filename) {
+      return filename.substr(
+          !filename.empty() && filename.front() == '/' ? 1 : 0);
+    };
     ColumnFamilyMetaData metadata;
     db_->GetColumnFamilyMetaData(handle, &metadata);
+    *blob_file_count = metadata.blob_file_count;
     std::set<std::string> files;
     for (const auto& level : metadata.levels) {
       for (const auto& file : level.files) {
-        files.insert(file.name.substr(file.name[0] == '/' ? 1 : 0));
+        files.insert(basename(file.name));
       }
     }
     for (const auto& blob : metadata.blob_files) {
-      files.insert(blob.blob_file_name.substr(
-          blob.blob_file_name[0] == '/' ? 1 : 0));
+      files.insert(basename(blob.blob_file_name));
     }
     return files;
   };
 
-  const std::set<std::string> default_files = get_data_files(handles_[0]);
-  const std::set<std::string> included_files = get_data_files(handles_[1]);
-  const std::set<std::string> excluded_files = get_data_files(handles_[2]);
+  size_t default_blob_file_count = 0;
+  size_t included_blob_file_count = 0;
+  size_t excluded_blob_file_count = 0;
+  const std::set<std::string> default_files =
+      get_data_files(handles_[0], &default_blob_file_count);
+  const std::set<std::string> included_files =
+      get_data_files(handles_[1], &included_blob_file_count);
+  const std::set<std::string> excluded_files =
+      get_data_files(handles_[2], &excluded_blob_file_count);
   ASSERT_FALSE(default_files.empty());
   ASSERT_FALSE(included_files.empty());
   ASSERT_FALSE(excluded_files.empty());
+  ASSERT_GT(default_blob_file_count, 0);
+  ASSERT_GT(included_blob_file_count, 0);
+  ASSERT_GT(excluded_blob_file_count, 0);
+
+  for (int cf = 0; cf < 3; ++cf) {
+    ASSERT_OK(Put(cf, "wal_key" + std::to_string(cf),
+                  "wal_value" + std::to_string(cf)));
+  }
 
   std::vector<std::string> source_live_files;
   uint64_t source_manifest_size = 0;
@@ -607,6 +626,9 @@ TEST_F(CheckpointTest, CheckpointSelectedColumnFamilies) {
     }
   }
   ASSERT_FALSE(source_manifest.empty());
+  std::string source_manifest_contents;
+  ASSERT_OK(ReadFileToString(env_, dbname_ + source_manifest,
+                             &source_manifest_contents));
 
   Checkpoint* checkpoint = nullptr;
   ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
@@ -627,6 +649,10 @@ TEST_F(CheckpointTest, CheckpointSelectedColumnFamilies) {
   ASSERT_NE(std::find(source_live_files_after.begin(),
                       source_live_files_after.end(), source_manifest),
             source_live_files_after.end());
+  std::string source_manifest_contents_after;
+  ASSERT_OK(ReadFileToString(env_, dbname_ + source_manifest,
+                             &source_manifest_contents_after));
+  ASSERT_EQ(source_manifest_contents, source_manifest_contents_after);
 
   std::vector<std::string> checkpoint_children;
   ASSERT_OK(env_->GetChildren(snapshot_name_, &checkpoint_children));
@@ -642,6 +668,12 @@ TEST_F(CheckpointTest, CheckpointSelectedColumnFamilies) {
     ASSERT_EQ(checkpoint_files.count(file), 0);
   }
 
+  std::vector<std::string> checkpoint_column_families;
+  ASSERT_OK(DB::ListColumnFamilies(DBOptions(options), snapshot_name_,
+                                   &checkpoint_column_families));
+  ASSERT_EQ(checkpoint_column_families,
+            std::vector<std::string>({kDefaultColumnFamilyName, "one"}));
+
   options.create_if_missing = false;
   std::vector<ColumnFamilyDescriptor> selected_descriptors = {
       {kDefaultColumnFamilyName, options}, {"one", options}};
@@ -656,6 +688,12 @@ TEST_F(CheckpointTest, CheckpointSelectedColumnFamilies) {
   ASSERT_OK(checkpoint_db->Get(ReadOptions(), checkpoint_handles[1], "key1",
                                &value));
   ASSERT_EQ(value, std::string(100, 'b'));
+  ASSERT_OK(checkpoint_db->Get(ReadOptions(), checkpoint_handles[0], "wal_key0",
+                               &value));
+  ASSERT_EQ(value, "wal_value0");
+  ASSERT_OK(checkpoint_db->Get(ReadOptions(), checkpoint_handles[1], "wal_key1",
+                               &value));
+  ASSERT_EQ(value, "wal_value1");
   for (ColumnFamilyHandle* handle : checkpoint_handles) {
     delete handle;
   }
@@ -675,6 +713,7 @@ TEST_F(CheckpointTest, CheckpointSelectedColumnFamilies) {
   checkpoint_db.reset();
 
   ASSERT_EQ(Get(2, "key2"), std::string(100, 'c'));
+  ASSERT_EQ(Get(2, "wal_key2"), "wal_value2");
 }
 
 TEST_F(CheckpointTest, EmptyColumnFamilySelectionCreatesFullCheckpoint) {

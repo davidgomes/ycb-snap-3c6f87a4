@@ -65,8 +65,7 @@ class CheckpointImpl : public Checkpoint {
       uint64_t* sequence_number, uint64_t log_size_for_flush,
       bool get_live_table_checksum = false, bool atomic_flush = false,
       const std::set<uint32_t>* column_family_ids = nullptr,
-      std::vector<uint32_t>* excluded_column_family_ids = nullptr,
-      std::string* manifest_filename = nullptr);
+      std::vector<uint32_t>* excluded_column_family_ids = nullptr);
 
  private:
   Status CleanStagingDirectory(const std::string& path, Logger* info_log);

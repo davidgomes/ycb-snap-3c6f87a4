@@ -439,7 +439,10 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
 
     if (s.ok() || s.IsNotSupported()) {
       std::vector<uint32_t> excluded_column_family_ids;
+      std::string source_manifest_path;
       std::string manifest_filename;
+      uint64_t source_manifest_size = 0;
+      Temperature source_manifest_temperature = Temperature::kUnknown;
       s = CreateCustomCheckpoint(
           [&](const std::string& src_dirname, const std::string& fname,
               FileType, const Temperature temperature) -> Status {
@@ -447,10 +450,17 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
                                full_private_path + "/" + fname, temperature);
           } /* link_file_cb */,
           [&](const std::string& src_dirname, const std::string& fname,
-              uint64_t size_limit_bytes, FileType,
+              uint64_t size_limit_bytes, FileType type,
               const std::string& /* checksum_func_name */,
               const std::string& /* checksum_val */,
               const Temperature temperature) -> Status {
+            if (column_family_ids != nullptr && type == kDescriptorFile) {
+              source_manifest_path = src_dirname + "/" + fname;
+              manifest_filename = fname;
+              source_manifest_size = size_limit_bytes;
+              source_manifest_temperature = temperature;
+              return Status::OK();
+            }
             return mover->Copy(src_dirname + "/" + fname,
                                full_private_path + "/" + fname,
                                size_limit_bytes, temperature);
@@ -463,8 +473,7 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
           &sequence_number, log_size_for_flush,
           /*get_live_table_checksum=*/false, /*atomic_flush=*/false,
           column_family_ids,
-          column_family_ids != nullptr ? &excluded_column_family_ids : nullptr,
-          column_family_ids != nullptr ? &manifest_filename : nullptr);
+          column_family_ids != nullptr ? &excluded_column_family_ids : nullptr);
 
       // Await any deferred work and fold in the first error before committing.
       Status finish_s = mover->Finish();
@@ -474,8 +483,7 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
         finish_s.PermitUncheckedError();
       }
 
-      if (s.ok() && column_family_ids != nullptr &&
-          !excluded_column_family_ids.empty()) {
+      if (s.ok() && column_family_ids != nullptr) {
         std::vector<std::string> drop_records;
         drop_records.reserve(excluded_column_family_ids.size());
         for (uint32_t column_family_id : excluded_column_family_ids) {
@@ -489,10 +497,17 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
           }
         }
         if (s.ok()) {
-          assert(!manifest_filename.empty());
-          auto* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
-          s = db_impl->AppendManifestRecords(
-              full_private_path + "/" + manifest_filename, drop_records);
+          if (source_manifest_path.empty() || manifest_filename.empty() ||
+              source_manifest_size == 0) {
+            s = Status::Corruption("No MANIFEST found in live files");
+          } else {
+            auto* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+            s = db_impl->CreateManifestWithRecords(
+                source_manifest_path,
+                full_private_path + "/" + manifest_filename,
+                source_manifest_size, source_manifest_temperature,
+                drop_records);
+          }
         }
       }
 
@@ -567,8 +582,7 @@ Status CheckpointImpl::CreateCustomCheckpoint(
     uint64_t* sequence_number, uint64_t log_size_for_flush,
     bool get_live_table_checksum, bool atomic_flush,
     const std::set<uint32_t>* column_family_ids,
-    std::vector<uint32_t>* excluded_column_family_ids,
-    std::string* manifest_filename) {
+    std::vector<uint32_t>* excluded_column_family_ids) {
   *sequence_number = db_->GetLatestSequenceNumber();
 
   LiveFilesStorageInfoOptions opts;
@@ -588,19 +602,6 @@ Status CheckpointImpl::CreateCustomCheckpoint(
     }
     if (!s.ok()) {
       return s;
-    }
-  }
-
-  if (manifest_filename != nullptr) {
-    manifest_filename->clear();
-    for (const auto& info : infos) {
-      if (info.file_type == kDescriptorFile) {
-        *manifest_filename = info.relative_filename;
-        break;
-      }
-    }
-    if (manifest_filename->empty()) {
-      return Status::Corruption("No MANIFEST found in live files");
     }
   }
 
