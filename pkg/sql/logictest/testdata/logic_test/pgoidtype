@@ -616,21 +616,21 @@ SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
 JOIN pg_namespace n ON c.relnamespace = n.oid
 WHERE c.oid='other_schema.table_with_indexes'::regclass
 ----
-table_with_indexes  table_with_indexes  other_schema
+table_with_indexes  other_schema.table_with_indexes  other_schema
 
 query TTT
 SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
 JOIN pg_namespace n ON c.relnamespace = n.oid
 WHERE c.oid='other_schema.table_with_indexes_pkey'::regclass
 ----
-table_with_indexes_pkey  table_with_indexes_pkey  other_schema
+table_with_indexes_pkey  other_schema.table_with_indexes_pkey  other_schema
 
 query TTT
 SELECT c.relname, c.oid::regclass::string, n.nspname from pg_class c
 JOIN pg_namespace n ON c.relnamespace = n.oid
 WHERE c.oid='other_schema.my_b_index'::regclass
 ----
-my_b_index  my_b_index  other_schema
+my_b_index  other_schema.my_b_index  other_schema
 
 # Changing the search_path should influence what gets resolved while casting.
 
@@ -810,5 +810,145 @@ true
 
 statement ok
 DROP TABLE t_oid_cmp
+
+subtest end
+
+subtest reg_name_visibility
+
+statement ok
+CREATE SCHEMA reg_first;
+CREATE SCHEMA reg_second;
+CREATE SCHEMA "Odd Schema";
+CREATE TABLE reg_first.shadowed (id INT PRIMARY KEY);
+CREATE TABLE reg_second.shadowed (id INT PRIMARY KEY);
+CREATE TABLE "Odd Schema"."select" (id INT PRIMARY KEY);
+CREATE TABLE reg_second.serial_reflection (id SERIAL PRIMARY KEY);
+CREATE TYPE reg_first.shadowed_type AS ENUM ('first');
+CREATE TYPE reg_second.shadowed_type AS ENUM ('second');
+CREATE TYPE reg_first.int4 AS ENUM ('shadow');
+CREATE FUNCTION reg_first.shadowed_fn() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE FUNCTION reg_second.shadowed_fn() RETURNS INT LANGUAGE SQL AS $$ SELECT 2 $$;
+CREATE FUNCTION reg_first.length() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+SET search_path = reg_first, reg_second, pg_catalog
+
+# Name-based and OID-based casts use the same visible or qualified spelling.
+query OTOT
+SELECT 'reg_first.shadowed'::regclass,
+       'reg_first.shadowed'::regclass::oid::regclass::text,
+       'reg_second.shadowed'::regclass,
+       'reg_second.shadowed'::regclass::oid::regclass::text
+----
+shadowed  shadowed  reg_second.shadowed  reg_second.shadowed
+
+query OTOT
+SELECT 'reg_first.shadowed_type'::regtype,
+       'reg_first.shadowed_type'::regtype::oid::regtype::text,
+       'reg_second.shadowed_type'::regtype,
+       'reg_second.shadowed_type'::regtype::oid::regtype::text
+----
+shadowed_type  shadowed_type  reg_second.shadowed_type  reg_second.shadowed_type
+
+query OTOT
+SELECT 'reg_first.shadowed_fn'::regproc,
+       'reg_first.shadowed_fn'::regproc::oid::regproc::text,
+       'reg_second.shadowed_fn'::regproc,
+       'reg_second.shadowed_fn'::regproc::oid::regproc::text
+----
+shadowed_fn  shadowed_fn  reg_second.shadowed_fn  reg_second.shadowed_fn
+
+query OTOT
+SELECT 'reg_first.shadowed_fn()'::regprocedure,
+       'reg_first.shadowed_fn()'::regprocedure::oid::regprocedure::text,
+       'reg_second.shadowed_fn()'::regprocedure,
+       'reg_second.shadowed_fn()'::regprocedure::oid::regprocedure::text
+----
+shadowed_fn  shadowed_fn  reg_second.shadowed_fn  reg_second.shadowed_fn
+
+# Built-in regtypes retain their SQL-standard names on every cast path.
+query OOT
+SELECT 'int4'::regtype, '23'::regtype, 23::oid::regtype::text
+----
+integer  integer  integer
+
+# Pgwire writes the resolved identifier directly, including identifier quotes.
+query OT
+SELECT '"Odd Schema"."select"'::regclass,
+       '"Odd Schema"."select"'::regclass::text
+----
+"Odd Schema"."select"  "Odd Schema"."select"
+
+statement ok
+SET search_path = "Odd Schema", reg_first, reg_second, pg_catalog
+
+query OT
+SELECT '"Odd Schema"."select"'::regclass,
+       '"Odd Schema"."select"'::regclass::text
+----
+"select"  "select"
+
+# Visibility follows the first schema containing any entity of the name.
+statement ok
+SET search_path = reg_first, reg_second, pg_catalog
+
+query TB rowsort
+SELECT n.nspname, pg_table_is_visible(c.oid)
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE c.relname = 'shadowed' AND n.nspname IN ('reg_first', 'reg_second')
+----
+reg_first   true
+reg_second  false
+
+query TB rowsort
+SELECT n.nspname, pg_type_is_visible(t.oid)
+FROM pg_type AS t
+JOIN pg_namespace AS n ON n.oid = t.typnamespace
+WHERE t.typname = 'shadowed_type' AND n.nspname IN ('reg_first', 'reg_second')
+----
+reg_first   true
+reg_second  false
+
+query TB rowsort
+SELECT n.nspname, pg_function_is_visible(p.oid)
+FROM pg_proc AS p
+JOIN pg_namespace AS n ON n.oid = p.pronamespace
+WHERE p.proname = 'shadowed_fn' AND n.nspname IN ('reg_first', 'reg_second')
+----
+reg_first   true
+reg_second  false
+
+# One earlier function shadows every pg_catalog overload with the same name.
+query BB
+SELECT count(*) > 1, bool_and(NOT pg_function_is_visible(p.oid))
+FROM pg_proc AS p
+JOIN pg_namespace AS n ON n.oid = p.pronamespace
+WHERE p.proname = 'length' AND n.nspname = 'pg_catalog'
+----
+true  true
+
+# Built-in type visibility follows pg_type names, while regtype output keeps
+# the SQL-standard spelling.
+query BBT
+SELECT pg_type_is_visible('reg_first.int4'::regtype),
+       pg_type_is_visible(23),
+       23::oid::regtype::text
+----
+true  false  integer
+
+# This is the cast shape used by SQLAlchemy column reflection.
+statement ok
+SET search_path = reg_first, pg_catalog
+
+query TT
+SELECT CAST(CAST(c.oid AS regclass) AS text),
+       pg_get_serial_sequence(CAST(CAST(c.oid AS regclass) AS text), 'id')
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE c.relname = 'serial_reflection' AND n.nspname = 'reg_second'
+----
+reg_second.serial_reflection  reg_second.serial_reflection_id_seq
+
+statement ok
+RESET search_path
 
 subtest end

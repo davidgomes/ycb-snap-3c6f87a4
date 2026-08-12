@@ -5579,6 +5579,10 @@ func (d *DOid) Format(ctx *FmtCtx) {
 		ctx.WriteString(UnknownOidName)
 	} else if d.semanticType.Oid() == oid.T_oid || d.name == "" {
 		ctx.Write(strconv.AppendUint(ctx.scratch[:0], uint64(d.Oid), 10))
+	} else if ctx.HasFlags(FmtPgwireText) {
+		// Reg* names are already formatted as identifiers. Write them verbatim
+		// rather than applying SQL string-literal escaping.
+		ctx.WriteString(d.name)
 	} else if ctx.HasFlags(fmtDisambiguateDatumTypes) {
 		ctx.WriteString("crdb_internal.create_")
 		ctx.WriteString(d.semanticType.SQLStandardName())

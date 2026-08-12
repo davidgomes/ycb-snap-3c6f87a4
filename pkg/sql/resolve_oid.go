@@ -59,10 +59,25 @@ func resolveOID(
 	if _, isOid := toResolve.(*tree.DOid); isOid {
 		queryCol = "oid"
 	}
-	q := fmt.Sprintf(
-		"SELECT %s.oid, %s FROM pg_catalog.%s WHERE %s = $1",
-		info.tableName, info.nameCol, info.tableName, queryCol,
-	)
+	var q string
+	if info.namespaceCol == "" {
+		q = fmt.Sprintf(
+			"SELECT %[1]s.oid, %[2]s FROM pg_catalog.%[1]s WHERE %[3]s = $1",
+			info.tableName, info.nameCol, queryCol,
+		)
+	} else {
+		q = fmt.Sprintf(
+			`SELECT obj.oid,
+			        CASE WHEN pg_catalog.%[1]s(obj.oid)
+			             THEN quote_ident(obj.%[2]s)
+			             ELSE quote_ident(n.nspname) || '.' || quote_ident(obj.%[2]s)
+			        END
+			   FROM pg_catalog.%[3]s AS obj
+			   JOIN pg_catalog.pg_namespace AS n ON obj.%[4]s = n.oid
+			  WHERE obj.%[5]s = $1`,
+			info.visibilityFn, info.nameCol, info.tableName, info.namespaceCol, queryCol,
+		)
+	}
 
 	results, err := ie.QueryRowEx(ctx, "queryOid", txn,
 		sessiondata.NoSessionDataOverride, q, toResolve)
@@ -94,6 +109,12 @@ type regTypeInfo struct {
 	tableName string
 	// nameCol is the name of the column that contains the table's entity name.
 	nameCol string
+	// namespaceCol is the name of the column that contains the entity's schema
+	// OID. It is empty for reg* types whose entities are not schema-qualified.
+	namespaceCol string
+	// visibilityFn is the PostgreSQL compatibility builtin that determines
+	// whether the entity can be referenced without a schema qualifier.
+	visibilityFn string
 	// objName is a human-readable name describing the objects in the table.
 	objName string
 	// errType is the pg error code in case the object does not exist.
@@ -103,10 +124,26 @@ type regTypeInfo struct {
 // regTypeInfos maps an oid.Oid to a regTypeInfo that describes the pg_catalog
 // table that contains the entities of the type of the key.
 var regTypeInfos = map[oid.Oid]regTypeInfo{
-	oid.T_regclass:     {"pg_class", "relname", "relation", pgcode.UndefinedTable},
-	oid.T_regnamespace: {"pg_namespace", "nspname", "namespace", pgcode.UndefinedObject},
-	oid.T_regproc:      {"pg_proc", "proname", "function", pgcode.UndefinedFunction},
-	oid.T_regprocedure: {"pg_proc", "proname", "function", pgcode.UndefinedFunction},
-	oid.T_regrole:      {"pg_authid", "rolname", "role", pgcode.UndefinedObject},
-	oid.T_regtype:      {"pg_type", "typname", "type", pgcode.UndefinedObject},
+	oid.T_regclass: {
+		"pg_class", "relname", "relnamespace", "pg_table_is_visible",
+		"relation", pgcode.UndefinedTable,
+	},
+	oid.T_regnamespace: {
+		"pg_namespace", "nspname", "", "", "namespace", pgcode.UndefinedObject,
+	},
+	oid.T_regproc: {
+		"pg_proc", "proname", "pronamespace", "pg_function_is_visible",
+		"function", pgcode.UndefinedFunction,
+	},
+	oid.T_regprocedure: {
+		"pg_proc", "proname", "pronamespace", "pg_function_is_visible",
+		"function", pgcode.UndefinedFunction,
+	},
+	oid.T_regrole: {
+		"pg_authid", "rolname", "", "", "role", pgcode.UndefinedObject,
+	},
+	oid.T_regtype: {
+		"pg_type", "typname", "typnamespace", "pg_type_is_visible",
+		"type", pgcode.UndefinedObject,
+	},
 }

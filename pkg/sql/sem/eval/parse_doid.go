@@ -42,6 +42,13 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 		if err != nil {
 			return nil, err
 		}
+		if t.Oid() == oid.T_regtype {
+			if typ, ok := types.OidToType[tmpOid.Oid]; ok {
+				return tree.NewDOidWithTypeAndName(
+					tmpOid.Oid, t, typ.SQLStandardName(),
+				), nil
+			}
+		}
 		oidRes, errSafeToIgnore, err := evalCtx.Planner.ResolveOIDFromOID(ctx, t, tmpOid)
 		if err != nil {
 			if !errSafeToIgnore {
@@ -88,7 +95,9 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 			return nil, funcDef.MakeUnsupportedError()
 		}
 		overload := funcDef.Overloads[0]
-		return tree.NewDOidWithTypeAndName(overload.Oid, t, funcDef.Name), nil
+		return resolveDOidDisplayName(
+			ctx, evalCtx, tree.NewDOidWithTypeAndName(overload.Oid, t, funcDef.Name),
+		)
 	case oid.T_regprocedure:
 		// Fake a ALTER FUNCTION statement to extract the function signature.
 		// We're kinda being lazy here to rely on the parser to determine if the
@@ -125,7 +134,9 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 			if !catid.IsOIDUserDefined(ol.Oid) &&
 				ol.Types.Length() == 1 &&
 				ol.Types.GetAt(0).Identical(types.AnyElement) {
-				return tree.NewDOidWithTypeAndName(ol.Oid, t, fd.Name), nil
+				return resolveDOidDisplayName(
+					ctx, evalCtx, tree.NewDOidWithTypeAndName(ol.Oid, t, fd.Name),
+				)
 			}
 		}
 
@@ -141,13 +152,17 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 		if err != nil {
 			return nil, err
 		}
-		return tree.NewDOidWithTypeAndName(ol.Oid, t, fd.Name), nil
+		return resolveDOidDisplayName(
+			ctx, evalCtx, tree.NewDOidWithTypeAndName(ol.Oid, t, fd.Name),
+		)
 	case oid.T_regtype:
 		parsedTyp, err := evalCtx.Planner.GetTypeFromValidSQLSyntax(ctx, s)
 		if err == nil {
-			return tree.NewDOidWithTypeAndName(
-				parsedTyp.Oid(), t, parsedTyp.SQLStandardName(),
-			), nil
+			d := tree.NewDOidWithTypeAndName(parsedTyp.Oid(), t, parsedTyp.SQLStandardName())
+			if !parsedTyp.UserDefined() {
+				return d, nil
+			}
+			return resolveDOidDisplayName(ctx, evalCtx, d)
 		}
 
 		// Fall back to searching pg_type, since we don't provide syntax for
@@ -201,7 +216,10 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 				uint32(id),
 				sessiondatapb.IsPgDumpCompatibilityEnabled(evalCtx.SessionData().PgDumpCompatibility),
 			)
-			return tree.NewDOidWithTypeAndName(resolvedOid, t, tn.ObjectName.String()), nil
+			return resolveDOidDisplayName(
+				ctx, evalCtx,
+				tree.NewDOidWithTypeAndName(resolvedOid, t, tn.ObjectName.String()),
+			)
 		} else if pgerror.GetPGCode(err) != pgcode.UndefinedTable {
 			return nil, err
 		}
@@ -211,12 +229,33 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 		if err != nil {
 			return nil, err
 		}
-		return tree.NewDOidWithTypeAndName(oidRes, t, tn.ObjectName.String()), nil
+		return resolveDOidDisplayName(
+			ctx, evalCtx, tree.NewDOidWithTypeAndName(oidRes, t, tn.ObjectName.String()),
+		)
 
 	default:
 		d, _ /* errSafeToIgnore */, err := evalCtx.Planner.ResolveOIDFromString(ctx, t, tree.NewDString(s))
 		return d, err
 	}
+}
+
+// resolveDOidDisplayName replaces d's name with the PostgreSQL-compatible
+// identifier that resolves back to the same OID through the current search
+// path. Some compatibility-only OIDs do not have catalog rows, so preserve the
+// caller's fallback name when the lookup can safely be ignored.
+func resolveDOidDisplayName(
+	ctx context.Context, evalCtx *Context, d *tree.DOid,
+) (*tree.DOid, error) {
+	resolved, errSafeToIgnore, err := evalCtx.Planner.ResolveOIDFromOID(
+		ctx, d.ResolvedType(), d,
+	)
+	if err != nil {
+		if errSafeToIgnore {
+			return d, nil
+		}
+		return nil, err
+	}
+	return resolved, nil
 }
 
 // indexNameToOID finds the OID for the given index. If the name is qualified,
