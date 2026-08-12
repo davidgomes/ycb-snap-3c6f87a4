@@ -144,6 +144,10 @@ pub struct LockfileReadFromPathOptions {
   pub frozen: bool,
   /// Causes the lockfile to only be read from, but not written to.
   pub skip_write: bool,
+  /// When set and the lockfile doesn't exist on disk yet, the lockfile is
+  /// seeded from a sibling npm `package-lock.json`, keeping only packages
+  /// reachable from these workspace dependency requirements.
+  pub seed_npm_lockfile_workspace_deps: Option<HashSet<JsrDepPackageReq>>,
 }
 
 #[sys_traits::auto_impl]
@@ -181,6 +185,9 @@ pub struct LockfileFlags {
   pub skip_write: bool,
   pub no_config: bool,
   pub no_npm: bool,
+  /// Whether to seed a not-yet-existing lockfile from a sibling npm
+  /// `package-lock.json` (used by local `deno install`).
+  pub seed_from_npm_lockfile: bool,
 }
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
@@ -343,16 +350,6 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
         .and_then(|c| c.to_lock_config().ok().flatten().map(|c| c.frozen()))
         .unwrap_or(false)
     });
-    let lockfile = Self::read_from_path(
-      sys,
-      LockfileReadFromPathOptions {
-        file_path,
-        frozen,
-        skip_write: flags.skip_write,
-      },
-      api,
-    )
-    .await?;
     let root_url = workspace.root_dir_url();
     let config = deno_lockfile::WorkspaceConfig {
       root: WorkspaceMemberConfig {
@@ -487,6 +484,21 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
         .npm_overrides()
         .map(|m| serde_json::Value::Object(m.clone())),
     };
+    let lockfile = Self::read_from_path(
+      sys,
+      LockfileReadFromPathOptions {
+        file_path,
+        frozen,
+        skip_write: flags.skip_write,
+        seed_npm_lockfile_workspace_deps: if flags.seed_from_npm_lockfile {
+          Some(workspace_config_dep_reqs(&config))
+        } else {
+          None
+        },
+      },
+      api,
+    )
+    .await?;
     lockfile.set_workspace_config(deno_lockfile::SetWorkspaceConfigOptions {
       no_npm: flags.no_npm,
       no_config: flags.no_config,
@@ -513,7 +525,11 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
         .await?
       }
       Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-        Lockfile::new_empty(opts.file_path, false)
+        let mut lockfile = Lockfile::new_empty(opts.file_path, false);
+        if let Some(workspace_deps) = &opts.seed_npm_lockfile_workspace_deps {
+          seed_from_sibling_npm_lockfile(&sys, &mut lockfile, workspace_deps);
+        }
+        lockfile
       }
       Err(err) => {
         return Err(err).with_context(|| {
@@ -560,6 +576,72 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
       )))
     } else {
       Ok(())
+    }
+  }
+}
+
+/// Collects every dependency requirement tracked by the workspace (root and
+/// members, from both deno.json and package.json).
+fn workspace_config_dep_reqs(
+  config: &deno_lockfile::WorkspaceConfig,
+) -> HashSet<JsrDepPackageReq> {
+  let mut deps = HashSet::new();
+  for member in std::iter::once(&config.root).chain(config.members.values()) {
+    deps.extend(member.dependencies.iter().cloned());
+    deps.extend(member.package_json_deps.iter().cloned());
+  }
+  deps
+}
+
+/// Seeds a new lockfile's npm packages from a `package-lock.json` sitting
+/// next to where the deno lockfile will be created. This is used by local
+/// `deno install` in projects migrating from npm so the first install
+/// preserves the versions and integrity hashes npm had already pinned.
+/// When the npm lockfile is missing or unusable this does nothing and the
+/// caller proceeds with an empty lockfile.
+fn seed_from_sibling_npm_lockfile<TSys: LockfileSys>(
+  sys: &TSys,
+  lockfile: &mut Lockfile,
+  workspace_deps: &HashSet<JsrDepPackageReq>,
+) {
+  let Some(dir) = lockfile.filename.parent() else {
+    return;
+  };
+  let package_lock_path = dir.join("package-lock.json");
+  let text = match sys.fs_read_to_string(&package_lock_path) {
+    Ok(text) => text,
+    Err(err) => {
+      if err.kind() != std::io::ErrorKind::NotFound {
+        log::debug!(
+          "Failed reading '{}': {:#}",
+          package_lock_path.display(),
+          err
+        );
+      }
+      return;
+    }
+  };
+  match crate::npm_package_lock::lockfile_content_from_npm_package_lock_json(
+    &text,
+    workspace_deps,
+  ) {
+    Ok(content) if !content.packages.npm.is_empty() => {
+      log::info!("Seeded lockfile from package-lock.json");
+      lockfile.content = content;
+      lockfile.has_content_changed = true;
+    }
+    Ok(_) => {
+      log::debug!(
+        "No npm packages to seed the lockfile with were found in '{}'",
+        package_lock_path.display()
+      );
+    }
+    Err(err) => {
+      log::debug!(
+        "Failed seeding lockfile from '{}': {:#}",
+        package_lock_path.display(),
+        err
+      );
     }
   }
 }

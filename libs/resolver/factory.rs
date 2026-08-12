@@ -206,6 +206,9 @@ pub struct WorkspaceFactoryOptions {
   pub is_package_manager_subcommand: bool,
   pub frozen_lockfile: Option<bool>,
   pub lock_arg: Option<PathBuf>,
+  /// Whether to seed a not-yet-existing lockfile from a sibling npm
+  /// `package-lock.json` (used by local `deno install`).
+  pub lockfile_seed_from_npm_lockfile: bool,
   /// Whether to skip writing to the lockfile.
   pub lockfile_skip_write: bool,
   pub maybe_custom_deno_dir_root: Option<PathBuf>,
@@ -547,6 +550,9 @@ impl<TSys: WorkspaceFactorySys> WorkspaceFactory<TSys> {
               ConfigDiscoveryOption::Disabled
             ),
             no_npm: self.options.no_npm,
+            seed_from_npm_lockfile: self
+              .options
+              .lockfile_seed_from_npm_lockfile,
           },
           &workspace_directory.workspace,
           maybe_external_import_map.as_ref().map(|v| &v.value),

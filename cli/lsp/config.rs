@@ -1301,6 +1301,7 @@ impl WorkspaceConfigData {
         is_package_manager_subcommand: false,
         frozen_lockfile: None,
         lock_arg: None,
+        lockfile_seed_from_npm_lockfile: false,
         lockfile_skip_write: true,
         node_modules_dir: Some(resolve_node_modules_dir_mode(workspace, byonm)),
         node_modules_linker: None,

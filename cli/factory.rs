@@ -1504,6 +1504,13 @@ fn new_workspace_factory_options(
       ),
     frozen_lockfile: flags.frozen_lockfile,
     lock_arg: flags.lock.as_ref().map(|l| initial_cwd.join(l)),
+    // Only local `deno install` seeds a not-yet-existing lockfile from a
+    // sibling package-lock.json (npm migration). Other commands keep
+    // starting from an empty lockfile when deno.lock is absent.
+    lockfile_seed_from_npm_lockfile: matches!(
+      flags.subcommand,
+      DenoSubcommand::Install(InstallFlags::Local(..))
+    ),
     lockfile_skip_write: flags.internal.lockfile_skip_write,
     no_npm: flags.no_npm,
     node_modules_dir: flags.node_modules_dir,
