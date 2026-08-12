@@ -45,6 +45,7 @@ envoy_cc_library(
         "//envoy/thread_local:thread_local_interface",
         "//source/common/access_log:access_log_lib",
         "//source/common/common:logger_lib",
+        "//source/common/formatter:stream_info_formatter_extension_lib",
         "//source/common/protobuf",
         "//source/common/stats:symbol_table_lib",
         "//source/common/stream_info:stream_info_lib",
