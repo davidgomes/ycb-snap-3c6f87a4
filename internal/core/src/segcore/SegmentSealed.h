@@ -82,7 +82,7 @@ class SegmentSealed : public SegmentInternalInterface {
                     }
                     switch (index.cast_type.data_type()) {
                         case JsonCastType::DataType::JSON:
-                            if (is_array && any_type) {
+                            if (is_array) {
                                 continue;
                             }
                             if (path_view.length() <
