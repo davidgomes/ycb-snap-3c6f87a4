@@ -597,6 +597,7 @@ message CertificateValidationContext {
 
   // If true, Envoy will not include the trusted CA subject names in downstream TLS
   // ``CertificateRequest`` messages. The configured trusted CAs are still used to validate
-  // presented client certificates. This setting has no effect on upstream TLS connections.
+  // presented client certificates. This setting has no effect on upstream TLS connections and
+  // defaults to false.
   bool suppress_client_ca_list = 18;
 }

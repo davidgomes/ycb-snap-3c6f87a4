@@ -4255,7 +4255,7 @@ void SslSocketTest::testClientAuthMultipleCAs(bool suppress_client_ca_list) {
 
   envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext server_tls_context;
   TestUtility::loadFromYaml(TestEnvironment::substitute(server_ctx_yaml), server_tls_context);
-  server_tls_context.set_require_client_certificate(true);
+  server_tls_context.mutable_require_client_certificate()->set_value(true);
   server_tls_context.mutable_common_tls_context()
       ->mutable_validation_context()
       ->set_suppress_client_ca_list(suppress_client_ca_list);
