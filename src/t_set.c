@@ -1845,6 +1845,148 @@ void sunionstoreCommand(client *c) {
     sunionDiffGenericCommand(c,c->argv+2,c->argc-2,c->argv[1],SET_OP_UNION);
 }
 
+/* Compute the cardinality of the union of 'setnum' sets ('setkeys') without
+ * materializing (or returning) the resulting elements.
+ *
+ * When 'approx' is false (the default) the exact cardinality is computed by
+ * deduplicating members into a throwaway set; the scan stops as soon as
+ * 'limit' (if non-zero) is reached, giving true early termination.
+ *
+ * When 'approx' is true the union cardinality is estimated with a
+ * HyperLogLog instead, which uses O(1) memory regardless of the size of the
+ * union at the cost of the usual ~0.81% HLL standard error. With a limit,
+ * scanning of the remaining keys stops as soon as the running estimate
+ * reaches the limit, and the reported cardinality is never higher than the
+ * limit. */
+void sunionCardGenericCommand(client *c, robj **setkeys, unsigned long setnum,
+                              unsigned long limit, int approx) {
+    setopsrc *sets = zmalloc(sizeof(setopsrc)*setnum);
+    setTypeIterator si;
+    char *str;
+    size_t len = 0;
+    int64_t llval = 0;
+    int encoding;
+    unsigned long j;
+    uint64_t cardinality = 0;
+
+    for (j = 0; j < setnum; j++) {
+        kvobj *setobj = lookupKeyRead(c->db, setkeys[j]);
+        if (!setobj) {
+            /* A missing key is treated as an empty set. */
+            sets[j].set = NULL;
+            sets[j].oldsize = 0;
+            continue;
+        }
+        if (checkType(c, setobj, OBJ_SET)) {
+            zfree(sets);
+            return;
+        }
+        sets[j].set = setobj;
+        if (server.memory_tracking_enabled)
+            sets[j].oldsize = kvobjAllocSize(setobj);
+    }
+
+    if (approx) {
+        robj *hll = createHLLObject();
+        int limit_reached = 0;
+
+        for (j = 0; j < setnum && !limit_reached; j++) {
+            if (!sets[j].set) continue; /* non existing keys are like empty sets */
+
+            setTypeInitIterator(&si, sets[j].set);
+            while ((encoding = setTypeNext(&si, &str, &len, &llval)) != -1) {
+                char tmpbuf[LONG_STR_SIZE];
+                unsigned char *ele;
+                size_t elesize;
+
+                if (str != NULL) {
+                    ele = (unsigned char*)str;
+                    elesize = len;
+                } else {
+                    elesize = ll2string(tmpbuf, sizeof tmpbuf, llval);
+                    ele = (unsigned char*)tmpbuf;
+                }
+                hllAdd(hll, ele, elesize);
+            }
+            setTypeResetIterator(&si);
+
+            /* Re-check the running estimate after every source set so we can
+             * skip the remaining keys once the limit has already been met. */
+            if (limit && hllCountObject(hll) >= limit)
+                limit_reached = 1;
+        }
+
+        cardinality = hllCountObject(hll);
+        decrRefCount(hll);
+    } else {
+        robj *dstset = createSetObject();
+
+        for (j = 0; j < setnum; j++) {
+            if (!sets[j].set) continue; /* non existing keys are like empty sets */
+
+            setTypeInitIterator(&si, sets[j].set);
+            while ((encoding = setTypeNext(&si, &str, &len, &llval)) != -1) {
+                cardinality += setTypeAddAux(dstset, str, len, llval, encoding == OBJ_ENCODING_HT);
+                if (limit && cardinality >= limit) break;
+            }
+            setTypeResetIterator(&si);
+
+            if (limit && cardinality >= limit) break;
+        }
+
+        server.lazyfree_lazy_server_del ? freeObjAsync(NULL, dstset, -1) :
+                                          decrRefCount(dstset);
+    }
+
+    if (server.memory_tracking_enabled) {
+        for (j = 0; j < setnum; j++) {
+            robj *obj = sets[j].set;
+            if (!obj) continue;
+            updateSlotAllocSize(c->db, getKeySlot(setkeys[j]->ptr), obj,
+                                sets[j].oldsize, kvobjAllocSize(obj));
+        }
+    }
+    zfree(sets);
+
+    if (limit && cardinality > limit) cardinality = limit;
+    addReplyLongLong(c, cardinality);
+}
+
+/* SUNIONCARD numkeys key [key ...] [APPROX] [LIMIT limit] */
+void sunionCardCommand(client *c) {
+    long j;
+    long numkeys = 0; /* Number of keys. */
+    long limit = 0;   /* 0 means no limit. */
+    int approx = 0;   /* Estimate with a HyperLogLog instead of an exact count. */
+
+    if (getRangeLongFromObjectOrReply(c, c->argv[1], 1, LONG_MAX,
+                                      &numkeys, "numkeys should be greater than 0") != C_OK)
+        return;
+    if (numkeys > (c->argc - 2)) {
+        addReplyError(c, "Number of keys can't be greater than number of args");
+        return;
+    }
+
+    for (j = 2 + numkeys; j < c->argc; j++) {
+        char *opt = c->argv[j]->ptr;
+        int moreargs = (c->argc - 1) - j;
+
+        if (!strcasecmp(opt, "LIMIT") && moreargs) {
+            j++;
+            if (getPositiveLongFromObjectOrReply(c, c->argv[j], &limit,
+                                                 "LIMIT can't be negative") != C_OK)
+                return;
+        } else if (!strcasecmp(opt, "APPROX")) {
+            approx = 1;
+        } else {
+            addReplyErrorObject(c, shared.syntaxerr);
+            return;
+        }
+    }
+
+    sunionCardGenericCommand(c, c->argv+2, numkeys, limit, approx);
+}
+
 /* SDIFF key [key ...] */
 void sdiffCommand(client *c) {
     sunionDiffGenericCommand(c,c->argv+1,c->argc-1,NULL,SET_OP_DIFF);

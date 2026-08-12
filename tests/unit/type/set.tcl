@@ -263,6 +263,41 @@ foreach type {single multiple single_multiple} {
         assert_equal 0 [r sintercard 1 non-existing-key limit 10]
     }
 
+    test "SUNIONCARD with illegal arguments" {
+        assert_error "ERR wrong number of arguments for 'sunioncard' command" {r sunioncard}
+        assert_error "ERR wrong number of arguments for 'sunioncard' command" {r sunioncard 1}
+
+        assert_error "ERR numkeys*" {r sunioncard 0 myset{t}}
+        assert_error "ERR numkeys*" {r sunioncard a myset{t}}
+
+        assert_error "ERR Number of keys*" {r sunioncard 2 myset{t}}
+        assert_error "ERR Number of keys*" {r sunioncard 3 myset{t} myset2{t}}
+
+        assert_error "ERR syntax error*" {r sunioncard 1 myset{t} myset2{t}}
+        assert_error "ERR syntax error*" {r sunioncard 1 myset{t} bar_arg}
+        assert_error "ERR syntax error*" {r sunioncard 1 myset{t} LIMIT}
+
+        assert_error "ERR LIMIT*" {r sunioncard 1 myset{t} LIMIT -1}
+        assert_error "ERR LIMIT*" {r sunioncard 1 myset{t} LIMIT a}
+    }
+
+    test "SUNIONCARD against non-set should throw error" {
+        r del set{t}
+        r sadd set{t} a b c
+        r set key1{t} x
+
+        assert_error "WRONGTYPE*" {r sunioncard 1 key1{t}}
+        assert_error "WRONGTYPE*" {r sunioncard 2 set{t} key1{t}}
+        assert_error "WRONGTYPE*" {r sunioncard 2 key1{t} noset{t}}
+    }
+
+    test "SUNIONCARD against non-existing key" {
+        assert_equal 0 [r sunioncard 1 non-existing-key]
+        assert_equal 0 [r sunioncard 1 non-existing-key limit 0]
+        assert_equal 0 [r sunioncard 1 non-existing-key limit 10]
+        assert_equal 0 [r sunioncard 1 non-existing-key approx]
+    }
+
     foreach {type} {regular intset} {
         # Create sets setN{t} where N = 1..5
         if {$type eq "regular"} {
@@ -345,6 +380,18 @@ foreach type {single multiple single_multiple} {
             assert_equal $expected [lsort [r smembers setres{t}]]
         }
 
+        test "SUNIONCARD with two sets - $type" {
+            set expected [llength [lsort -uniq "[r smembers set1{t}] [r smembers set2{t}]"]]
+            assert_equal $expected [r sunioncard 2 set1{t} set2{t}]
+            assert_equal $expected [r sunioncard 2 set1{t} set2{t} limit 0]
+            assert_equal 3 [r sunioncard 2 set1{t} set2{t} limit 3]
+            assert_equal $expected [r sunioncard 2 set1{t} set2{t} limit 1000]
+            # APPROX uses a HyperLogLog estimate, so allow for its usual error margin.
+            assert_range [r sunioncard 2 set1{t} set2{t} approx] \
+                [expr {int($expected * 0.9)}] [expr {int($expected * 1.1) + 1}]
+            assert_equal 3 [r sunioncard 2 set1{t} set2{t} approx limit 3]
+        }
+
         test "SINTER against three sets - $type" {
             assert_equal [list 195 199 $large] [lsort [r sinter set1{t} set2{t} set3{t}]]
         }
@@ -359,6 +406,14 @@ foreach type {single multiple single_multiple} {
         test "SINTERSTORE with three sets - $type" {
             r sinterstore setres{t} set1{t} set2{t} set3{t}
             assert_equal [list 195 199 $large] [lsort [r smembers setres{t}]]
+        }
+
+        test "SUNIONCARD against three sets - $type" {
+            set expected [llength [lsort -uniq "[r smembers set1{t}] [r smembers set2{t}] [r smembers set3{t}]"]]
+            assert_equal $expected [r sunioncard 3 set1{t} set2{t} set3{t}]
+            assert_equal $expected [r sunioncard 3 set1{t} set2{t} set3{t} limit 0]
+            assert_equal 2 [r sunioncard 3 set1{t} set2{t} set3{t} limit 2]
+            assert_equal $expected [r sunioncard 3 set1{t} set2{t} set3{t} limit 1000]
         }
 
         test "SUNION with non existing keys - $type" {
@@ -388,6 +443,13 @@ foreach type {single multiple single_multiple} {
             assert_equal $expected [lsort [r sinter set1{t} set1{t} set1{t}]]
             assert_equal $expected [lsort [r sunion set1{t} set1{t} set1{t}]]
             assert_equal {} [lsort [r sdiff set1{t} set1{t} set1{t}]]
+        }
+
+        test "SUNIONCARD with three same sets - $type" {
+            set expected [llength [r smembers set1{t}]]
+            assert_equal $expected [r sunioncard 3 set1{t} set1{t} set1{t}]
+            assert_range [r sunioncard 3 set1{t} set1{t} set1{t} approx] \
+                [expr {int($expected * 0.9)}] [expr {int($expected * 1.1) + 1}]
         }
     }
 

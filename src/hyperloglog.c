@@ -1131,6 +1131,14 @@ int hllAdd(robj *o, unsigned char *ele, size_t elesize) {
     }
 }
 
+/* Return the approximated cardinality of the HLL object 'o'. This is a thin
+ * wrapper around hllCount() used by callers outside this file (e.g.
+ * SUNIONCARD APPROX) that only deal with the HLL through an opaque robj,
+ * without needing to know about the internal 'hllhdr' representation. */
+uint64_t hllCountObject(robj *o) {
+    return hllCount((struct hllhdr*)o->ptr, NULL);
+}
+
 #ifdef HAVE_AVX2
 /* A specialized version of hllMergeDense, optimized for default configurations.
  * 
