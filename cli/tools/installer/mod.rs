@@ -27,6 +27,7 @@ use crate::util::display;
 mod bin_name_resolver;
 mod global;
 mod local;
+mod package_lock;
 
 pub use global::uninstall;
 use local::CategorizedInstalledDeps;

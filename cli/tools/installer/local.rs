@@ -1,6 +1,7 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::collections::HashSet;
+use std::fs;
 use std::sync::Arc;
 
 use deno_core::anyhow::bail;
@@ -37,9 +38,47 @@ pub async fn install_local(
       super::install_from_entrypoints(flags, entrypoints).await
     }
     InstallFlagsLocal::TopLevel(top_level_flags) => {
+      maybe_seed_lockfile_from_package_lock(&flags)?;
       install_top_level(flags, top_level_flags).await
     }
   }
+}
+
+fn maybe_seed_lockfile_from_package_lock(
+  flags: &Flags,
+) -> Result<(), AnyError> {
+  if flags.no_lock || flags.no_npm {
+    return Ok(());
+  }
+  let factory = CliFactory::from_flags(Arc::new(flags.clone()));
+  let cli_options = factory.cli_options()?;
+  let lockfile_path = match &flags.lock {
+    Some(path) => cli_options.initial_cwd().join(path),
+    None => match cli_options.workspace().resolve_lockfile_path()? {
+      Some(path) => path,
+      None => return Ok(()),
+    },
+  };
+  if lockfile_path.exists() {
+    return Ok(());
+  }
+  let Some(package_lock_path) = lockfile_path
+    .parent()
+    .map(|path| path.join("package-lock.json"))
+  else {
+    return Ok(());
+  };
+  let Ok(package_lock_text) = fs::read_to_string(package_lock_path) else {
+    return Ok(());
+  };
+  let Some(lockfile_text) = super::package_lock::package_lock_to_deno_lockfile(
+    &lockfile_path,
+    &package_lock_text,
+  ) else {
+    return Ok(());
+  };
+  fs::write(lockfile_path, lockfile_text)?;
+  Ok(())
 }
 
 #[derive(Debug, Default)]
