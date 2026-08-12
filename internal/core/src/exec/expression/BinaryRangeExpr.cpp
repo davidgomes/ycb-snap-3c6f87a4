@@ -749,9 +749,8 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonStats() {
              lower_inclusive,
              upper_inclusive,
              &res_view,
-             &known_view](milvus::BsonView bson,
-                          uint32_t row_id,
-                          uint32_t value_offset) {
+             &known_view](
+                milvus::BsonView bson, uint32_t row_id, uint32_t value_offset) {
                 if constexpr (std::is_same_v<GetType, int64_t> ||
                               std::is_same_v<GetType, double>) {
                     auto val = bson.ParseAsValueAtOffset<double>(value_offset);

@@ -89,9 +89,14 @@ class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
         } else {
             static_assert(std::is_same_v<T, std::string>,
                           "unsupported type for JsonFlatIndexQueryExecutor");
-            this->wrapper_->json_range_query(
-                json_path_, std::string(), std::string(), false, true, true,
-                false, &bitset);
+            this->wrapper_->json_range_query(json_path_,
+                                             std::string(),
+                                             std::string(),
+                                             false,
+                                             true,
+                                             true,
+                                             false,
+                                             &bitset);
         }
         return bitset;
     }

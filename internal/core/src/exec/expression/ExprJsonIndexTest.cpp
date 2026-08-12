@@ -285,7 +285,10 @@ TEST(JsonIndexTest, TestJsonNotEqualExpr) {
         std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, unary_expr);
     auto final =
         ExecuteQueryExpr(plan, seg.get(), 2 * json_strs.size(), MAX_TIMESTAMP);
-    EXPECT_EQ(final.count(), 2 * json_strs.size() - 2);
+    // SQL three-valued logic: only rows holding a definite numeric value
+    // different from 1 match ({"a": 3.0} in each chunk); string values,
+    // JSON nulls and missing paths are UNKNOWN and must not count.
+    EXPECT_EQ(final.count(), 2);
 }
 
 class JsonIndexExistsTest : public ::testing::TestWithParam<std::string> {};

@@ -276,19 +276,22 @@ TEST(JsonContainsByStatsTest, BasicContainsAnyOnArray) {
     }
 }
 
-TEST(JsonStatsUnaryRangeTest, NotEqualKeepsJsonPathErrorsButMasksFieldNull) {
+TEST(JsonStatsUnaryRangeTest, NotEqualTreatsJsonPathErrorsAsUnknown) {
     auto schema = std::make_shared<Schema>();
     auto json_fid = schema->AddDebugField("json", DataType::JSON, true);
 
     auto segment = segcore::CreateSealedSegment(schema);
 
+    // SQL three-valued logic: NotEqual only matches rows holding a definite
+    // string value different from the operand; missing paths, JSON null and
+    // type-mismatched values are UNKNOWN and must not count as matches.
     std::vector<std::string> json_raw_data = {
         R"({"a": "1"})",    // equal, filtered out
         R"({"a": "123"})",  // string mismatch, kept
-        R"({"a": 1})",      // type mismatch for string compare, kept
-        R"({"b": 1})",      // path missing, kept
-        R"({"a": null})",   // JSON path error, kept
-        R"({})",            // path missing, kept
+        R"({"a": 1})",      // type mismatch for string compare, UNKNOWN
+        R"({"b": 1})",      // path missing, UNKNOWN
+        R"({"a": null})",   // JSON null, UNKNOWN
+        R"({})",            // path missing, UNKNOWN
         R"({"a": "321"})",  // string mismatch, kept
         R"({"a": "123"})",  // field-level null, filtered out by valid data
     };
@@ -338,9 +341,11 @@ TEST(JsonStatsUnaryRangeTest, NotEqualKeepsJsonPathErrorsButMasksFieldNull) {
 
     ASSERT_EQ(result.size(), json_raw_data.size());
     EXPECT_FALSE(result[0]);
-    for (int i = 1; i <= 6; ++i) {
-        EXPECT_TRUE(result[i]) << "row " << i;
+    EXPECT_TRUE(result[1]);
+    for (int i = 2; i <= 5; ++i) {
+        EXPECT_FALSE(result[i]) << "row " << i << " must stay UNKNOWN";
     }
+    EXPECT_TRUE(result[6]);
     EXPECT_FALSE(result[7]);
-    EXPECT_EQ(result.count(), 6);
+    EXPECT_EQ(result.count(), 2);
 }
