@@ -119,13 +119,18 @@ void Aggregator::DoSort(const SortParams& sort_params) {
     return false;
   };
 
+  // Use a stable sort so documents with tied sort keys (e.g. equal @__score after ADDSCORES)
+  // keep a deterministic relative order instead of whatever an unstable sort/partial_sort
+  // happens to produce. This matters more now that BM25STD/TFIDF/TFIDF.DOCNORM scores are
+  // aggregated across shards (see GlobalScoringStats): genuine ties are common, and an
+  // unstable sort could otherwise reorder tied docs differently between runs.
   auto& values = result.values;
   if (sort_params.SortAll()) {
-    rng::sort(values, comparator);
+    rng::stable_sort(values, comparator);
   } else {
     DCHECK_GE(sort_params.max, 0);
     const size_t limit = std::min(values.size(), size_t(sort_params.max));
-    std::partial_sort(values.begin(), values.begin() + limit, values.end(), comparator);
+    rng::stable_sort(values, comparator);
     values.resize(limit);
   }
 
