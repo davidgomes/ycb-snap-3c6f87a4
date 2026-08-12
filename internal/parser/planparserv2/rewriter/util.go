@@ -205,20 +205,20 @@ func newAlwaysTrueExpr() *planpb.Expr {
 	}
 }
 
-func hasNullableFieldSemantics(col *planpb.ColumnInfo) bool {
-	return col != nil && col.GetNullable()
-}
-
 func hasMissingPathSemantics(col *planpb.ColumnInfo) bool {
 	return col != nil && len(col.GetNestedPath()) > 0
 }
 
+func hasUnknownValueSemantics(col *planpb.ColumnInfo) bool {
+	return col != nil && (col.GetNullable() || hasMissingPathSemantics(col))
+}
+
 func canFoldBoolDomainToConstant(col *planpb.ColumnInfo) bool {
-	return !hasNullableFieldSemantics(col) && !hasMissingPathSemantics(col)
+	return !hasUnknownValueSemantics(col)
 }
 
 func canFoldInNotEqualTautologyToTrue(col *planpb.ColumnInfo) bool {
-	return !hasNullableFieldSemantics(col) && !hasMissingPathSemantics(col)
+	return !hasUnknownValueSemantics(col)
 }
 
 func hasMissingPathNotEqualSemantics(col *planpb.ColumnInfo, _ ...*planpb.GenericValue) bool {
