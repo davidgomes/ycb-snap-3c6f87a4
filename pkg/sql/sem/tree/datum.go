@@ -5587,6 +5587,11 @@ func (d *DOid) Format(ctx *FmtCtx) {
 		ctx.WriteByte(',')
 		lexbase.EncodeSQLStringWithFlags(&ctx.Buffer, d.name, lexbase.EncNoFlags)
 		ctx.WriteByte(')')
+	} else if ctx.HasFlags(FmtPgwireText) {
+		// reg* values are identifiers, rather than SQL string literals. In
+		// particular, names that need identifier quotes must be sent verbatim
+		// instead of receiving an additional layer of SQL string escaping.
+		ctx.WriteString(d.name)
 	} else {
 		// This is used to print the name of pseudo-procedures in e.g.
 		// pg_catalog.pg_type.typinput
