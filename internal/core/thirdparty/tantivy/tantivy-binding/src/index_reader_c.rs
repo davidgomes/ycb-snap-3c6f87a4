@@ -508,6 +508,36 @@ pub extern "C" fn tantivy_json_range_query_i64(
 }
 
 #[no_mangle]
+pub extern "C" fn tantivy_json_range_query_u64(
+    ptr: *mut c_void,
+    json_path: *const c_char,
+    lower_bound: u64,
+    higher_bound: u64,
+    lb_unbounded: bool,
+    up_unbounded: bool,
+    lb_inclusive: bool,
+    ub_inclusive: bool,
+    bitset: *mut c_void,
+) -> RustResult {
+    let real = ptr as *mut IndexReaderWrapper;
+    let json_path = cstr_to_str!(json_path);
+    unsafe {
+        (*real)
+            .json_range_query(
+                json_path,
+                lower_bound,
+                higher_bound,
+                lb_unbounded,
+                up_unbounded,
+                lb_inclusive,
+                ub_inclusive,
+                bitset,
+            )
+            .into()
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn tantivy_json_range_query_f64(
     ptr: *mut c_void,
     json_path: *const c_char,

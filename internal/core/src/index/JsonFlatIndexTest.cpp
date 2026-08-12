@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -118,9 +119,9 @@ class JsonFlatIndexTest : public ::testing::Test {
         fs_ = storage::InitArrowFileSystem(storage_config);
 
         json_data_ = {
-            R"({"profile": {"name": {"first": "Alice", "last": "Smith", "preferred_name": "Al"}, "team": {"name": "Engineering", "supervisor": {"name": "Bob"}}, "is_active": true, "employee_id": 1001, "skills": ["cpp", "rust", "python"], "scores": [95, 88, 92]}})",
-            R"({"profile": {"name": {"first": "Bob", "last": "Johnson", "preferred_name": null}, "team": {"name": "Product", "supervisor": {"name": "Charlie"}}, "is_active": false, "employee_id": 1002, "skills": ["java", "python"], "scores": [85, 90]}})",
-            R"({"profile": {"name": {"first": "Charlie", "last": "Williams"}, "team": {"name": "Design", "supervisor": {"name": "Alice"}}, "is_active": true, "employee_id": 1003, "skills": ["python", "javascript"], "scores": [87, 91, 89]}})"};
+            R"({"profile": {"name": {"first": "Alice", "last": "Smith", "preferred_name": "Al"}, "team": {"name": "Engineering", "supervisor": {"name": "Bob"}}, "is_active": true, "employee_id": 1001, "large_id": 18446744073709551615, "skills": ["cpp", "rust", "python"], "scores": [95, 88, 92]}})",
+            R"({"profile": {"name": {"first": "Bob", "last": "Johnson", "preferred_name": null}, "team": {"name": "Product", "supervisor": {"name": "Charlie"}}, "is_active": false, "employee_id": 1002, "large_id": null, "skills": ["java", "python"], "scores": [85, 90]}})",
+            R"({"profile": {"name": {"first": "Charlie", "last": "Williams"}, "team": {"name": "Design", "supervisor": {"name": "Alice"}}, "is_active": true, "employee_id": 1003, "large_id": "wrong", "skills": ["python", "javascript"], "scores": [87, 91, 89]}})"};
 
         // Create field data with JSON values
         auto field_data =
@@ -258,6 +259,14 @@ TEST_F(JsonFlatIndexTest, TestTypedValidityQuery) {
     auto wrong_type_executor =
         json_flat_index->create_executor<std::string>(employee_id_path);
     EXPECT_TRUE(wrong_type_executor->IsNotNull().none());
+
+    std::string large_id_path = "/profile/large_id";
+    auto numeric_executor =
+        json_flat_index->create_executor<double>(large_id_path);
+    auto numeric_valid = numeric_executor->IsNotNull();
+    EXPECT_TRUE(numeric_valid[0]);   // u64 JSON number
+    EXPECT_FALSE(numeric_valid[1]);  // JSON null
+    EXPECT_FALSE(numeric_valid[2]);  // wrong type
 }
 
 TEST_F(JsonFlatIndexTest, TestNotInQuery) {
@@ -460,6 +469,16 @@ TEST_F(JsonFlatIndexTest, TestMixedNumericRangeQuery) {
     EXPECT_FALSE(bounded[0]);
     EXPECT_TRUE(bounded[1]);
     EXPECT_FALSE(bounded[2]);
+
+    std::string large_id_path = "/profile/large_id";
+    auto large_executor =
+        json_flat_index->create_executor<double>(large_id_path);
+    auto large_result = large_executor->Range(
+        static_cast<double>(std::numeric_limits<int64_t>::max()),
+        OpType::GreaterThan);
+    EXPECT_TRUE(large_result[0]);
+    EXPECT_FALSE(large_result[1]);
+    EXPECT_FALSE(large_result[2]);
 }
 
 TEST_F(JsonFlatIndexTest, TestArrayStringInQuery) {

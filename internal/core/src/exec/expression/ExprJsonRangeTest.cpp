@@ -499,13 +499,13 @@ TEST_P(ExprTest, JsonPathErrorsRemainUnknownUnderNot) {
     auto segment = segcore::CreateSealedSegment(schema);
 
     std::vector<std::string> json_strings{
-        R"({"a": "x", "arr": [1, 2]})",
-        R"({"a": "y", "arr": [2]})",
+        R"({"a": "x", "arr": [1, 2], "bool_arr": [true, false]})",
+        R"({"a": "y", "arr": [2], "bool_arr": [false]})",
         R"({"b": "x"})",
-        R"({"a": null, "arr": null})",
-        R"({"a": 1, "arr": "bad"})",
+        R"({"a": null, "arr": null, "bool_arr": null})",
+        R"({"a": 1, "arr": "bad", "bool_arr": "bad"})",
         R"({"a": ["x"], "arr": [1]})",
-        R"({"a": "z", "arr": []})",
+        R"({"a": "z", "arr": [], "bool_arr": []})",
         R"({"a": "x", "arr": [1, 3]})",
     };
     std::vector<milvus::Json> jsons;
@@ -594,6 +594,22 @@ TEST_P(ExprTest, JsonPathErrorsRemainUnknownUnderNot) {
             EXPECT_TRUE(result[row]);
         }
     }
+
+    proto::plan::GenericValue bool_value;
+    bool_value.set_bool_val(true);
+    auto contains_all_bool =
+        std::make_shared<milvus::expr::JsonContainsExpr>(
+            milvus::expr::ColumnInfo(
+                json_fid, DataType::JSON, {"bool_arr"}),
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+            true,
+            std::vector<proto::plan::GenericValue>{bool_value});
+    auto bool_plan = std::make_shared<plan::FilterBitsNode>(
+        DEFAULT_PLANNODE_ID, contains_all_bool);
+    auto bool_result = ExecuteQueryExpr(
+        bool_plan, segment.get(), json_strings.size(), MAX_TIMESTAMP);
+    ASSERT_EQ(bool_result.count(), 1);
+    EXPECT_TRUE(bool_result[0]);
 }
 
 TEST_P(ExprTest, TestUnaryRangeJson) {

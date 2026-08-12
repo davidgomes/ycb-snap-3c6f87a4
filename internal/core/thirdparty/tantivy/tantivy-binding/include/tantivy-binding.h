@@ -299,6 +299,16 @@ RustResult tantivy_json_range_query_i64(void *ptr,
                                         bool ub_inclusive,
                                         void *bitset);
 
+RustResult tantivy_json_range_query_u64(void *ptr,
+                                        const char *json_path,
+                                        uint64_t lower_bound,
+                                        uint64_t higher_bound,
+                                        bool lb_unbounded,
+                                        bool up_unbounded,
+                                        bool lb_inclusive,
+                                        bool ub_inclusive,
+                                        void *bitset);
+
 RustResult tantivy_json_range_query_f64(void *ptr,
                                         const char *json_path,
                                         double lower_bound,

@@ -1274,6 +1274,18 @@ struct TantivyIndexWrapper {
                                                      bitset);
             }
 
+            if constexpr (std::is_same_v<T, uint64_t>) {
+                return tantivy_json_range_query_u64(reader_,
+                                                    json_path.c_str(),
+                                                    lower_bound,
+                                                    upper_bound,
+                                                    lb_unbounded,
+                                                    ub_unbounded,
+                                                    lb_inclusive,
+                                                    ub_inclusive,
+                                                    bitset);
+            }
+
             if constexpr (std::is_integral_v<T>) {
                 return tantivy_json_range_query_i64(reader_,
                                                     json_path.c_str(),

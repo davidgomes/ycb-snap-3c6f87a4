@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <optional>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -118,7 +119,11 @@ class ContainsAllMatcher {
     }
 
  private:
-    ankerl::unordered_dense::map<T, uint32_t> value_to_bit_;
+    using ValueToBitMap = std::conditional_t<
+        std::is_same_v<T, bool>,
+        std::unordered_map<bool, uint32_t>,
+        ankerl::unordered_dense::map<T, uint32_t>>;
+    ValueToBitMap value_to_bit_;
     size_t target_count_{0};
     bool use_small_{true};
     uint64_t full_mask_{0};
