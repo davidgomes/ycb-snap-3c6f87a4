@@ -411,6 +411,10 @@ TEST_F(CheckpointTest, CheckpointWithSelectedColumnFamilies) {
   ASSERT_FALSE(included_files.empty());
   ASSERT_FALSE(excluded_files.empty());
 
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put(i, "wal-key", "wal-value" + std::to_string(i)));
+  }
+
   std::string source_manifest;
   std::vector<std::string> source_files;
   ASSERT_OK(env_->GetChildren(dbname_, &source_files));
@@ -466,6 +470,12 @@ TEST_F(CheckpointTest, CheckpointWithSelectedColumnFamilies) {
   ASSERT_OK(checkpoint_db->Get(ReadOptions(), checkpoint_handles[1], "key",
                                &value));
   ASSERT_EQ("value1", value);
+  ASSERT_OK(checkpoint_db->Get(ReadOptions(), checkpoint_handles[0], "wal-key",
+                               &value));
+  ASSERT_EQ("wal-value0", value);
+  ASSERT_OK(checkpoint_db->Get(ReadOptions(), checkpoint_handles[1], "wal-key",
+                               &value));
+  ASSERT_EQ("wal-value1", value);
   for (auto* handle : checkpoint_handles) {
     delete handle;
   }
