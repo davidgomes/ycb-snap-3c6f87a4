@@ -7,6 +7,7 @@
  */
 
 #include "server.h"
+#include "cluster.h"
 #include "sha256.h"
 #include <fcntl.h>
 #include <ctype.h>
