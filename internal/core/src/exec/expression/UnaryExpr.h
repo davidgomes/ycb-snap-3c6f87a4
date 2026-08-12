@@ -935,7 +935,9 @@ class ShreddingArrayBsonExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array_view = bson.ParseAsArrayAtOffset(0);
             if (!array_view.has_value()) {
-                res[i] = false;
+                // Not a parsable array value: UNKNOWN under three-valued
+                // logic, so clear validity as well.
+                res[i] = valid_res[i] = false;
                 continue;
             }
             bool equal = CompareTwoJsonArray(array_view.value(), val_);

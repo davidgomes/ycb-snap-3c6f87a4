@@ -54,7 +54,9 @@ class ShreddingArrayBsonContainsArrayExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array_view = bson.ParseAsArrayAtOffset(0);
             if (!array_view.has_value()) {
-                res[i] = false;
+                // Not a parsable array value: UNKNOWN under three-valued
+                // logic, so clear validity as well.
+                res[i] = valid_res[i] = false;
                 continue;
             }
             bool matched = false;
@@ -102,7 +104,9 @@ class ShreddingArrayBsonContainsAllArrayExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array_view = bson.ParseAsArrayAtOffset(0);
             if (!array_view.has_value()) {
-                res[i] = false;
+                // Not a parsable array value: UNKNOWN under three-valued
+                // logic, so clear validity as well.
+                res[i] = valid_res[i] = false;
                 continue;
             }
             std::set<int> exist_elements_index;
@@ -156,7 +160,9 @@ class ShreddingArrayBsonContainsAnyExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array_view = bson.ParseAsArrayAtOffset(0);
             if (!array_view.has_value()) {
-                res[i] = false;
+                // Not a parsable array value: UNKNOWN under three-valued
+                // logic, so clear validity as well.
+                res[i] = valid_res[i] = false;
                 continue;
             }
             bool matched = false;
@@ -212,7 +218,9 @@ class ShreddingArrayBsonContainsAllExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array_view = bson.ParseAsArrayAtOffset(0);
             if (!array_view.has_value()) {
-                res[i] = false;
+                // Not a parsable array value: UNKNOWN under three-valued
+                // logic, so clear validity as well.
+                res[i] = valid_res[i] = false;
                 continue;
             }
             std::set<GetType> tmp_elements(elements_);
@@ -259,7 +267,9 @@ class ShreddingArrayBsonContainsAllWithDiffTypeExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array = bson.ParseAsArrayAtOffset(0);
             if (!array.has_value()) {
-                res[i] = false;
+                // Not a parsable array value: UNKNOWN under three-valued
+                // logic, so clear validity as well.
+                res[i] = valid_res[i] = false;
                 continue;
             }
             std::set<int> tmp_elements_index(elements_index_);
@@ -372,7 +382,9 @@ class ShreddingArrayBsonContainsAnyWithDiffTypeExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array = bson.ParseAsArrayAtOffset(0);
             if (!array.has_value()) {
-                res[i] = false;
+                // Not a parsable array value: UNKNOWN under three-valued
+                // logic, so clear validity as well.
+                res[i] = valid_res[i] = false;
                 continue;
             }
             bool matched = false;

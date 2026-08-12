@@ -748,13 +748,16 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJson(EvalCtx& context) {
 // precision; uint64 and double values fall back to double comparison,
 // consistent with the Tantivy index and JSON-stats paths.
 // - 'cmp' must reference 'value' (auto-typed as int64_t or double).
-// - 'error_result': result when JSON path is missing or type mismatch.
-#define UnaryRangeJSONCompareCore(cmp, error_result)                   \
+// SQL three-valued logic: when the JSON path is missing, the parent value
+// is JSON null, or the value type is incompatible with the comparison, the
+// predicate result is UNKNOWN (res=false, valid=false) — for every operator,
+// including NotEqual.
+#define UnaryRangeJSONCompare(cmp)                                     \
     do {                                                               \
         if constexpr (std::is_same_v<GetType, int64_t>) {              \
             auto x_num = data[offset].at_numeric(pointer);             \
             if (x_num.error()) {                                       \
-                res[i] = (error_result);                               \
+                res[i] = valid_res[i] = false;                         \
                 break;                                                 \
             }                                                          \
             auto n = x_num.value();                                    \
@@ -770,17 +773,13 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJson(EvalCtx& context) {
         } else {                                                       \
             auto x = data[offset].template at<GetType>(pointer);       \
             if (x.error()) {                                           \
-                res[i] = (error_result);                               \
+                res[i] = valid_res[i] = false;                         \
                 break;                                                 \
             }                                                          \
             auto value = x.value();                                    \
             res[i] = (cmp);                                            \
         }                                                              \
     } while (false)
-
-#define UnaryRangeJSONCompare(cmp) UnaryRangeJSONCompareCore(cmp, false)
-
-#define UnaryRangeJSONCompareNotEqual(cmp) UnaryRangeJSONCompareCore(cmp, true)
 
     int processed_cursor = 0;
     auto execute_sub_batch =
@@ -901,7 +900,7 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJson(EvalCtx& context) {
                         auto doc = data[i].doc();
                         auto array = doc.at_pointer(pointer).get_array();
                         if (array.error()) {
-                            res[i] = false;
+                            res[i] = valid_res[i] = false;
                             continue;
                         }
                         res[i] = CompareTwoJsonArray(array, val);
@@ -929,12 +928,12 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJson(EvalCtx& context) {
                         auto doc = data[i].doc();
                         auto array = doc.at_pointer(pointer).get_array();
                         if (array.error()) {
-                            res[i] = false;
+                            res[i] = valid_res[i] = false;
                             continue;
                         }
                         res[i] = !CompareTwoJsonArray(array, val);
                     } else {
-                        UnaryRangeJSONCompareNotEqual(value != val);
+                        UnaryRangeJSONCompare(value != val);
                     }
                 }
                 break;
@@ -1076,8 +1075,9 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJsonByStats() {
                                  : std::stoi(pointerpair.second);
 
         ExprValueType val = GetValueFromProto<ExprValueType>(expr_->val_);
-        // for NotEqual: compute Equal and flip the result
-        // this avoids handling NULL values differently in multiple places
+        // for NotEqual: compute Equal on the rows with a definite typed value
+        // and flip only those rows afterwards; rows without a definite value
+        // stay UNKNOWN under SQL three-valued logic.
         auto op_type = (expr_->op_type_ == proto::plan::OpType::NotEqual)
                            ? proto::plan::OpType::Equal
                            : expr_->op_type_;
@@ -1091,6 +1091,12 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJsonByStats() {
             std::make_shared<TargetBitmap>(active_count_, true);
         TargetBitmapView res_view(*cached_index_chunk_res_);
         TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
+        // Rows with a definite (typed, comparable) value at the JSON path.
+        // Rows never marked known — path missing, JSON null, or type
+        // incompatible with the comparison — stay UNKNOWN (valid=false)
+        // under SQL three-valued logic.
+        TargetBitmap known(active_count_, false);
+        TargetBitmapView known_view(known);
         int64_t valid_processed_size = 0;
         for (size_t i = 0;
              i < num_data_chunk_ && valid_processed_size < active_count_;
@@ -1125,6 +1131,8 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJsonByStats() {
                 using ValType = decltype(ValType);
                 TargetBitmap target_res(active_count_, false);
                 TargetBitmapView target_res_view(target_res);
+                TargetBitmap target_valid(active_count_, true);
+                TargetBitmapView target_valid_view(target_valid);
                 ShreddingExecutor<ColType, ValType> executor(
                     op_type, pointer, val);
                 index->ExecutorForShreddingData<ColType>(op_ctx_,
@@ -1132,8 +1140,9 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJsonByStats() {
                                                          executor,
                                                          nullptr,
                                                          target_res_view,
-                                                         target_res_view);
+                                                         target_valid_view);
                 res_view.inplace_or_with_count(target_res_view, active_count_);
+                known_view.inplace_or(target_valid_view, active_count_);
                 LOG_DEBUG(
                     "using shredding data's field: {} with value {}, count {} "
                     "for segment {}",
@@ -1176,6 +1185,8 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJsonByStats() {
                 if (!target_field.empty()) {
                     TargetBitmap target_res(active_count_, false);
                     TargetBitmapView target_res_view(target_res);
+                    TargetBitmap target_valid(active_count_, true);
+                    TargetBitmapView target_valid_view(target_valid);
                     ShreddingArrayBsonExecutor executor(op_type, pointer, val);
                     index->ExecutorForShreddingData<std::string_view>(
                         op_ctx_,
@@ -1183,9 +1194,10 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJsonByStats() {
                         executor,
                         nullptr,
                         target_res_view,
-                        target_res_view);
+                        target_valid_view);
                     res_view.inplace_or_with_count(target_res_view,
                                                    active_count_);
+                    known_view.inplace_or(target_valid_view, active_count_);
                     LOG_DEBUG("using shredding array field: {}, count {}",
                               target_field,
                               res_view.count());
@@ -1209,15 +1221,20 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJsonByStats() {
         UnaryCompareContext context{
             like_matcher.has_value() ? &like_matcher.value() : nullptr,
             regex_matcher.has_value() ? &regex_matcher.value() : nullptr};
-        auto shared_executor = [op_type, val, array_index, &res_view, &context](
-                                   milvus::BsonView bson,
-                                   uint32_t row_id,
-                                   uint32_t value_offset) {
+        auto shared_executor = [op_type,
+                                val,
+                                array_index,
+                                &res_view,
+                                &known_view,
+                                &context](milvus::BsonView bson,
+                                          uint32_t row_id,
+                                          uint32_t value_offset) {
             auto set_unknown = [&](uint32_t row_id) {
                 res_view[row_id] = false;
             };
             auto set_known = [&](uint32_t row_id, bool value) {
                 res_view[row_id] = value;
+                known_view[row_id] = true;
             };
             if constexpr (std::is_same_v<GetType, proto::plan::Array>) {
                 Assert(op_type == proto::plan::OpType::Equal ||
@@ -1354,7 +1371,11 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJsonByStats() {
                 op_ctx_, bson_index_, pointer, shared_executor);
         }
 
-        // for NotEqual: flip the result
+        // Rows without a definite typed value are UNKNOWN: clear their
+        // validity in addition to the field-level null mask.
+        valid_res_view.inplace_and(known_view, active_count_);
+        // for NotEqual: flip the result; the AND below confines the flip to
+        // rows with a definite value, so UNKNOWN rows do not become true.
         if (expr_->op_type_ == proto::plan::OpType::NotEqual) {
             cached_index_chunk_res_->flip();
         }

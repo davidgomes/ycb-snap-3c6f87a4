@@ -65,6 +65,10 @@ ProcessJsonFieldData(
                 error_recorder(
                     *json_column, nested_path, simdjson::NO_SUCH_FIELD);
                 non_exist_adder(offset);
+                // Missing path carries no definite value: record as null so
+                // index NotIn/IsNotNull treat the row as UNKNOWN under SQL
+                // three-valued logic instead of a definite match.
+                null_adder(offset);
                 data_adder(nullptr, 0, offset++);
                 continue;
             }
@@ -76,6 +80,9 @@ ProcessJsonFieldData(
                 if (array_res.error() != simdjson::SUCCESS) {
                     error_recorder(
                         *json_column, nested_path, array_res.error());
+                    // Path exists but is not an array: no definite value for
+                    // element queries — record as null (UNKNOWN).
+                    null_adder(offset);
                 } else {
                     auto array_values = array_res.value();
                     for (auto value : array_values) {
@@ -92,12 +99,19 @@ ProcessJsonFieldData(
                         cast_function, *json_column, nested_path);
                     if (res.has_value()) {
                         values.push_back(res.value());
+                    } else {
+                        // Cast failure (JSON null or incompatible type):
+                        // record as null (UNKNOWN).
+                        null_adder(offset);
                     }
                 } else {
                     value_result<SIMDJSON_T> res =
                         json_column->at<SIMDJSON_T>(nested_path);
                     if (res.error() != simdjson::SUCCESS) {
                         error_recorder(*json_column, nested_path, res.error());
+                        // Type mismatch or JSON null at an existing path:
+                        // record as null (UNKNOWN).
+                        null_adder(offset);
                     } else {
                         values.push_back(static_cast<T>(res.value()));
                     }

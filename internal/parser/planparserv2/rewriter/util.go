@@ -221,22 +221,16 @@ func canFoldInNotEqualTautologyToTrue(col *planpb.ColumnInfo) bool {
 	return !hasNullableFieldSemantics(col) && !hasMissingPathSemantics(col)
 }
 
+// hasMissingPathNotEqualSemantics reports whether a column carries
+// missing-path semantics that make NotEqual rewrites unsafe. Under SQL
+// three-valued logic a predicate on a missing / JSON-null / type-mismatched
+// path evaluates to UNKNOWN — never a definite TRUE — so `!=` is NOT the
+// complement of `==` on such columns. Keep the user's explicit NOT form for
+// every nested path (scalar JSON included; the previous carve-out relied on
+// the old executor behavior that treated missing-path `!=` as definitely
+// true).
 func hasMissingPathNotEqualSemantics(col *planpb.ColumnInfo, values ...*planpb.GenericValue) bool {
-	if !hasMissingPathSemantics(col) {
-		return false
-	}
-	if col.GetDataType() != schemapb.DataType_JSON {
-		return true
-	}
-	for _, value := range values {
-		if value == nil || value.GetVal() == nil {
-			continue
-		}
-		if _, ok := value.GetVal().(*planpb.GenericValue_ArrayVal); ok {
-			return true
-		}
-	}
-	return false
+	return hasMissingPathSemantics(col)
 }
 
 func newAlwaysFalseExpr() *planpb.Expr {

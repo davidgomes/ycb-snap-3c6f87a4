@@ -11,6 +11,7 @@
 
 #pragma once
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include "common/EasyAssert.h"
 #include "common/JsonCastType.h"
@@ -49,6 +50,49 @@ class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
                               tracer::GetRootSpan());
         TargetBitmap bitset(this->Count());
         this->wrapper_->json_exist_query(json_path_, &bitset);
+        return bitset;
+    }
+
+    // Validity bitmap for SQL three-valued logic: only rows holding a value
+    // of this executor's type at the JSON path can be evaluated definitely;
+    // rows where the path is missing, the value is JSON null, or the value
+    // has an incompatible type are UNKNOWN. Implemented as a range query
+    // bounded below by the lowest value of T (a fully unbounded range query
+    // would carry no path/type information).
+    TargetBitmap
+    IsNotNull() override {
+        tracer::AutoSpan span("JsonFlatIndexQueryExecutor::IsNotNull",
+                              tracer::GetRootSpan());
+        TargetBitmap bitset(this->Count());
+        if constexpr (std::is_same_v<T, bool>) {
+            this->wrapper_->json_range_query(
+                json_path_, false, false, false, true, true, false, &bitset);
+        } else if constexpr (std::is_floating_point_v<T>) {
+            this->wrapper_->json_range_query(
+                json_path_,
+                -std::numeric_limits<T>::infinity(),
+                T(),
+                false,
+                true,
+                true,
+                false,
+                &bitset);
+        } else if constexpr (std::is_integral_v<T>) {
+            this->wrapper_->json_range_query(json_path_,
+                                             std::numeric_limits<T>::lowest(),
+                                             T(),
+                                             false,
+                                             true,
+                                             true,
+                                             false,
+                                             &bitset);
+        } else {
+            static_assert(std::is_same_v<T, std::string>,
+                          "unsupported type for JsonFlatIndexQueryExecutor");
+            this->wrapper_->json_range_query(
+                json_path_, std::string(), std::string(), false, true, true,
+                false, &bitset);
+        }
         return bitset;
     }
 

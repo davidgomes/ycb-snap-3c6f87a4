@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <variant>
 
@@ -525,11 +526,14 @@ PhyTermFilterExpr::ExecTermJsonVariableInField(EvalCtx& context) {
             processed_cursor += size;
             return;
         }
-        auto executor = [&](size_t i) {
+        // Returns nullopt when the JSON path is missing or does not hold an
+        // array: the membership test is UNKNOWN under SQL three-valued logic.
+        auto executor = [&](size_t i) -> std::optional<bool> {
             auto doc = data[i].doc();
             auto array = doc.at_pointer(pointer).get_array();
-            if (array.error())
-                return false;
+            if (array.error()) {
+                return std::nullopt;
+            }
             for (auto it = array.begin(); it != array.end(); ++it) {
                 auto val = (*it).template get<GetType>();
                 if (val.error()) {
@@ -554,7 +558,12 @@ PhyTermFilterExpr::ExecTermJsonVariableInField(EvalCtx& context) {
             if (has_bitmap_input && !bitmap_input[processed_cursor + i]) {
                 continue;
             }
-            res[i] = executor(offset);
+            auto result = executor(offset);
+            if (!result.has_value()) {
+                res[i] = valid_res[i] = false;
+            } else {
+                res[i] = result.value();
+            }
         }
         processed_cursor += size;
     };
@@ -627,15 +636,23 @@ PhyTermFilterExpr::ExecJsonInVariableByStats() {
             std::make_shared<TargetBitmap>(active_count_, true);
         TargetBitmapView res_view(*cached_index_chunk_res_);
         TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
+        // Rows with a definite (typed, comparable) value at the JSON path.
+        // Rows never marked known — path missing, JSON null, field null, or
+        // type incompatible with the term set — stay UNKNOWN (valid=false)
+        // under SQL three-valued logic.
+        TargetBitmap known(active_count_, false);
+        TargetBitmapView known_view(known);
 
         // process shredding data
         auto try_execute = [&](milvus::index::JSONType json_type,
-                               TargetBitmapView& res_view,
-                               TargetBitmapView& valid_res_view,
                                auto GetType) {
             auto target_field = index->GetShreddingField(pointer, json_type);
             if (!target_field.empty()) {
                 using ColType = decltype(GetType);
+                TargetBitmap target_res(active_count_, false);
+                TargetBitmapView target_res_view(target_res);
+                TargetBitmap target_valid(active_count_, true);
+                TargetBitmapView target_valid_view(target_valid);
                 auto shredding_executor = [this](const ColType* src,
                                                  const bool* valid,
                                                  size_t size,
@@ -657,8 +674,10 @@ PhyTermFilterExpr::ExecJsonInVariableByStats() {
                                                          target_field,
                                                          shredding_executor,
                                                          nullptr,
-                                                         res_view,
-                                                         valid_res_view);
+                                                         target_res_view,
+                                                         target_valid_view);
+                res_view.inplace_or(target_res_view, active_count_);
+                known_view.inplace_or(target_valid_view, active_count_);
                 LOG_DEBUG("using shredding data's field: {} count {}",
                           target_field,
                           res_view.count());
@@ -671,58 +690,27 @@ PhyTermFilterExpr::ExecJsonInVariableByStats() {
                 [this](double us) { json_stats_shredding_latency_us_ += us; });
 
             if constexpr (std::is_same_v<GetType, bool>) {
-                try_execute(milvus::index::JSONType::BOOL,
-                            res_view,
-                            valid_res_view,
-                            bool{});
+                try_execute(milvus::index::JSONType::BOOL, bool{});
             } else if constexpr (std::is_same_v<GetType, int64_t>) {
-                try_execute(milvus::index::JSONType::INT64,
-                            res_view,
-                            valid_res_view,
-                            int64_t{});
+                try_execute(milvus::index::JSONType::INT64, int64_t{});
                 // and double compare
-                TargetBitmap res_double(active_count_, false);
-                TargetBitmapView res_double_view(res_double);
-                TargetBitmap res_double_valid(active_count_, true);
-                TargetBitmapView valid_res_double_view(res_double_valid);
-                try_execute(milvus::index::JSONType::DOUBLE,
-                            res_double_view,
-                            valid_res_double_view,
-                            double{});
-                res_view.inplace_or_with_count(res_double_view, active_count_);
-                valid_res_view.inplace_or_with_count(valid_res_double_view,
-                                                     active_count_);
-
+                try_execute(milvus::index::JSONType::DOUBLE, double{});
             } else if constexpr (std::is_same_v<GetType, double>) {
-                try_execute(milvus::index::JSONType::DOUBLE,
-                            res_view,
-                            valid_res_view,
-                            double{});
+                try_execute(milvus::index::JSONType::DOUBLE, double{});
                 // and int64 compare
-                TargetBitmap res_int64(active_count_, false);
-                TargetBitmapView res_int64_view(res_int64);
-                TargetBitmap res_int64_valid(active_count_, true);
-                TargetBitmapView valid_res_int64_view(res_int64_valid);
-                try_execute(milvus::index::JSONType::INT64,
-                            res_int64_view,
-                            valid_res_int64_view,
-                            int64_t{});
-                res_view.inplace_or_with_count(res_int64_view, active_count_);
-                valid_res_view.inplace_or_with_count(valid_res_int64_view,
-                                                     active_count_);
+                try_execute(milvus::index::JSONType::INT64, int64_t{});
             } else if constexpr (std::is_same_v<GetType, std::string_view> ||
                                  std::is_same_v<GetType, std::string>) {
                 try_execute(milvus::index::JSONType::STRING,
-                            res_view,
-                            valid_res_view,
                             std::string_view{});
             }
         }
 
         // process shared data
-        auto shared_executor = [this, &res_view](milvus::BsonView bson,
-                                                 uint32_t row_offset,
-                                                 uint32_t value_offset) {
+        auto shared_executor = [this, &res_view, &known_view](
+                                   milvus::BsonView bson,
+                                   uint32_t row_offset,
+                                   uint32_t value_offset) {
             if constexpr (std::is_same_v<GetType, int64_t> ||
                           std::is_same_v<GetType, double>) {
                 auto get_value =
@@ -730,6 +718,7 @@ PhyTermFilterExpr::ExecJsonInVariableByStats() {
                 if (get_value.has_value()) {
                     res_view[row_offset] =
                         this->arg_set_double_->In(get_value.value());
+                    known_view[row_offset] = true;
                 }
                 return;
             } else {
@@ -738,6 +727,7 @@ PhyTermFilterExpr::ExecJsonInVariableByStats() {
                 if (get_value.has_value()) {
                     res_view[row_offset] =
                         this->arg_set_->In(get_value.value());
+                    known_view[row_offset] = true;
                 }
                 return;
             }
@@ -751,12 +741,17 @@ PhyTermFilterExpr::ExecJsonInVariableByStats() {
             index->ExecuteForSharedData(
                 op_ctx_, bson_index_, pointer, shared_executor);
         }
+        // Rows without a definite typed value are UNKNOWN.
+        valid_res_view.inplace_and(known_view, active_count_);
+        res_view.inplace_and(valid_res_view, active_count_);
         cached_index_chunk_id_ = 0;
         CachePut(CacheElapsedUs(cache_compute_start));
     }
 
-    auto res = MoveOrSliceBitmap(
-        *cached_index_chunk_res_, current_data_global_pos_, real_batch_size);
+    auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
+                                 *cached_index_chunk_valid_res_,
+                                 current_data_global_pos_,
+                                 real_batch_size);
     MoveCursor();
     return res;
 }
@@ -823,11 +818,14 @@ PhyTermFilterExpr::ExecTermJsonFieldInVariable(EvalCtx& context) {
             processed_cursor += size;
             return;
         }
-        auto executor = [&](size_t i) {
+        // Returns nullopt when the JSON path is missing, the parent value is
+        // JSON null, or the value type is incompatible with the term set:
+        // the membership test is UNKNOWN under SQL three-valued logic.
+        auto executor = [&](size_t i) -> std::optional<bool> {
             if constexpr (std::is_same_v<GetType, std::int64_t>) {
                 auto x_num = data[i].at_numeric(pointer);
                 if (x_num.error()) {
-                    return false;
+                    return std::nullopt;
                 }
                 auto n = x_num.value();
                 if (n.is_int64()) {
@@ -843,7 +841,7 @@ PhyTermFilterExpr::ExecTermJsonFieldInVariable(EvalCtx& context) {
             } else {
                 auto x = data[i].template at<GetType>(pointer);
                 if (x.error()) {
-                    return false;
+                    return std::nullopt;
                 }
                 return terms->In(ValueType(x.value()));
             }
@@ -866,7 +864,12 @@ PhyTermFilterExpr::ExecTermJsonFieldInVariable(EvalCtx& context) {
             if (has_bitmap_input && !bitmap_input[processed_cursor + i]) {
                 continue;
             }
-            res[i] = executor(offset);
+            auto result = executor(offset);
+            if (!result.has_value()) {
+                res[i] = valid_res[i] = false;
+            } else {
+                res[i] = result.value();
+            }
         }
         processed_cursor += size;
     };

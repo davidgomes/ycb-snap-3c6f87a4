@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -479,11 +480,14 @@ PhyJsonContainsFilterExpr::ExecJsonContains(EvalCtx& context) {
             processed_cursor += size;
             return;
         }
-        auto executor = [&](size_t i) {
+        // Returns nullopt when the JSON path is missing or does not hold an
+        // array: the containment test is UNKNOWN under SQL three-valued
+        // logic.
+        auto executor = [&](size_t i) -> std::optional<bool> {
             auto doc = data[i].doc();
             auto array = doc.at_pointer(pointer).get_array();
             if (array.error()) {
-                return false;
+                return std::nullopt;
             }
             for (auto&& it : array) {
                 auto val = it.template get<GetType>();
@@ -520,7 +524,12 @@ PhyJsonContainsFilterExpr::ExecJsonContains(EvalCtx& context) {
             if (has_bitmap_input && !bitmap_input[processed_cursor + i]) {
                 continue;
             }
-            res[i] = executor(offset);
+            auto result = executor(offset);
+            if (!result.has_value()) {
+                res[i] = valid_res[i] = false;
+            } else {
+                res[i] = result.value();
+            }
         }
         processed_cursor += size;
     };
@@ -603,6 +612,11 @@ PhyJsonContainsFilterExpr::ExecJsonContainsByStats() {
             std::make_shared<TargetBitmap>(active_count_, true);
         TargetBitmapView res_view(*cached_index_chunk_res_);
         TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
+        // Rows with a definite array value at the JSON path. Rows never
+        // marked known — path missing, JSON null, field null, or non-array
+        // value — stay UNKNOWN (valid=false) under SQL three-valued logic.
+        TargetBitmap known(active_count_, false);
+        TargetBitmapView known_view(known);
         // process shredding data for ARRAY type (non-shared)
         {
             milvus::ScopedTimer timer(
@@ -614,25 +628,35 @@ PhyJsonContainsFilterExpr::ExecJsonContainsByStats() {
                 ShreddingArrayBsonContainsAnyExecutor<GetType> executor(
                     arg_set_, arg_set_double_);
 
+                TargetBitmap target_res(active_count_, false);
+                TargetBitmapView target_res_view(target_res);
+                TargetBitmap target_valid(active_count_, true);
+                TargetBitmapView target_valid_view(target_valid);
                 index->ExecutorForShreddingData<std::string_view>(
                     op_ctx_,
                     target_field,
                     executor,
                     nullptr,
-                    res_view,
-                    valid_res_view);
+                    target_res_view,
+                    target_valid_view);
+                res_view.inplace_or(target_res_view, active_count_);
+                known_view.inplace_or(target_valid_view, active_count_);
             }
         }
         // process shared data
-        auto shared_executor = [this, &res_view](milvus::BsonView bson,
-                                                 uint32_t row_offset,
-                                                 uint32_t value_offset) {
+        auto shared_executor = [this, &res_view, &known_view](
+                                   milvus::BsonView bson,
+                                   uint32_t row_offset,
+                                   uint32_t value_offset) {
             auto val = bson.ParseAsArrayAtOffset(value_offset);
 
             if (!val.has_value()) {
+                // Not an array value: UNKNOWN, leave the row unmarked in
+                // the known bitmap.
                 res_view[row_offset] = false;
                 return;
             }
+            known_view[row_offset] = true;
 
             for (const auto& element : val.value()) {
                 if constexpr (std::is_same_v<GetType, int64_t> ||
@@ -663,12 +687,17 @@ PhyJsonContainsFilterExpr::ExecJsonContainsByStats() {
             index->ExecuteForSharedData(
                 op_ctx_, bson_index_, pointer, shared_executor);
         }
+        // Rows without a definite array value are UNKNOWN.
+        valid_res_view.inplace_and(known_view, active_count_);
+        res_view.inplace_and(valid_res_view, active_count_);
         cached_index_chunk_id_ = 0;
         CachePut(CacheElapsedUs(cache_compute_start));
     }
 
-    auto res = MoveOrSliceBitmap(
-        *cached_index_chunk_res_, current_data_global_pos_, real_batch_size);
+    auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
+                                 *cached_index_chunk_valid_res_,
+                                 current_data_global_pos_,
+                                 real_batch_size);
     MoveCursor();
     return res;
 }
@@ -732,11 +761,14 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArray(EvalCtx& context) {
             processed_cursor += size;
             return;
         }
-        auto executor = [&](size_t i) -> bool {
+        // Returns nullopt when the JSON path is missing or does not hold an
+        // array: the containment test is UNKNOWN under SQL three-valued
+        // logic.
+        auto executor = [&](size_t i) -> std::optional<bool> {
             auto doc = data[i].doc();
             auto array = doc.at_pointer(pointer).get_array();
             if (array.error()) {
-                return false;
+                return std::nullopt;
             }
             for (auto&& it : array) {
                 auto val = it.get_array();
@@ -771,7 +803,12 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArray(EvalCtx& context) {
             if (has_bitmap_input && !bitmap_input[processed_cursor + i]) {
                 continue;
             }
-            res[i] = executor(offset);
+            auto result = executor(offset);
+            if (!result.has_value()) {
+                res[i] = valid_res[i] = false;
+            } else {
+                res[i] = result.value();
+            }
         }
         processed_cursor += size;
     };
@@ -835,6 +872,11 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArrayByStats() {
             std::make_shared<TargetBitmap>(active_count_, true);
         TargetBitmapView res_view(*cached_index_chunk_res_);
         TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
+        // Rows with a definite array value at the JSON path. Rows never
+        // marked known — path missing, JSON null, field null, or non-array
+        // value — stay UNKNOWN (valid=false) under SQL three-valued logic.
+        TargetBitmap known(active_count_, false);
+        TargetBitmapView known_view(known);
 
         // process shredding data for ARRAY type (non-shared)
         {
@@ -845,24 +887,35 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArrayByStats() {
                 pointer, milvus::index::JSONType::ARRAY);
             if (!target_field.empty()) {
                 ShreddingArrayBsonContainsArrayExecutor executor(elements);
+                TargetBitmap target_res(active_count_, false);
+                TargetBitmapView target_res_view(target_res);
+                TargetBitmap target_valid(active_count_, true);
+                TargetBitmapView target_valid_view(target_valid);
                 index->ExecutorForShreddingData<std::string_view>(
                     op_ctx_,
                     target_field,
                     executor,
                     nullptr,
-                    res_view,
-                    valid_res_view);
+                    target_res_view,
+                    target_valid_view);
+                res_view.inplace_or(target_res_view, active_count_);
+                known_view.inplace_or(target_valid_view, active_count_);
             }
         }
 
-        auto shared_executor = [&elements, &res_view](milvus::BsonView bson,
-                                                      uint32_t row_offset,
-                                                      uint32_t value_offset) {
+        auto shared_executor = [&elements, &res_view, &known_view](
+                                   milvus::BsonView bson,
+                                   uint32_t row_offset,
+                                   uint32_t value_offset) {
             auto array = bson.ParseAsArrayAtOffset(value_offset);
 
             if (!array.has_value()) {
+                // Not an array value: UNKNOWN, leave the row unmarked in
+                // the known bitmap.
                 res_view[row_offset] = false;
+                return;
             }
+            known_view[row_offset] = true;
 
             for (const auto& sub_value : array.value()) {
                 auto sub_array = milvus::BsonView::GetValueFromBsonView<
@@ -873,11 +926,12 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArrayByStats() {
 
                 for (const auto& element : elements) {
                     if (CompareTwoJsonArray(sub_array.value(), element)) {
-                        return true;
+                        res_view[row_offset] = true;
+                        return;
                     }
                 }
             }
-            return false;
+            res_view[row_offset] = false;
         };
         {
             milvus::ScopedTimer timer(
@@ -886,12 +940,17 @@ PhyJsonContainsFilterExpr::ExecJsonContainsArrayByStats() {
             index->ExecuteForSharedData(
                 op_ctx_, bson_index_, pointer, shared_executor);
         }
+        // Rows without a definite array value are UNKNOWN.
+        valid_res_view.inplace_and(known_view, active_count_);
+        res_view.inplace_and(valid_res_view, active_count_);
         cached_index_chunk_id_ = 0;
         CachePut(CacheElapsedUs(cache_compute_start));
     }
 
-    auto res = MoveOrSliceBitmap(
-        *cached_index_chunk_res_, current_data_global_pos_, real_batch_size);
+    auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
+                                 *cached_index_chunk_valid_res_,
+                                 current_data_global_pos_,
+                                 real_batch_size);
     MoveCursor();
     return res;
 }
@@ -1083,11 +1142,14 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAll(EvalCtx& context) {
             processed_cursor += size;
             return;
         }
-        auto executor = [&](const size_t i) -> bool {
+        // Returns nullopt when the JSON path is missing or does not hold an
+        // array: the containment test is UNKNOWN under SQL three-valued
+        // logic.
+        auto executor = [&](const size_t i) -> std::optional<bool> {
             auto doc = data[i].doc();
             auto array = doc.at_pointer(pointer).get_array();
             if (array.error()) {
-                return false;
+                return std::nullopt;
             }
             if (matcher.use_small()) {
                 uint64_t found = 0;
@@ -1157,7 +1219,12 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAll(EvalCtx& context) {
             if (has_bitmap_input && !bitmap_input[processed_cursor + i]) {
                 continue;
             }
-            res[i] = executor(offset);
+            auto result = executor(offset);
+            if (!result.has_value()) {
+                res[i] = valid_res[i] = false;
+            } else {
+                res[i] = result.value();
+            }
         }
         processed_cursor += size;
     };
@@ -1232,6 +1299,11 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
             std::make_shared<TargetBitmap>(active_count_, true);
         TargetBitmapView res_view(*cached_index_chunk_res_);
         TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
+        // Rows with a definite array value at the JSON path. Rows never
+        // marked known — path missing, JSON null, field null, or non-array
+        // value — stay UNKNOWN (valid=false) under SQL three-valued logic.
+        TargetBitmap known(active_count_, false);
+        TargetBitmapView known_view(known);
         // process shredding data for ARRAY type (non-shared)
         {
             milvus::ScopedTimer timer(
@@ -1243,13 +1315,19 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
                 ShreddingArrayBsonContainsAllExecutor<GetType> executor(
                     *elements);
 
+                TargetBitmap target_res(active_count_, false);
+                TargetBitmapView target_res_view(target_res);
+                TargetBitmap target_valid(active_count_, true);
+                TargetBitmapView target_valid_view(target_valid);
                 index->ExecutorForShreddingData<std::string_view>(
                     op_ctx_,
                     target_field,
                     executor,
                     nullptr,
-                    res_view,
-                    valid_res_view);
+                    target_res_view,
+                    target_valid_view);
+                res_view.inplace_or(target_res_view, active_count_);
+                known_view.inplace_or(target_valid_view, active_count_);
             }
         }
         // process shared data
@@ -1258,15 +1336,19 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
             shared_matcher.use_small() ? 0 : shared_matcher.num_words());
         auto shared_executor = [&shared_matcher,
                                 &res_view,
+                                &known_view,
                                 &shared_found_large](milvus::BsonView bson,
                                                      uint32_t row_offset,
                                                      uint32_t value_offset) {
             auto val = bson.ParseAsArrayAtOffset(value_offset);
 
             if (!val.has_value()) {
+                // Not an array value: UNKNOWN, leave the row unmarked in
+                // the known bitmap.
                 res_view[row_offset] = false;
                 return;
             }
+            known_view[row_offset] = true;
 
             if (shared_matcher.use_small()) {
                 uint64_t found = 0;
@@ -1343,12 +1425,17 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllByStats() {
             index->ExecuteForSharedData(
                 op_ctx_, bson_index_, pointer, shared_executor);
         }
+        // Rows without a definite array value are UNKNOWN.
+        valid_res_view.inplace_and(known_view, active_count_);
+        res_view.inplace_and(valid_res_view, active_count_);
         cached_index_chunk_id_ = 0;
         CachePut(CacheElapsedUs(cache_compute_start));
     }
 
-    auto res = MoveOrSliceBitmap(
-        *cached_index_chunk_res_, current_data_global_pos_, real_batch_size);
+    auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
+                                 *cached_index_chunk_valid_res_,
+                                 current_data_global_pos_,
+                                 real_batch_size);
     MoveCursor();
     return res;
 }
@@ -1407,12 +1494,15 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllWithDiffType(EvalCtx& context) {
             processed_cursor += size;
             return;
         }
-        auto executor = [&](size_t i) -> bool {
+        // Returns nullopt when the JSON path is missing or does not hold an
+        // array: the containment test is UNKNOWN under SQL three-valued
+        // logic.
+        auto executor = [&](size_t i) -> std::optional<bool> {
             const auto& json = data[i];
             auto doc = json.dom_doc();
             auto array = doc.at_pointer(pointer).get_array();
             if (array.error()) {
-                return false;
+                return std::nullopt;
             }
             std::unordered_set<int> tmp_elements_index(elements_index);
             for (auto&& it : array) {
@@ -1504,7 +1594,12 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllWithDiffType(EvalCtx& context) {
                 continue;
             }
 
-            res[i] = executor(offset);
+            auto result = executor(offset);
+            if (!result.has_value()) {
+                res[i] = valid_res[i] = false;
+            } else {
+                res[i] = result.value();
+            }
         }
         processed_cursor += size;
     };
@@ -1570,6 +1665,11 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllWithDiffTypeByStats() {
             std::make_shared<TargetBitmap>(active_count_, true);
         TargetBitmapView res_view(*cached_index_chunk_res_);
         TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
+        // Rows with a definite array value at the JSON path. Rows never
+        // marked known — path missing, JSON null, field null, or non-array
+        // value — stay UNKNOWN (valid=false) under SQL three-valued logic.
+        TargetBitmap known(active_count_, false);
+        TargetBitmapView known_view(known);
 
         // process shredding data for ARRAY type (non-shared)
         {
@@ -1581,26 +1681,37 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllWithDiffTypeByStats() {
             if (!target_field.empty()) {
                 ShreddingArrayBsonContainsAllWithDiffTypeExecutor executor(
                     elements, elements_index);
+                TargetBitmap target_res(active_count_, false);
+                TargetBitmapView target_res_view(target_res);
+                TargetBitmap target_valid(active_count_, true);
+                TargetBitmapView target_valid_view(target_valid);
                 index->ExecutorForShreddingData<std::string_view>(
                     op_ctx_,
                     target_field,
                     executor,
                     nullptr,
-                    res_view,
-                    valid_res_view);
+                    target_res_view,
+                    target_valid_view);
+                res_view.inplace_or(target_res_view, active_count_);
+                known_view.inplace_or(target_valid_view, active_count_);
             }
         }
 
-        auto shared_executor = [&elements, &elements_index, &res_view](
-                                   milvus::BsonView bson,
-                                   uint32_t row_offset,
-                                   uint32_t value_offset) {
+        auto shared_executor = [&elements,
+                                &elements_index,
+                                &res_view,
+                                &known_view](milvus::BsonView bson,
+                                             uint32_t row_offset,
+                                             uint32_t value_offset) {
             std::set<int> tmp_elements_index(elements_index);
             auto array = bson.ParseAsArrayAtOffset(value_offset);
             if (!array.has_value()) {
+                // Not an array value: UNKNOWN, leave the row unmarked in
+                // the known bitmap.
                 res_view[row_offset] = false;
                 return;
             }
+            known_view[row_offset] = true;
 
             for (const auto& sub_value : array.value()) {
                 int i = -1;
@@ -1692,12 +1803,17 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllWithDiffTypeByStats() {
             index->ExecuteForSharedData(
                 op_ctx_, bson_index_, pointer, shared_executor);
         }
+        // Rows without a definite array value are UNKNOWN.
+        valid_res_view.inplace_and(known_view, active_count_);
+        res_view.inplace_and(valid_res_view, active_count_);
         cached_index_chunk_id_ = 0;
         CachePut(CacheElapsedUs(cache_compute_start));
     }
 
-    auto res = MoveOrSliceBitmap(
-        *cached_index_chunk_res_, current_data_global_pos_, real_batch_size);
+    auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
+                                 *cached_index_chunk_valid_res_,
+                                 current_data_global_pos_,
+                                 real_batch_size);
     MoveCursor();
     return res;
 }
@@ -1756,11 +1872,14 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllArray(EvalCtx& context) {
             processed_cursor += size;
             return;
         }
-        auto executor = [&](const size_t i) {
+        // Returns nullopt when the JSON path is missing or does not hold an
+        // array: the containment test is UNKNOWN under SQL three-valued
+        // logic.
+        auto executor = [&](const size_t i) -> std::optional<bool> {
             auto doc = data[i].doc();
             auto array = doc.at_pointer(pointer).get_array();
             if (array.error()) {
-                return false;
+                return std::nullopt;
             }
             std::unordered_set<int> exist_elements_index;
             for (auto&& it : array) {
@@ -1800,7 +1919,12 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllArray(EvalCtx& context) {
                 continue;
             }
 
-            res[i] = executor(offset);
+            auto result = executor(offset);
+            if (!result.has_value()) {
+                res[i] = valid_res[i] = false;
+            } else {
+                res[i] = result.value();
+            }
         }
         processed_cursor += size;
     };
@@ -1864,6 +1988,11 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllArrayByStats() {
             std::make_shared<TargetBitmap>(active_count_, true);
         TargetBitmapView res_view(*cached_index_chunk_res_);
         TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
+        // Rows with a definite array value at the JSON path. Rows never
+        // marked known — path missing, JSON null, field null, or non-array
+        // value — stay UNKNOWN (valid=false) under SQL three-valued logic.
+        TargetBitmap known(active_count_, false);
+        TargetBitmapView known_view(known);
 
         // process shredding data for ARRAY type (non-shared)
         {
@@ -1874,24 +2003,34 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllArrayByStats() {
                 pointer, milvus::index::JSONType::ARRAY);
             if (!target_field.empty()) {
                 ShreddingArrayBsonContainsAllArrayExecutor executor(elements);
+                TargetBitmap target_res(active_count_, false);
+                TargetBitmapView target_res_view(target_res);
+                TargetBitmap target_valid(active_count_, true);
+                TargetBitmapView target_valid_view(target_valid);
                 index->ExecutorForShreddingData<std::string_view>(
                     op_ctx_,
                     target_field,
                     executor,
                     nullptr,
-                    res_view,
-                    valid_res_view);
+                    target_res_view,
+                    target_valid_view);
+                res_view.inplace_or(target_res_view, active_count_);
+                known_view.inplace_or(target_valid_view, active_count_);
             }
         }
 
-        auto shared_executor = [&elements, &res_view](milvus::BsonView bson,
-                                                      uint32_t row_offset,
-                                                      uint32_t value_offset) {
+        auto shared_executor = [&elements, &res_view, &known_view](
+                                   milvus::BsonView bson,
+                                   uint32_t row_offset,
+                                   uint32_t value_offset) {
             auto array = bson.ParseAsArrayAtOffset(value_offset);
             if (!array.has_value()) {
+                // Not an array value: UNKNOWN, leave the row unmarked in
+                // the known bitmap.
                 res_view[row_offset] = false;
                 return;
             }
+            known_view[row_offset] = true;
 
             std::set<int> exist_elements_index;
             for (const auto& sub_value : array.value()) {
@@ -1922,12 +2061,17 @@ PhyJsonContainsFilterExpr::ExecJsonContainsAllArrayByStats() {
             index->ExecuteForSharedData(
                 op_ctx_, bson_index_, pointer, shared_executor);
         }
+        // Rows without a definite array value are UNKNOWN.
+        valid_res_view.inplace_and(known_view, active_count_);
+        res_view.inplace_and(valid_res_view, active_count_);
         cached_index_chunk_id_ = 0;
         CachePut(CacheElapsedUs(cache_compute_start));
     }
 
-    auto res = MoveOrSliceBitmap(
-        *cached_index_chunk_res_, current_data_global_pos_, real_batch_size);
+    auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
+                                 *cached_index_chunk_valid_res_,
+                                 current_data_global_pos_,
+                                 real_batch_size);
     MoveCursor();
     return res;
 }
@@ -1982,12 +2126,15 @@ PhyJsonContainsFilterExpr::ExecJsonContainsWithDiffType(EvalCtx& context) {
             processed_cursor += size;
             return;
         }
-        auto executor = [&](const size_t i) {
+        // Returns nullopt when the JSON path is missing or does not hold an
+        // array: the containment test is UNKNOWN under SQL three-valued
+        // logic.
+        auto executor = [&](const size_t i) -> std::optional<bool> {
             auto& json = data[i];
             auto doc = json.dom_doc();
             auto array = doc.at_pointer(pointer).get_array();
             if (array.error()) {
-                return false;
+                return std::nullopt;
             }
             // Note: array can only be iterated once
             for (auto&& it : array) {
@@ -2071,7 +2218,12 @@ PhyJsonContainsFilterExpr::ExecJsonContainsWithDiffType(EvalCtx& context) {
                 continue;
             }
 
-            res[i] = executor(offset);
+            auto result = executor(offset);
+            if (!result.has_value()) {
+                res[i] = valid_res[i] = false;
+            } else {
+                res[i] = result.value();
+            }
         }
         processed_cursor += size;
     };
@@ -2131,6 +2283,11 @@ PhyJsonContainsFilterExpr::ExecJsonContainsWithDiffTypeByStats() {
             std::make_shared<TargetBitmap>(active_count_, true);
         TargetBitmapView res_view(*cached_index_chunk_res_);
         TargetBitmapView valid_res_view(*cached_index_chunk_valid_res_);
+        // Rows with a definite array value at the JSON path. Rows never
+        // marked known — path missing, JSON null, field null, or non-array
+        // value — stay UNKNOWN (valid=false) under SQL three-valued logic.
+        TargetBitmap known(active_count_, false);
+        TargetBitmapView known_view(known);
 
         // process shredding data for ARRAY type (non-shared)
         {
@@ -2142,24 +2299,34 @@ PhyJsonContainsFilterExpr::ExecJsonContainsWithDiffTypeByStats() {
             if (!target_field.empty()) {
                 ShreddingArrayBsonContainsAnyWithDiffTypeExecutor executor(
                     elements);
+                TargetBitmap target_res(active_count_, false);
+                TargetBitmapView target_res_view(target_res);
+                TargetBitmap target_valid(active_count_, true);
+                TargetBitmapView target_valid_view(target_valid);
                 index->ExecutorForShreddingData<std::string_view>(
                     op_ctx_,
                     target_field,
                     executor,
                     nullptr,
-                    res_view,
-                    valid_res_view);
+                    target_res_view,
+                    target_valid_view);
+                res_view.inplace_or(target_res_view, active_count_);
+                known_view.inplace_or(target_valid_view, active_count_);
             }
         }
 
-        auto shared_executor = [&elements, &res_view](milvus::BsonView bson,
-                                                      uint32_t row_offset,
-                                                      uint32_t value_offset) {
+        auto shared_executor = [&elements, &res_view, &known_view](
+                                   milvus::BsonView bson,
+                                   uint32_t row_offset,
+                                   uint32_t value_offset) {
             auto array = bson.ParseAsArrayAtOffset(value_offset);
             if (!array.has_value()) {
+                // Not an array value: UNKNOWN, leave the row unmarked in
+                // the known bitmap.
                 res_view[row_offset] = false;
                 return;
             }
+            known_view[row_offset] = true;
 
             for (const auto& sub_value : array.value()) {
                 for (auto const& element : elements) {
@@ -2244,12 +2411,17 @@ PhyJsonContainsFilterExpr::ExecJsonContainsWithDiffTypeByStats() {
             index->ExecuteForSharedData(
                 op_ctx_, bson_index_, pointer, shared_executor);
         }
+        // Rows without a definite array value are UNKNOWN.
+        valid_res_view.inplace_and(known_view, active_count_);
+        res_view.inplace_and(valid_res_view, active_count_);
         cached_index_chunk_id_ = 0;
         CachePut(CacheElapsedUs(cache_compute_start));
     }
 
-    auto res = MoveOrSliceBitmap(
-        *cached_index_chunk_res_, current_data_global_pos_, real_batch_size);
+    auto res = MoveOrSliceBitmap(*cached_index_chunk_res_,
+                                 *cached_index_chunk_valid_res_,
+                                 current_data_global_pos_,
+                                 real_batch_size);
     MoveCursor();
     return res;
 }

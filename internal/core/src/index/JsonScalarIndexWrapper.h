@@ -128,15 +128,27 @@ class JsonScalarIndexWrapper : public BaseIndex {
         return exists_bitset_.clone();
     }
 
-    // JSON brute-force semantics: NotEqual on error (path missing / cast fail)
-    // returns TRUE. Base indexes mask invalid rows to false via valid_bitset_,
-    // which is correct for regular nullable columns but wrong for JSON path
-    // indexes. Fix: OR back the invalid rows after the base NotIn.
+    // SQL three-valued logic: rows where the JSON path is missing, the value
+    // is JSON null, or the value cannot be cast to the index type carry no
+    // definite value, so NotEqual/NotIn must NOT match them — they are
+    // UNKNOWN, not TRUE. The base index already masks its null rows to false;
+    // additionally mask the non-exist rows so indexes whose null set does not
+    // cover path-missing rows (e.g. data built before the null tracking was
+    // extended) behave consistently.
     const TargetBitmap
     NotIn(size_t n, const T* values) override {
         auto result = BaseIndex::NotIn(n, values);
-        auto null_rows = BaseIndex::IsNull();
-        result |= null_rows;
+        MaskNonExistRows(result);
+        return result;
+    }
+
+    // Validity bitmap consumed by the expression layer: rows without a
+    // definite typed value at the path (missing / JSON null / cast failure)
+    // are invalid so predicate results on them stay UNKNOWN.
+    TargetBitmap
+    IsNotNull() override {
+        auto result = BaseIndex::IsNotNull();
+        MaskNonExistRows(result);
         return result;
     }
 
@@ -375,6 +387,17 @@ class JsonScalarIndexWrapper : public BaseIndex {
             [](const Json&, const std::string&, simdjson::error_code) {});
 
         BuildExistsBitset(total_rows);
+    }
+
+    void
+    MaskNonExistRows(TargetBitmap& bitmap) const {
+        auto count = bitmap.size();
+        for (auto offset : non_exist_offsets_) {
+            if (offset >= count) {
+                break;
+            }
+            bitmap.reset(offset);
+        }
     }
 
     // Build the exists bitmap. The caller must supply the total row count

@@ -112,6 +112,9 @@ struct BinaryRangeElementFunc {
 // precision; uint64 and double values fall back to double comparison,
 // consistent with the Tantivy index and JSON-stats paths.
 // 'cmp' must reference 'value' (int64_t or double depending on the JSON value).
+// SQL three-valued logic: when the JSON path is missing, the parent value is
+// JSON null, or the value type is incompatible with the comparison, the
+// range predicate is UNKNOWN (res=false, valid=false).
 #define BinaryRangeJSONCompare(cmp)                                    \
     do {                                                               \
         if (valid_data != nullptr && !valid_data[offset]) {            \
@@ -124,7 +127,7 @@ struct BinaryRangeElementFunc {
         if constexpr (std::is_same_v<GetType, int64_t>) {              \
             auto x = src[offset].at_numeric(pointer);                  \
             if (x.error()) {                                           \
-                res[i] = false;                                        \
+                res[i] = valid_res[i] = false;                         \
                 break;                                                 \
             }                                                          \
             auto n = x.value();                                        \
@@ -140,7 +143,7 @@ struct BinaryRangeElementFunc {
         } else {                                                       \
             auto x = src[offset].template at<GetType>(pointer);        \
             if (x.error()) {                                           \
-                res[i] = false;                                        \
+                res[i] = valid_res[i] = false;                         \
                 break;                                                 \
             }                                                          \
             auto value = x.value();                                    \

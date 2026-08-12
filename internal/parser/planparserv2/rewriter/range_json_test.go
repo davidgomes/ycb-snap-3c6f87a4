@@ -69,9 +69,12 @@ func TestRewrite_JSON_NestedPath_Nullable_ContradictionsKeepPredicate(t *testing
 	}
 }
 
-func TestRewrite_JSON_NestedPath_ScalarNotEqualRewriteAllowed(t *testing.T) {
+func TestRewrite_JSON_NestedPath_ScalarNotEqualRewriteBlocked(t *testing.T) {
 	helper := buildSchemaHelperWithJSON(t)
 
+	// Under SQL three-valued logic a predicate on a missing JSON path is
+	// UNKNOWN, never a definite TRUE, so NOT(==) / NOT IN must stay as
+	// explicit NOT forms instead of being collapsed to a bare `!=`.
 	for _, exprStr := range []string{
 		`not (JSONField["age"] == 1)`,
 		`JSONField["age"] not in [1]`,
@@ -79,10 +82,19 @@ func TestRewrite_JSON_NestedPath_ScalarNotEqualRewriteAllowed(t *testing.T) {
 		expr, err := parser.ParseExpr(helper, exprStr, nil)
 		require.NoError(t, err, exprStr)
 		require.NotNil(t, expr, exprStr)
-		ure := expr.GetUnaryRangeExpr()
-		require.NotNil(t, ure, "scalar JSON missing-path != is compatible with NOT(==): %s", exprStr)
-		require.Equal(t, planpb.OpType_NotEqual, ure.GetOp(), exprStr)
+		unary := expr.GetUnaryExpr()
+		require.NotNil(t, unary, "scalar JSON missing-path NOT must remain explicit: %s", exprStr)
+		require.Equal(t, planpb.UnaryExpr_Not, unary.GetOp(), exprStr)
 	}
+}
+
+func TestRewrite_JSON_NestedPath_ScalarNotEqualsKeepPredicates(t *testing.T) {
+	helper := buildSchemaHelperWithJSON(t)
+
+	expr, err := parser.ParseExpr(helper, `JSONField["age"] != 1 and JSONField["age"] != 2`, nil)
+	require.NoError(t, err)
+	require.NotNil(t, expr)
+	require.NotNil(t, expr.GetBinaryExpr(), "scalar JSON != chain must not become NOT(IN)")
 }
 
 func TestRewrite_JSON_NestedPath_ArrayNotEqualRewriteBlocked(t *testing.T) {
