@@ -2024,21 +2024,21 @@ TEST_F(ReverseConnectionIOHandleTest, OnConnectionDoneFailureAndRecovery) {
   std::vector<std::pair<std::string, std::string>> access_log_events;
   EXPECT_CALL(*access_log, log(_, _))
       .Times(2)
-      .WillRepeatedly(Invoke(
-          [&access_log_events](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
-            const auto& fields = stream_info.dynamicMetadata()
-                                     .filter_metadata()
-                                     .at("envoy.reverse_tunnel.initiator")
-                                     .fields();
-            EXPECT_EQ(fields.at("node_id").string_value(), "test-node");
-            EXPECT_EQ(fields.at("cluster_id").string_value(), "test-cluster");
-            EXPECT_EQ(fields.at("tenant_id").string_value(), "test-tenant");
-            EXPECT_EQ(fields.at("upstream_cluster").string_value(), "test-cluster");
-            EXPECT_EQ(fields.at("host_address").string_value(), "192.168.1.1");
-            EXPECT_FALSE(fields.at("connection_key").string_value().empty());
-            access_log_events.emplace_back(fields.at("event").string_value(),
-                                           fields.at("error").string_value());
-          }));
+      .WillRepeatedly(Invoke([&access_log_events](const Formatter::Context&,
+                                                  const StreamInfo::StreamInfo& stream_info) {
+        const auto& fields = stream_info.dynamicMetadata()
+                                 .filter_metadata()
+                                 .at("envoy.reverse_tunnel.initiator")
+                                 .fields();
+        EXPECT_EQ(fields.at("node_id").string_value(), "test-node");
+        EXPECT_EQ(fields.at("cluster_id").string_value(), "test-cluster");
+        EXPECT_EQ(fields.at("tenant_id").string_value(), "test-tenant");
+        EXPECT_EQ(fields.at("upstream_cluster").string_value(), "test-cluster");
+        EXPECT_EQ(fields.at("host_address").string_value(), "192.168.1.1");
+        EXPECT_FALSE(fields.at("connection_key").string_value().empty());
+        access_log_events.emplace_back(fields.at("event").string_value(),
+                                       fields.at("error").string_value());
+      }));
 
   // Set up mock thread local cluster.
   auto mock_thread_local_cluster = std::make_shared<NiceMock<Upstream::MockThreadLocalCluster>>();
@@ -2214,21 +2214,21 @@ TEST_F(ReverseConnectionIOHandleTest, OnDownstreamConnectionClosedTriggersReInit
   std::vector<std::pair<std::string, std::string>> access_log_events;
   EXPECT_CALL(*access_log, log(_, _))
       .Times(2)
-      .WillRepeatedly(Invoke(
-          [&access_log_events](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
-            const auto& fields = stream_info.dynamicMetadata()
-                                     .filter_metadata()
-                                     .at("envoy.reverse_tunnel.initiator")
-                                     .fields();
-            EXPECT_EQ(fields.at("node_id").string_value(), "test-node");
-            EXPECT_EQ(fields.at("cluster_id").string_value(), "test-cluster");
-            EXPECT_EQ(fields.at("tenant_id").string_value(), "test-tenant");
-            EXPECT_EQ(fields.at("upstream_cluster").string_value(), "test-cluster");
-            EXPECT_EQ(fields.at("host_address").string_value(), "192.168.1.1");
-            EXPECT_TRUE(fields.at("error").string_value().empty());
-            access_log_events.emplace_back(fields.at("event").string_value(),
-                                           fields.at("connection_key").string_value());
-          }));
+      .WillRepeatedly(Invoke([&access_log_events](const Formatter::Context&,
+                                                  const StreamInfo::StreamInfo& stream_info) {
+        const auto& fields = stream_info.dynamicMetadata()
+                                 .filter_metadata()
+                                 .at("envoy.reverse_tunnel.initiator")
+                                 .fields();
+        EXPECT_EQ(fields.at("node_id").string_value(), "test-node");
+        EXPECT_EQ(fields.at("cluster_id").string_value(), "test-cluster");
+        EXPECT_EQ(fields.at("tenant_id").string_value(), "test-tenant");
+        EXPECT_EQ(fields.at("upstream_cluster").string_value(), "test-cluster");
+        EXPECT_EQ(fields.at("host_address").string_value(), "192.168.1.1");
+        EXPECT_TRUE(fields.at("error").string_value().empty());
+        access_log_events.emplace_back(fields.at("event").string_value(),
+                                       fields.at("connection_key").string_value());
+      }));
 
   // Create trigger pipe BEFORE initiating connection to ensure it's ready.
   createTriggerPipe();

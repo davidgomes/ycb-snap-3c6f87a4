@@ -112,11 +112,10 @@ public:
   /**
    * Emit a reverse tunnel initiator lifecycle access log.
    */
-  void emitAccessLog(TimeSource& time_source, const std::string& event,
-                     const std::string& node_id, const std::string& cluster_id,
-                     const std::string& tenant_id, const std::string& upstream_cluster,
-                     const std::string& host_address, const std::string& connection_key,
-                     const std::string& error_message);
+  void emitAccessLog(TimeSource& time_source, const std::string& event, const std::string& node_id,
+                     const std::string& cluster_id, const std::string& tenant_id,
+                     const std::string& upstream_cluster, const std::string& host_address,
+                     const std::string& connection_key, const std::string& error_message);
 
   /**
    * Increment handshake stats for reverse tunnel connections (per-worker only).
