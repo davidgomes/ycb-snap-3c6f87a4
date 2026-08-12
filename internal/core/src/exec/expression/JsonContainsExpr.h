@@ -472,7 +472,7 @@ class PhyJsonContainsFilterExpr : public SegmentExpr {
                       active_count,
                       batch_size,
                       consistency_level,
-                      false,
+                      expr->vals_.empty(),
                       true,
                       plan_options),
           expr_(expr) {

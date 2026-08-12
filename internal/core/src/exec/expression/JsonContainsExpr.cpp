@@ -152,7 +152,19 @@ PhyJsonContainsFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
             break;
         }
         case DataType::JSON: {
-            if (expr_->vals_.empty()) {
+            if (expr_->vals_.empty() &&
+                exec_path_ == ExprExecPath::ScalarIndex &&
+                !has_offset_input_) {
+                AssertInfo(!pinned_index_.empty(),
+                           "JSON contains index path has no pinned index");
+                auto cast_type = pinned_index_[0]->GetCastType();
+                AssertInfo(cast_type.data_type() ==
+                               JsonCastType::DataType::ARRAY,
+                           "empty JSON contains requires an ARRAY index, got {}",
+                           cast_type);
+                result = EvalArrayContainsForIndexSegment(
+                    cast_type.ToMilvusDataType());
+            } else if (expr_->vals_.empty()) {
                 result = EvalJsonContainsForDataSegment(context);
             } else if (exec_path_ == ExprExecPath::ScalarIndex &&
                        !has_offset_input_) {
