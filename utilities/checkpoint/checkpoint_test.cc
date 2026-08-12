@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -555,6 +556,43 @@ TEST_F(CheckpointTest, CheckpointEmptyColumnFamilySelectionIncludesAll) {
                                    &checkpoint_column_families));
   ASSERT_EQ((std::vector<std::string>{kDefaultColumnFamilyName, "one", "two"}),
             checkpoint_column_families);
+}
+
+TEST_F(CheckpointTest, CheckpointSelectedColumnFamiliesWithoutFlush) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"included", "excluded"}, options);
+  ASSERT_OK(Put(0, "default-key", "default-value"));
+  ASSERT_OK(Put(1, "included-key", "included-value"));
+  ASSERT_OK(Put(2, "excluded-key", "excluded-value"));
+
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint_guard(checkpoint);
+  std::vector<ColumnFamilyHandle*> selected = {handles_[1]};
+  ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_, selected,
+                                         std::numeric_limits<uint64_t>::max()));
+
+  Options checkpoint_options = options;
+  checkpoint_options.create_if_missing = false;
+  std::vector<ColumnFamilyDescriptor> descriptors = {
+      {kDefaultColumnFamilyName, checkpoint_options},
+      {"included", checkpoint_options}};
+  std::vector<ColumnFamilyHandle*> checkpoint_handles;
+  std::unique_ptr<DB> checkpoint_db;
+  ASSERT_OK(DB::Open(DBOptions(checkpoint_options), snapshot_name_, descriptors,
+                     &checkpoint_handles, &checkpoint_db));
+
+  std::string value;
+  ASSERT_OK(checkpoint_db->Get(ReadOptions(), checkpoint_handles[0],
+                               "default-key", &value));
+  ASSERT_EQ("default-value", value);
+  ASSERT_OK(checkpoint_db->Get(ReadOptions(), checkpoint_handles[1],
+                               "included-key", &value));
+  ASSERT_EQ("included-value", value);
+
+  for (auto* handle : checkpoint_handles) {
+    delete handle;
+  }
 }
 
 TEST_F(CheckpointTest, ExportColumnFamilyWithLinks) {
