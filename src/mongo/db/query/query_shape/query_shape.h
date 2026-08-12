@@ -12,6 +12,8 @@
 #include "mongo/db/query/util/deferred.h"
 #include "mongo/util/modules.h"
 
+#include <cstdint>
+
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 
 namespace mongo::query_shape {
