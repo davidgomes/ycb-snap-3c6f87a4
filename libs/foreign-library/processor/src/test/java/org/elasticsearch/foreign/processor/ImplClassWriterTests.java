@@ -214,6 +214,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import org.elasticsearch.foreign.CaptureErrno;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.SymbolResolver;
             import org.elasticsearch.foreign.Variadic;
             @LibrarySpecification(symbolResolver = ErrnoLib.FakeResolver.class)
@@ -229,9 +230,9 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
                         // downcallHandle validates the address is non-NULL; any positive value works.
-                        return MemorySegment.ofAddress(1L);
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }
@@ -241,8 +242,8 @@ public class ImplClassWriterTests extends ProcessorTestCase {
         assertTrue("Expected compilation to succeed but got errors: " + result.errors(), result.success());
 
         // Loading with init runs the whole downcall-handle build path for both methods:
-        // Linker.nativeLinker().downcallHandle(FakeResolver.resolve(...), descriptor,
-        // [captureCallState("errno"), firstVariadicArg(1)])
+        // new DefaultMethodHandleResolver().resolve(FakeResolver.resolve(...), descriptor,
+        // Linker.nativeLinker(), [captureCallState("errno"), firstVariadicArg(1)])
         // A descriptor mismatch (e.g. captureCallState declared as varargs but emitted as
         // (String)) throws NoSuchMethodError from <clinit>.
         Class<?> implClass = result.loadClass("test.ErrnoLib$Impl");
@@ -442,6 +443,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import java.lang.foreign.SymbolLookup;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.StructSpecification;
             import org.elasticsearch.foreign.SymbolResolver;
             @LibrarySpecification(symbolResolver = StructParamLib.FakeResolver.class)
@@ -457,8 +459,8 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
-                        return MemorySegment.ofAddress(1L);
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }
@@ -870,6 +872,7 @@ public class ImplClassWriterTests extends ProcessorTestCase {
             import org.elasticsearch.foreign.CaptureErrno;
             import org.elasticsearch.foreign.Function;
             import org.elasticsearch.foreign.LibrarySpecification;
+            import org.elasticsearch.foreign.ResolvedSymbol;
             import org.elasticsearch.foreign.SymbolResolver;
             import org.elasticsearch.foreign.Variadic;
             @LibrarySpecification(symbolResolver = OpenLib.FakeResolver.class)
@@ -882,8 +885,8 @@ public class ImplClassWriterTests extends ProcessorTestCase {
 
                 class FakeResolver implements SymbolResolver {
                     public FakeResolver() {}
-                    public MemorySegment resolve(String name, SymbolLookup lookup) {
-                        return MemorySegment.ofAddress(1L);
+                    public ResolvedSymbol resolve(String name, SymbolLookup lookup) {
+                        return new ResolvedSymbol(name, MemorySegment.ofAddress(1L));
                     }
                 }
             }

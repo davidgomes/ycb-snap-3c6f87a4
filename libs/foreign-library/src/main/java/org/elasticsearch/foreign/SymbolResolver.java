@@ -9,7 +9,6 @@
 
 package org.elasticsearch.foreign;
 
-import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 
 /**
@@ -17,9 +16,9 @@ import java.lang.foreign.SymbolLookup;
  * strategies such as capability-based fallback, name mangling, or prefix/suffix schemes.
  *
  * <p>The resolver receives the symbol name declared in {@link Function @Function} and a
- * {@link SymbolLookup} for probing the loaded library. It returns the {@link MemorySegment}
- * (function pointer) for the resolved symbol. The framework then creates the downcall handle
- * from the returned address.
+ * {@link SymbolLookup} for probing the loaded library. It returns a {@link ResolvedSymbol}
+ * carrying both the actual symbol name that was chosen and its function pointer. The framework
+ * then creates the downcall handle via the library's {@link MethodHandleResolver}.
  *
  * <p>Implementing classes must have a public no-arg constructor.
  *
@@ -30,15 +29,16 @@ import java.lang.foreign.SymbolLookup;
  *     private final int capLevel = detectCapabilityLevel();
  *
  *     @Override
- *     public MemorySegment resolve(String symbolName, SymbolLookup lookup) {
+ *     public ResolvedSymbol resolve(String symbolName, SymbolLookup lookup) {
  *         for (int level = capLevel; level >= 1; level--) {
- *             var addr = lookup.find(symbolName + "_" + level);
+ *             String name = symbolName + "_" + level;
+ *             var addr = lookup.find(name);
  *             if (addr.isPresent()) {
- *                 return addr.get();
+ *                 return new ResolvedSymbol(name, addr.get());
  *             }
  *         }
- *         return lookup.find(symbolName).orElseThrow(() ->
- *             new UnsatisfiedLinkError("Symbol not found: " + symbolName));
+ *         return new ResolvedSymbol(symbolName, lookup.find(symbolName).orElseThrow(() ->
+ *             new UnsatisfiedLinkError("Symbol not found: " + symbolName)));
  *     }
  * }
  * }</pre>
@@ -50,8 +50,8 @@ public interface SymbolResolver {
      *
      * @param symbolName the C symbol name from the {@link Function @Function} annotation
      * @param lookup the symbol lookup for the loaded library
-     * @return the function pointer for the resolved symbol (must not be null)
+     * @return the resolved symbol — actual name chosen and its function pointer (must not be null)
      * @throws UnsatisfiedLinkError if no suitable symbol is found
      */
-    MemorySegment resolve(String symbolName, SymbolLookup lookup);
+    ResolvedSymbol resolve(String symbolName, SymbolLookup lookup);
 }
