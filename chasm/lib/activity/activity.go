@@ -153,6 +153,7 @@ func NewStandaloneActivity(
 			HeartbeatTimeout:       request.GetHeartbeatTimeout(),
 			RetryPolicy:            request.GetRetryPolicy(),
 			Priority:               request.Priority,
+			StartDelay:             request.GetStartDelay(),
 		},
 		LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{}),
 		RequestData: chasm.NewDataField(ctx, &activitypb.ActivityRequestData{
@@ -256,11 +257,11 @@ func (a *Activity) GenerateRecordActivityTaskStartedResponse(
 }
 
 // attemptScheduleTime returns when the given attempt was scheduled to run:
-// the activity's original schedule time for the first attempt, or
-// calculated from attemptScheduleTimeForRetry on retries.
+// the activity's original schedule time plus any configured start delay for the first attempt, or
+// calculated from attemptScheduleTimeForRetry on retries. Retries never re-apply the start delay.
 func (a *Activity) attemptScheduleTime(attempt *activitypb.ActivityAttemptState) *timestamppb.Timestamp {
 	if attempt.GetCount() == 1 {
-		return a.GetScheduleTime()
+		return timestamppb.New(a.GetScheduleTime().AsTime().Add(a.GetStartDelay().AsDuration()))
 	}
 	return attemptScheduleTimeForRetry(attempt)
 }
@@ -649,6 +650,10 @@ func (a *Activity) shouldRetry(ctx chasm.Context, overridingRetryInterval time.D
 
 // hasEnoughTimeForRetry checks if there is enough time left in the schedule-to-close timeout. If sufficient time
 // remains, it will also return a valid retry interval.
+//
+// The schedule-to-close deadline is measured from the schedule time plus any configured start
+// delay, since the delay defers the first dispatch and therefore the start of the schedule-to-close
+// window. Retries do not re-apply the start delay on top of this deadline.
 func (a *Activity) hasEnoughTimeForRetry(ctx chasm.Context, overridingRetryInterval time.Duration) (bool, time.Duration) {
 	attempt := a.LastAttempt.Get(ctx)
 
@@ -663,7 +668,7 @@ func (a *Activity) hasEnoughTimeForRetry(ctx chasm.Context, overridingRetryInter
 		return true, retryInterval
 	}
 
-	deadline := a.ScheduleTime.AsTime().Add(scheduleToClose)
+	deadline := a.ScheduleTime.AsTime().Add(a.GetStartDelay().AsDuration()).Add(scheduleToClose)
 	return ctx.Now(a).Add(retryInterval).Before(deadline), retryInterval
 }
 
@@ -783,7 +788,7 @@ func (a *Activity) buildActivityExecutionInfo(ctx chasm.Context) *apiactivitypb.
 
 	var expirationTime *timestamppb.Timestamp
 	if timeout := a.GetScheduleToCloseTimeout().AsDuration(); timeout > 0 {
-		expirationTime = timestamppb.New(a.GetScheduleTime().AsTime().Add(timeout))
+		expirationTime = timestamppb.New(a.GetScheduleTime().AsTime().Add(a.GetStartDelay().AsDuration()).Add(timeout))
 	}
 
 	sa := &commonpb.SearchAttributes{

@@ -45,11 +45,16 @@ var TransitionScheduled = chasm.NewTransition(
 		attempt.Count++
 		attempt.Stamp++
 
+		// The start delay defers the first dispatch attempt, so the schedule-to-start and
+		// schedule-to-close timers must also start counting only after the delay elapses.
+		startDelay := a.GetStartDelay().AsDuration()
+		dispatchTime := currentTime.Add(startDelay)
+
 		if timeout := a.GetScheduleToStartTimeout().AsDuration(); timeout > 0 {
 			ctx.AddTask(
 				a,
 				chasm.TaskAttributes{
-					ScheduledTime: currentTime.Add(timeout),
+					ScheduledTime: dispatchTime.Add(timeout),
 				},
 				&activitypb.ScheduleToStartTimeoutTask{
 					Stamp: attempt.GetStamp(),
@@ -60,14 +65,18 @@ var TransitionScheduled = chasm.NewTransition(
 			ctx.AddTask(
 				a,
 				chasm.TaskAttributes{
-					ScheduledTime: currentTime.Add(timeout),
+					ScheduledTime: dispatchTime.Add(timeout),
 				},
 				&activitypb.ScheduleToCloseTimeoutTask{})
 		}
 
+		dispatchAttrs := chasm.TaskAttributes{}
+		if startDelay > 0 {
+			dispatchAttrs.ScheduledTime = dispatchTime
+		}
 		ctx.AddTask(
 			a,
-			chasm.TaskAttributes{},
+			dispatchAttrs,
 			&activitypb.ActivityDispatchTask{
 				Stamp: attempt.GetStamp(),
 			})

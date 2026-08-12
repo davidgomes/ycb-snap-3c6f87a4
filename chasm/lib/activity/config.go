@@ -28,6 +28,13 @@ var (
  Specifically, activity long-poll requests are timed out at a time which leaves at least the buffer's duration
  remaining before the caller's deadline, if permitted by the caller's deadline.`,
 	)
+
+	StartDelayEnabled = dynamicconfig.NewNamespaceBoolSetting(
+		"activity.startDelayEnabled",
+		false,
+		`Toggles whether standalone activities honor the start_delay field on StartActivityExecutionRequest,
+ deferring the first activity task dispatch by the requested duration.`,
+	)
 )
 
 type Config struct {
@@ -41,6 +48,7 @@ type Config struct {
 	MaxCallbacksPerExecution    dynamicconfig.IntPropertyFnWithNamespaceFilter
 	DefaultActivityRetryPolicy  dynamicconfig.TypedPropertyFnWithNamespaceFilter[retrypolicy.DefaultRetrySettings]
 	VisibilityMaxPageSize       dynamicconfig.IntPropertyFnWithNamespaceFilter
+	StartDelayEnabled           dynamicconfig.BoolPropertyFnWithNamespaceFilter
 }
 
 func ConfigProvider(dc *dynamicconfig.Collection) *Config {
@@ -55,5 +63,6 @@ func ConfigProvider(dc *dynamicconfig.Collection) *Config {
 		MaxIDLengthLimit:            dynamicconfig.MaxIDLengthLimit.Get(dc),
 		MaxCallbacksPerExecution:    callback.MaxPerExecution.Get(dc),
 		VisibilityMaxPageSize:       dynamicconfig.FrontendVisibilityMaxPageSize.Get(dc),
+		StartDelayEnabled:           StartDelayEnabled.Get(dc),
 	}
 }

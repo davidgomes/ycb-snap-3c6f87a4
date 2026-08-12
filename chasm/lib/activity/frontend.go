@@ -367,6 +367,16 @@ func (h *frontendHandler) validateAndPopulateStartRequest(
 		req.RetryPolicy = &commonpb.RetryPolicy{}
 	}
 
+	if h.config.StartDelayEnabled(req.GetNamespace()) {
+		if err := validateStartDelay(req.GetStartDelay()); err != nil {
+			return nil, err
+		}
+	} else {
+		// Silently drop the start delay when the feature is disabled for the namespace, mirroring
+		// how other gated request fields (e.g. eager workflow start) are overridden rather than rejected.
+		req.StartDelay = nil
+	}
+
 	opts := activityOptionsFromStartRequest(req)
 	err := ValidateAndNormalizeStandaloneActivity(
 		req.ActivityId,

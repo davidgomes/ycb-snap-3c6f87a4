@@ -207,6 +207,15 @@ func validateAndNormalizeTimeouts(
 	return nil
 }
 
+// validateStartDelay validates the start delay duration for a standalone activity. A nil or zero
+// duration means no delay; negative or otherwise malformed durations are rejected.
+func validateStartDelay(startDelay *durationpb.Duration) error {
+	if err := timestamp.ValidateAndCapProtoDuration(startDelay); err != nil {
+		return serviceerror.NewInvalidArgumentf("invalid StartDelay: %v", err)
+	}
+	return nil
+}
+
 func validateAndNormalizeIDPolicy(req *workflowservice.StartActivityExecutionRequest) error {
 	if req.GetIdReusePolicy() == enumspb.ACTIVITY_ID_REUSE_POLICY_UNSPECIFIED {
 		req.IdReusePolicy = enumspb.ACTIVITY_ID_REUSE_POLICY_ALLOW_DUPLICATE
