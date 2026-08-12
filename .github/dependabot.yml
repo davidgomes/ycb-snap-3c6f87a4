@@ -1,0 +1,36 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      golang-x:
+        patterns:
+          - "golang.org/x/*"
+      k8s:
+        patterns:
+          - "k8s.io/*"
+      moby-sys:
+        patterns:
+          - "github.com/moby/sys/*"
+      otel:
+        patterns:
+          - "go.opentelemetry.io/*"
+    cooldown:
+      default-days: 7
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    groups:
+      codeql-actions:
+        patterns:
+          - "github/codeql-action/*"
+      docker-actions:
+        patterns:
+          - "docker/*"
