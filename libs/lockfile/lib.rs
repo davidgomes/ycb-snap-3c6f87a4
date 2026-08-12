@@ -359,6 +359,142 @@ pub struct LockfileContent {
 }
 
 impl LockfileContent {
+  pub fn from_package_lock(
+    json: serde_json::Map<String, serde_json::Value>,
+  ) -> Result<Self, LockfileErrorReason> {
+    let mut content = LockfileContent::default();
+    
+    if let Some(packages) = json.get("packages").and_then(|p| p.as_object()) {
+      for (key, value) in packages {
+        if key.is_empty() {
+          continue;
+        }
+        
+        let Some(value_obj) = value.as_object() else {
+          continue;
+        };
+        
+        // Skip workspace links, file/git/http deps
+        if value_obj.get("link").and_then(|v| v.as_bool()).unwrap_or(false) {
+          continue;
+        }
+        
+        let Some(name) = key.strip_prefix("node_modules/").or_else(|| {
+          // Handle nested node_modules
+          let parts: Vec<&str> = key.split("node_modules/").collect();
+          if parts.len() > 1 {
+            Some(parts.last().unwrap())
+          } else {
+            None
+          }
+        }) else {
+          continue;
+        };
+        
+        let Some(version) = value_obj.get("version").and_then(|v| v.as_str()) else {
+          continue;
+        };
+        
+        // Skip non-registry deps (file:, git:, http:)
+        if version.starts_with("file:") || version.starts_with("git:") || version.starts_with("git+") || version.starts_with("http:") || version.starts_with("https:") {
+          continue;
+        }
+        
+        let Some(integrity) = value_obj.get("integrity").and_then(|v| v.as_str()) else {
+          continue;
+        };
+        
+        // We don't need to parse dependencies here, the resolution process will handle it
+        
+        let mut os = Vec::new();
+        if let Some(os_arr) = value_obj.get("os").and_then(|v| v.as_array()) {
+          for os_val in os_arr {
+            if let Some(os_str) = os_val.as_str() {
+              os.push(SmallStackString::from(os_str));
+            }
+          }
+        }
+
+        let mut cpu = Vec::new();
+        if let Some(cpu_arr) = value_obj.get("cpu").and_then(|v| v.as_array()) {
+          for cpu_val in cpu_arr {
+            if let Some(cpu_str) = cpu_val.as_str() {
+              cpu.push(SmallStackString::from(cpu_str));
+            }
+          }
+        }
+
+        let mut optional_dependencies = BTreeMap::new();
+        if let Some(opt_deps) = value_obj.get("optionalDependencies").and_then(|v| v.as_object()) {
+          for (dep_name, dep_version) in opt_deps {
+            if let Some(dep_version_str) = dep_version.as_str() {
+              optional_dependencies.insert(StackString::from(dep_name.as_str()), StackString::from(dep_version_str));
+            }
+          }
+        }
+        
+        let mut dependencies = BTreeMap::new();
+        if let Some(deps) = value_obj.get("dependencies").and_then(|v| v.as_object()) {
+          for (dep_name, dep_version) in deps {
+            if let Some(dep_version_str) = dep_version.as_str() {
+              dependencies.insert(StackString::from(dep_name.as_str()), StackString::from(dep_version_str));
+            }
+          }
+        }
+
+        let mut optional_peers = BTreeMap::new();
+        if let Some(peer_deps_meta) = value_obj.get("peerDependenciesMeta").and_then(|v| v.as_object()) {
+          for (peer_name, meta) in peer_deps_meta {
+            if let Some(meta_obj) = meta.as_object() {
+              if meta_obj.get("optional").and_then(|v| v.as_bool()).unwrap_or(false) {
+                // In package-lock.json, peerDependenciesMeta indicates optionality, but the version
+                // is usually in peerDependencies. We'll try to find it there.
+                if let Some(peer_deps) = value_obj.get("peerDependencies").and_then(|v| v.as_object()) {
+                  if let Some(peer_version) = peer_deps.get(peer_name).and_then(|v| v.as_str()) {
+                    optional_peers.insert(StackString::from(peer_name.as_str()), StackString::from(peer_version));
+                  }
+                }
+              }
+            }
+          }
+        }
+        
+        let tarball = value_obj.get("resolved").and_then(|v| v.as_str()).map(|s| StackString::from(s));
+        let deprecated = value_obj.get("deprecated").is_some();
+        let scripts = value_obj.get("hasInstallScript").and_then(|v| v.as_bool()).unwrap_or(false);
+        let bin = value_obj.get("bin").is_some();
+
+        let nv = format!("{}@{}", name, version);
+        
+        content.packages.npm.insert(
+          StackString::from(nv.as_str()),
+          NpmPackageInfo {
+            integrity: Some(integrity.to_string()),
+            dependencies,
+            optional_dependencies,
+            optional_peers,
+            os,
+            cpu,
+            tarball,
+            deprecated,
+            scripts,
+            bin,
+          },
+        );
+        
+        // Also add it to the top-level specifiers if it's in the root dependencies
+        // Wait, the specifiers are handled by the resolution process.
+        // But what about optional dependencies that are not in the dependencies tree?
+        // They should be in the lockfile if they are in package-lock.json.
+        // The above insert already adds them to `content.packages.npm`.
+        // The issue is that the resolution process might prune them if they are not reachable.
+        // However, `deno install` should just use the lockfile as is.
+      }
+    }
+    
+    Ok(content)
+  }
+
   pub fn from_json(
     json: serde_json::Value,
   ) -> Result<Self, DeserializationError> {
@@ -693,6 +829,13 @@ impl Lockfile {
         serde_json::from_str(content)
           .map_err(LockfileErrorReason::ParseError)?;
       let version = value.get("version").and_then(|v| v.as_str());
+      let lockfile_version = value.get("lockfileVersion").and_then(|v| v.as_i64());
+      if let Some(lockfile_version) = lockfile_version {
+        if lockfile_version == 2 || lockfile_version == 3 {
+          return Ok(LockfileContent::from_package_lock(value)?);
+        }
+        return Ok(LockfileContent::default());
+      }
       // When the value is transformed, we don't consider that a lockfile
       // change that should update the lockfile because we want to reduce
       // lockfile churn. For example, say someone with a new version of

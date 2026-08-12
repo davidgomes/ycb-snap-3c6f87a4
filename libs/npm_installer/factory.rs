@@ -314,7 +314,32 @@ impl<
                     .dedup_lockfile_peer_variants,
                 }
               }
-              None => NpmResolverManagedSnapshotOption::Specified(None),
+              None => {
+                let workspace_factory = self.workspace_factory();
+                if let Ok(Some(lockfile)) = deno_resolver::lockfile::LockfileLock::discover(
+                  workspace_factory.sys().clone(),
+                  deno_resolver::lockfile::LockfileFlags {
+                    no_lock: false,
+                    frozen_lockfile: None,
+                    lock: None,
+                    skip_write: true,
+                    no_config: false,
+                    no_npm: false,
+                  },
+                  &workspace_factory.workspace_directory()?.workspace,
+                  None,
+                  self.lockfile_npm_package_info_provider()?,
+                ).await {
+                  NpmResolverManagedSnapshotOption::ResolveFromLockfile {
+                    lockfile: Arc::new(lockfile),
+                    dedup_equivalent_peer_variants: self
+                      .options
+                      .dedup_lockfile_peer_variants,
+                  }
+                } else {
+                  NpmResolverManagedSnapshotOption::Specified(None)
+                }
+              },
             },
           },
         )))
