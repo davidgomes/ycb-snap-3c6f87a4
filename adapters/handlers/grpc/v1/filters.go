@@ -1,0 +1,396 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package v1
+
+import (
+	"fmt"
+	"math"
+	"strconv"
+
+	"github.com/weaviate/weaviate/entities/filters"
+	"github.com/weaviate/weaviate/entities/filters/nested"
+	"github.com/weaviate/weaviate/entities/models"
+	"github.com/weaviate/weaviate/entities/schema"
+	pb "github.com/weaviate/weaviate/grpc/generated/protocol/v1"
+	"github.com/weaviate/weaviate/usecases/schema/namespacing"
+)
+
+// ExtractFilters converts a proto Filters tree into an internal filter Clause.
+//
+// NS-enabled: old-style reference-path filters (Target nil, len(On) > 1)
+// are rejected — inner class segments aren't auto-qualified and would miss
+// the schema lookup. New-style FilterTarget filters are NS-aware:
+// extractPathNew stitches parent NS onto each nested linked class.
+// SingleTarget uses pre-qualified Property.DataType; MultiTarget routes
+// caller-supplied TargetCollection through QualifyRefTarget.
+func ExtractFilters(filterIn *pb.Filters, authorizedGetClass classGetterWithAuthzFunc, className, tenant string, namespacesEnabled bool, principal *models.Principal) (filters.Clause, error) {
+	returnFilter := filters.Clause{}
+
+	switch filterIn.Operator {
+	case pb.Filters_OPERATOR_AND, pb.Filters_OPERATOR_OR, pb.Filters_OPERATOR_NOT:
+		switch filterIn.Operator {
+		case pb.Filters_OPERATOR_AND:
+			returnFilter.Operator = filters.OperatorAnd
+		case pb.Filters_OPERATOR_OR:
+			returnFilter.Operator = filters.OperatorOr
+		case pb.Filters_OPERATOR_NOT:
+			returnFilter.Operator = filters.OperatorNot
+		default:
+		}
+
+		clauses := make([]filters.Clause, len(filterIn.Filters))
+		for i, clause := range filterIn.Filters {
+			retClause, err := ExtractFilters(clause, authorizedGetClass, className, tenant, namespacesEnabled, principal)
+			if err != nil {
+				return filters.Clause{}, err
+			}
+			clauses[i] = retClause
+		}
+
+		returnFilter.Operands = clauses
+
+	default:
+		if filterIn.Target == nil && len(filterIn.On)%2 != 1 {
+			return filters.Clause{}, fmt.Errorf(
+				"paths needs to have a uneven number of components: property, class, property, ...., got %v", filterIn.On,
+			)
+		}
+
+		if namespacesEnabled && filterIn.Target == nil && len(filterIn.On) > 1 {
+			return filters.Clause{}, fmt.Errorf(
+				"reference-path filters via Filters.on are not supported on namespace-enabled clusters; use Filters.target with a SingleTarget instead",
+			)
+		}
+
+		switch filterIn.Operator {
+		case pb.Filters_OPERATOR_EQUAL:
+			returnFilter.Operator = filters.OperatorEqual
+		case pb.Filters_OPERATOR_NOT_EQUAL:
+			returnFilter.Operator = filters.OperatorNotEqual
+		case pb.Filters_OPERATOR_GREATER_THAN:
+			returnFilter.Operator = filters.OperatorGreaterThan
+		case pb.Filters_OPERATOR_GREATER_THAN_EQUAL:
+			returnFilter.Operator = filters.OperatorGreaterThanEqual
+		case pb.Filters_OPERATOR_LESS_THAN:
+			returnFilter.Operator = filters.OperatorLessThan
+		case pb.Filters_OPERATOR_LESS_THAN_EQUAL:
+			returnFilter.Operator = filters.OperatorLessThanEqual
+		case pb.Filters_OPERATOR_WITHIN_GEO_RANGE:
+			returnFilter.Operator = filters.OperatorWithinGeoRange
+		case pb.Filters_OPERATOR_LIKE:
+			returnFilter.Operator = filters.OperatorLike
+		case pb.Filters_OPERATOR_IS_NULL:
+			returnFilter.Operator = filters.OperatorIsNull
+		case pb.Filters_OPERATOR_CONTAINS_ANY:
+			returnFilter.Operator = filters.ContainsAny
+		case pb.Filters_OPERATOR_CONTAINS_ALL:
+			returnFilter.Operator = filters.ContainsAll
+		case pb.Filters_OPERATOR_CONTAINS_NONE:
+			returnFilter.Operator = filters.ContainsNone
+		default:
+			return filters.Clause{}, fmt.Errorf("unknown filter operator %v", filterIn.Operator)
+		}
+
+		var dataType schema.DataType
+		if filterIn.Target == nil {
+			path, err := extractPath(className, filterIn.On)
+			if err != nil {
+				return filters.Clause{}, err
+			}
+			returnFilter.On = path
+
+			dataType, err = extractDataType(authorizedGetClass, returnFilter.Operator, className, tenant, filterIn.On)
+			if err != nil {
+				return filters.Clause{}, err
+			}
+		} else {
+			path, dataType2, err := extractPathNew(authorizedGetClass, className, tenant, filterIn.Target, returnFilter.Operator, namespacesEnabled, principal)
+			if err != nil {
+				return filters.Clause{}, err
+			}
+			dataType = dataType2
+			returnFilter.On = path
+		}
+
+		// datatype UUID is just a string
+		if dataType == schema.DataTypeUUID {
+			dataType = schema.DataTypeText
+		}
+
+		var val interface{}
+		switch filterIn.TestValue.(type) {
+		case *pb.Filters_ValueText:
+			val = filterIn.GetValueText()
+		case *pb.Filters_ValueInt:
+			val = int(filterIn.GetValueInt())
+		case *pb.Filters_ValueBoolean:
+			val = filterIn.GetValueBoolean()
+		case *pb.Filters_ValueNumber:
+			val = filterIn.GetValueNumber()
+		case *pb.Filters_ValueIntArray:
+			// convert from int32 GRPC to go-int
+			valInt32 := filterIn.GetValueIntArray().Values
+			valInt := make([]int, len(valInt32))
+			for i := 0; i < len(valInt32); i++ {
+				valInt[i] = int(valInt32[i])
+			}
+			val = valInt
+		case *pb.Filters_ValueTextArray:
+			val = filterIn.GetValueTextArray().Values
+		case *pb.Filters_ValueNumberArray:
+			val = filterIn.GetValueNumberArray().Values
+		case *pb.Filters_ValueBooleanArray:
+			val = filterIn.GetValueBooleanArray().Values
+		case *pb.Filters_ValueGeo:
+			valueFilter := filterIn.GetValueGeo()
+			val = filters.GeoRange{
+				GeoCoordinates: &models.GeoCoordinates{
+					Latitude:  &valueFilter.Latitude,
+					Longitude: &valueFilter.Longitude,
+				},
+				Distance: valueFilter.Distance,
+			}
+		default:
+			return filters.Clause{}, fmt.Errorf("unknown value type %v", filterIn.TestValue)
+		}
+
+		// correct the type of value when filtering on a float/int property but sending an int/float/string. This is easy to
+		// get wrong for humans and agents alike (e.g. sending "2.3" as a filter on a number property)
+		if dataType == schema.DataTypeNumber {
+			switch v := val.(type) {
+			case int:
+				val = float64(v)
+			case string:
+				fVal, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					return filters.Clause{}, fmt.Errorf("expected a number value, but could not parse string '%v' as float: %w", v, err)
+				}
+				val = fVal
+			// correct type for containsXXX in case users send ints for a []number type
+			case []int:
+				if !returnFilter.Operator.IsContains() {
+					break
+				}
+				val64 := make([]float64, len(v))
+				for i := 0; i < len(v); i++ {
+					val64[i] = float64(v[i])
+				}
+				val = val64
+			}
+		}
+		if dataType == schema.DataTypeInt {
+			switch v := val.(type) {
+			case float64:
+				iVal, err := floatToInt(v)
+				if err != nil {
+					return filters.Clause{}, err
+				}
+				val = iVal
+			case string:
+				fVal, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					return filters.Clause{}, fmt.Errorf("expected an integer value, but could not parse string '%v' as int: %w", v, err)
+				}
+				iVal, err := floatToInt(fVal)
+				if err != nil {
+					return filters.Clause{}, err
+				}
+				val = iVal
+			// correct type for containsXXX in case users send floats for a []int type
+			case []float64:
+				if !returnFilter.Operator.IsContains() {
+					break
+				}
+				valInt := make([]int, len(v))
+				for i := 0; i < len(v); i++ {
+					iVal, err := floatToInt(v[i])
+					if err != nil {
+						return filters.Clause{}, err
+					}
+					valInt[i] = iVal
+				}
+				val = valInt
+			}
+		}
+
+		value := filters.Value{Value: val, Type: dataType}
+		returnFilter.Value = &value
+
+	}
+	return returnFilter, nil
+}
+
+func extractDataTypeProperty(authorizedGetClass classGetterWithAuthzFunc, operator filters.Operator, className, tenant string, on []string) (schema.DataType, error) {
+	var dataType schema.DataType
+	if operator == filters.OperatorIsNull {
+		dataType = schema.DataTypeBoolean
+	} else if len(on) > 1 {
+		propToCheck := on[len(on)-1]
+		_, isPropLengthFilter := schema.IsPropertyLength(propToCheck, 0)
+		if isPropLengthFilter {
+			return schema.DataTypeInt, nil
+		}
+
+		classOfProp := on[len(on)-2]
+		class, err := authorizedGetClass(classOfProp)
+		if err != nil {
+			return dataType, err
+		}
+		prop, err := schema.GetPropertyByName(class, propToCheck)
+		if err != nil {
+			return dataType, err
+		}
+		dataType = schema.DataType(prop.DataType[0])
+	} else {
+		propToCheck := on[0]
+		_, isPropLengthFilter := schema.IsPropertyLength(propToCheck, 0)
+		if isPropLengthFilter {
+			return schema.DataTypeInt, nil
+		}
+
+		class, err := authorizedGetClass(className)
+		if err != nil {
+			return dataType, err
+		}
+		if class == nil {
+			return dataType, fmt.Errorf("could not find class %s in schema", className)
+		}
+
+		// Nested filter path: walk into NestedProperties to find the leaf
+		// type instead of stopping at the root. The nested package owns
+		// path-syntax details (separator, [N] indices) so this branch
+		// doesn't need to know them. ResolveLeaf produces the same path-
+		// navigation error messages the validator would emit, so callers
+		// don't need to wrap or rephrase them here.
+		if nested.IsNestedPath(class, propToCheck) {
+			leaf, err := nested.ResolveLeaf(class, propToCheck)
+			if err != nil {
+				return dataType, err
+			}
+			dataType = schema.DataType(leaf.DataType[0])
+		} else {
+			prop, err := schema.GetPropertyByName(class, propToCheck)
+			if err != nil {
+				return dataType, err
+			}
+			if schema.IsRefDataType(prop.DataType) {
+				// This is a filter on a reference property without a path so is counting
+				// the number of references. Needs schema.DataTypeInt: entities/filters/filters_validator.go#L116-L127
+				return schema.DataTypeInt, nil
+			}
+			dataType = schema.DataType(prop.DataType[0])
+		}
+	}
+
+	// searches on array datatypes always need the base-type as value-type
+	if baseType, isArray := schema.IsArrayType(dataType); isArray {
+		return baseType, nil
+	}
+	return dataType, nil
+}
+
+func extractDataType(authorizedGetClass classGetterWithAuthzFunc, operator filters.Operator, classname, tenant string, on []string) (schema.DataType, error) {
+	propToFilterOn := on[len(on)-1]
+	if propToFilterOn == filters.InternalPropID {
+		return schema.DataTypeText, nil
+	} else if propToFilterOn == filters.InternalPropCreationTimeUnix || propToFilterOn == filters.InternalPropLastUpdateTimeUnix {
+		return schema.DataTypeDate, nil
+	} else {
+		return extractDataTypeProperty(authorizedGetClass, operator, classname, tenant, on)
+	}
+}
+
+func extractPath(className string, on []string) (*filters.Path, error) {
+	if len(on) > 1 {
+		var err error
+		child, err := extractPath(on[1], on[2:])
+		if err != nil {
+			return nil, err
+		}
+		return &filters.Path{Class: schema.ClassName(className), Property: schema.PropertyName(on[0]), Child: child}, nil
+
+	}
+	return &filters.Path{Class: schema.ClassName(className), Property: schema.PropertyName(on[0]), Child: nil}, nil
+}
+
+func extractPathNew(authorizedGetClass classGetterWithAuthzFunc, className, tenant string, target *pb.FilterTarget, operator filters.Operator, namespacesEnabled bool, principal *models.Principal) (*filters.Path, schema.DataType, error) {
+	class, err := authorizedGetClass(className)
+	if err != nil {
+		return nil, "", err
+	}
+	switch target.Target.(type) {
+	case *pb.FilterTarget_Property:
+		dt, err := extractDataType(authorizedGetClass, operator, className, tenant, []string{target.GetProperty()})
+		if err != nil {
+			return nil, "", err
+		}
+		return &filters.Path{Class: schema.ClassName(className), Property: schema.PropertyName(target.GetProperty()), Child: nil}, dt, nil
+	case *pb.FilterTarget_SingleTarget:
+		singleTarget := target.GetSingleTarget()
+		normalizedRefPropName := schema.LowercaseFirstLetter(singleTarget.On)
+		refProp, err := schema.GetPropertyByName(class, normalizedRefPropName)
+		if err != nil {
+			return nil, "", err
+		}
+		if len(refProp.DataType) != 1 {
+			return nil, "", fmt.Errorf("expected reference property with a single target, got %v for %v ", refProp.DataType, refProp.Name)
+		}
+		// DataType is pre-qualified; see namespacing.QualifyPropertyDataTypes.
+		linkedClassName := refProp.DataType[0]
+		child, property, err := extractPathNew(authorizedGetClass, linkedClassName, tenant, singleTarget.Target, operator, namespacesEnabled, principal)
+		if err != nil {
+			return nil, "", err
+		}
+		return &filters.Path{Class: schema.ClassName(className), Property: schema.PropertyName(normalizedRefPropName), Child: child}, property, nil
+	case *pb.FilterTarget_MultiTarget:
+		multiTarget := target.GetMultiTarget()
+		// className is pre-qualified upstream; QualifyRefTarget normalises
+		// caller-supplied TargetCollection against the source NS.
+		linkedClassName, _, err := namespacing.QualifyRefTarget(principal, namespacesEnabled, className, multiTarget.TargetCollection)
+		if err != nil {
+			return nil, "", err
+		}
+		child, property, err := extractPathNew(authorizedGetClass, linkedClassName, tenant, multiTarget.Target, operator, namespacesEnabled, principal)
+		if err != nil {
+			return nil, "", err
+		}
+		return &filters.Path{Class: schema.ClassName(className), Property: schema.PropertyName(schema.LowercaseFirstLetter(multiTarget.On)), Child: child}, property, nil
+	case *pb.FilterTarget_Count:
+		count := target.GetCount()
+		return &filters.Path{Class: schema.ClassName(className), Property: schema.PropertyName(schema.LowercaseFirstLetter(count.On)), Child: nil}, schema.DataTypeInt, nil
+	default:
+		return nil, "", fmt.Errorf("unknown target type %v", target)
+	}
+}
+
+// floatToInt safely converts a float64 to int for use as an integer filter
+// value. It rejects NaN, ±Inf, values outside the int64 range, and fractional
+// values. This allows whole-number floats (e.g. 2.0 or "2.0") to be accepted
+// as a convenience, while avoiding Go's implementation-defined behavior for
+// out-of-range float→int conversions and silent truncation of fractional
+// values.
+//
+// Note: float64 cannot represent every int64 exactly. Values near the int64
+// boundary that ParseFloat rounds up to float64(math.MaxInt64) = 2^63 are
+// rejected as out of range. Callers that need exact large integers should
+// use the native integer filter value instead of float/text.
+func floatToInt(v float64) (int, error) {
+	switch {
+	case math.IsNaN(v) || math.IsInf(v, 0):
+		return 0, fmt.Errorf("filtering for integer, but received a non-finite number %v", v)
+	case v < float64(math.MinInt64) || v >= float64(math.MaxInt64):
+		return 0, fmt.Errorf("filtering for integer, but received a value out of range %v", v)
+	case math.Trunc(v) != v:
+		return 0, fmt.Errorf("filtering for integer, but received a floating point number %v", v)
+	}
+	return int(v), nil
+}

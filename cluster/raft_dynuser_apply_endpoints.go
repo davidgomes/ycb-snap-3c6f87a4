@@ -1,0 +1,168 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package cluster
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	cmd "github.com/weaviate/weaviate/cluster/proto/api"
+)
+
+func (s *Raft) CreateUser(ctx context.Context, userId, secureHash, userIdentifier, apiKeyFirstLetters, namespace string, createdAt time.Time) error {
+	req := cmd.CreateUsersRequest{
+		UserId:             userId,
+		SecureHash:         secureHash,
+		UserIdentifier:     userIdentifier,
+		CreatedAt:          createdAt,
+		ApiKeyFirstLetters: apiKeyFirstLetters,
+		Namespace:          namespace,
+		Version:            cmd.DynUserLatestCommandPolicyVersion,
+	}
+	subCommand, err := json.Marshal(&req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	command := &cmd.ApplyRequest{
+		Type:       cmd.ApplyRequest_TYPE_UPSERT_USER,
+		SubCommand: subCommand,
+	}
+	if _, err := s.Execute(ctx, command); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Raft) CreateUserWithKey(ctx context.Context, userId, apiKeyFirstLetters string, weakHash [sha256.Size]byte, createdAt time.Time) error {
+	req := cmd.CreateUserWithKeyRequest{
+		UserId:             userId,
+		CreatedAt:          createdAt,
+		ApiKeyFirstLetters: apiKeyFirstLetters,
+		WeakHash:           weakHash,
+		Version:            cmd.DynUserLatestCommandPolicyVersion,
+	}
+	subCommand, err := json.Marshal(&req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	command := &cmd.ApplyRequest{
+		Type:       cmd.ApplyRequest_TYPE_CREATE_USER_WITH_KEY,
+		SubCommand: subCommand,
+	}
+	if _, err := s.Execute(ctx, command); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Raft) RotateKey(ctx context.Context, userId, apiKeyFirstLetters, secureHash, oldIdentifier, newIdentifier string) error {
+	req := cmd.RotateUserApiKeyRequest{
+		UserId:             userId,
+		ApiKeyFirstLetters: apiKeyFirstLetters,
+		SecureHash:         secureHash,
+		OldIdentifier:      oldIdentifier,
+		NewIdentifier:      newIdentifier,
+		Version:            cmd.DynUserLatestCommandPolicyVersion,
+	}
+	subCommand, err := json.Marshal(&req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	command := &cmd.ApplyRequest{
+		Type:       cmd.ApplyRequest_TYPE_ROTATE_USER_API_KEY,
+		SubCommand: subCommand,
+	}
+	if _, err := s.Execute(ctx, command); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Raft) DeleteUser(ctx context.Context, userId string) error {
+	req := cmd.DeleteUsersRequest{
+		UserId:  userId,
+		Version: cmd.DynUserLatestCommandPolicyVersion,
+	}
+	subCommand, err := json.Marshal(&req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	command := &cmd.ApplyRequest{
+		Type:       cmd.ApplyRequest_TYPE_DELETE_USER,
+		SubCommand: subCommand,
+	}
+	if _, err := s.Execute(ctx, command); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Raft) DeleteUsersInNamespace(ctx context.Context, namespace string) error {
+	req := cmd.DeleteUsersInNamespaceRequest{
+		Namespace: namespace,
+		Version:   cmd.DynUserLatestCommandPolicyVersion,
+	}
+	subCommand, err := json.Marshal(&req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	command := &cmd.ApplyRequest{
+		Type:       cmd.ApplyRequest_TYPE_DELETE_USERS_IN_NAMESPACE,
+		SubCommand: subCommand,
+	}
+	if _, err := s.Execute(ctx, command); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Raft) ActivateUser(ctx context.Context, userId string) error {
+	req := cmd.ActivateUsersRequest{
+		UserId:  userId,
+		Version: cmd.DynUserLatestCommandPolicyVersion,
+	}
+	subCommand, err := json.Marshal(&req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	command := &cmd.ApplyRequest{
+		Type:       cmd.ApplyRequest_TYPE_ACTIVATE_USER,
+		SubCommand: subCommand,
+	}
+	if _, err := s.Execute(ctx, command); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Raft) DeactivateUser(ctx context.Context, userId string, revokeKey bool) error {
+	req := cmd.SuspendUserRequest{
+		UserId:    userId,
+		RevokeKey: revokeKey,
+		Version:   cmd.DynUserLatestCommandPolicyVersion,
+	}
+	subCommand, err := json.Marshal(&req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	command := &cmd.ApplyRequest{
+		Type:       cmd.ApplyRequest_TYPE_SUSPEND_USER,
+		SubCommand: subCommand,
+	}
+	if _, err := s.Execute(ctx, command); err != nil {
+		return err
+	}
+	return nil
+}

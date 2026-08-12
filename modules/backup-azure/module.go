@@ -1,0 +1,141 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package modstgazure
+
+import (
+	"context"
+	"os"
+
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"github.com/weaviate/weaviate/entities/modulecapabilities"
+	"github.com/weaviate/weaviate/entities/moduletools"
+)
+
+const (
+	Name           = "backup-azure"
+	AltName1       = "azure"
+	azureContainer = "BACKUP_AZURE_CONTAINER"
+
+	// this is an optional value, allowing for
+	// the backup to be stored in a specific
+	// directory inside the provided container.
+	//
+	// if left unset, the backup files will
+	// be stored directly in the root of the
+	// container.
+	azurePath = "BACKUP_AZURE_PATH"
+)
+
+type clientConfig struct {
+	Container string
+
+	// this is an optional value, allowing for
+	// the backup to be stored in a specific
+	// directory inside the provided bucket
+	BackupPath string
+
+	// SkipAccessCheck disables the write+delete probe in Initialize.
+	SkipAccessCheck bool
+}
+
+type Module struct {
+	logger       logrus.FieldLogger
+	*azureClient              // backup client
+	exportClient *azureClient // export-only client: no default container or path; the scheduler supplies both
+	dataPath     string
+}
+
+func New() *Module {
+	return &Module{}
+}
+
+func (m *Module) Name() string {
+	return Name
+}
+
+func (m *Module) IsExternal() bool {
+	return true
+}
+
+func (m *Module) AltNames() []string {
+	return []string{AltName1}
+}
+
+func (m *Module) Type() modulecapabilities.ModuleType {
+	return modulecapabilities.Backup
+}
+
+func (m *Module) Init(ctx context.Context,
+	params moduletools.ModuleInitParams,
+) error {
+	m.logger = params.GetLogger()
+	m.dataPath = params.GetStorageProvider().DataPath()
+
+	config := &clientConfig{
+		Container:       os.Getenv(azureContainer),
+		BackupPath:      os.Getenv(azurePath),
+		SkipAccessCheck: params.GetConfig().Backup.SkipAccessCheck,
+	}
+	if config.Container == "" {
+		return errors.Errorf("backup init: '%s' must be set", azureContainer)
+	}
+
+	client, err := newClient(ctx, config, m.dataPath, m.logger)
+	if err != nil {
+		return errors.Wrap(err, "init Azure client")
+	}
+	m.azureClient = client
+
+	exportConfig := &clientConfig{
+		Container:       "", // export scheduler provides bucket via EXPORT_DEFAULT_BUCKET
+		BackupPath:      "", // export scheduler provides path via EXPORT_DEFAULT_PATH
+		SkipAccessCheck: params.GetConfig().Export.SkipAccessCheck,
+	}
+	exportClient, err := newClient(ctx, exportConfig, m.dataPath, m.logger)
+	if err != nil {
+		return errors.Wrap(err, "init Azure export client")
+	}
+	m.exportClient = exportClient
+	return nil
+}
+
+func (m *Module) MetaInfo() (map[string]interface{}, error) {
+	metaInfo := make(map[string]interface{})
+	metaInfo["containerName"] = m.config.Container
+	if root := m.config.BackupPath; root != "" {
+		metaInfo["rootName"] = root
+	}
+	return metaInfo, nil
+}
+
+// ExportBackend returns the export-specific backend. It has no default
+// container or path; the export scheduler supplies both via
+// EXPORT_DEFAULT_BUCKET and EXPORT_DEFAULT_PATH.
+func (m *Module) ExportBackend() modulecapabilities.BackupBackend {
+	return &exportAzureBackend{m.exportClient}
+}
+
+type exportAzureBackend struct {
+	*azureClient
+}
+
+func (e *exportAzureBackend) IsExternal() bool { return true }
+func (e *exportAzureBackend) Name() string     { return Name }
+
+// verify we implement the modules.Module interface
+var (
+	_ = modulecapabilities.Module(New())
+	_ = modulecapabilities.BackupBackend(New())
+	_ = modulecapabilities.MetaProvider(New())
+	_ = modulecapabilities.ExportBackendProvider(New())
+)

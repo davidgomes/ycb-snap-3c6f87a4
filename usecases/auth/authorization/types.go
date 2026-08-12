@@ -1,0 +1,789 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package authorization
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/weaviate/weaviate/usecases/auth/authentication"
+
+	"github.com/go-openapi/strfmt"
+
+	"github.com/weaviate/weaviate/entities/models"
+	"github.com/weaviate/weaviate/entities/schema"
+	"github.com/weaviate/weaviate/entities/verbosity"
+)
+
+const (
+	// CREATE Represents the action to create a new resource.
+	CREATE = "C"
+	// READ Represents the action to retrieve a resource.
+	READ = "R"
+	// UPDATE Represents the action to update an existing resource.
+	UPDATE = "U"
+	// DELETE Represents the action to delete a resource.
+	DELETE = "D"
+
+	ROLE_SCOPE_ALL   = "ALL"
+	ROLE_SCOPE_MATCH = "MATCH"
+
+	USER_AND_GROUP_ASSIGN_AND_REVOKE = "A"
+)
+
+const (
+	GroupsDomain      = "groups"
+	UsersDomain       = "users"
+	RolesDomain       = "roles"
+	ClusterDomain     = "cluster"
+	NodesDomain       = "nodes"
+	BackupsDomain     = "backups"
+	SchemaDomain      = "schema"
+	CollectionsDomain = "collections"
+	TenantsDomain     = "tenants"
+	DataDomain        = "data"
+	McpDomain         = "mcp"
+	ReplicateDomain   = "replicate"
+	AliasesDomain     = "aliases"
+	NamespacesDomain  = "namespaces"
+)
+
+var (
+	All = String("*")
+
+	AllBackups = &models.PermissionBackups{
+		Collection: All,
+	}
+	AllData = &models.PermissionData{
+		Collection: All,
+		Tenant:     All,
+		Object:     All,
+	}
+	AllTenants = &models.PermissionTenants{
+		Collection: All,
+		Tenant:     All,
+	}
+	AllNodes = &models.PermissionNodes{
+		Verbosity:  String(verbosity.OutputVerbose),
+		Collection: All,
+	}
+	AllOIDCGroups = &models.PermissionGroups{
+		Group:     All,
+		GroupType: models.GroupTypeOidc,
+	}
+	AllRoles = &models.PermissionRoles{
+		Role:  All,
+		Scope: String(models.PermissionRolesScopeAll),
+	}
+	AllRolesWithMatchScope = &models.PermissionRoles{
+		Role:  All,
+		Scope: String(models.PermissionRolesScopeMatch),
+	}
+	AllUsers = &models.PermissionUsers{
+		Users: All,
+	}
+	AllCollections = &models.PermissionCollections{
+		Collection: All,
+	}
+	AllReplicate = &models.PermissionReplicate{
+		Collection: All,
+		Shard:      All,
+	}
+	AllAliases = &models.PermissionAliases{
+		Collection: All,
+		Alias:      All,
+	}
+	AllNamespaces = &models.PermissionNamespaces{
+		Namespace: All,
+	}
+
+	ComponentName = "RBAC"
+
+	// Note:  if a new action added, don't forget to add it to availableWeaviateActions
+	// to be added to built in roles
+	// any action has to contain of `{verb}_{domain}` verb: CREATE, READ, UPDATE, DELETE domain: roles, users, cluster, collections, data
+	ReadRoles   = "read_roles"
+	CreateRoles = "create_roles"
+	UpdateRoles = "update_roles"
+	DeleteRoles = "delete_roles"
+
+	ReadCluster = "read_cluster"
+	ReadNodes   = "read_nodes"
+
+	AssignAndRevokeGroups = "assign_and_revoke_groups"
+	ReadGroups            = "read_groups"
+
+	AssignAndRevokeUsers = "assign_and_revoke_users"
+	CreateUsers          = "create_users"
+	ReadUsers            = "read_users"
+	UpdateUsers          = "update_users"
+	DeleteUsers          = "delete_users"
+
+	ManageBackups = "manage_backups"
+
+	ManageNamespaces = "manage_namespaces"
+
+	CreateCollections = "create_collections"
+	ReadCollections   = "read_collections"
+	UpdateCollections = "update_collections"
+	DeleteCollections = "delete_collections"
+
+	CreateData = "create_data"
+	ReadData   = "read_data"
+	UpdateData = "update_data"
+	DeleteData = "delete_data"
+
+	CreateTenants = "create_tenants"
+	ReadTenants   = "read_tenants"
+	UpdateTenants = "update_tenants"
+	DeleteTenants = "delete_tenants"
+
+	CreateReplicate = "create_replicate"
+	ReadReplicate   = "read_replicate"
+	UpdateReplicate = "update_replicate"
+	DeleteReplicate = "delete_replicate"
+
+	CreateAliases = "create_aliases"
+	ReadAliases   = "read_aliases"
+	UpdateAliases = "update_aliases"
+	DeleteAliases = "delete_aliases"
+
+	CreateMcp = "create_mcp"
+	ReadMcp   = "read_mcp"
+	UpdateMcp = "update_mcp"
+
+	availableWeaviateActions = []string{
+		// Roles domain
+		CreateRoles,
+		ReadRoles,
+		UpdateRoles,
+		DeleteRoles,
+
+		// Backups domain
+		ManageBackups,
+
+		// Namespaces domain
+		ManageNamespaces,
+
+		// Users domain
+		AssignAndRevokeUsers,
+		CreateUsers,
+		ReadUsers,
+		UpdateUsers,
+		DeleteUsers,
+
+		// Cluster domain
+		ReadCluster,
+
+		// Groups domain
+		AssignAndRevokeGroups,
+		ReadGroups,
+
+		// Nodes domain
+		ReadNodes,
+
+		// Collections domain
+		CreateCollections,
+		ReadCollections,
+		UpdateCollections,
+		DeleteCollections,
+
+		// Data domain
+		CreateData,
+		ReadData,
+		UpdateData,
+		DeleteData,
+
+		// Tenant domain
+		CreateTenants,
+		ReadTenants,
+		UpdateTenants,
+		DeleteTenants,
+
+		// Replicate domain
+		CreateReplicate,
+		ReadReplicate,
+		UpdateReplicate,
+		DeleteReplicate,
+
+		// Aliases domain
+		CreateAliases,
+		ReadAliases,
+		UpdateAliases,
+		DeleteAliases,
+
+		// MCP domain
+		CreateMcp,
+		ReadMcp,
+		UpdateMcp,
+	}
+)
+
+var (
+	// build-in roles that can be assigned via API
+	Viewer = "viewer"
+	Admin  = "admin"
+	// build-in roles that can be assigned via env vars and cannot be changed via APIS
+	Root         = "root"
+	ReadOnly     = "read-only"
+	BuiltInRoles = []string{Viewer, Admin, Root, ReadOnly}
+
+	EnvVarRoles = []string{ReadOnly, Root}
+
+	// OperatorReservedRolePrefixes mark a global role operator-only: invisible to,
+	// unassignable to, and uncreatable-as-a-local-role by namespace-confined callers.
+	OperatorReservedRolePrefixes = []string{"operator_", "global_"}
+)
+
+// IsOperatorReservedRoleName reports whether a role short name (no namespace
+// qualifier) carries an operator-reserved prefix. Case-sensitive.
+func IsOperatorReservedRoleName(shortName string) bool {
+	for _, prefix := range OperatorReservedRolePrefixes {
+		if strings.HasPrefix(shortName, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// BuiltInPermissionsFor returns the canonical permission shape of the four
+// built-in roles. On namespace-enabled clusters admin/viewer are narrowed
+// to collections/schema, data, multi-tenancy, aliases, and MCP; root/read-only
+// keep wildcard CRUD/READ across all domains.
+func BuiltInPermissionsFor(namespacesEnabled bool) map[string][]*models.Permission {
+	if !namespacesEnabled {
+		return map[string][]*models.Permission{
+			Viewer:   viewerPermissions(),
+			Admin:    adminPermissions(),
+			Root:     adminPermissions(),
+			ReadOnly: viewerPermissions(),
+		}
+	}
+	return map[string][]*models.Permission{
+		Viewer:   tenantSafeViewerPermissions(),
+		Admin:    tenantSafeAdminPermissions(),
+		Root:     adminPermissions(),
+		ReadOnly: viewerPermissions(),
+	}
+}
+
+type Policy struct {
+	Resource string
+	Verb     string
+	Domain   string
+}
+
+// Cluster returns a string representing the cluster authorization scope.
+// The returned string is "cluster/*", which can be used to specify that
+// the authorization applies to all resources within the cluster.
+func Cluster() string {
+	return fmt.Sprintf("%s/*", ClusterDomain)
+}
+
+func nodes(verbosity, class string) string {
+	if verbosity == "" {
+		verbosity = "minimal"
+	}
+	if verbosity == "minimal" {
+		return fmt.Sprintf("%s/verbosity/%s", NodesDomain, verbosity)
+	}
+	return fmt.Sprintf("%s/verbosity/%s/collections/%s", NodesDomain, verbosity, class)
+}
+
+func Nodes(verbosity string, classes ...string) []string {
+	classes = schema.UppercaseClassesNames(classes...)
+
+	if len(classes) == 0 || (len(classes) == 1 && (classes[0] == "" || classes[0] == "*")) {
+		return []string{nodes(verbosity, "*")}
+	}
+
+	resources := make([]string, len(classes))
+	for idx := range classes {
+		if classes[idx] == "" {
+			resources[idx] = nodes(verbosity, "*")
+		} else {
+			resources[idx] = nodes(verbosity, classes[idx])
+		}
+	}
+
+	return resources
+}
+
+// Groups generates a list of user resource strings based on the provided group names.
+// If no group names are provided, it returns a default user resource string "groups/*".
+//
+// Parameters:
+//
+//	groups - A variadic parameter representing the group names.
+//
+// Returns:
+//
+//	A slice of strings where each string is a formatted user resource string.
+func Groups(groupType authentication.AuthType, groups ...string) []string {
+	if len(groups) == 0 || (len(groups) == 1 && (groups[0] == "" || groups[0] == "*")) {
+		return []string{
+			fmt.Sprintf("%s/%s/*", GroupsDomain, groupType),
+		}
+	}
+
+	resources := make([]string, len(groups))
+	for idx := range groups {
+		resources[idx] = fmt.Sprintf("%s/%s/%s", GroupsDomain, groupType, groups[idx])
+	}
+
+	return resources
+}
+
+// Users generates a list of user resource strings based on the provided user names.
+// If no user names are provided, it returns a default user resource string "users/*".
+//
+// Parameters:
+//
+//	users - A variadic parameter representing the user names.
+//
+// Returns:
+//
+//	A slice of strings where each string is a formatted user resource string.
+func Users(users ...string) []string {
+	if len(users) == 0 || (len(users) == 1 && (users[0] == "" || users[0] == "*")) {
+		return []string{
+			fmt.Sprintf("%s/*", UsersDomain),
+		}
+	}
+
+	resources := make([]string, len(users))
+	for idx := range users {
+		resources[idx] = fmt.Sprintf("%s/%s", UsersDomain, users[idx])
+	}
+
+	return resources
+}
+
+// Roles generates a list of role resource strings based on the provided role names.
+// If no role names are provided, it returns a default role resource string "roles/*".
+//
+// Parameters:
+//
+//	roles - A variadic parameter representing the role names.
+//
+// Returns:
+//
+//	A slice of strings where each string is a formatted role resource string.
+func Roles(roles ...string) []string {
+	if len(roles) == 0 || (len(roles) == 1 && (roles[0] == "" || roles[0] == "*")) {
+		return []string{
+			fmt.Sprintf("%s/*", RolesDomain),
+		}
+	}
+
+	resources := make([]string, len(roles))
+	for idx := range roles {
+		resources[idx] = fmt.Sprintf("%s/%s", RolesDomain, roles[idx])
+	}
+
+	return resources
+}
+
+// CollectionsMetadata generates a list of resource strings for the given classes.
+// If no classes are provided, it returns a default resource string "collections/*".
+// Each class is formatted as "collection/{class}".
+//
+// Parameters:
+//
+//	classes - a variadic parameter representing the class names.
+//
+// Returns:
+//
+//	A slice of strings representing the resource paths.
+func CollectionsMetadata(classes ...string) []string {
+	classes = schema.UppercaseClassesNames(classes...)
+
+	if len(classes) == 0 || (len(classes) == 1 && (classes[0] == "" || classes[0] == "*")) {
+		return []string{fmt.Sprintf("%s/collections/*/shards/#", SchemaDomain)}
+	}
+
+	resources := make([]string, len(classes))
+	for idx := range classes {
+		if classes[idx] == "" {
+			resources[idx] = fmt.Sprintf("%s/collections/*/shards/#", SchemaDomain)
+		} else {
+			resources[idx] = fmt.Sprintf("%s/collections/%s/shards/#", SchemaDomain, classes[idx])
+		}
+	}
+
+	return resources
+}
+
+// Namespaces generates a list of namespace resource strings based on the
+// provided names. If no names are provided (or a single empty/"*"), it
+// returns the wildcard resource string "namespaces/*".
+func Namespaces(names ...string) []string {
+	if len(names) == 0 || (len(names) == 1 && (names[0] == "" || names[0] == "*")) {
+		return []string{fmt.Sprintf("%s/*", NamespacesDomain)}
+	}
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = fmt.Sprintf("%s/%s", NamespacesDomain, n)
+	}
+	return out
+}
+
+func Aliases(class string, aliases ...string) []string {
+	class = schema.UppercaseClassName(class)
+	aliases = schema.UppercaseClassesNames(aliases...)
+
+	if class == "" {
+		class = "*"
+	}
+
+	if len(aliases) == 0 || (len(aliases) == 1 && (aliases[0] == "" || aliases[0] == "*")) {
+		return []string{fmt.Sprintf("%s/collections/%s/aliases/*", AliasesDomain, class)}
+	}
+
+	resources := make([]string, len(aliases))
+	for idx := range aliases {
+		if aliases[idx] == "" {
+			resources[idx] = fmt.Sprintf("%s/collections/%s/aliases/*", AliasesDomain, class)
+		} else {
+			resources[idx] = fmt.Sprintf("%s/collections/%s/aliases/%s", AliasesDomain, class, aliases[idx])
+		}
+	}
+
+	return resources
+}
+
+func CollectionsData(classes ...string) []string {
+	classes = schema.UppercaseClassesNames(classes...)
+
+	if len(classes) == 0 || (len(classes) == 1 && (classes[0] == "" || classes[0] == "*")) {
+		return []string{Objects("*", "*", "*")}
+	}
+
+	var paths []string
+	for _, class := range classes {
+		paths = append(paths, Objects(class, "*", "*"))
+	}
+	return paths
+}
+
+func Collections(classes ...string) []string {
+	classes = schema.UppercaseClassesNames(classes...)
+	return append(CollectionsData(classes...), CollectionsMetadata(classes...)...)
+}
+
+// ShardsMetadata generates a list of shard resource strings for a given class and shards.
+// If the class is an empty string, it defaults to "*". If no shards are provided,
+// it returns a single resource string with a wildcard for shards. If shards are
+// provided, it returns a list of resource strings for each shard.
+//
+// Parameters:
+//   - class: The class name for the resource. If empty, defaults to "*".
+//   - shards: A variadic list of shard names. If empty, it will replace it with '#' to mark it as collection only check
+//
+// Returns:
+//
+//	A slice of strings representing the resource paths for the given class and shards.
+func ShardsMetadata(class string, shards ...string) []string {
+	class = schema.UppercaseClassesNames(class)[0]
+	if class == "" {
+		class = "*"
+	}
+
+	if len(shards) == 0 || (len(shards) == 1 && (shards[0] == "" || shards[0] == "*")) {
+		return []string{fmt.Sprintf("%s/collections/%s/shards/*", SchemaDomain, class)}
+	}
+
+	resources := make([]string, len(shards))
+	for idx := range shards {
+		if shards[idx] == "" {
+			resources[idx] = fmt.Sprintf("%s/collections/%s/shards/*", SchemaDomain, class)
+		} else {
+			resources[idx] = fmt.Sprintf("%s/collections/%s/shards/%s", SchemaDomain, class, shards[idx])
+		}
+	}
+
+	return resources
+}
+
+func ShardsData(class string, shards ...string) []string {
+	class = schema.UppercaseClassesNames(class)[0]
+	var paths []string
+	for _, shard := range shards {
+		paths = append(paths, Objects(class, shard, "*"))
+	}
+	return paths
+}
+
+// Objects generates a string representing a path to objects within a collection and shard.
+// The path format varies based on the provided class, shard, and id parameters.
+//
+// Parameters:
+// - class: the class of the collection (string)
+// - shard: the shard identifier (string)
+// - id: the unique identifier of the object (strfmt.UUID)
+//
+// Returns:
+// - A string representing the path to the objects, with wildcards (*) used for any empty parameters.
+//
+// Example outputs:
+// - "collections/*/shards/*/objects/*" if all parameters are empty
+// - "collections/*/shards/*/objects/{id}" if only id is provided
+// - "collections/{class}/shards/{shard}/objects/{id}" if all parameters are provided
+func Objects(class, shard string, id strfmt.UUID) string {
+	class = schema.UppercaseClassesNames(class)[0]
+	if class == "" {
+		class = "*"
+	}
+	if shard == "" {
+		shard = "*"
+	}
+	if id == "" {
+		id = "*"
+	}
+	return fmt.Sprintf("%s/collections/%s/shards/%s/objects/%s", DataDomain, class, shard, id)
+}
+
+// Backups generates a resource string for the given classes.
+// If the backend is an empty string, it defaults to "*".
+
+// Parameters:
+// - class: the class name (string)
+
+// Returns:
+// - A string representing the resource path for the given classes.
+
+// Example outputs:
+// - "backups/*" if the backend is an empty string
+// - "backups/{backend}" for the provided backend
+func Backups(classes ...string) []string {
+	classes = schema.UppercaseClassesNames(classes...)
+	if len(classes) == 0 || (len(classes) == 1 && (classes[0] == "" || classes[0] == "*")) {
+		return []string{fmt.Sprintf("%s/collections/*", BackupsDomain)}
+	}
+
+	resources := make([]string, len(classes))
+	for idx := range classes {
+		if classes[idx] == "" {
+			resources[idx] = fmt.Sprintf("%s/collections/*", BackupsDomain)
+		} else {
+			resources[idx] = fmt.Sprintf("%s/collections/%s", BackupsDomain, classes[idx])
+		}
+	}
+
+	return resources
+}
+
+// Replications generates a replication resource string for a given class and shard.
+//
+// Parameters:
+//   - class: The class name for the resource. If empty, defaults to "*".
+//   - shard: The shard name for the resource. If empty, defaults to "*".
+//
+// Returns:
+//
+//	A slice of strings representing the resource paths for the given class and shards.
+func Replications(class, shard string) string {
+	class = schema.UppercaseClassName(class)
+	if class == "" {
+		class = "*"
+	}
+	if shard == "" {
+		shard = "*"
+	}
+	return fmt.Sprintf("%s/collections/%s/shards/%s", ReplicateDomain, class, shard)
+}
+
+// Mcp generates a resource string covering the MCP endpoint.
+// For now, this gates nothing specific to the MCP server besides its entirety
+//
+// Returns:
+// - A string representing the resource path.
+//
+// Example outputs:
+// - mcp
+func Mcp() string {
+	return McpDomain
+}
+
+// WildcardPath returns the appropriate wildcard path based on the domain and original resource path.
+// The domain is expected to be the first part of the resource path.
+func WildcardPath(resource string) string {
+	parts := strings.Split(resource, "/")
+	parts[len(parts)-1] = "*"
+	return strings.Join(parts, "/")
+}
+
+func String(s string) *string {
+	return &s
+}
+
+// viewer : can view everything , roles, users, schema, data
+func viewerPermissions() []*models.Permission {
+	perms := []*models.Permission{}
+	for _, action := range availableWeaviateActions {
+		if strings.ToUpper(action)[0] != READ[0] {
+			continue
+		}
+
+		perms = append(perms, &models.Permission{
+			Action:      &action,
+			Backups:     AllBackups,
+			Data:        AllData,
+			Nodes:       AllNodes,
+			Roles:       AllRoles,
+			Collections: AllCollections,
+			Tenants:     AllTenants,
+			Users:       AllUsers,
+			Aliases:     AllAliases,
+			Groups:      AllOIDCGroups,
+			Namespaces:  AllNamespaces,
+		})
+	}
+
+	return perms
+}
+
+// Admin : aka basically super Admin or root
+func adminPermissions() []*models.Permission {
+	// TODO ignore CRUD if there is manage
+	perms := []*models.Permission{}
+	for _, action := range availableWeaviateActions {
+		perms = append(perms, &models.Permission{
+			Action:      &action,
+			Backups:     AllBackups,
+			Data:        AllData,
+			Nodes:       AllNodes,
+			Roles:       AllRoles,
+			Collections: AllCollections,
+			Tenants:     AllTenants,
+			Users:       AllUsers,
+			Aliases:     AllAliases,
+			Groups:      AllOIDCGroups,
+			Namespaces:  AllNamespaces,
+		})
+	}
+
+	return perms
+}
+
+// tenantSafeActions is the ordered list of actions whose resource paths are
+// namespace-bearing (collections, data, tenants, aliases). The matcher
+// specializes these to the principal's namespace, so they are safe to grant
+// to API-assignable built-in roles on namespace-enabled clusters.
+var tenantSafeActions = []string{
+	CreateCollections, ReadCollections, UpdateCollections, DeleteCollections,
+	CreateData, ReadData, UpdateData, DeleteData,
+	CreateTenants, ReadTenants, UpdateTenants, DeleteTenants,
+	CreateAliases, ReadAliases, UpdateAliases, DeleteAliases,
+}
+
+// tenantSafeMcpActions are namespace-safe because the MCP tools self-scope to
+// principal.Namespace; the mcp resource carries no collection field. A future
+// non-self-scoping MCP tool would require revisiting this.
+var tenantSafeMcpActions = []string{CreateMcp, ReadMcp, UpdateMcp}
+
+// tenantSafeUserActions is the user-CRUD subset granted alongside the
+// namespace-bearing actions. AssignAndRevokeUsers is excluded.
+var tenantSafeUserActions = []string{
+	CreateUsers, ReadUsers, UpdateUsers, DeleteUsers,
+}
+
+// tenantSafeRoleActions is the role-management subset granted at MATCH scope.
+// The matcher specializes roles/* to the caller's namespace, confining reads
+// and writes alike to it.
+var tenantSafeRoleActions = []string{
+	CreateRoles, ReadRoles, UpdateRoles, DeleteRoles,
+}
+
+// tenantSafeAdminPermissions returns the narrowed admin shape for
+// namespace-enabled clusters: CRUD over the namespace-bearing domains plus
+// MCP, user CRUD, role management at MATCH scope, and role assignment.
+// Cluster-only domains (backups, replicate, nodes, cluster, groups,
+// namespaces) and group assignment are excluded.
+func tenantSafeAdminPermissions() []*models.Permission {
+	perms := make([]*models.Permission, 0, len(tenantSafeActions)+len(tenantSafeMcpActions)+len(tenantSafeUserActions)+len(tenantSafeRoleActions)+1)
+	for _, action := range tenantSafeActions {
+		perms = append(perms, &models.Permission{
+			Action:      &action,
+			Data:        AllData,
+			Collections: AllCollections,
+			Tenants:     AllTenants,
+			Aliases:     AllAliases,
+		})
+	}
+	for _, action := range tenantSafeMcpActions {
+		perms = append(perms, &models.Permission{Action: &action})
+	}
+	for _, action := range tenantSafeUserActions {
+		perms = append(perms, &models.Permission{
+			Action: &action,
+			Users:  AllUsers,
+		})
+	}
+	for _, action := range tenantSafeRoleActions {
+		perms = append(perms, &models.Permission{
+			Action: &action,
+			Roles:  AllRolesWithMatchScope,
+		})
+	}
+	// Safe because the assign handler requires the caller to already hold every
+	// permission the assigned role grants, projected into the target's namespace;
+	// the user-target match only confines which user, not which role.
+	assign := AssignAndRevokeUsers
+	perms = append(perms, &models.Permission{Action: &assign, Users: AllUsers})
+	return perms
+}
+
+// tenantSafeViewerPermissions returns the read-only subset of
+// tenantSafeAdminPermissions.
+func tenantSafeViewerPermissions() []*models.Permission {
+	perms := []*models.Permission{}
+	for _, action := range tenantSafeActions {
+		if strings.ToUpper(action)[0] != READ[0] {
+			continue
+		}
+		perms = append(perms, &models.Permission{
+			Action:      &action,
+			Data:        AllData,
+			Collections: AllCollections,
+			Tenants:     AllTenants,
+			Aliases:     AllAliases,
+		})
+	}
+	for _, action := range tenantSafeMcpActions {
+		if strings.ToUpper(action)[0] != READ[0] {
+			continue
+		}
+		perms = append(perms, &models.Permission{Action: &action})
+	}
+	for _, action := range tenantSafeUserActions {
+		if strings.ToUpper(action)[0] != READ[0] {
+			continue
+		}
+		perms = append(perms, &models.Permission{Action: &action, Users: AllUsers})
+	}
+	for _, action := range tenantSafeRoleActions {
+		if strings.ToUpper(action)[0] != READ[0] {
+			continue
+		}
+		perms = append(perms, &models.Permission{Action: &action, Roles: AllRolesWithMatchScope})
+	}
+	return perms
+}
+
+func VerbWithScope(verb, scope string) string {
+	if strings.Contains(verb, "_") {
+		return verb
+	}
+
+	return fmt.Sprintf("%s_%s", verb, scope)
+}

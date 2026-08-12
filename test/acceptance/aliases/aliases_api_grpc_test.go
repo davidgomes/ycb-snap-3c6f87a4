@@ -1,0 +1,452 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/weaviate/weaviate/entities/filters"
+	"github.com/weaviate/weaviate/entities/models"
+	pb "github.com/weaviate/weaviate/grpc/generated/protocol/v1"
+	"github.com/weaviate/weaviate/test/helper"
+	"github.com/weaviate/weaviate/test/helper/sample-schema/books"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/structpb"
+)
+
+func testAliasesAPIgRPC(t *testing.T, grpcURI string) {
+	ctx := context.Background()
+
+	gRPCClient := func(t *testing.T, addr string) (pb.WeaviateClient, *grpc.ClientConn) {
+		conn, err := helper.CreateGrpcConnectionClient(addr)
+		require.NoError(t, err)
+		require.NotNil(t, conn)
+		grpcClient := helper.CreateGrpcWeaviateClient(conn)
+		require.NotNil(t, grpcClient)
+		return grpcClient, conn
+	}
+
+	grpcClient, _ := gRPCClient(t, grpcURI)
+
+	booksAliasName := "GrpcBooksAlias"
+
+	// Shared container: leave no class/alias behind so the other suites'
+	// instance-wide alias counts stay correct. Delete only aliases that exist so
+	// a failure before the alias is created can't mask the original error.
+	defer func() {
+		resp := helper.GetAliases(t, nil)
+		require.NotNil(t, resp)
+		for _, alias := range resp.Aliases {
+			helper.DeleteAlias(t, alias.Alias)
+		}
+		helper.DeleteClass(t, books.DefaultClassName)
+	}()
+
+	t.Run("create schema", func(t *testing.T) {
+		booksClass := books.ClassModel2VecVectorizer()
+		helper.CreateClass(t, booksClass)
+		for _, book := range books.Objects() {
+			helper.CreateObject(t, book)
+			helper.AssertGetObjectEventually(t, book.Class, book.ID)
+		}
+	})
+
+	t.Run("create alias", func(t *testing.T) {
+		alias := &models.Alias{Alias: booksAliasName, Class: books.DefaultClassName}
+		helper.CreateAlias(t, alias)
+		resp := helper.GetAliases(t, &alias.Class)
+		require.NotNil(t, resp)
+		require.NotEmpty(t, resp.Aliases)
+	})
+
+	assertTargetCollectionName := func(res []*pb.SearchResult, collection string) {
+		for _, r := range res {
+			require.NotNil(t, r.GetProperties())
+			assert.Equal(t, collection, r.GetProperties().GetTargetCollection())
+		}
+	}
+
+	tests := []struct {
+		name        string
+		collection  string
+		accessUsing string
+	}{
+		{
+			name:        "search using collection name",
+			collection:  books.DefaultClassName,
+			accessUsing: books.DefaultClassName,
+		},
+		{
+			name:        "search using alias",
+			collection:  books.DefaultClassName,
+			accessUsing: booksAliasName,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Run("search", func(t *testing.T) {
+				t.Run("get", func(t *testing.T) {
+					resp, err := grpcClient.Search(ctx, &pb.SearchRequest{
+						Collection:  tt.accessUsing,
+						Uses_123Api: true,
+						Uses_125Api: true,
+						Uses_127Api: true,
+					})
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+					assert.Len(t, resp.Results, 3)
+					assertTargetCollectionName(resp.Results, tt.collection)
+				})
+				t.Run("get with filters", func(t *testing.T) {
+					resp, err := grpcClient.Search(ctx, &pb.SearchRequest{
+						Collection: tt.accessUsing,
+						Metadata:   &pb.MetadataRequest{Vector: true, Uuid: true},
+						Filters: &pb.Filters{
+							Operator:  pb.Filters_OPERATOR_EQUAL,
+							On:        []string{"title"},
+							TestValue: &pb.Filters_ValueText{ValueText: "Dune"},
+						},
+						Uses_123Api: true,
+						Uses_125Api: true,
+						Uses_127Api: true,
+					})
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+					assert.Len(t, resp.Results, 1)
+					assert.Equal(t, resp.Results[0].Metadata.Id, books.Dune.String())
+					assert.NotEmpty(t, resp.Results[0].Metadata.GetVectorBytes())
+					assertTargetCollectionName(resp.Results, tt.collection)
+				})
+				t.Run("nearText", func(t *testing.T) {
+					resp, err := grpcClient.Search(ctx, &pb.SearchRequest{
+						Collection: tt.accessUsing,
+						Metadata:   &pb.MetadataRequest{Uuid: true},
+						NearText: &pb.NearTextSearch{
+							Query: []string{"Dune"},
+						},
+						Uses_123Api: true,
+						Uses_125Api: true,
+						Uses_127Api: true,
+					})
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+					assert.Len(t, resp.Results, 3)
+					assert.Equal(t, resp.Results[0].Metadata.Id, books.Dune.String())
+					assertTargetCollectionName(resp.Results, tt.collection)
+				})
+				t.Run("bm25", func(t *testing.T) {
+					resp, err := grpcClient.Search(ctx, &pb.SearchRequest{
+						Collection: tt.accessUsing,
+						Metadata:   &pb.MetadataRequest{Uuid: true},
+						Bm25Search: &pb.BM25{
+							Query:      "Dune",
+							Properties: []string{"title"},
+						},
+						Uses_123Api: true,
+						Uses_125Api: true,
+						Uses_127Api: true,
+					})
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+					assert.Len(t, resp.Results, 1)
+					assert.Equal(t, resp.Results[0].Metadata.Id, books.Dune.String())
+					assertTargetCollectionName(resp.Results, tt.collection)
+				})
+				t.Run("hybrid", func(t *testing.T) {
+					resp, err := grpcClient.Search(ctx, &pb.SearchRequest{
+						Collection: tt.accessUsing,
+						Metadata:   &pb.MetadataRequest{Uuid: true},
+						HybridSearch: &pb.Hybrid{
+							Query: "Project",
+							Alpha: 0.75,
+						},
+						Properties: &pb.PropertiesRequest{
+							NonRefProperties: []string{"title"},
+						},
+						Uses_123Api: true,
+						Uses_125Api: true,
+						Uses_127Api: true,
+					})
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+					assert.Len(t, resp.Results, 3)
+					assert.Equal(t, resp.Results[0].Metadata.Id, books.ProjectHailMary.String())
+					assertTargetCollectionName(resp.Results, tt.collection)
+				})
+			})
+			t.Run("aggregate using alias", func(t *testing.T) {
+				t.Run("count", func(t *testing.T) {
+					resp, err := grpcClient.Aggregate(ctx, &pb.AggregateRequest{
+						Collection:   tt.accessUsing,
+						ObjectsCount: true,
+					})
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+					require.NotNil(t, resp.GetSingleResult())
+					require.Equal(t, int64(3), resp.GetSingleResult().GetObjectsCount())
+				})
+				t.Run("count with filters", func(t *testing.T) {
+					resp, err := grpcClient.Aggregate(ctx, &pb.AggregateRequest{
+						Collection: tt.accessUsing,
+						Filters: &pb.Filters{
+							Operator:  pb.Filters_OPERATOR_EQUAL,
+							On:        []string{"title"},
+							TestValue: &pb.Filters_ValueText{ValueText: "Dune"},
+						},
+						ObjectsCount: true,
+					})
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+					require.NotNil(t, resp.GetSingleResult())
+					require.Equal(t, int64(1), resp.GetSingleResult().GetObjectsCount())
+				})
+				t.Run("count with nearText", func(t *testing.T) {
+					certainty := float64(0.8)
+					resp, err := grpcClient.Aggregate(ctx, &pb.AggregateRequest{
+						Collection: tt.accessUsing,
+						Filters: &pb.Filters{
+							Operator:  pb.Filters_OPERATOR_EQUAL,
+							On:        []string{"title"},
+							TestValue: &pb.Filters_ValueText{ValueText: "Dune"},
+						},
+						Search: &pb.AggregateRequest_NearText{
+							NearText: &pb.NearTextSearch{
+								Query:     []string{"Dune"},
+								Certainty: &certainty,
+							},
+						},
+						ObjectsCount: true,
+					})
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+					require.NotNil(t, resp.GetSingleResult())
+					require.Equal(t, int64(1), resp.GetSingleResult().GetObjectsCount())
+				})
+			})
+		})
+	}
+
+	t.Run("batch delete using alias", func(t *testing.T) {
+		resp, err := grpcClient.BatchObjects(ctx, &pb.BatchObjectsRequest{
+			Objects: []*pb.BatchObject{
+				{
+					Collection: booksAliasName,
+					Uuid:       uuid.NewString(),
+					Properties: &pb.BatchObject_Properties{
+						NonRefProperties: &structpb.Struct{
+							Fields: map[string]*structpb.Value{
+								"title":       structpb.NewStringValue("To be Deleted"),
+								"description": structpb.NewStringValue("object1"),
+							},
+						},
+					},
+				},
+				{
+					Collection: booksAliasName,
+					Uuid:       uuid.NewString(),
+					Properties: &pb.BatchObject_Properties{
+						NonRefProperties: &structpb.Struct{
+							Fields: map[string]*structpb.Value{
+								"title":       structpb.NewStringValue("To be Deleted"),
+								"description": structpb.NewStringValue("object2"),
+							},
+						},
+					},
+				},
+			},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.Len(t, resp.Errors, 0)
+
+		// make sure objects exists
+		srep, err := grpcClient.Search(ctx, &pb.SearchRequest{
+			Collection: booksAliasName,
+			Filters:    &pb.Filters{Operator: pb.Filters_OPERATOR_EQUAL, TestValue: &pb.Filters_ValueText{ValueText: "To be Deleted"}, Target: &pb.FilterTarget{Target: &pb.FilterTarget_Property{Property: "title"}}},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, srep)
+		require.Len(t, srep.Results, 2)
+
+		// delete
+		dresp, err := grpcClient.BatchDelete(ctx, &pb.BatchDeleteRequest{
+			Collection: booksAliasName,
+			Filters:    &pb.Filters{Operator: pb.Filters_OPERATOR_EQUAL, TestValue: &pb.Filters_ValueText{ValueText: "To be Deleted"}, Target: &pb.FilterTarget{Target: &pb.FilterTarget_Property{Property: "title"}}},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, dresp)
+
+		// make sure objects are gone
+		srep, err = grpcClient.Search(ctx, &pb.SearchRequest{
+			Collection: booksAliasName,
+			Filters:    &pb.Filters{Operator: pb.Filters_OPERATOR_EQUAL, TestValue: &pb.Filters_ValueText{ValueText: "To be Deleted"}, Target: &pb.FilterTarget{Target: &pb.FilterTarget_Property{Property: "title"}}},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, srep)
+		require.Len(t, srep.Results, 0)
+	})
+	t.Run("TenantsGet using alias", func(t *testing.T) {
+		mtClassName := "GRPCTenantsAliasTarget"
+		mtAliasName := "GRPCTenantsAlias"
+
+		helper.CreateClass(t, &models.Class{
+			Class:              mtClassName,
+			MultiTenancyConfig: &models.MultiTenancyConfig{Enabled: true},
+			Properties:         []*models.Property{{Name: "title", DataType: []string{"text"}}},
+		})
+		defer helper.DeleteClass(t, mtClassName)
+
+		helper.CreateAlias(t, &models.Alias{Alias: mtAliasName, Class: mtClassName})
+		defer helper.DeleteAlias(t, mtAliasName)
+
+		helper.CreateTenants(t, mtClassName, []*models.Tenant{
+			{Name: "alphaT", ActivityStatus: "HOT"},
+			{Name: "betaT", ActivityStatus: "HOT"},
+			{Name: "gammaT", ActivityStatus: "HOT"},
+		})
+
+		// No Params → returns all tenants of the underlying class.
+		respAll, err := grpcClient.TenantsGet(ctx, &pb.TenantsGetRequest{Collection: mtAliasName})
+		require.NoError(t, err)
+		gotAll := make([]string, len(respAll.Tenants))
+		for i, tt := range respAll.Tenants {
+			gotAll[i] = tt.Name
+		}
+		assert.ElementsMatch(t, []string{"alphaT", "betaT", "gammaT"}, gotAll)
+
+		// Names param → filtered subset, also resolved via alias.
+		respFiltered, err := grpcClient.TenantsGet(ctx, &pb.TenantsGetRequest{
+			Collection: mtAliasName,
+			Params: &pb.TenantsGetRequest_Names{
+				Names: &pb.TenantNames{Values: []string{"alphaT", "gammaT"}},
+			},
+		})
+		require.NoError(t, err)
+		gotFiltered := make([]string, len(respFiltered.Tenants))
+		for i, tt := range respFiltered.Tenants {
+			gotFiltered[i] = tt.Name
+		}
+		assert.ElementsMatch(t, []string{"alphaT", "gammaT"}, gotFiltered)
+	})
+
+	t.Run("batch insert using alias", func(t *testing.T) {
+		theMartian := "67b79643-cf8b-4b22-b206-000000000001"
+		resp, err := grpcClient.BatchObjects(ctx, &pb.BatchObjectsRequest{
+			Objects: []*pb.BatchObject{
+				{
+					Collection: booksAliasName,
+					Uuid:       theMartian,
+					Properties: &pb.BatchObject_Properties{
+						NonRefProperties: &structpb.Struct{
+							Fields: map[string]*structpb.Value{
+								"title":       structpb.NewStringValue("The Martian"),
+								"description": structpb.NewStringValue("Stranded on Mars after a dust storm forces his crew to evacuate, astronaut Mark Watney is presumed dead and left alone on the hostile planet."),
+							},
+						},
+					},
+				},
+			},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+
+		tests := []struct {
+			name       string
+			collection string
+		}{
+			{
+				name:       "search using collection name",
+				collection: books.DefaultClassName,
+			},
+			{
+				name:       "search using alias",
+				collection: booksAliasName,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Run("count", func(t *testing.T) {
+					resp, err := grpcClient.Aggregate(ctx, &pb.AggregateRequest{
+						Collection:   tt.collection,
+						ObjectsCount: true,
+					})
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+					require.NotNil(t, resp.GetSingleResult())
+					require.Equal(t, int64(4), resp.GetSingleResult().GetObjectsCount())
+				})
+				t.Run("search using id", func(t *testing.T) {
+					resp, err := grpcClient.Search(ctx, &pb.SearchRequest{
+						Collection: tt.collection,
+						Metadata:   &pb.MetadataRequest{Vector: true, Uuid: true},
+						Filters: &pb.Filters{
+							Operator:  pb.Filters_OPERATOR_EQUAL,
+							On:        []string{filters.InternalPropID},
+							TestValue: &pb.Filters_ValueText{ValueText: theMartian},
+						},
+						Uses_123Api: true,
+						Uses_125Api: true,
+						Uses_127Api: true,
+					})
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+					require.Len(t, resp.Results, 1)
+					assert.Equal(t, theMartian, resp.Results[0].Metadata.Id)
+				})
+			})
+		}
+	})
+
+	// Regression: dangling-alias writes used to fall into auto-schema and silently re-create the deleted target.
+	t.Run("batch insert through alias with deleted target fails", func(t *testing.T) {
+		danglingClass := "GRPCBatchAliasDanglingTarget"
+		danglingAlias := "GRPCBatchAliasDangling"
+
+		helper.CreateClass(t, &models.Class{
+			Class:      danglingClass,
+			Properties: []*models.Property{{Name: "title", DataType: []string{"text"}}},
+		})
+		helper.CreateAlias(t, &models.Alias{Alias: danglingAlias, Class: danglingClass})
+		defer helper.DeleteAlias(t, danglingAlias)
+		helper.DeleteClass(t, danglingClass)
+
+		resp, err := grpcClient.BatchObjects(ctx, &pb.BatchObjectsRequest{
+			Objects: []*pb.BatchObject{
+				{
+					Collection: danglingAlias,
+					Uuid:       uuid.NewString(),
+					Properties: &pb.BatchObject_Properties{
+						NonRefProperties: &structpb.Struct{
+							Fields: map[string]*structpb.Value{
+								"title": structpb.NewStringValue("should not be inserted"),
+							},
+						},
+					},
+				},
+			},
+		})
+		// Per-object failure: transport call succeeds, error surfaces in resp.Errors.
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.Len(t, resp.Errors, 1, "expected the dangling-alias insert to fail")
+		assert.Contains(t, resp.Errors[0].Error, danglingAlias)
+		assert.Contains(t, resp.Errors[0].Error, "does not exist")
+
+		got, getErr := helper.GetClassWithoutAssert(t, danglingClass, "")
+		require.Error(t, getErr, "deleted collection should return an error from the schema API")
+		require.Nil(t, got, "alias write must not auto-create the deleted collection")
+	})
+}

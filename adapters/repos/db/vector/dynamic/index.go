@@ -1,0 +1,873 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package dynamic
+
+import (
+	"context"
+	"encoding/binary"
+	simpleErrors "errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"go.etcd.io/bbolt"
+
+	"github.com/weaviate/weaviate/adapters/repos/db/helpers"
+	"github.com/weaviate/weaviate/adapters/repos/db/lsmkv"
+	"github.com/weaviate/weaviate/adapters/repos/db/vector/common"
+	"github.com/weaviate/weaviate/adapters/repos/db/vector/compressionhelpers"
+	"github.com/weaviate/weaviate/adapters/repos/db/vector/flat"
+	"github.com/weaviate/weaviate/adapters/repos/db/vector/hnsw"
+	"github.com/weaviate/weaviate/adapters/repos/db/vector/hnsw/distancer"
+	"github.com/weaviate/weaviate/entities/cyclemanager"
+	enterrors "github.com/weaviate/weaviate/entities/errors"
+	schemaconfig "github.com/weaviate/weaviate/entities/schema/config"
+	ent "github.com/weaviate/weaviate/entities/vectorindex/dynamic"
+	"github.com/weaviate/weaviate/usecases/byteops"
+	"github.com/weaviate/weaviate/usecases/memwatch"
+	"github.com/weaviate/weaviate/usecases/monitoring"
+)
+
+const (
+	composerUpgradedKey = "upgraded"
+	batchSize           = 500
+	StateDBFileName     = "index.db"
+)
+
+var dynamicBucket = []byte("dynamic")
+
+type Index interface {
+	// UnderlyingIndex returns the underlying index type (flat or hnsw)
+	UnderlyingIndex() common.IndexType
+	IsUpgraded() bool
+}
+
+type VectorIndex interface {
+	Add(ctx context.Context, id uint64, vector []float32) error
+	AddBatch(ctx context.Context, id []uint64, vector [][]float32) error
+	Delete(id ...uint64) error
+	SearchByVector(ctx context.Context, vector []float32, k int, allow helpers.AllowList) ([]uint64, []float32, error)
+	SearchByVectorDistance(ctx context.Context, vector []float32, dist float32,
+		maxLimit int64, allow helpers.AllowList) ([]uint64, []float32, error)
+	UpdateUserConfig(updated schemaconfig.VectorIndexConfig, callback func()) error
+	Drop(ctx context.Context, keepFiles bool) error
+	Shutdown(ctx context.Context) error
+	Flush() error
+	PrepareForBackup(ctx context.Context) error
+	ResumeAfterBackup(ctx context.Context) error
+	ListFiles(ctx context.Context, basePath string) ([]string, error)
+	SnapshotMutableFiles(ctx context.Context, basePath, stagingDir string) ([]string, error)
+	PostStartup(ctx context.Context)
+	Compressed() bool
+	Multivector() bool
+	ValidateBeforeInsert(vector []float32) error
+	ContainsDoc(docID uint64) bool
+	Preload(id uint64, vector []float32)
+	QueryVectorDistancer(queryVector []float32) common.QueryVectorDistancer
+	// Iterate over all indexed document ids in the index.
+	// Consistency or order is not guaranteed, as the index may be concurrently modified.
+	// If the callback returns false, the iteration will stop.
+	Iterate(fn func(docID uint64) bool)
+	Type() common.IndexType
+}
+
+type upgradableIndexer interface {
+	Upgraded() bool
+	Upgrade(callback func()) error
+	ShouldUpgrade() (bool, int)
+	AlreadyIndexed() uint64
+	UpgradeInProgress() bool
+}
+
+var (
+	upgrading = "upgrading"
+	upgraded  = "upgraded"
+)
+
+type status atomic.Pointer[string]
+
+// IsUpgraded returns true if the index has been upgraded from flat to HNSW.
+func (s *status) IsUpgraded() bool {
+	if s == nil {
+		return false
+	}
+	v := (*atomic.Pointer[string])(s).Load()
+	return v != nil && *v == upgraded
+}
+
+// IsUpgrading returns true if the index is currently being upgraded from flat to HNSW.
+func (s *status) IsUpgrading() bool {
+	if s == nil {
+		return false
+	}
+	v := (*atomic.Pointer[string])(s).Load()
+	return v != nil && *v == upgrading
+}
+
+// Reset sets the status to nil. This is used to indicate that the index is neither upgraded nor upgrading.
+func (s *status) Reset() {
+	if s == nil {
+		return
+	}
+	(*atomic.Pointer[string])(s).Store(nil)
+}
+
+// Upgraded sets the status to upgraded. This is used to indicate that the index has been upgraded from flat to HNSW.
+func (s *status) Upgraded() {
+	if s == nil {
+		return
+	}
+	(*atomic.Pointer[string])(s).Store(&upgraded)
+}
+
+// TryUpgrading claims the upgrade attempt; only the winning caller gets true,
+// so a Reset after a failed attempt lets a later call retry.
+func (s *status) TryUpgrading() bool {
+	if s == nil {
+		return false
+	}
+	return (*atomic.Pointer[string])(s).CompareAndSwap(nil, &upgrading)
+}
+
+type dynamic struct {
+	sync.RWMutex
+	id                           string
+	targetVector                 string
+	store                        *lsmkv.Store
+	logger                       logrus.FieldLogger
+	rootPath                     string
+	shardName                    string
+	className                    string
+	prometheusMetrics            *monitoring.PrometheusMetrics
+	vectorForIDThunk             common.VectorForID[float32]
+	getViewThunk                 common.GetViewThunk
+	tempVectorForIDWithViewThunk common.TempVectorForIDWithView[float32]
+	distanceProvider             distancer.Provider
+	makeCommitLoggerThunk        hnsw.MakeCommitLogger
+	threshold                    uint64
+	index                        VectorIndex
+	status                       status
+	tombstoneCallbacks           cyclemanager.CycleCallbackGroup
+	uc                           ent.UserConfig
+	db                           *bbolt.DB
+	ctx                          context.Context
+	cancel                       context.CancelFunc
+	hnswDisableSnapshots         bool
+	hnswSnapshotOnStartup        bool
+	hnswWaitForCachePrefill      bool
+	AllocChecker                 memwatch.AllocChecker
+	MakeBucketOptions            lsmkv.MakeBucketOptions
+	AsyncIndexingEnabled         bool
+
+	// upgradeFn performs the flat→HNSW rebuild. New wires it to the doUpgrade
+	// method; keeping it as an injected field (like the *Thunk dependencies
+	// above) lets tests substitute a failing or blocking rebuild without a
+	// test-only branch in the production path. Production always runs doUpgrade.
+	upgradeFn func() error
+}
+
+func New(cfg Config, uc ent.UserConfig, store *lsmkv.Store) (*dynamic, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, errors.Wrap(err, "invalid config")
+	}
+
+	logger := cfg.Logger
+	if logger == nil {
+		l := logrus.New()
+		l.Out = io.Discard
+		logger = l
+	}
+
+	flatConfig := flat.Config{
+		ID:                cfg.ID,
+		RootPath:          cfg.RootPath,
+		TargetVector:      cfg.TargetVector,
+		Logger:            cfg.Logger,
+		DistanceProvider:  cfg.DistanceProvider,
+		AllocChecker:      cfg.AllocChecker,
+		MakeBucketOptions: cfg.MakeBucketOptions,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	index := &dynamic{
+		id:                           cfg.ID,
+		targetVector:                 cfg.TargetVector,
+		logger:                       logger,
+		rootPath:                     cfg.RootPath,
+		shardName:                    cfg.ShardName,
+		className:                    cfg.ClassName,
+		prometheusMetrics:            cfg.PrometheusMetrics,
+		vectorForIDThunk:             cfg.VectorForIDThunk,
+		getViewThunk:                 cfg.GetViewThunk,
+		tempVectorForIDWithViewThunk: cfg.TempVectorForIDWithViewThunk,
+		distanceProvider:             cfg.DistanceProvider,
+		makeCommitLoggerThunk:        cfg.MakeCommitLoggerThunk,
+		store:                        store,
+		threshold:                    uc.Threshold,
+		tombstoneCallbacks:           cfg.TombstoneCallbacks,
+		uc:                           uc,
+		db:                           cfg.SharedDB,
+		ctx:                          ctx,
+		cancel:                       cancel,
+		hnswDisableSnapshots:         cfg.HNSWDisableSnapshots,
+		hnswSnapshotOnStartup:        cfg.HNSWSnapshotOnStartup,
+		hnswWaitForCachePrefill:      cfg.HNSWWaitForCachePrefill,
+		AllocChecker:                 cfg.AllocChecker,
+		MakeBucketOptions:            cfg.MakeBucketOptions,
+		AsyncIndexingEnabled:         cfg.AsyncIndexingEnabled,
+	}
+	index.upgradeFn = index.doUpgrade
+
+	upgraded, err := index.init(&cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if upgraded {
+		index.status.Upgraded()
+		hnsw, err := hnsw.New(
+			hnsw.Config{
+				Logger:                       index.logger,
+				RootPath:                     index.rootPath,
+				ID:                           index.id,
+				ShardName:                    index.shardName,
+				ClassName:                    index.className,
+				PrometheusMetrics:            index.prometheusMetrics,
+				VectorForIDThunk:             index.vectorForIDThunk,
+				GetViewThunk:                 index.getViewThunk,
+				TempVectorForIDWithViewThunk: index.tempVectorForIDWithViewThunk,
+				DistanceProvider:             index.distanceProvider,
+				MakeCommitLoggerThunk:        index.makeCommitLoggerThunk,
+				DisableSnapshots:             index.hnswDisableSnapshots,
+				SnapshotOnStartup:            index.hnswSnapshotOnStartup,
+				WaitForCachePrefill:          index.hnswWaitForCachePrefill,
+				AllocChecker:                 index.AllocChecker,
+				MakeBucketOptions:            index.MakeBucketOptions,
+				AsyncIndexingEnabled:         index.AsyncIndexingEnabled,
+			},
+			index.uc.HnswUC,
+			index.tombstoneCallbacks,
+			index.store,
+		)
+		if err != nil {
+			return nil, err
+		}
+		index.index = hnsw
+	} else {
+		flat, err := flat.New(flatConfig, uc.FlatUC, store)
+		if err != nil {
+			return nil, err
+		}
+		index.index = flat
+	}
+
+	return index, nil
+}
+
+func (dynamic *dynamic) Type() common.IndexType {
+	return common.IndexTypeDynamic
+}
+
+func (dynamic *dynamic) dbKey() []byte {
+	var key []byte
+	if dynamic.targetVector != "" {
+		key = make([]byte, 0, len(composerUpgradedKey)+len(dynamic.targetVector)+1)
+		key = append(key, composerUpgradedKey...)
+		key = append(key, '_')
+		key = append(key, dynamic.targetVector...)
+	} else {
+		key = []byte(composerUpgradedKey)
+	}
+
+	return key
+}
+
+func (dynamic *dynamic) getBucketName() string {
+	if dynamic.targetVector != "" {
+		return fmt.Sprintf("%s_%s", helpers.VectorsBucketLSM, dynamic.targetVector)
+	}
+
+	return helpers.VectorsBucketLSM
+}
+
+func (dynamic *dynamic) init(cfg *Config) (bool, error) {
+	upgraded := false
+
+	hnswDirExists := false
+	_, err := os.Stat(hnswCommitLogDirectory(cfg.RootPath, cfg.ID))
+	if err == nil {
+		hnswDirExists = true
+	}
+
+	dbKey := dynamic.dbKey()
+	err = cfg.SharedDB.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(dynamicBucket)
+		if err != nil {
+			return err
+		}
+
+		if cfg.TargetVector == "" {
+			v := b.Get(dbKey)
+			if v == nil {
+				return nil
+			}
+
+			upgraded = v[0] != 0
+			return nil
+		}
+
+		// a bug in earlier versions caused target vectors to all use the same key.
+		// this is a mitigation to preserve existing upgraded state and migrate to
+		// target-vector-specific keys going forward.
+
+		// first, check if there's an entry for this specific target vector
+		v := b.Get(dbKey)
+		if v != nil {
+			upgraded = v[0] != 0
+			return nil
+		}
+
+		// if not, let's create one by default
+		// and infer the upgraded state from the existence of the HNSW dir
+		if hnswDirExists {
+			err = b.Put(dbKey, []byte{1})
+		} else {
+			err = b.Put(dbKey, []byte{0})
+		}
+		if err != nil {
+			return errors.Wrap(err, "migrate dynamic state for target vector")
+		}
+
+		// if the HNSW dir exists, we assume it was upgraded
+		upgraded = hnswDirExists
+
+		return nil
+	})
+	if err != nil {
+		return false, errors.Wrap(err, "get dynamic state")
+	}
+
+	return upgraded, nil
+}
+
+func (dynamic *dynamic) getCompressedBucketName() string {
+	return helpers.GetCompressedBucketName(dynamic.targetVector)
+}
+
+func (dynamic *dynamic) Compressed() bool {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.Compressed()
+}
+
+func (dynamic *dynamic) Multivector() bool {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.Multivector()
+}
+
+func (dynamic *dynamic) AddBatch(ctx context.Context, ids []uint64, vectors [][]float32) error {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.AddBatch(ctx, ids, vectors)
+}
+
+func (dynamic *dynamic) Add(ctx context.Context, id uint64, vector []float32) error {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.Add(ctx, id, vector)
+}
+
+func (dynamic *dynamic) Delete(ids ...uint64) error {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.Delete(ids...)
+}
+
+func (dynamic *dynamic) SearchByVector(ctx context.Context, vector []float32, k int, allow helpers.AllowList) ([]uint64, []float32, error) {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.SearchByVector(ctx, vector, k, allow)
+}
+
+func (dynamic *dynamic) SearchByVectorDistance(ctx context.Context, vector []float32, targetDistance float32, maxLimit int64, allow helpers.AllowList) ([]uint64, []float32, error) {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.SearchByVectorDistance(ctx, vector, targetDistance, maxLimit, allow)
+}
+
+func (dynamic *dynamic) UpdateUserConfig(updated schemaconfig.VectorIndexConfig, callback func()) error {
+	parsed, ok := updated.(ent.UserConfig)
+	if !ok {
+		callback()
+		return errors.Errorf("config is not UserConfig, but %T", updated)
+	}
+	// doUpgrade swaps dynamic.index and flips upgraded under the exclusive lock;
+	// hold it across the check and the use so an upgrade can't land in between
+	// and route the wrong sub-config into the swapped index.
+	dynamic.Lock()
+	defer dynamic.Unlock()
+	if dynamic.status.IsUpgraded() {
+		return dynamic.index.UpdateUserConfig(parsed.HnswUC, callback)
+	}
+	dynamic.uc = parsed
+	return dynamic.index.UpdateUserConfig(parsed.FlatUC, callback)
+}
+
+func (dynamic *dynamic) Drop(ctx context.Context, keepFiles bool) error {
+	if dynamic.ctx.Err() != nil {
+		// already dropped
+		return nil
+	}
+
+	// cancel the context before locking to stop any ongoing operations
+	// and prevent new ones from starting
+	dynamic.cancel()
+
+	dynamic.Lock()
+	defer dynamic.Unlock()
+	if err := dynamic.db.Close(); err != nil {
+		return err
+	}
+	if !keepFiles {
+		os.Remove(filepath.Join(dynamic.rootPath, StateDBFileName))
+	}
+
+	return dynamic.index.Drop(ctx, keepFiles)
+}
+
+func (dynamic *dynamic) Flush() error {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.Flush()
+}
+
+func (dynamic *dynamic) Shutdown(ctx context.Context) error {
+	if dynamic.ctx.Err() != nil {
+		// already closed
+		return nil
+	}
+
+	// cancel the context before locking to stop any ongoing operations
+	// and prevent new ones from starting
+	dynamic.cancel()
+
+	dynamic.Lock()
+	defer dynamic.Unlock()
+
+	return dynamic.index.Shutdown(ctx)
+}
+
+func (dynamic *dynamic) PrepareForBackup(ctx context.Context) error {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.PrepareForBackup(ctx)
+}
+
+func (dynamic *dynamic) ResumeAfterBackup(ctx context.Context) error {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.ResumeAfterBackup(ctx)
+}
+
+func (dynamic *dynamic) ListFiles(ctx context.Context, basePath string) ([]string, error) {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.ListFiles(ctx, basePath)
+}
+
+// SnapshotMutableFiles delegates to the underlying index. The shared, shard-level
+// StateDBFileName (index.db) is NOT snapshotted here — it is snapshotted once per
+// shard via SnapshotSharedStateDB rather than through this per-index method, which
+// the shard's ForEachVectorIndex would otherwise invoke once per named vector and
+// thus duplicate the copy and its sd.Files entry.
+func (dynamic *dynamic) SnapshotMutableFiles(ctx context.Context, basePath, stagingDir string) ([]string, error) {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.SnapshotMutableFiles(ctx, basePath, stagingDir)
+}
+
+// SnapshotSharedStateDB writes a consistent point-in-time copy of the shard-level
+// dynamic-index state DB (StateDBFileName) into stagingDir and returns its
+// backup-relative path. The state DB is shard-owned and shared by every target-vector
+// dynamic index, so Shard.CreateBackupSnapshot calls this ONCE per shard — NOT via the
+// per-index SnapshotMutableFiles, which ForEachVectorIndex would invoke once per named
+// vector and thus duplicate the snapshot.
+//
+// rootPath is the directory holding the live state DB (the shard path); basePath is the
+// backup root the returned relpath is relative to. The copy is taken inside a bbolt read
+// transaction (tx.CopyFile) so an in-place write during the long upload window cannot tear
+// the staged copy.
+func SnapshotSharedStateDB(db *bbolt.DB, rootPath, basePath, stagingDir string) (string, error) {
+	src := filepath.Join(rootPath, StateDBFileName)
+	relPath, err := filepath.Rel(basePath, src)
+	if err != nil {
+		return "", fmt.Errorf("index.db relative path: %w", err)
+	}
+	dst := filepath.Join(stagingDir, relPath)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return "", fmt.Errorf("create staging subdir for %s: %w", relPath, err)
+	}
+	if err := db.View(func(tx *bbolt.Tx) error {
+		return tx.CopyFile(dst, 0o600)
+	}); err != nil {
+		return "", fmt.Errorf("snapshot index.db to staging: %w", err)
+	}
+	return relPath, nil
+}
+
+func (dynamic *dynamic) ValidateBeforeInsert(vector []float32) error {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.ValidateBeforeInsert(vector)
+}
+
+func (dynamic *dynamic) PostStartup(ctx context.Context) {
+	dynamic.Lock()
+	defer dynamic.Unlock()
+	dynamic.index.PostStartup(ctx)
+}
+
+func (dynamic *dynamic) ContainsDoc(docID uint64) bool {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.ContainsDoc(docID)
+}
+
+func (dynamic *dynamic) Preload(id uint64, vector []float32) {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	dynamic.index.Preload(id, vector)
+}
+
+func (dynamic *dynamic) AlreadyIndexed() uint64 {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return (dynamic.index).(upgradableIndexer).AlreadyIndexed()
+}
+
+func (dynamic *dynamic) QueryVectorDistancer(queryVector []float32) common.QueryVectorDistancer {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.QueryVectorDistancer(queryVector)
+}
+
+func (dynamic *dynamic) ShouldUpgrade() (bool, int) {
+	if !dynamic.status.IsUpgraded() {
+		return true, int(dynamic.threshold)
+	}
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return (dynamic.index).(upgradableIndexer).ShouldUpgrade()
+}
+
+func (dynamic *dynamic) Upgraded() bool {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.status.IsUpgraded() && dynamic.index.(upgradableIndexer).Upgraded()
+}
+
+// UpgradeInProgress reports a flat→HNSW restructure in flight, or (post-upgrade)
+// an in-flight compression on the inner HNSW.
+func (dynamic *dynamic) UpgradeInProgress() bool {
+	if dynamic.status.IsUpgrading() {
+		return true
+	}
+	if !dynamic.status.IsUpgraded() {
+		return false
+	}
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	if u, ok := dynamic.index.(upgradableIndexer); ok {
+		return u.UpgradeInProgress()
+	}
+	return false
+}
+
+func float32SliceFromByteSlice(vector []byte, slice []float32) []float32 {
+	byteops.CopyBytesToSlice(slice, vector[:len(slice)*4])
+	return slice
+}
+
+func (dynamic *dynamic) Upgrade(callback func()) error {
+	if dynamic.ctx.Err() != nil {
+		// no goroutine will run to fire the callback, so the pause/resume
+		// contract must be resolved synchronously here.
+		callback()
+		return dynamic.ctx.Err()
+	}
+
+	if dynamic.status.IsUpgraded() {
+		return dynamic.index.(upgradableIndexer).Upgrade(callback)
+	}
+
+	if !dynamic.status.TryUpgrading() {
+		// an attempt is already in flight (or just finished) and owns its own
+		// callback; resolve this caller's separately instead of blocking on it.
+		callback()
+		return nil
+	}
+
+	enterrors.GoWrapper(func() {
+		defer callback()
+		// re-arm on error AND panic (GoWrapper recovers): a later Upgrade call
+		// must be able to retry. doUpgrade flips status only on success.
+		defer func() {
+			if !dynamic.status.IsUpgraded() {
+				dynamic.status.Reset()
+			}
+		}()
+		dynamic.logger.WithField("shard", dynamic.shardName).WithField("class", dynamic.className).Debugf("upgrade to HNSW started")
+
+		err := dynamic.upgradeFn()
+		if err != nil {
+			dynamic.logger.WithError(err).Error("failed to upgrade index")
+			return
+		}
+		dynamic.logger.WithField("shard", dynamic.shardName).WithField("class", dynamic.className).Debugf("upgrade to HNSW completed")
+	}, dynamic.logger)
+
+	return nil
+}
+
+func (dynamic *dynamic) doUpgrade() error {
+	// The read lock keeps the current index alive (not dropped/closed) while
+	// the new one is built; searches continue throughout. Closure so the
+	// unlock is deferred and panic-safe.
+	index, err := func() (*hnsw.HNSW, error) {
+		dynamic.RLock()
+		defer dynamic.RUnlock()
+
+		index, err := hnsw.New(
+			hnsw.Config{
+				Logger:                       dynamic.logger,
+				RootPath:                     dynamic.rootPath,
+				ID:                           dynamic.id,
+				ShardName:                    dynamic.shardName,
+				ClassName:                    dynamic.className,
+				PrometheusMetrics:            dynamic.prometheusMetrics,
+				VectorForIDThunk:             dynamic.vectorForIDThunk,
+				GetViewThunk:                 dynamic.getViewThunk,
+				TempVectorForIDWithViewThunk: dynamic.tempVectorForIDWithViewThunk,
+				DistanceProvider:             dynamic.distanceProvider,
+				MakeCommitLoggerThunk:        dynamic.makeCommitLoggerThunk,
+				DisableSnapshots:             dynamic.hnswDisableSnapshots,
+				SnapshotOnStartup:            dynamic.hnswSnapshotOnStartup,
+				WaitForCachePrefill:          dynamic.hnswWaitForCachePrefill,
+				AllocChecker:                 dynamic.AllocChecker,
+				MakeBucketOptions:            dynamic.MakeBucketOptions,
+				AsyncIndexingEnabled:         dynamic.AsyncIndexingEnabled,
+			},
+			dynamic.uc.HnswUC,
+			dynamic.tombstoneCallbacks,
+			dynamic.store,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := dynamic.copyToVectorIndex(index); err != nil {
+			return nil, err
+		}
+
+		// Start commit-log maintenance on the new HNSW index. The cache prefill
+		// is a no-op because cachePrefilled was already set during init (fresh
+		// index with no commit-log state) and the cache is populated by AddBatch.
+		index.PostStartup(dynamic.ctx)
+		return index, nil
+	}()
+	if err != nil {
+		return err
+	}
+
+	// Lock the index for writing but check if it was already
+	// closed in the meantime
+	dynamic.Lock()
+	defer dynamic.Unlock()
+
+	if err := dynamic.ctx.Err(); err != nil {
+		// already closed
+		return errors.Wrap(err, "index was closed while upgrading")
+	}
+
+	err = dynamic.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(dynamicBucket)
+		return b.Put(dynamic.dbKey(), []byte{1})
+	})
+	if err != nil {
+		return errors.Wrap(err, "update dynamic")
+	}
+
+	dynamic.index.Drop(dynamic.ctx, false)
+	dynamic.index = index
+	dynamic.status.Upgraded()
+
+	var errs []error
+	bDir := dynamic.store.Bucket(dynamic.getBucketName()).GetDir()
+	err = dynamic.store.ShutdownBucket(dynamic.ctx, dynamic.getBucketName())
+	if err != nil {
+		errs = append(errs, err)
+	}
+	err = os.RemoveAll(bDir)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	// Due to the potential for a different quantizer using a different endianness
+	// we remove the bucket here if needed
+	removeCompressedBucket := false
+	if dynamic.uc.FlatUC.BQ.Enabled || dynamic.uc.FlatUC.RQ.Enabled {
+		if !dynamic.uc.HnswUC.BQ.Enabled && !dynamic.uc.HnswUC.RQ.Enabled {
+			removeCompressedBucket = true
+		}
+	}
+
+	if removeCompressedBucket {
+		bDir = dynamic.store.Bucket(dynamic.getCompressedBucketName()).GetDir()
+		err = dynamic.store.ShutdownBucket(dynamic.ctx, dynamic.getCompressedBucketName())
+		if err != nil {
+			errs = append(errs, err)
+		}
+		err = os.RemoveAll(bDir)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		dynamic.logger.Warn(simpleErrors.Join(errs...))
+	}
+
+	return nil
+}
+
+// Loop over the store and add each vector to the HNSW.
+// This can take a while, so we use short-lived cursors to not block
+// other operations on the KV store (e.g. flush)
+func (dynamic *dynamic) copyToVectorIndex(index VectorIndex) error {
+	bucket := dynamic.store.Bucket(dynamic.getBucketName())
+
+	var k, v []byte
+
+	var ids []uint64
+	var vectors [][]float32
+
+	for {
+		ids = ids[:0]
+		vectors = vectors[:0]
+
+		cursor := bucket.Cursor()
+
+		if len(k) == 0 {
+			k, v = cursor.First()
+		} else {
+			k, v = cursor.Seek(k)
+		}
+
+		var i int
+		for k != nil && i < batchSize {
+			if err := dynamic.ctx.Err(); err != nil {
+				cursor.Close()
+				// context was cancelled, stop processing
+				return err
+			}
+
+			id := binary.BigEndian.Uint64(k)
+			vc := make([]float32, len(v)/4)
+			float32SliceFromByteSlice(v, vc)
+
+			ids = append(ids, id)
+			vectors = append(vectors, vc)
+
+			k, v = cursor.Next()
+			i++
+		}
+
+		cursor.Close()
+
+		err := index.AddBatch(dynamic.ctx, ids, vectors)
+		if err != nil {
+			dynamic.logger.WithError(err).Error("failed to add vectors")
+		}
+
+		if k == nil {
+			break
+		}
+	}
+
+	return nil
+}
+
+func (dynamic *dynamic) Iterate(fn func(id uint64) bool) {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	dynamic.index.Iterate(fn)
+}
+
+type hnswStats interface {
+	Stats() (*hnsw.HnswStats, error)
+}
+
+func (dynamic *dynamic) Stats() (*hnsw.HnswStats, error) {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+
+	h, ok := dynamic.index.(hnswStats)
+	if !ok {
+		return nil, errors.New("index is not hnsw")
+	}
+	return h.Stats()
+}
+
+func (dynamic *dynamic) CompressionStats() compressionhelpers.CompressionStats {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+
+	// Delegate to the underlying index (flat or hnsw)
+	if vectorIndex, ok := dynamic.index.(compressionhelpers.CompressionStats); ok {
+		return vectorIndex
+	}
+
+	// Fallback: return uncompressed stats if the underlying index doesn't support CompressionStats
+	return compressionhelpers.UncompressedStats{}
+}
+
+// UnderlyingIndex returns the underlying index type (flat or hnsw)
+// for dynamic indexes.
+func (dynamic *dynamic) UnderlyingIndex() common.IndexType {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.index.Type()
+}
+
+func (dynamic *dynamic) IsUpgraded() bool {
+	dynamic.RLock()
+	defer dynamic.RUnlock()
+	return dynamic.status.IsUpgraded()
+}
+
+type DynamicStats struct{}
+
+func (s *DynamicStats) IndexType() common.IndexType {
+	return common.IndexTypeDynamic
+}
+
+func hnswCommitLogDirectory(rootPath, name string) string {
+	return fmt.Sprintf("%s/%s.hnsw.commitlog.d", rootPath, name)
+}
+
+// to make sure the dynamic index satisfies the Index interface
+var _ = Index(&dynamic{})

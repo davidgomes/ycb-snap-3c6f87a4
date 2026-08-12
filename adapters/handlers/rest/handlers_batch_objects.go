@@ -1,0 +1,296 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package rest
+
+import (
+	"errors"
+
+	middleware "github.com/go-openapi/runtime/middleware"
+	"github.com/sirupsen/logrus"
+
+	restCtx "github.com/weaviate/weaviate/adapters/handlers/rest/context"
+	"github.com/weaviate/weaviate/adapters/handlers/rest/operations"
+	"github.com/weaviate/weaviate/adapters/handlers/rest/operations/batch"
+	"github.com/weaviate/weaviate/entities/models"
+	"github.com/weaviate/weaviate/entities/verbosity"
+	autherrs "github.com/weaviate/weaviate/usecases/auth/authorization/errors"
+	"github.com/weaviate/weaviate/usecases/monitoring"
+	"github.com/weaviate/weaviate/usecases/objects"
+	"github.com/weaviate/weaviate/usecases/schema/namespacing"
+	"github.com/weaviate/weaviate/usecases/usagelimits"
+)
+
+type batchObjectHandlers struct {
+	manager             *objects.BatchManager
+	metricRequestsTotal restApiRequestsTotal
+}
+
+func (h *batchObjectHandlers) addObjects(params batch.BatchObjectsCreateParams,
+	principal *models.Principal,
+) middleware.Responder {
+	ctx := restCtx.AddPrincipalToContext(params.HTTPRequest.Context(), principal)
+	repl, err := getReplicationProperties(params.ConsistencyLevel, nil)
+	if err != nil {
+		h.metricRequestsTotal.logError("", err)
+		return batch.NewBatchObjectsCreateBadRequest().
+			WithPayload(errPayloadFromSingleErr(principal, err))
+	}
+
+	objs, err := h.manager.AddObjects(ctx, principal,
+		params.Body.Objects, params.Body.Fields, repl)
+	if err != nil {
+		h.metricRequestsTotal.logError("", err)
+		if le, ok := usagelimits.AsLimitExceeded(err); ok {
+			return batch.NewBatchObjectsCreateTooManyRequests().
+				WithPayload(newUsageLimitPayload(le))
+		}
+		switch {
+		case errors.As(err, &autherrs.Forbidden{}):
+			return batch.NewBatchObjectsCreateForbidden().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		case errors.As(err, &objects.ErrInvalidUserInput{}):
+			return batch.NewBatchObjectsCreateUnprocessableEntity().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		case errors.As(err, &objects.ErrMultiTenancy{}):
+			return batch.NewBatchObjectsCreateUnprocessableEntity().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		default:
+			return batch.NewBatchObjectsCreateInternalServerError().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		}
+	}
+
+	h.metricRequestsTotal.logOk("")
+	return batch.NewBatchObjectsCreateOK().
+		WithPayload(h.objectsResponse(principal, objs))
+}
+
+func (h *batchObjectHandlers) objectsResponse(principal *models.Principal, input objects.BatchObjects) []*models.ObjectsGetResponse {
+	response := make([]*models.ObjectsGetResponse, len(input))
+	for i, object := range input {
+		var errorResponse *models.ErrorResponse
+		status := models.ObjectsGetResponseAO2ResultStatusSUCCESS
+		if object.Err != nil {
+			errorResponse = errPayloadFromSingleErr(principal, object.Err)
+			status = models.ObjectsGetResponseAO2ResultStatusFAILED
+		}
+
+		object.Object.ID = object.UUID
+		namespacing.StripObjectResponseClass(principal, object.Object)
+		response[i] = &models.ObjectsGetResponse{
+			Object: *object.Object,
+			Result: &models.ObjectsGetResponseAO2Result{
+				Errors: errorResponse,
+				Status: &status,
+			},
+		}
+	}
+
+	return response
+}
+
+func (h *batchObjectHandlers) addReferences(params batch.BatchReferencesCreateParams,
+	principal *models.Principal,
+) middleware.Responder {
+	ctx := restCtx.AddPrincipalToContext(params.HTTPRequest.Context(), principal)
+	repl, err := getReplicationProperties(params.ConsistencyLevel, nil)
+	if err != nil {
+		h.metricRequestsTotal.logError("", err)
+		return batch.NewBatchReferencesCreateBadRequest().
+			WithPayload(errPayloadFromSingleErr(principal, err))
+	}
+
+	references, err := h.manager.AddReferences(ctx, principal, params.Body, repl)
+	if err != nil {
+		h.metricRequestsTotal.logError("", err)
+		switch {
+		case errors.As(err, &autherrs.Forbidden{}):
+			return batch.NewBatchReferencesCreateForbidden().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		case errors.As(err, &objects.ErrInvalidUserInput{}):
+			return batch.NewBatchReferencesCreateUnprocessableEntity().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		case errors.As(err, &objects.ErrMultiTenancy{}):
+			return batch.NewBatchReferencesCreateUnprocessableEntity().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		default:
+			return batch.NewBatchReferencesCreateInternalServerError().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		}
+	}
+
+	h.metricRequestsTotal.logOk("")
+	return batch.NewBatchReferencesCreateOK().
+		WithPayload(h.referencesResponse(principal, references))
+}
+
+func (h *batchObjectHandlers) referencesResponse(principal *models.Principal, input objects.BatchReferences) []*models.BatchReferenceResponse {
+	response := make([]*models.BatchReferenceResponse, len(input))
+	for i, ref := range input {
+		var errorResponse *models.ErrorResponse
+		var reference models.BatchReference
+
+		// Echo beacons on every row so clients can correlate failures back
+		// to the input. Strip helpers tolerate nil inputs (return ""), so
+		// unconditional invocation is safe when the upstream rejected the
+		// row before populating From/To. resolveNS qualifies the From class
+		// upstream; To strip is defense in depth.
+		reference.From = namespacing.StripRefSourceBeacon(principal, ref.From)
+		reference.To = namespacing.StripRefBeacon(principal, ref.To)
+
+		status := models.BatchReferenceResponseAO1ResultStatusSUCCESS
+		if ref.Err != nil {
+			errorResponse = errPayloadFromSingleErr(principal, ref.Err)
+			status = models.BatchReferenceResponseAO1ResultStatusFAILED
+		}
+
+		response[i] = &models.BatchReferenceResponse{
+			BatchReference: reference,
+			Result: &models.BatchReferenceResponseAO1Result{
+				Errors: errorResponse,
+				Status: &status,
+			},
+		}
+	}
+
+	return response
+}
+
+func (h *batchObjectHandlers) deleteObjects(params batch.BatchObjectsDeleteParams,
+	principal *models.Principal,
+) middleware.Responder {
+	ctx := restCtx.AddPrincipalToContext(params.HTTPRequest.Context(), principal)
+	repl, err := getReplicationProperties(params.ConsistencyLevel, nil)
+	if err != nil {
+		h.metricRequestsTotal.logError("", err)
+		return batch.NewBatchObjectsDeleteBadRequest().
+			WithPayload(errPayloadFromSingleErr(principal, err))
+	}
+
+	tenant := getTenant(params.Tenant)
+
+	res, err := h.manager.DeleteObjects(ctx, principal,
+		params.Body.Match, params.Body.DeletionTimeUnixMilli, params.Body.DryRun, params.Body.Output, repl, tenant)
+	if err != nil {
+		h.metricRequestsTotal.logError("", err)
+		if errors.As(err, &objects.ErrInvalidUserInput{}) {
+			return batch.NewBatchObjectsDeleteUnprocessableEntity().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		} else if errors.As(err, &objects.ErrMultiTenancy{}) {
+			return batch.NewBatchObjectsDeleteUnprocessableEntity().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		} else if errors.As(err, &autherrs.Forbidden{}) {
+			return batch.NewBatchObjectsDeleteForbidden().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		} else {
+			return batch.NewBatchObjectsDeleteInternalServerError().
+				WithPayload(errPayloadFromSingleErr(principal, err))
+		}
+	}
+
+	h.metricRequestsTotal.logOk("")
+	return batch.NewBatchObjectsDeleteOK().
+		WithPayload(h.objectsDeleteResponse(principal, res))
+}
+
+func (h *batchObjectHandlers) objectsDeleteResponse(principal *models.Principal, input *objects.BatchDeleteResponse) *models.BatchDeleteResponse {
+	var successful, failed int64
+	output := input.Output
+	var objects []*models.BatchDeleteResponseResultsObjectsItems0
+	for _, obj := range input.Result.Objects {
+		var errorResponse *models.ErrorResponse
+
+		status := models.BatchDeleteResponseResultsObjectsItems0StatusSUCCESS
+		if input.DryRun {
+			status = models.BatchDeleteResponseResultsObjectsItems0StatusDRYRUN
+		} else if obj.Err != nil {
+			status = models.BatchDeleteResponseResultsObjectsItems0StatusFAILED
+			errorResponse = errPayloadFromSingleErr(principal, obj.Err)
+			failed += 1
+		} else {
+			successful += 1
+		}
+
+		if output == verbosity.OutputMinimal &&
+			(status == models.BatchDeleteResponseResultsObjectsItems0StatusSUCCESS ||
+				status == models.BatchDeleteResponseResultsObjectsItems0StatusDRYRUN) {
+			// only add SUCCESS and DRYRUN results if output is "verbose"
+			continue
+		}
+
+		objects = append(objects, &models.BatchDeleteResponseResultsObjectsItems0{
+			ID:     obj.UUID,
+			Status: &status,
+			Errors: errorResponse,
+		})
+	}
+
+	deletionTimeUnixMilli := input.DeletionTime.UnixMilli()
+
+	response := &models.BatchDeleteResponse{
+		Match: &models.BatchDeleteResponseMatch{
+			Class: namespacing.StripOwnNamespace(principal, input.Match.Class),
+			Where: input.Match.Where,
+		},
+		DeletionTimeUnixMilli: &deletionTimeUnixMilli,
+		DryRun:                &input.DryRun,
+		Output:                &output,
+		Results: &models.BatchDeleteResponseResults{
+			Matches:    input.Result.Matches,
+			Limit:      input.Result.Limit,
+			Successful: successful,
+			Failed:     failed,
+			Objects:    objects,
+		},
+	}
+	return response
+}
+
+func setupObjectBatchHandlers(api *operations.WeaviateAPI, manager *objects.BatchManager, metrics *monitoring.PrometheusMetrics, logger logrus.FieldLogger) {
+	h := &batchObjectHandlers{manager, newBatchRequestsTotal(metrics, logger)}
+
+	api.BatchBatchObjectsCreateHandler = batch.
+		BatchObjectsCreateHandlerFunc(h.addObjects)
+	api.BatchBatchReferencesCreateHandler = batch.
+		BatchReferencesCreateHandlerFunc(h.addReferences)
+	api.BatchBatchObjectsDeleteHandler = batch.
+		BatchObjectsDeleteHandlerFunc(h.deleteObjects)
+}
+
+type batchRequestsTotal struct {
+	*restApiRequestsTotalImpl
+}
+
+func newBatchRequestsTotal(metrics *monitoring.PrometheusMetrics, logger logrus.FieldLogger) restApiRequestsTotal {
+	return &batchRequestsTotal{
+		restApiRequestsTotalImpl: &restApiRequestsTotalImpl{newRequestsTotalMetric(metrics, "rest"), "rest", "batch", logger},
+	}
+}
+
+func (e *batchRequestsTotal) logError(className string, err error) {
+	switch {
+	case errors.As(err, &errReplication{}):
+		e.logUserError(className)
+	case errors.As(err, &autherrs.Forbidden{}), errors.As(err, &objects.ErrInvalidUserInput{}):
+		e.logUserError(className)
+	case errors.As(err, &objects.ErrMultiTenancy{}):
+		e.logUserError(className)
+	default:
+		if errors.As(err, &objects.ErrMultiTenancy{}) ||
+			errors.As(err, &objects.ErrInvalidUserInput{}) ||
+			errors.As(err, &autherrs.Forbidden{}) {
+			e.logUserError(className)
+		} else {
+			e.logServerError(className, err)
+		}
+	}
+}

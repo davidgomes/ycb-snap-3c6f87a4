@@ -1,0 +1,1324 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package clusterapi
+
+import (
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/go-openapi/strfmt"
+	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
+	"github.com/sirupsen/logrus"
+
+	"github.com/weaviate/weaviate/adapters/handlers/rest/clusterapi/shared"
+	"github.com/weaviate/weaviate/cluster/router/types"
+	enterrors "github.com/weaviate/weaviate/entities/errors"
+	"github.com/weaviate/weaviate/usecases/objects"
+	"github.com/weaviate/weaviate/usecases/replica"
+	"github.com/weaviate/weaviate/usecases/replica/hashtree"
+	replicaTypes "github.com/weaviate/weaviate/usecases/replica/types"
+)
+
+type replicatedIndices struct {
+	replicator replicaTypes.Replicator
+	auth       auth
+	// maintenanceModeEnabled is an experimental feature to allow the system to be
+	// put into a maintenance mode where all replicatedIndices requests just return a 418
+	maintenanceModeEnabled func() bool
+
+	logger logrus.FieldLogger
+	// nodeReady reports whether the node is ready to accept requests
+	nodeReady func() bool
+}
+
+// maxDecompressedReplicaBody caps decompressed REST replica bodies (matching the gRPC 2 GiB cap) so a zstd bomb can't OOM the receiver.
+const maxDecompressedReplicaBody = 2 << 30 // 2 GiB
+
+// zstdDecoderPool pools *zstd.Decoder instances to avoid the allocation cost
+// of zstd.NewReader on every compressed request. New returns nil only when
+// zstd.NewReader fails during construction; the call site detects this and
+// falls back to newZstdDecoder() to surface the error explicitly.
+var zstdDecoderPool = sync.Pool{
+	New: func() any {
+		dec, err := newZstdDecoder()
+		if err != nil {
+			return nil
+		}
+		return dec
+	},
+}
+
+func newZstdDecoder() (*zstd.Decoder, error) {
+	return zstd.NewReader(nil, zstd.WithDecoderMaxMemory(maxDecompressedReplicaBody))
+}
+
+var (
+	regxObject = regexp.MustCompile(`\/replicas\/indices\/(` + cl + `)` +
+		`\/shards\/(` + sh + `)\/objects\/(` + ob + `)(\/[0-9]{1,18})?`)
+	regxOverwriteObjects = regexp.MustCompile(`\/indices\/(` + cl + `)` +
+		`\/shards\/(` + sh + `)\/objects/_overwrite`)
+	regxCountObjects = regexp.MustCompile(`\/indices\/(` + cl + `)` +
+		`\/shards\/(` + sh + `)\/objects/_count`)
+	regxObjectsDigest = regexp.MustCompile(`\/indices\/(` + cl + `)` +
+		`\/shards\/(` + sh + `)\/objects/_digest`)
+	regexObjectsDigestsInRange = regexp.MustCompile(`\/indices\/(` + cl + `)` +
+		`\/shards\/(` + sh + `)\/objects/digestsInRange`)
+	regxHashTreeLevel = regexp.MustCompile(`\/indices\/(` + cl + `)` +
+		`\/shards\/(` + sh + `)\/objects\/hashtree\/level\/(` + l + `)`)
+	regexCompareDigests = regexp.MustCompile(`\/indices\/(` + cl + `)` +
+		`\/shards\/(` + sh + `)\/objects/compareDigests`)
+	regxAsyncCheckpoint       = regexp.MustCompile(`\/replicas\/indices\/(` + cl + `)\/async-checkpoint`)
+	regexCompareHashTreeRoots = regexp.MustCompile(`\/indices\/(` + cl + `)` +
+		`\/objects/_compareHashTreeRoots`)
+	regxObjects = regexp.MustCompile(`\/replicas\/indices\/(` + cl + `)` +
+		`\/shards\/(` + sh + `)\/objects`)
+	regxReferences = regexp.MustCompile(`\/replicas\/indices\/(` + cl + `)` +
+		`\/shards\/(` + sh + `)\/objects/references`)
+	regxCommitPhase = regexp.MustCompile(`\/replicas\/indices\/(` + cl + `)` +
+		`\/shards\/(` + sh + `):(commit|abort)`)
+)
+
+func NewReplicatedIndices(
+	replicator replicaTypes.Replicator,
+	auth auth,
+	maintenanceModeEnabled func() bool,
+	logger logrus.FieldLogger,
+	nodeReady func() bool,
+) *replicatedIndices {
+	return &replicatedIndices{
+		replicator:             replicator,
+		auth:                   auth,
+		maintenanceModeEnabled: maintenanceModeEnabled,
+		logger:                 logger,
+		nodeReady:              nodeReady,
+	}
+}
+
+func (i *replicatedIndices) Indices() http.Handler {
+	return i.auth.handleFunc(i.indicesHandler())
+}
+
+func (i *replicatedIndices) indicesHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if i.maintenanceModeEnabled() {
+			http.Error(w, "418 Maintenance mode", http.StatusTeapot)
+			return
+		}
+
+		if i.nodeReady != nil && !i.nodeReady() {
+			http.Error(w, "503 Node not ready", http.StatusServiceUnavailable)
+			return
+		}
+
+		i.handleRequest(w, r)
+	}
+}
+
+func (i *replicatedIndices) handleRequest(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+
+	// NOTE if you update any of these handler methods/paths, also update the indices_replicas_test.go
+	// TestMaintenanceModeReplicatedIndices test to include the new methods/paths.
+	switch {
+	case regxObjectsDigest.MatchString(path):
+		if r.Method == http.MethodGet {
+			i.getObjectsDigest().ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+		return
+	case regexObjectsDigestsInRange.MatchString(path):
+		if r.Method == http.MethodPost {
+			i.getObjectsDigestsInRange().ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+		return
+	case regxHashTreeLevel.MatchString(path):
+		if r.Method == http.MethodPost {
+			i.getHashTreeLevel().ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+		return
+	case regxOverwriteObjects.MatchString(path):
+		if r.Method == http.MethodPut {
+			i.putOverwriteObjects().ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+		return
+	case regexCompareDigests.MatchString(path):
+		if r.Method == http.MethodPost {
+			i.postCompareDigests().ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+		return
+	case regexCompareHashTreeRoots.MatchString(path):
+		if r.Method == http.MethodPost {
+			i.postCompareHashTreeRoots().ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+		return
+	case regxCountObjects.MatchString(path):
+		if r.Method == http.MethodGet {
+			i.countObjects().ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+		return
+	case regxAsyncCheckpoint.MatchString(path):
+		switch r.Method {
+		case http.MethodGet:
+			i.getAsyncCheckpointStatus().ServeHTTP(w, r)
+			return
+		case http.MethodPost:
+			i.postAsyncCheckpoint().ServeHTTP(w, r)
+			return
+		case http.MethodDelete:
+			i.deleteAsyncCheckpoint().ServeHTTP(w, r)
+			return
+		default:
+			http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	case regxObject.MatchString(path):
+		if r.Method == http.MethodDelete {
+			i.deleteObject().ServeHTTP(w, r)
+			return
+		}
+
+		if r.Method == http.MethodPatch {
+			i.patchObject().ServeHTTP(w, r)
+			return
+		}
+
+		if r.Method == http.MethodGet {
+			i.getObject().ServeHTTP(w, r)
+			return
+		}
+
+		if regxReferences.MatchString(path) {
+			if r.Method == http.MethodPost {
+				i.postRefs().ServeHTTP(w, r)
+				return
+			}
+		}
+
+		http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+		return
+
+	case regxObjects.MatchString(path):
+		if r.Method == http.MethodGet {
+			i.getObjectsMulti().ServeHTTP(w, r)
+			return
+		}
+
+		if r.Method == http.MethodPost {
+			i.postObject().ServeHTTP(w, r)
+			return
+		}
+
+		if r.Method == http.MethodDelete {
+			i.deleteObjects().ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+		return
+
+	case regxCommitPhase.MatchString(path):
+		if r.Method == http.MethodPost {
+			i.executeCommitPhase().ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+		return
+
+	default:
+		http.NotFound(w, r)
+		return
+	}
+}
+
+func (i *replicatedIndices) executeCommitPhase() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxCommitPhase.FindStringSubmatch(r.URL.Path)
+		if len(args) != 4 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		requestID := r.URL.Query().Get(replica.RequestKey)
+		if requestID == "" {
+			http.Error(w, "request_id not provided", http.StatusBadRequest)
+			return
+		}
+
+		index, shard, cmd := args[1], args[2], args[3]
+
+		var resp interface{}
+
+		switch cmd {
+		case "commit":
+			resp = i.replicator.CommitReplication(r.Context(), index, shard, requestID)
+		case "abort":
+			resp = i.replicator.AbortReplication(r.Context(), index, shard, requestID)
+		default:
+			http.Error(w, fmt.Sprintf("unrecognized command: %s", cmd), http.StatusNotImplemented)
+			return
+		}
+		if resp == nil { // could not find request with specified id
+			http.Error(w, "request not found", http.StatusNotFound)
+			return
+		}
+		b, err := json.Marshal(resp)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to marshal response: %+v, error: %v", resp, err),
+				http.StatusInternalServerError)
+			return
+		}
+		w.Write(b)
+	})
+}
+
+func (i *replicatedIndices) postObject() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxObjects.FindStringSubmatch(r.URL.Path)
+		if len(args) != 3 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		requestID := r.URL.Query().Get(replica.RequestKey)
+		if requestID == "" {
+			http.Error(w, "request_id not provided", http.StatusBadRequest)
+			return
+		}
+
+		schemaVersion, err := extractSchemaVersionFromUrlQuery(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		index, shard := args[1], args[2]
+
+		defer r.Body.Close()
+
+		ct := r.Header.Get("content-type")
+
+		switch ct {
+
+		case shared.IndicesPayloads.SingleObject.MIME():
+			i.postObjectSingle(w, r, index, shard, requestID, schemaVersion)
+			return
+		case shared.IndicesPayloads.ObjectList.MIME():
+			i.postObjectBatch(w, r, index, shard, requestID, schemaVersion)
+			return
+		default:
+			http.Error(w, "415 Unsupported Media Type", http.StatusUnsupportedMediaType)
+			return
+		}
+	})
+}
+
+func (i *replicatedIndices) patchObject() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxObjects.FindStringSubmatch(r.URL.Path)
+		if len(args) != 3 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		requestID := r.URL.Query().Get(replica.RequestKey)
+		if requestID == "" {
+			http.Error(w, "request_id not provided", http.StatusBadRequest)
+			return
+		}
+
+		index, shard := args[1], args[2]
+
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		mergeDoc, err := shared.IndicesPayloads.MergeDoc.Unmarshal(bodyBytes)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		schemaVersion, err := extractSchemaVersionFromUrlQuery(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resp := i.replicator.ReplicateUpdate(r.Context(), index, shard, requestID, &mergeDoc, schemaVersion)
+		if shared.LocalIndexNotReady(resp) {
+			http.Error(w, resp.FirstError().Error(), http.StatusServiceUnavailable)
+			return
+		}
+
+		b, err := json.Marshal(resp)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to marshal response: %+v, error: %v", resp, err),
+				http.StatusInternalServerError)
+			return
+		}
+
+		w.Write(b)
+	})
+}
+
+func (i *replicatedIndices) getObjectsDigest() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxObjectsDigest.FindStringSubmatch(r.URL.Path)
+		if len(args) != 3 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		index, shard := args[1], args[2]
+
+		defer r.Body.Close()
+		reqPayload, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read request body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		var ids []strfmt.UUID
+		if err := json.Unmarshal(reqPayload, &ids); err != nil {
+			http.Error(w, "unmarshal digest objects params from json: "+err.Error(),
+				http.StatusBadRequest)
+			return
+		}
+
+		results, err := i.replicator.DigestObjects(r.Context(), index, shard, ids)
+		if err != nil && errors.As(err, &enterrors.ErrUnprocessable{}) {
+			http.Error(w, "digest objects: "+err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+
+		if err != nil {
+			http.Error(w, "digest objects: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		resBytes, err := json.Marshal(results)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Write(resBytes)
+	})
+}
+
+func (i *replicatedIndices) getObjectsDigestsInRange() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regexObjectsDigestsInRange.FindStringSubmatch(r.URL.Path)
+		if len(args) != 3 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		index, shard := args[1], args[2]
+
+		defer r.Body.Close()
+		reqPayload, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read request body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		var rangeReq replica.DigestObjectsInRangeReq
+		if err := json.Unmarshal(reqPayload, &rangeReq); err != nil {
+			http.Error(w, "unmarshal digest objects in token range params from json: "+err.Error(),
+				http.StatusBadRequest)
+			return
+		}
+
+		digests, err := i.replicator.DigestObjectsInRange(r.Context(), index, shard, rangeReq.InitialUUID, rangeReq.FinalUUID, rangeReq.Limit)
+		if err != nil {
+			http.Error(w, "digest objects in range: "+err.Error(),
+				http.StatusInternalServerError)
+			return
+		}
+
+		writeDigestsInRangeResponse(w, r, digests)
+	})
+}
+
+func (i *replicatedIndices) getHashTreeLevel() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxHashTreeLevel.FindStringSubmatch(r.URL.Path)
+		if len(args) != 4 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		index, shard, level := args[1], args[2], args[3]
+
+		l, err := strconv.Atoi(level)
+		if err != nil {
+			http.Error(w, "unmarshal hashtree level params: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		defer r.Body.Close()
+
+		reqPayload, err := readRequestBodyWithOptionalCompression(
+			http.MaxBytesReader(w, r.Body, maxDecompressedReplicaBody),
+			r.Header.Get("X-Request-Compression"),
+			maxDecompressedReplicaBody,
+		)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		var discriminant hashtree.Bitset
+		if err := discriminant.Unmarshal(reqPayload); err != nil {
+			http.Error(w, "unmarshal hashtree level params from json: "+err.Error(),
+				http.StatusBadRequest)
+			return
+		}
+
+		results, err := i.replicator.HashTreeLevel(r.Context(), index, shard, l, &discriminant)
+		if err != nil {
+			http.Error(w, "hashtree level: "+err.Error(),
+				http.StatusInternalServerError)
+			return
+		}
+
+		writeHashTreeLevelResponse(w, r, results)
+	})
+}
+
+func (i *replicatedIndices) postCompareHashTreeRoots() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regexCompareHashTreeRoots.FindStringSubmatch(r.URL.Path)
+		if len(args) != 2 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+		index := args[1]
+
+		defer r.Body.Close()
+
+		var req replica.CompareHashTreeRootsReq
+		body := http.MaxBytesReader(w, r.Body, maxDecompressedReplicaBody)
+		if err := json.NewDecoder(body).Decode(&req); err != nil {
+			http.Error(w, "unmarshal compare hashtree roots request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(req.Roots) > replica.CompareHashTreeRootsMaxShardsPerRequest {
+			http.Error(w, fmt.Sprintf("too many shards: %d exceeds maximum %d",
+				len(req.Roots), replica.CompareHashTreeRootsMaxShardsPerRequest), http.StatusBadRequest)
+			return
+		}
+
+		roots := make(map[string]hashtree.Digest, len(req.Roots))
+		for shard, root := range req.Roots {
+			roots[shard] = hashtree.Digest(root)
+		}
+
+		diverging, err := i.replicator.CompareHashTreeRoots(r.Context(), index, roots)
+		if err != nil {
+			http.Error(w, "compare hashtree roots: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		resBytes, err := json.Marshal(replica.CompareHashTreeRootsResp{DivergingShards: diverging})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write(resBytes) //nolint:errcheck
+	})
+}
+
+// writeDigestsInRangeResponse writes the digests as a fixed-size binary stream
+// when the client signals support via X-Accept-Response-Encoding: binary,
+// falling back to JSON for older nodes. Each binary record is
+// replica.DigestObjectsInRangeRecordLength bytes: 16 bytes UUID (RFC-4122
+// binary form) followed by 8 bytes UpdateTime (int64 big-endian). The Err and
+// Deleted fields are intentionally omitted — ObjectDigestsInRange never
+// populates them.
+func writeDigestsInRangeResponse(w http.ResponseWriter, r *http.Request, results []types.RepairResponse) {
+	if r.Header.Get("X-Accept-Response-Encoding") != "binary" {
+		resBytes, err := json.Marshal(replica.DigestObjectsInRangeResp{Digests: results})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write(resBytes) //nolint:errcheck
+		return
+	}
+
+	// Encode all records before writing any headers so that errors don't
+	// produce an http.Error response with a stale Content-Length already set.
+	body := make([]byte, 0, len(results)*replica.DigestObjectsInRangeRecordLength)
+	var buf [replica.DigestObjectsInRangeRecordLength]byte
+	for _, d := range results {
+		uuidParsed, err := uuid.Parse(d.ID)
+		if err != nil {
+			// Should never happen — IDs come directly from the LSM store.
+			http.Error(w, "parse uuid: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		copy(buf[:16], uuidParsed[:])
+		binary.BigEndian.PutUint64(buf[16:], uint64(d.UpdateTime))
+		body = append(body, buf[:]...)
+	}
+
+	w.Header().Set("X-Response-Encoding", "binary")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Write(body) //nolint:errcheck
+}
+
+// writeHashTreeLevelResponse writes digests as binary when the client signals
+// support via X-Accept-Response-Encoding: binary, falling back to the legacy
+// JSON encoding for older nodes.
+func writeHashTreeLevelResponse(w http.ResponseWriter, r *http.Request, results []hashtree.Digest) {
+	if r.Header.Get("X-Accept-Response-Encoding") != "binary" {
+		resBytes, err := json.Marshal(results)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write(resBytes)
+		return
+	}
+
+	w.Header().Set("X-Response-Encoding", "binary")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(results))*int64(hashtree.DigestLength), 10))
+	var buf [hashtree.DigestLength]byte
+	for _, d := range results {
+		binary.BigEndian.PutUint64(buf[:8], d[0])
+		binary.BigEndian.PutUint64(buf[8:], d[1])
+		w.Write(buf[:]) //nolint:errcheck
+	}
+}
+
+func readRequestBodyWithOptionalCompression(
+	body io.ReadCloser,
+	compressionHeader string,
+	maxDecodedBytes int64,
+) ([]byte, error) {
+	if compressionHeader == "" {
+		// No compression header – read raw body (backward compatibility)
+		return readAllCapped(body, maxDecodedBytes)
+	}
+
+	if compressionHeader != "zstd" {
+		return nil, fmt.Errorf("compression algorithm unsupported: %s", compressionHeader)
+	}
+
+	zstdr, ok := zstdDecoderPool.Get().(*zstd.Decoder)
+	if !ok || zstdr == nil {
+		// pool.New failed; call directly to surface the underlying error
+		var err error
+		zstdr, err = newZstdDecoder()
+		if err != nil {
+			return nil, fmt.Errorf("create zstd decoder: %w", err)
+		}
+	}
+	if err := zstdr.Reset(body); err != nil {
+		zstdr.Close()
+		return nil, fmt.Errorf("reset zstd decoder: %w", err)
+	}
+	defer func() {
+		if err := zstdr.Reset(nil); err == nil {
+			zstdDecoderPool.Put(zstdr)
+		} else {
+			// decoder is closed/broken; close it before discarding
+			zstdr.Close()
+		}
+	}()
+
+	b, err := readAllCapped(zstdr, maxDecodedBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read decompressed body: %w", err)
+	}
+
+	return b, nil
+}
+
+// readAllCapped reads r fully but errors if it yields more than maxBytes, bounding decompressed (or raw) body size.
+func readAllCapped(r io.Reader, maxBytes int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf("body exceeds maximum allowed size of %d bytes", maxBytes)
+	}
+	return b, nil
+}
+
+func (i *replicatedIndices) putOverwriteObjects() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxOverwriteObjects.FindStringSubmatch(r.URL.Path)
+		if len(args) != 3 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		index, shard := args[1], args[2]
+
+		defer r.Body.Close()
+		reqPayload, err := readRequestBodyWithOptionalCompression(
+			http.MaxBytesReader(w, r.Body, maxDecompressedReplicaBody),
+			r.Header.Get("X-Request-Compression"),
+			maxDecompressedReplicaBody,
+		)
+		if err != nil {
+			http.Error(w, "read request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		var vobjs []*objects.VObject
+		switch r.Header.Get("X-Request-Encoding") {
+		case shared.OverwriteEncodingHeaderRaw:
+			vobjs, err = shared.IndicesPayloads.VersionedObjectList.UnmarshalRaw(reqPayload)
+		case "binary":
+			vobjs, err = shared.IndicesPayloads.VersionedObjectList.UnmarshalV2(reqPayload)
+		default:
+			vobjs, err = shared.IndicesPayloads.VersionedObjectList.Unmarshal(reqPayload)
+		}
+		if err != nil {
+			http.Error(w, "unmarshal overwrite objects: "+err.Error(),
+				http.StatusBadRequest)
+			return
+		}
+
+		results, err := i.replicator.OverwriteObjects(r.Context(), index, shard, vobjs)
+		if err != nil {
+			http.Error(w, "overwrite objects: "+err.Error(),
+				http.StatusInternalServerError)
+			return
+		}
+
+		resBytes, err := json.Marshal(results)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Write(resBytes)
+	})
+}
+
+// postCompareDigests compares a binary-encoded list of source digests against
+// local state and returns the actionable subset. Wire format on both sides is
+// replica.CompareDigestsRecordLength bytes per record (see usecases/replica
+// for the record layout and flag bits).
+func (i *replicatedIndices) postCompareDigests() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regexCompareDigests.FindStringSubmatch(r.URL.Path)
+		if len(args) != 3 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		index, shard := args[1], args[2]
+
+		defer r.Body.Close()
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, replica.CompareDigestsMaxBodyBytes))
+		if err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(w, "read request body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		var sourceDigests []types.RepairResponse
+		if len(body) > 0 {
+			if len(body)%replica.CompareDigestsRecordLength != 0 {
+				http.Error(w, "invalid binary payload length", http.StatusBadRequest)
+				return
+			}
+			n := len(body) / replica.CompareDigestsRecordLength
+			sourceDigests = make([]types.RepairResponse, n)
+			for j := 0; j < n; j++ {
+				off := j * replica.CompareDigestsRecordLength
+				rec := body[off : off+replica.CompareDigestsRecordLength]
+				id, err := uuid.FromBytes(rec[:16])
+				if err != nil {
+					http.Error(w, "parse uuid from binary: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+				sourceDigests[j] = types.RepairResponse{
+					ID:         id.String(),
+					UpdateTime: int64(binary.BigEndian.Uint64(rec[16:24])),
+					Deleted:    rec[24]&replica.CompareDigestsFlagDeleted != 0,
+				}
+			}
+		}
+
+		stale, err := i.replicator.CompareDigests(r.Context(), index, shard, sourceDigests)
+		if err != nil {
+			http.Error(w, "compare digests: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Encode all records before writing headers so that a UUID parse error
+		// doesn't produce an http.Error after headers have been sent.
+		out := make([]byte, 0, len(stale)*replica.CompareDigestsRecordLength)
+		var obuf [replica.CompareDigestsRecordLength]byte
+		for _, d := range stale {
+			id, err := uuid.Parse(d.ID)
+			if err != nil {
+				http.Error(w, "parse uuid: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			copy(obuf[:16], id[:])
+			binary.BigEndian.PutUint64(obuf[16:24], uint64(d.UpdateTime))
+			obuf[24] = 0
+			if d.Deleted {
+				obuf[24] = replica.CompareDigestsFlagDeleted
+			}
+			out = append(out, obuf[:]...)
+		}
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+		w.Write(out) //nolint:errcheck
+	})
+}
+
+func (i *replicatedIndices) countObjects() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxCountObjects.FindStringSubmatch(r.URL.Path)
+		if len(args) != 3 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		index, shard := args[1], args[2]
+
+		count, err := i.replicator.CountObjects(r.Context(), index, shard)
+		if err != nil {
+			http.Error(w, "count objects: "+err.Error(),
+				http.StatusInternalServerError)
+			return
+		}
+
+		io.WriteString(w, strconv.Itoa(count))
+	})
+}
+
+func (i *replicatedIndices) deleteObject() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxObject.FindStringSubmatch(r.URL.Path)
+		if len(args) != 5 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		requestID := r.URL.Query().Get(replica.RequestKey)
+		if requestID == "" {
+			http.Error(w, "request_id not provided", http.StatusBadRequest)
+			return
+		}
+
+		index, shard, id := args[1], args[2], args[3]
+
+		var deletionTime time.Time
+
+		if args[4] != "" {
+			deletionTimeUnixMilli, err := strconv.ParseInt(args[4][1:], 10, 64)
+			if err != nil {
+				http.Error(w, "invalid URI", http.StatusBadRequest)
+				return
+			}
+			deletionTime = time.UnixMilli(deletionTimeUnixMilli)
+		}
+
+		defer r.Body.Close()
+
+		schemaVersion, err := extractSchemaVersionFromUrlQuery(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resp := i.replicator.ReplicateDeletion(r.Context(), index, shard, requestID, strfmt.UUID(id), deletionTime, schemaVersion)
+		if shared.LocalIndexNotReady(resp) {
+			http.Error(w, resp.FirstError().Error(), http.StatusServiceUnavailable)
+			return
+		}
+
+		b, err := json.Marshal(resp)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to marshal response: %+v, error: %v", resp, err),
+				http.StatusInternalServerError)
+			return
+		}
+		w.Write(b)
+	})
+}
+
+func (i *replicatedIndices) deleteObjects() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxObjects.FindStringSubmatch(r.URL.Path)
+		if len(args) != 3 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		requestID := r.URL.Query().Get(replica.RequestKey)
+		if requestID == "" {
+			http.Error(w, "request_id not provided", http.StatusBadRequest)
+			return
+		}
+
+		index, shard := args[1], args[2]
+
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer r.Body.Close()
+
+		uuids, deletionTimeUnix, dryRun, err := shared.IndicesPayloads.BatchDeleteParams.Unmarshal(bodyBytes)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		schemaVersion, err := extractSchemaVersionFromUrlQuery(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		resp := i.replicator.ReplicateDeletions(r.Context(), index, shard, requestID, uuids, deletionTimeUnix, dryRun, schemaVersion)
+		if shared.LocalIndexNotReady(resp) {
+			http.Error(w, resp.FirstError().Error(), http.StatusServiceUnavailable)
+			return
+		}
+
+		b, err := json.Marshal(resp)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to marshal response: %+v, error: %v", resp, err),
+				http.StatusInternalServerError)
+			return
+		}
+		w.Write(b)
+	})
+}
+
+func (i *replicatedIndices) postObjectSingle(w http.ResponseWriter, r *http.Request,
+	index, shard, requestID string, schemaVersion uint64,
+) {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	obj, err := shared.IndicesPayloads.SingleObject.Unmarshal(bodyBytes, shared.MethodPut)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp := i.replicator.ReplicateObject(r.Context(), index, shard, requestID, obj, schemaVersion)
+	if shared.LocalIndexNotReady(resp) {
+		http.Error(w, resp.FirstError().Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	b, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to marshal response: %+v, error: %v", resp, err),
+			http.StatusInternalServerError)
+		return
+	}
+
+	w.Write(b)
+}
+
+func (i *replicatedIndices) postObjectBatch(w http.ResponseWriter, r *http.Request,
+	index, shard, requestID string, schemaVersion uint64,
+) {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	objs, err := shared.IndicesPayloads.ObjectList.Unmarshal(bodyBytes, shared.MethodPut)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp := i.replicator.ReplicateObjects(r.Context(), index, shard, requestID, objs, schemaVersion)
+	if shared.LocalIndexNotReady(resp) {
+		http.Error(w, resp.FirstError().Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	b, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("unmarshal resp: %+v, error: %v", resp, err),
+			http.StatusInternalServerError)
+		return
+	}
+
+	w.Write(b)
+}
+
+func (i *replicatedIndices) getObject() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxObject.FindStringSubmatch(r.URL.Path)
+		if len(args) != 5 || args[4] != "" {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		index, shard, id := args[1], args[2], args[3]
+
+		defer r.Body.Close()
+
+		resp, err := i.replicator.FetchObject(r.Context(), index, shard, strfmt.UUID(id))
+		if err != nil && errors.As(err, &enterrors.ErrUnprocessable{}) {
+			http.Error(w, "fetch objects: "+err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		b, err := resp.MarshalBinary()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("unmarshal resp: %+v, error: %v", resp, err),
+				http.StatusInternalServerError)
+			return
+		}
+
+		w.Write(b)
+	})
+}
+
+func (i *replicatedIndices) getObjectsMulti() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxObjects.FindStringSubmatch(r.URL.Path)
+		if len(args) != 3 {
+			http.Error(w, fmt.Sprintf("invalid URI: %s", r.URL.Path),
+				http.StatusBadRequest)
+			return
+		}
+
+		index, shard := args[1], args[2]
+
+		defer r.Body.Close()
+
+		idsEncoded := r.URL.Query().Get("ids")
+		if idsEncoded == "" {
+			http.Error(w, "missing required url param 'ids'",
+				http.StatusBadRequest)
+			return
+		}
+
+		idsBytes, err := base64.StdEncoding.DecodeString(idsEncoded)
+		if err != nil {
+			http.Error(w, "base64 decode 'ids' param: "+err.Error(),
+				http.StatusBadRequest)
+			return
+		}
+
+		var ids []strfmt.UUID
+		if err := json.Unmarshal(idsBytes, &ids); err != nil {
+			http.Error(w, "unmarshal 'ids' param from json: "+err.Error(),
+				http.StatusBadRequest)
+			return
+		}
+
+		resp, err := i.replicator.FetchObjects(r.Context(), index, shard, ids)
+		if err != nil && errors.As(err, &enterrors.ErrUnprocessable{}) {
+			http.Error(w, "fetch objects: "+err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		b, err := replica.Replicas(resp).MarshalBinary()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("unmarshal resp: %+v, error: %v", resp, err),
+				http.StatusInternalServerError)
+			return
+		}
+
+		w.Write(b)
+	})
+}
+
+func (i *replicatedIndices) postRefs() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxObjects.FindStringSubmatch(r.URL.Path)
+		if len(args) != 3 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		requestID := r.URL.Query().Get(replica.RequestKey)
+		if requestID == "" {
+			http.Error(w, "request_id not provided", http.StatusBadRequest)
+			return
+		}
+
+		index, shard := args[1], args[2]
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		refs, err := shared.IndicesPayloads.ReferenceList.Unmarshal(bodyBytes)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		schemaVersion, err := extractSchemaVersionFromUrlQuery(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		resp := i.replicator.ReplicateReferences(r.Context(), index, shard, requestID, refs, schemaVersion)
+		if shared.LocalIndexNotReady(resp) {
+			http.Error(w, resp.FirstError().Error(), http.StatusServiceUnavailable)
+			return
+		}
+
+		b, err := json.Marshal(resp)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("unmarshal resp: %+v, error: %v", resp, err),
+				http.StatusInternalServerError)
+			return
+		}
+
+		w.Write(b)
+	})
+}
+
+const asyncCheckpointMaxBodyBytes = 64 * 1024
+
+// Rolling upgrades: pre-feature nodes return 404; the broadcast helper in finder.go
+// logs and continues, so convergence resumes once rollout completes.
+
+// Root is a raw []byte (base64 on the wire) because hashtree.Digest's
+// pointer-receiver MarshalJSON doesn't fire on non-addressable map values.
+type asyncCheckpointCreateRequest struct {
+	Shards      []string `json:"shards"`
+	CutoffMs    int64    `json:"cutoff_ms"`
+	CreatedAtMs int64    `json:"created_at_ms"`
+}
+
+type asyncCheckpointDeleteRequest struct {
+	Shards []string `json:"shards"`
+}
+
+type asyncCheckpointStatusEntry struct {
+	Root        []byte `json:"root"`
+	CutoffMs    int64  `json:"cutoff_ms"`
+	CreatedAtMs int64  `json:"created_at_ms"`
+}
+
+func readAsyncCheckpointBody(w http.ResponseWriter, r *http.Request, out interface{}) (int, error) {
+	defer r.Body.Close()
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, asyncCheckpointMaxBodyBytes))
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return http.StatusRequestEntityTooLarge, fmt.Errorf("request body too large")
+		}
+		return http.StatusInternalServerError, fmt.Errorf("read request body: %w", err)
+	}
+	if len(body) == 0 {
+		return http.StatusBadRequest, fmt.Errorf("empty request body")
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return http.StatusBadRequest, fmt.Errorf("decode request body: %w", err)
+	}
+	return 0, nil
+}
+
+func (i *replicatedIndices) postAsyncCheckpoint() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxAsyncCheckpoint.FindStringSubmatch(r.URL.Path)
+		if len(args) != 2 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+		className := args[1]
+
+		var req asyncCheckpointCreateRequest
+		if status, err := readAsyncCheckpointBody(w, r, &req); err != nil {
+			http.Error(w, err.Error(), status)
+			return
+		}
+		if len(req.Shards) > replica.AsyncCheckpointMaxShardsPerRequest {
+			http.Error(w, fmt.Sprintf("too many shards in request (%d > %d)",
+				len(req.Shards), replica.AsyncCheckpointMaxShardsPerRequest),
+				http.StatusBadRequest)
+			return
+		}
+		if req.CutoffMs <= 0 {
+			http.Error(w, "cutoff_ms must be > 0", http.StatusBadRequest)
+			return
+		}
+		if req.CreatedAtMs <= 0 {
+			http.Error(w, "created_at_ms must be > 0", http.StatusBadRequest)
+			return
+		}
+
+		createdAt := time.UnixMilli(req.CreatedAtMs).UTC()
+		// Past values are fine (tie-breaker handles them); reject only far-future skew.
+		if skew := time.Until(createdAt); skew > replica.AsyncCheckpointCreatedAtSkewTolerance {
+			http.Error(w,
+				fmt.Sprintf("created_at_ms is too far in the future (%s ahead of this node's clock; tolerance %s)",
+					skew.Truncate(time.Second), replica.AsyncCheckpointCreatedAtSkewTolerance),
+				http.StatusBadRequest)
+			return
+		}
+		if err := i.replicator.CreateAsyncCheckpoint(r.Context(), className, req.Shards, req.CutoffMs, createdAt); err != nil {
+			http.Error(w, "create async checkpoint: "+err.Error(), asyncCheckpointHTTPStatus(err))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+}
+
+// asyncCheckpointHTTPStatus keeps HTTP status codes in sync with asyncCheckpointErrorToGRPC.
+func asyncCheckpointHTTPStatus(err error) int {
+	switch {
+	case errors.Is(err, replica.ErrAsyncCheckpointStale):
+		return http.StatusConflict
+	case errors.Is(err, replica.ErrAsyncReplicationNotActive):
+		return http.StatusPreconditionFailed
+	}
+	return http.StatusInternalServerError
+}
+
+func (i *replicatedIndices) deleteAsyncCheckpoint() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxAsyncCheckpoint.FindStringSubmatch(r.URL.Path)
+		if len(args) != 2 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+		className := args[1]
+
+		var req asyncCheckpointDeleteRequest
+		if status, err := readAsyncCheckpointBody(w, r, &req); err != nil {
+			http.Error(w, err.Error(), status)
+			return
+		}
+		if len(req.Shards) > replica.AsyncCheckpointMaxShardsPerRequest {
+			http.Error(w, fmt.Sprintf("too many shards in request (%d > %d)",
+				len(req.Shards), replica.AsyncCheckpointMaxShardsPerRequest),
+				http.StatusBadRequest)
+			return
+		}
+
+		if err := i.replicator.DeleteAsyncCheckpoint(r.Context(), className, req.Shards); err != nil {
+			http.Error(w, "delete async checkpoint: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+}
+
+func (i *replicatedIndices) getAsyncCheckpointStatus() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regxAsyncCheckpoint.FindStringSubmatch(r.URL.Path)
+		if len(args) != 2 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+		className := args[1]
+
+		shards := r.URL.Query()["shards"]
+		if len(shards) > replica.AsyncCheckpointMaxShardsPerRequest {
+			http.Error(w, fmt.Sprintf("too many shards in request (%d > %d)",
+				len(shards), replica.AsyncCheckpointMaxShardsPerRequest),
+				http.StatusBadRequest)
+			return
+		}
+
+		statuses, err := i.replicator.GetAsyncCheckpointStatus(r.Context(), className, shards)
+		if err != nil {
+			http.Error(w, "get async checkpoint status: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		resp := make(map[string]asyncCheckpointStatusEntry, len(statuses))
+		for shardName, s := range statuses {
+			rootBytes, _ := s.Root.MarshalBinary()
+			// Inactive shards: Root=nil + created_at_ms=0, to avoid the negative time.Time{}.UnixMilli() value.
+			createdAtMs := s.CreatedAt.UnixMilli()
+			if s.CutoffMs == 0 {
+				rootBytes = nil
+				createdAtMs = 0
+			}
+			resp[shardName] = asyncCheckpointStatusEntry{
+				Root:        rootBytes,
+				CutoffMs:    s.CutoffMs,
+				CreatedAtMs: createdAtMs,
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			i.logger.WithField("action", "get_async_checkpoint_status").Error(err)
+		}
+	})
+}

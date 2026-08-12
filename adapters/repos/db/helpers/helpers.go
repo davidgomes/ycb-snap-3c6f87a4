@@ -1,0 +1,218 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package helpers
+
+import (
+	"fmt"
+
+	"github.com/weaviate/weaviate/adapters/repos/db/vector/common"
+	"github.com/weaviate/weaviate/entities/models"
+	"github.com/weaviate/weaviate/entities/schema"
+	schemaConfig "github.com/weaviate/weaviate/entities/schema/config"
+	"github.com/weaviate/weaviate/entities/vectorindex/flat"
+	"github.com/weaviate/weaviate/entities/vectorindex/hnsw"
+)
+
+var (
+	ObjectsBucket              = []byte("objects")
+	ObjectsBucketLSM           = "objects"
+	VectorsBucketLSM           = "vectors"
+	DimensionsBucketLSM        = "dimensions"
+	VectorsCompressedBucketLSM = "vectors_compressed"
+)
+
+const ObjectsBucketLSMDocIDSecondaryIndex int = 0
+
+func GetCompressedBucketName(targetVector string) string {
+	if targetVector != "" {
+		return fmt.Sprintf("%s_%s", VectorsCompressedBucketLSM, targetVector)
+	}
+	return VectorsCompressedBucketLSM
+}
+
+func GetVectorsBucketName(targetVector string) string {
+	if targetVector != "" {
+		return fmt.Sprintf("%s_%s", VectorsBucketLSM, targetVector)
+	}
+	return VectorsBucketLSM
+}
+
+func GetHNSWCommitLogDirName(targetVector string) string {
+	if targetVector != "" {
+		return fmt.Sprintf("%s.hnsw.commitlog.d", GetVectorsBucketName(targetVector))
+	}
+	return "main.hnsw.commitlog.d"
+}
+
+func GetHNSWSnapshotDirName(targetVector string) string {
+	if targetVector != "" {
+		return fmt.Sprintf("%s.hnsw.snapshot.d", GetVectorsBucketName(targetVector))
+	}
+	return "main.hnsw.snapshot.d"
+}
+
+// MetaCountProp helps create an internally used propName for meta props that
+// don't explicitly exist in the user schema, but are required for proper
+// indexing, such as the count of arrays.
+func MetaCountProp(propName string) string {
+	return propName + schema.InternalMetaCountSuffix
+}
+
+func PropLength(propName string) string {
+	return propName + schema.InternalPropertyLengthSuffix
+}
+
+func PropNull(propName string) string {
+	return propName + schema.InternalNullStateSuffix
+}
+
+// BucketFromPropNameLSM creates string used as the bucket name
+// for a particular prop in the inverted index
+func BucketFromPropNameLSM(propName string) string {
+	return fmt.Sprintf("property_%s", propName)
+}
+
+func BucketFromPropNameLengthLSM(propName string) string {
+	return BucketFromPropNameLSM(PropLength(propName))
+}
+
+func BucketFromPropNameNullLSM(propName string) string {
+	return BucketFromPropNameLSM(PropNull(propName))
+}
+
+func BucketFromPropNameMetaCountLSM(propName string) string {
+	return BucketFromPropNameLSM(MetaCountProp(propName))
+}
+
+func TempBucketFromBucketName(bucketName string) string {
+	return bucketName + schema.InternalTempSuffix
+}
+
+func BucketNestedFromPropNameLSM(propName string) string {
+	return fmt.Sprintf("property.nested_%s", propName)
+}
+
+func BucketNestedMetaFromPropNameLSM(propName string) string {
+	return fmt.Sprintf("property.nestedmeta_%s", propName)
+}
+
+func BucketSearchableFromPropNameLSM(propName string) string {
+	return BucketFromPropNameLSM(propName + schema.InternalSearchableSuffix)
+}
+
+func BucketRangeableFromPropNameLSM(propName string) string {
+	return BucketFromPropNameLSM(propName + schema.InternalRangeableSuffix)
+}
+
+// propertyBucketGenSuffix returns the suffix appended to a property bucket
+// name to disambiguate generations created by semantic runtime-reindex
+// migrations. Generation 0 (the default for never-migrated properties)
+// returns "" so the bucket name matches the legacy unsuffixed form —
+// existing clusters on disk continue to find their buckets without a
+// rename. Generations >= 1 return "__gen<N>".
+//
+// The double-underscore is chosen to be unambiguous: property names are
+// user-supplied identifiers that, in practice, do not end in "__gen<digits>".
+// Even if one did, the suffix would never collide because the resolver
+// only appends a non-empty suffix when the schema-tracked
+// BucketGeneration is non-zero.
+func propertyBucketGenSuffix(gen int64) string {
+	if gen <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("__gen%d", gen)
+}
+
+// BucketFromPropNameLSMAtGen is the generation-aware variant of
+// [BucketFromPropNameLSM]. For gen=0 it returns the legacy unsuffixed
+// bucket name (no behavior change for properties that have never been
+// semantically reindexed). For gen>=1 the returned name includes a
+// "__gen<N>" suffix so old and new generations can coexist on disk during
+// a migration: the reindex builds the next-generation bucket alongside
+// the active one, and the cluster-wide cutover is the RAFT commit that
+// bumps the property's BucketGeneration field.
+func BucketFromPropNameLSMAtGen(propName string, gen int64) string {
+	return BucketFromPropNameLSM(propName) + propertyBucketGenSuffix(gen)
+}
+
+// BucketSearchableFromPropNameLSMAtGen is the generation-aware variant of
+// [BucketSearchableFromPropNameLSM]. See [BucketFromPropNameLSMAtGen] for
+// the cutover semantics.
+func BucketSearchableFromPropNameLSMAtGen(propName string, gen int64) string {
+	return BucketSearchableFromPropNameLSM(propName) + propertyBucketGenSuffix(gen)
+}
+
+// BucketRangeableFromPropNameLSMAtGen is the generation-aware variant of
+// [BucketRangeableFromPropNameLSM]. See [BucketFromPropNameLSMAtGen] for
+// the cutover semantics.
+func BucketRangeableFromPropNameLSMAtGen(propName string, gen int64) string {
+	return BucketRangeableFromPropNameLSM(propName) + propertyBucketGenSuffix(gen)
+}
+
+// BucketFromPropertyLSM returns the filterable bucket name for a property
+// at its currently-active generation, as recorded in the schema. Equivalent
+// to [BucketFromPropNameLSMAtGen] with the property's BucketGeneration.
+// Prefer this form at sites that already hold a *models.Property — the
+// schema is the single source of truth for which generation is active,
+// so passing the resolved name into a downstream API risks staleness.
+func BucketFromPropertyLSM(prop *models.Property) string {
+	return BucketFromPropNameLSMAtGen(prop.Name, prop.BucketGeneration)
+}
+
+// BucketSearchableFromPropertyLSM returns the searchable bucket name for
+// a property at its currently-active generation. See [BucketFromPropertyLSM].
+func BucketSearchableFromPropertyLSM(prop *models.Property) string {
+	return BucketSearchableFromPropNameLSMAtGen(prop.Name, prop.BucketGeneration)
+}
+
+// BucketRangeableFromPropertyLSM returns the rangeable bucket name for
+// a property at its currently-active generation. See [BucketFromPropertyLSM].
+func BucketRangeableFromPropertyLSM(prop *models.Property) string {
+	return BucketRangeableFromPropNameLSMAtGen(prop.Name, prop.BucketGeneration)
+}
+
+// CompressionRatioFromConfig calculates the compression ratio from vector index config
+// This is used for inactive tenants where we don't have access to the actual vector index
+func CompressionRatioFromConfig(config schemaConfig.VectorIndexConfig, dimensions int) float64 {
+	// Check for different compression types in config by type asserting
+	if hnswConfig, ok := config.(hnsw.UserConfig); ok {
+		// Check for different compression types in HNSW config
+		if hnswConfig.PQ.Enabled {
+			// PQ compression ratio depends on segments
+			segments := hnswConfig.PQ.Segments
+			if segments == 0 {
+				segments = common.CalculateOptimalSegments(dimensions)
+			}
+			return float64(dimensions*4) / float64(segments)
+		} else if hnswConfig.BQ.Enabled {
+			// BQ compression ratio is approximately 32x
+			return 32
+		} else if hnswConfig.SQ.Enabled {
+			// SQ compression ratio is approximately 4x
+			return 4
+		}
+	} else if flatConfig, ok := config.(flat.UserConfig); ok {
+		// Check for different compression types in Flat config
+		if flatConfig.BQ.Enabled {
+			// BQ compression ratio is approximately 32x
+			return 32
+		} else if flatConfig.PQ.Enabled {
+			// PQ compression ratio depends on segments (not supported in flat but handle gracefully)
+		} else if flatConfig.SQ.Enabled {
+			// SQ compression ratio is approximately 4x
+			return 4
+		}
+	}
+
+	// Default to no compression
+	return 1
+}

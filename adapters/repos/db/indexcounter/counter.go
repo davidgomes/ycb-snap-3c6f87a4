@@ -1,0 +1,149 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package indexcounter
+
+import (
+	"encoding/binary"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+
+	"github.com/pkg/errors"
+)
+
+type Counter struct {
+	count uint64
+	sync.Mutex
+	f *os.File
+}
+
+func New(shardPath string) (cr *Counter, rerr error) {
+	fileName := fmt.Sprintf("%s/indexcount", shardPath)
+	f, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE, 0o666)
+	if err != nil {
+		return nil, err
+	}
+
+	// The lifetime of the `f` exceeds this constructor as we store the open file for later use in Counter.
+	// invariant: We close `f`  **only** if any error happened after successfully opening the file. To avoid leaking open file descriptor.
+	// NOTE: This `defer` works even with `err` being shadowed in the whole function because defer checks for named `rerr` return value.
+	defer func() {
+		if rerr != nil {
+			f.Close()
+		}
+	}()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	var initialCount uint64 = 0
+	if stat.Size() > 0 {
+		// the file has existed before, we need to initialize with its content
+		err := binary.Read(f, binary.LittleEndian, &initialCount)
+		if err != nil {
+			return nil, errors.Wrap(err, "read initial count from file")
+		}
+
+	}
+
+	return &Counter{
+		count: initialCount,
+		f:     f,
+	}, nil
+}
+
+// Read returns the persisted counter value for the shard at shardPath
+// without opening/creating the counter for use. It returns 0 when the counter
+// file is missing or empty.
+//
+// Because the counter is incremented and persisted on every write (see
+// GetAndInc), a zero value reliably means the shard has never held any objects —
+// including data still sitting in an unflushed/reused WAL, which segment metadata
+// would not yet reflect. This makes it a safe, cheap probe for deciding whether a
+// not-yet-loaded shard is empty.
+func Read(shardPath string) (uint64, error) {
+	f, err := os.Open(filepath.Join(shardPath, "indexcount"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if stat.Size() == 0 {
+		return 0, nil
+	}
+
+	var count uint64
+	if err := binary.Read(f, binary.LittleEndian, &count); err != nil {
+		return 0, errors.Wrap(err, "read counter from file")
+	}
+	return count, nil
+}
+
+func (c *Counter) Get() uint64 {
+	c.Lock()
+	defer c.Unlock()
+	return c.count
+}
+
+func (c *Counter) GetAndInc() (uint64, error) {
+	c.Lock()
+	defer c.Unlock()
+	before := c.count
+	c.count++
+	c.f.Seek(0, 0)
+	err := binary.Write(c.f, binary.LittleEndian, &c.count)
+	if err != nil {
+		return 0, errors.Wrap(err, "increase counter on disk")
+	}
+	c.f.Seek(0, 0)
+	return before, nil
+}
+
+// PreviewNext can be used to check if there is data present in the index, if
+// it returns 0, you can be certain that no data exists
+func (c *Counter) PreviewNext() uint64 {
+	c.Lock()
+	defer c.Unlock()
+
+	return c.count
+}
+
+func (c *Counter) Drop(keepFiles bool) error {
+	c.Lock()
+	defer c.Unlock()
+	if c.f == nil {
+		return nil
+	}
+	filename := c.FileName()
+	c.f.Close()
+	if !keepFiles {
+		err := os.Remove(filename)
+		if err != nil {
+			return errors.Wrap(err, "drop counter file")
+		}
+	}
+	return nil
+}
+
+func (c *Counter) FileName() string {
+	return c.f.Name()
+}
