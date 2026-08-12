@@ -1,0 +1,399 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.flink.table.api.internal;
+
+import org.apache.flink.annotation.Internal;
+import org.apache.flink.table.api.TableException;
+import org.apache.flink.table.catalog.CatalogBaseTable;
+import org.apache.flink.table.catalog.CatalogBaseTable.TableKind;
+import org.apache.flink.table.catalog.CatalogDescriptor;
+import org.apache.flink.table.catalog.CatalogView;
+import org.apache.flink.table.catalog.Column;
+import org.apache.flink.table.catalog.IntervalFreshness;
+import org.apache.flink.table.catalog.ObjectIdentifier;
+import org.apache.flink.table.catalog.QueryOperationCatalogView;
+import org.apache.flink.table.catalog.ResolvedCatalogBaseTable;
+import org.apache.flink.table.catalog.ResolvedCatalogMaterializedTable;
+import org.apache.flink.table.catalog.ResolvedCatalogModel;
+import org.apache.flink.table.catalog.ResolvedCatalogTable;
+import org.apache.flink.table.catalog.ResolvedSchema;
+import org.apache.flink.table.catalog.TableDistribution;
+import org.apache.flink.table.catalog.UniqueConstraint;
+import org.apache.flink.table.expressions.SqlFactory;
+import org.apache.flink.table.utils.EncodingUtils;
+
+import org.apache.commons.lang3.StringUtils;
+
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+/** SHOW CREATE statement Util. */
+@Internal
+public class ShowCreateUtil {
+
+    private static final String PRINT_INDENT = "  ";
+
+    private ShowCreateUtil() {}
+
+    public static String buildShowCreateModelRow(
+            ResolvedCatalogModel model, ObjectIdentifier modelIdentifier, boolean isTemporary) {
+        StringBuilder sb =
+                new StringBuilder()
+                        .append(
+                                buildCreateFormattedPrefix(
+                                        "MODEL", isTemporary, modelIdentifier, false));
+        extractFormattedColumns(model.getResolvedInputSchema())
+                .ifPresent(
+                        c -> sb.append(String.format("INPUT (%s)%s", c, System.lineSeparator())));
+        extractFormattedColumns(model.getResolvedOutputSchema())
+                .ifPresent(
+                        c -> sb.append(String.format("OUTPUT (%s)%s", c, System.lineSeparator())));
+        extractComment(model)
+                .ifPresent(c -> sb.append(formatComment(c)).append(System.lineSeparator()));
+        extractFormattedOptions(model.getOptions(), PRINT_INDENT)
+                .ifPresent(
+                        v ->
+                                sb.append(String.format("WITH (%s", System.lineSeparator()))
+                                        .append(v)
+                                        .append(
+                                                String.format(
+                                                        "%s)%s",
+                                                        System.lineSeparator(),
+                                                        System.lineSeparator())));
+        return sb.toString();
+    }
+
+    public static String buildShowCreateTableRow(
+            ResolvedCatalogBaseTable<?> table,
+            ObjectIdentifier tableIdentifier,
+            boolean isTemporary,
+            SqlFactory sqlFactory) {
+        validateTableKind(table, tableIdentifier, TableKind.TABLE);
+        StringBuilder sb =
+                new StringBuilder()
+                        .append(
+                                buildCreateFormattedPrefix(
+                                        "TABLE", isTemporary, tableIdentifier, true));
+        sb.append(extractFormattedColumns(table, PRINT_INDENT));
+        extractFormattedWatermarkSpecs(table, PRINT_INDENT, sqlFactory)
+                .ifPresent(watermarkSpecs -> sb.append(",\n").append(watermarkSpecs));
+        extractFormattedPrimaryKey(table, PRINT_INDENT)
+                .ifPresent(pk -> sb.append(",\n").append(pk));
+        sb.append("\n)\n");
+        extractComment(table).ifPresent(c -> sb.append(formatComment(c)).append("\n"));
+        extractFormattedDistributedInfo((ResolvedCatalogTable) table)
+                .ifPresent(d -> sb.append(d).append("\n"));
+        extractFormattedPartitionedInfo((ResolvedCatalogTable) table)
+                .ifPresent(
+                        partitionedInfoFormatted ->
+                                sb.append(formatPartitionedBy(partitionedInfoFormatted)));
+        extractFormattedOptions(table.getOptions(), PRINT_INDENT)
+                .ifPresent(v -> sb.append("WITH (\n").append(v).append("\n)\n"));
+        return sb.toString();
+    }
+
+    /** Show create materialized table statement only for materialized tables. */
+    public static String buildShowCreateMaterializedTableRow(
+            ResolvedCatalogMaterializedTable table,
+            ObjectIdentifier tableIdentifier,
+            boolean isTemporary,
+            SqlFactory sqlFactory) {
+        validateTableKind(table, tableIdentifier, TableKind.MATERIALIZED_TABLE);
+        StringBuilder sb =
+                new StringBuilder()
+                        .append(
+                                buildCreateFormattedPrefix(
+                                        "MATERIALIZED TABLE", isTemporary, tableIdentifier, true));
+        sb.append(extractFormattedColumns(table, PRINT_INDENT));
+        extractFormattedWatermarkSpecs(table, PRINT_INDENT, sqlFactory)
+                .ifPresent(watermarkSpecs -> sb.append(",\n").append(watermarkSpecs));
+        extractFormattedPrimaryKey(table, PRINT_INDENT)
+                .ifPresent(pk -> sb.append(",\n").append(pk));
+        sb.append("\n)\n");
+        extractComment(table).ifPresent(c -> sb.append(formatComment(c)).append("\n"));
+        table.getDistribution()
+                .map(TableDistribution::toString)
+                .ifPresent(d -> sb.append(d).append("\n"));
+        extractFormattedPartitionedInfo(table)
+                .ifPresent(partitionedBy -> sb.append(formatPartitionedBy(partitionedBy)));
+        extractFormattedOptions(table.getOptions(), PRINT_INDENT)
+                .ifPresent(v -> sb.append("WITH (\n").append(v).append("\n)\n"));
+        sb.append(extractFreshness(table))
+                .append("\n")
+                .append(extractRefreshMode(table))
+                .append("\n");
+        sb.append("AS ").append(table.getExpandedQuery()).append('\n');
+        return sb.toString();
+    }
+
+    /** Show create view statement only for views. */
+    public static String buildShowCreateViewRow(
+            ResolvedCatalogBaseTable<?> view,
+            ObjectIdentifier viewIdentifier,
+            boolean isTemporary) {
+        validateTableKind(view, viewIdentifier, TableKind.VIEW);
+        final CatalogBaseTable origin = view.getOrigin();
+        if (origin instanceof QueryOperationCatalogView
+                && !((QueryOperationCatalogView) origin).supportsShowCreateView()) {
+            throw new TableException(
+                    "SHOW CREATE VIEW is not supported for views registered by Table API.");
+        }
+        StringBuilder sb =
+                new StringBuilder()
+                        .append(
+                                buildCreateFormattedPrefix(
+                                        "VIEW", isTemporary, viewIdentifier, true));
+        sb.append(extractFormattedColumnNames(view, PRINT_INDENT)).append("\n)\n");
+        extractComment(view).ifPresent(c -> sb.append(formatComment(c)).append("\n"));
+        sb.append("AS ").append(((CatalogView) origin).getExpandedQuery()).append("\n");
+
+        return sb.toString();
+    }
+
+    public static String buildShowCreateCatalogRow(CatalogDescriptor catalogDescriptor) {
+        final Optional<String> comment = catalogDescriptor.getComment();
+        StringBuilder sb = new StringBuilder();
+        sb.append("CREATE CATALOG ")
+                .append(EncodingUtils.escapeIdentifier(catalogDescriptor.getCatalogName()))
+                .append("\n");
+        comment.ifPresent(c -> sb.append(formatComment(c)).append("\n"));
+        extractFormattedOptions(catalogDescriptor.getConfiguration().toMap(), PRINT_INDENT)
+                .ifPresent(o -> sb.append("WITH (\n").append(o).append("\n)\n"));
+        return sb.toString();
+    }
+
+    static String buildCreateFormattedPrefix(
+            String type,
+            boolean isTemporary,
+            ObjectIdentifier identifier,
+            boolean openParenthesis) {
+        return String.format(
+                "CREATE %s%s %s%s%s",
+                isTemporary ? "TEMPORARY " : "",
+                type,
+                identifier.asSerializableString(),
+                openParenthesis ? " (" : "",
+                System.lineSeparator());
+    }
+
+    static Optional<String> extractFormattedPrimaryKey(
+            ResolvedCatalogBaseTable<?> table, String printIndent) {
+        Optional<UniqueConstraint> primaryKey = table.getResolvedSchema().getPrimaryKey();
+        return primaryKey.map(
+                uniqueConstraint -> String.format("%s%s", printIndent, uniqueConstraint));
+    }
+
+    static String getColumnString(Column column) {
+        final StringBuilder sb = new StringBuilder();
+        sb.append(EncodingUtils.escapeIdentifier(column.getName()));
+        sb.append(" ");
+        // skip data type for computed column
+        if (column instanceof Column.ComputedColumn) {
+            sb.append(
+                    column.explainExtras()
+                            .orElseThrow(
+                                    () ->
+                                            new TableException(
+                                                    String.format(
+                                                            "Column expression can not be null for computed column '%s'",
+                                                            column.getName()))));
+        } else {
+            sb.append(column.getDataType().getLogicalType().asSerializableString());
+            column.explainExtras()
+                    .ifPresent(
+                            e -> {
+                                sb.append(" ");
+                                sb.append(e);
+                            });
+        }
+        column.getComment()
+                .ifPresent(
+                        comment -> {
+                            if (StringUtils.isNotEmpty(comment)) {
+                                sb.append(" ");
+                                sb.append(formatComment(comment));
+                            }
+                        });
+        return sb.toString();
+    }
+
+    static String extractFormattedColumns(ResolvedCatalogBaseTable<?> table, String printIndent) {
+        return table.getResolvedSchema().getColumns().stream()
+                .map(column -> String.format("%s%s", printIndent, getColumnString(column)))
+                .collect(Collectors.joining(",\n"));
+    }
+
+    static Optional<String> extractFormattedColumns(ResolvedSchema schema) {
+        List<Column> columns = schema.getColumns();
+        if (columns.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+                columns.stream()
+                        .map(ShowCreateUtil::getColumnString)
+                        .collect(Collectors.joining(", ")));
+    }
+
+    static Optional<String> extractFormattedWatermarkSpecs(
+            ResolvedCatalogBaseTable<?> table, String printIndent, SqlFactory sqlFactory) {
+        if (table.getResolvedSchema().getWatermarkSpecs().isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+                table.getResolvedSchema().getWatermarkSpecs().stream()
+                        .map(
+                                watermarkSpec ->
+                                        String.format(
+                                                "%sWATERMARK FOR %s AS %s",
+                                                printIndent,
+                                                EncodingUtils.escapeIdentifier(
+                                                        watermarkSpec.getRowtimeAttribute()),
+                                                watermarkSpec
+                                                        .getWatermarkExpression()
+                                                        .asSerializableString(sqlFactory)))
+                        .collect(Collectors.joining("\n")));
+    }
+
+    private static String formatComment(String comment) {
+        return String.format("COMMENT '%s'", EncodingUtils.escapeSingleQuotes(comment));
+    }
+
+    private static String formatPartitionedBy(String partitionedByColumns) {
+        return String.format("PARTITIONED BY (%s)\n", partitionedByColumns);
+    }
+
+    static Optional<String> extractComment(ResolvedCatalogBaseTable<?> table) {
+        return StringUtils.isEmpty(table.getComment())
+                ? Optional.empty()
+                : Optional.of(table.getComment());
+    }
+
+    static Optional<String> extractComment(ResolvedCatalogModel model) {
+        return StringUtils.isEmpty(model.getComment())
+                ? Optional.empty()
+                : Optional.of(model.getComment());
+    }
+
+    static Optional<String> extractFormattedDistributedInfo(ResolvedCatalogTable catalogTable) {
+        return catalogTable.getDistribution().map(TableDistribution::toString);
+    }
+
+    static Optional<String> extractFormattedPartitionedInfo(ResolvedCatalogTable catalogTable) {
+        if (!catalogTable.isPartitioned()) {
+            return Optional.empty();
+        }
+        return Optional.of(extractPartitionKeys(catalogTable.getPartitionKeys()));
+    }
+
+    static Optional<String> extractFormattedPartitionedInfo(
+            ResolvedCatalogMaterializedTable catalogMaterializedTable) {
+        if (!catalogMaterializedTable.isPartitioned()) {
+            return Optional.empty();
+        }
+        return Optional.of(extractPartitionKeys(catalogMaterializedTable.getPartitionKeys()));
+    }
+
+    private static String extractPartitionKeys(List<String> partitionKeys) {
+        return partitionKeys.stream()
+                .map(EncodingUtils::escapeIdentifier)
+                .collect(Collectors.joining(", "));
+    }
+
+    static String extractFreshness(ResolvedCatalogMaterializedTable materializedTable) {
+        final IntervalFreshness definitionFreshness = materializedTable.getDefinitionFreshness();
+        return String.format(
+                "FRESHNESS = INTERVAL '%s' %s",
+                definitionFreshness.getInterval(), definitionFreshness.getTimeUnit());
+    }
+
+    static String extractRefreshMode(ResolvedCatalogMaterializedTable materializedTable) {
+        return String.format("REFRESH_MODE = %s", materializedTable.getRefreshMode());
+    }
+
+    static Optional<String> extractFormattedOptions(Map<String, String> conf, String printIndent) {
+        if (Objects.isNull(conf) || conf.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+                conf.entrySet().stream()
+                        .map(
+                                entry ->
+                                        String.format(
+                                                "%s'%s' = '%s'",
+                                                printIndent,
+                                                EncodingUtils.escapeSingleQuotes(entry.getKey()),
+                                                EncodingUtils.escapeSingleQuotes(entry.getValue())))
+                        .sorted()
+                        .collect(Collectors.joining("," + System.lineSeparator())));
+    }
+
+    static String extractFormattedColumnNames(
+            ResolvedCatalogBaseTable<?> baseTable, String printIndent) {
+        return baseTable.getResolvedSchema().getColumns().stream()
+                .map(
+                        column ->
+                                String.format(
+                                        "%s%s",
+                                        printIndent,
+                                        EncodingUtils.escapeIdentifier(column.getName())))
+                .collect(Collectors.joining(",\n"));
+    }
+
+    private static void validateTableKind(
+            ResolvedCatalogBaseTable<?> table,
+            ObjectIdentifier tableIdentifier,
+            TableKind expectedTableKind) {
+        if (table.getTableKind() == expectedTableKind) {
+            return;
+        }
+
+        final String tableKindName = table.getTableKind().name().replace('_', ' ');
+        final String commandToUse = showCreateCommandToUse(table.getTableKind());
+        final String expectedTableKindName = expectedTableKind.name().replace('_', ' ');
+        final String currentCommand = "SHOW CREATE " + expectedTableKindName;
+
+        throw new TableException(
+                String.format(
+                        "%s is only supported for %ss, but %s is a %s. Please use %s instead.",
+                        currentCommand,
+                        expectedTableKindName.toLowerCase(Locale.ROOT),
+                        tableIdentifier.asSerializableString(),
+                        tableKindName.toLowerCase(Locale.ROOT),
+                        commandToUse));
+    }
+
+    private static String showCreateCommandToUse(TableKind tableKind) {
+        switch (tableKind) {
+            case MATERIALIZED_TABLE:
+                return "SHOW CREATE MATERIALIZED TABLE";
+            case TABLE:
+                return "SHOW CREATE TABLE";
+            case VIEW:
+                return "SHOW CREATE VIEW";
+            default:
+                throw new TableException(
+                        String.format(
+                                "SHOW CREATE is not implemented for %s yet.", tableKind.name()));
+        }
+    }
+}
