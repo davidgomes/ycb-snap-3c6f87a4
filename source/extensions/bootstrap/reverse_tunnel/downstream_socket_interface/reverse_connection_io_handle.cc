@@ -78,7 +78,17 @@ void ReverseConnectionIOHandle::cleanup() {
     original_socket_fd_ = -1;
   }
 
-  // Clear cluster to hosts mapping.
+  // Emit close records for established connections that are torn down as part of parent cleanup.
+  if (extension_ != nullptr && worker_dispatcher_ != nullptr) {
+    for (const auto& [connection_key, target] : connection_key_to_target_map_) {
+      extension_->emitAccessLog(worker_dispatcher_->timeSource(), "connection_closed",
+                                config_.src_node_id, config_.src_cluster_id, config_.src_tenant_id,
+                                target.second, target.first, connection_key, "");
+    }
+  }
+
+  // Clear cluster and connection mappings.
+  connection_key_to_target_map_.clear();
   cluster_to_resolved_hosts_map_.clear();
   host_to_conn_info_map_.clear();
 
@@ -773,29 +783,20 @@ void ReverseConnectionIOHandle::removeConnectionState(const std::string& host_ad
 void ReverseConnectionIOHandle::onDownstreamConnectionClosed(const std::string& connection_key) {
   ENVOY_LOG(debug, "reverse_tunnel: Downstream connection closed: {}", connection_key);
 
-  // Find the host for this connection key.
-  std::string host_address;
-  std::string cluster_name;
-
-  // Search through host_to_conn_info_map_ to find which host this connection belongs to.
-  for (const auto& [host, host_info] : host_to_conn_info_map_) {
-    if (host_info.connection_keys.find(connection_key) != host_info.connection_keys.end()) {
-      host_address = host;
-      cluster_name = host_info.cluster_name;
-      break;
-    }
-  }
-
-  if (host_address.empty()) {
+  const auto target_it = connection_key_to_target_map_.find(connection_key);
+  if (target_it == connection_key_to_target_map_.end()) {
     ENVOY_LOG(warn, "Could not find host for connection key: {}", connection_key);
     return;
   }
+  const std::string host_address = target_it->second.first;
+  const std::string cluster_name = target_it->second.second;
 
   if (extension_ != nullptr) {
     extension_->emitAccessLog(getTimeSource(), "connection_closed", config_.src_node_id,
                               config_.src_cluster_id, config_.src_tenant_id, cluster_name,
                               host_address, connection_key, "");
   }
+  connection_key_to_target_map_.erase(target_it);
 
   ENVOY_LOG(debug, "Found connection {} belongs to host {} in cluster {}", connection_key,
             host_address, cluster_name);
@@ -1109,9 +1110,11 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
 
   if (closed || (!error.empty() && !is_success)) {
     if (extension_ != nullptr) {
+      const std::string error_message =
+          error.empty() ? "connection closed during handshake" : error;
       extension_->emitAccessLog(getTimeSource(), "handshake_failure", config_.src_node_id,
                                 config_.src_cluster_id, config_.src_tenant_id, cluster_name,
-                                host_address, connection_key, error);
+                                host_address, connection_key, error_message);
     }
 
     // Handle connection failure.
@@ -1165,6 +1168,7 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
     auto host_it = host_to_conn_info_map_.find(host_address);
     if (host_it != host_to_conn_info_map_.end()) {
       host_it->second.connection_keys.insert(connection_key);
+      connection_key_to_target_map_[connection_key] = {host_address, cluster_name};
       ENVOY_LOG(debug, "reverse_tunnel: Added connection key {} for host {}", connection_key,
                 host_address);
     }

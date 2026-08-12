@@ -1919,6 +1919,7 @@ TEST_F(ReverseConnectionIOHandleTest, OnConnectionDoneSuccess) {
   EXPECT_EQ(bytes_read, 1) << "Expected to read 1 byte from trigger pipe, got " << bytes_read;
   EXPECT_EQ(trigger_byte, 1) << "Expected trigger byte to be 1, got "
                              << static_cast<int>(trigger_byte);
+  extension_->access_logs_.clear();
 }
 
 // Success path where trigger write fails: still enqueues connection and cleans up wrapper.
@@ -2194,6 +2195,7 @@ TEST_F(ReverseConnectionIOHandleTest, OnConnectionDoneFailureAndRecovery) {
   const auto& host_to_conn_info_map = getHostToConnInfoMap();
   EXPECT_EQ(host_to_conn_info_map.size(), 1);
   EXPECT_NE(host_to_conn_info_map.find("192.168.1.1"), host_to_conn_info_map.end());
+  extension_->access_logs_.clear();
 }
 
 // Test downstream connection closure and re-initiation.
@@ -2208,6 +2210,7 @@ TEST_F(ReverseConnectionIOHandleTest, OnDownstreamConnectionClosedTriggersReInit
   auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
   extension_->access_logs_ = {access_log};
   std::vector<std::string> lifecycle_events;
+  std::vector<std::string> lifecycle_connection_keys;
   EXPECT_CALL(*access_log, log(_, _))
       .Times(2)
       .WillRepeatedly(
@@ -2215,6 +2218,8 @@ TEST_F(ReverseConnectionIOHandleTest, OnDownstreamConnectionClosedTriggersReInit
             const auto& metadata = stream_info.dynamicMetadata().filter_metadata().at(
                 "envoy.reverse_tunnel.initiator");
             lifecycle_events.push_back(metadata.fields().at("event").string_value());
+            lifecycle_connection_keys.push_back(
+                metadata.fields().at("connection_key").string_value());
           }));
 
   // Create trigger pipe BEFORE initiating connection to ensure it's ready.
@@ -2311,6 +2316,7 @@ TEST_F(ReverseConnectionIOHandleTest, OnDownstreamConnectionClosedTriggersReInit
   ASSERT_EQ(lifecycle_events.size(), 2);
   EXPECT_EQ(lifecycle_events[0], "handshake_success");
   EXPECT_EQ(lifecycle_events[1], "connection_closed");
+  EXPECT_EQ(lifecycle_connection_keys[0], lifecycle_connection_keys[1]);
 
   // Verify connection key is removed from host tracking.
   host_it = getHostToConnInfoMap().find("192.168.1.1");

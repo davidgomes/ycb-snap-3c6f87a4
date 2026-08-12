@@ -3,6 +3,7 @@
 #include <memory>
 #include <queue>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "envoy/config/core/v3/base.pb.h"
@@ -425,6 +426,9 @@ private:
   absl::flat_hash_map<std::string, HostConnectionInfo> host_to_conn_info_map_;
   // Map from cluster name to set of resolved hosts
   absl::flat_hash_map<std::string, absl::flat_hash_set<std::string>> cluster_to_resolved_hosts_map_;
+  // Stable target metadata for established connections, retained until connection close.
+  absl::flat_hash_map<std::string, std::pair<std::string, std::string>>
+      connection_key_to_target_map_;
 
   // Core components
   const ReverseConnectionSocketConfig config_; // Configuration for reverse connections
