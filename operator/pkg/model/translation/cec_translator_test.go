@@ -246,6 +246,167 @@ func TestSharedIngressTranslator_getServices(t *testing.T) {
 			},
 		},
 		{
+			name: "multi-port TLS passthrough (Gateway API)",
+			fields: fields{
+				name:      "cilium-ingress",
+				namespace: "default",
+			},
+			model: &model.Model{
+				TLSPassthrough: []model.TLSPassthroughListener{
+					{
+						Port: 443,
+						Routes: []model.TLSPassthroughRoute{
+							{
+								Hostnames: []string{"foo.com"},
+								Backends: []model.Backend{
+									{Name: "my-service", Namespace: "default", Port: &model.BackendPort{Port: 8080}},
+								},
+							},
+						},
+					},
+					{
+						Port: 8443,
+						Routes: []model.TLSPassthroughRoute{
+							{
+								Hostnames: []string{"foo.com"},
+								Backends: []model.Backend{
+									{Name: "my-service-2", Namespace: "default", Port: &model.BackendPort{Port: 9090}},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: []*ciliumv2.ServiceListener{
+				{
+					Name:      "cilium-ingress",
+					Namespace: "default",
+					Ports:     []uint16{443},
+					Listener:  "listener-443",
+				},
+				{
+					Name:      "cilium-ingress",
+					Namespace: "default",
+					Ports:     []uint16{8443},
+					Listener:  "listener-8443",
+				},
+			},
+		},
+		{
+			name: "catch-all HTTPS with multi-port TLS passthrough (Gateway API)",
+			fields: fields{
+				name:      "cilium-ingress",
+				namespace: "default",
+			},
+			model: &model.Model{
+				HTTP: []model.HTTPListener{
+					{
+						Port:     443,
+						Hostname: "*",
+						TLS: []model.TLSSecret{
+							{Name: "example-tls", Namespace: "default"},
+						},
+					},
+				},
+				TLSPassthrough: []model.TLSPassthroughListener{
+					{
+						Port: 6443,
+						Routes: []model.TLSPassthroughRoute{
+							{
+								Hostnames: []string{"foo.com"},
+								Backends: []model.Backend{
+									{Name: "my-service", Namespace: "default", Port: &model.BackendPort{Port: 8080}},
+								},
+							},
+						},
+					},
+					{
+						Port: 8443,
+						Routes: []model.TLSPassthroughRoute{
+							{
+								Hostnames: []string{"foo.com"},
+								Backends: []model.Backend{
+									{Name: "my-service-2", Namespace: "default", Port: &model.BackendPort{Port: 9090}},
+								},
+							},
+						},
+					},
+				},
+			},
+			// The single HTTPS port stays on the shared listener; the TLS
+			// passthrough ports each get their own listener.
+			want: []*ciliumv2.ServiceListener{
+				{
+					Name:      "cilium-ingress",
+					Namespace: "default",
+					Ports:     []uint16{443},
+					Listener:  "listener",
+				},
+				{
+					Name:      "cilium-ingress",
+					Namespace: "default",
+					Ports:     []uint16{6443},
+					Listener:  "listener-6443",
+				},
+				{
+					Name:      "cilium-ingress",
+					Namespace: "default",
+					Ports:     []uint16{8443},
+					Listener:  "listener-8443",
+				},
+			},
+		},
+		{
+			name: "multi-port HTTPS with single-port TLS passthrough (Gateway API)",
+			fields: fields{
+				name:      "cilium-ingress",
+				namespace: "default",
+			},
+			model: &model.Model{
+				HTTP: multiPortHTTPSModel.HTTP,
+				TLSPassthrough: []model.TLSPassthroughListener{
+					{
+						Port: 6443,
+						Routes: []model.TLSPassthroughRoute{
+							{
+								Hostnames: []string{"foo.com"},
+								Backends: []model.Backend{
+									{Name: "my-service", Namespace: "default", Port: &model.BackendPort{Port: 8080}},
+								},
+							},
+						},
+					},
+				},
+			},
+			// The single TLS passthrough port stays on the shared listener.
+			want: []*ciliumv2.ServiceListener{
+				{
+					Name:      "cilium-ingress",
+					Namespace: "default",
+					Ports:     []uint16{80},
+					Listener:  "listener",
+				},
+				{
+					Name:      "cilium-ingress",
+					Namespace: "default",
+					Ports:     []uint16{443},
+					Listener:  "listener-443",
+				},
+				{
+					Name:      "cilium-ingress",
+					Namespace: "default",
+					Ports:     []uint16{50051},
+					Listener:  "listener-50051",
+				},
+				{
+					Name:      "cilium-ingress",
+					Namespace: "default",
+					Ports:     []uint16{6443},
+					Listener:  "listener",
+				},
+			},
+		},
+		{
 			name: "multi-port HTTPS (Gateway API)",
 			fields: fields{
 				name:      "cilium-ingress",

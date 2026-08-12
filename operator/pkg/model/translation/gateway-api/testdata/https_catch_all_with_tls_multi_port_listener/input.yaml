@@ -1,0 +1,57 @@
+http:
+- hostname: '*'
+  name: https
+  port: 443
+  routes:
+  - backends:
+    - name: http-backend
+      namespace: default
+      port:
+        port: 8080
+    path_match:
+      prefix: /web
+    timeout: {}
+  sources:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: my-gateway
+    namespace: default
+    version: v1
+  tls:
+  - name: example-tls
+    namespace: default
+tls_passthrough:
+- hostname: '*'
+  name: tls-6443
+  port: 6443
+  routes:
+  - backends:
+    - name: my-service
+      namespace: default
+      port:
+        port: 8080
+    hostnames:
+    - foo.com
+  sources:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: my-gateway
+    namespace: default
+    version: v1
+- hostname: '*'
+  name: tls-8443
+  port: 8443
+  routes:
+  - backends:
+    - name: my-service-2
+      namespace: default
+      port:
+        port: 9090
+    hostnames:
+    - foo.com
+  sources:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: my-gateway
+    namespace: default
+    version: v1
