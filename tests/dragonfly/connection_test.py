@@ -1162,6 +1162,39 @@ server crashing. The two command classes exercised:
 """
 
 
+async def test_reset_reauthenticates_squashed_pipeline(df_factory):
+    server = df_factory.create(proactor_threads=1, pipeline_squash=1, requirepass="reset-password")
+    server.start()
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+
+    try:
+        writer.write(b"AUTH reset-password\r\n")
+        await writer.drain()
+        assert await reader.readline() == b"+OK\r\n"
+
+        # RESET must split the squash. Commands after it are validated against the reset,
+        # unauthenticated connection rather than the preceding authenticated state.
+        writer.write(b"SET before-reset value\r\n" * 40)
+        writer.write(b"RESET\r\nGET before-reset\r\n")
+        await writer.drain()
+
+        for _ in range(40):
+            assert await reader.readline() == b"+OK\r\n"
+        assert await reader.readline() == b"+RESET\r\n"
+        assert (await reader.readline()).startswith(b"-NOAUTH Authentication required.")
+
+        # RESET itself remains available without authentication and does not discard server data.
+        writer.write(b"RESET\r\nAUTH reset-password\r\nGET before-reset\r\n")
+        await writer.drain()
+        assert await reader.readline() == b"+RESET\r\n"
+        assert await reader.readline() == b"+OK\r\n"
+        assert await reader.readline() == b"$5\r\n"
+        assert await reader.readline() == b"value\r\n"
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 @dfly_args({"proactor_threads": "1", "pipeline_squash": 1})
 async def test_squashed_pipeline_control_commands(df_server: DflyInstance):
     reader, writer = await asyncio.open_connection("localhost", df_server.port)

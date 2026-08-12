@@ -1955,6 +1955,7 @@ void ServerFamily::SendInvalidationMessages() const {
       if (cntx->conn_state.tracking_info_.IsTrackingOn()) {
         facade::Connection::InvalidationMessage x;
         x.invalidate_due_to_flush = true;
+        x.tracking_generation = cntx->tracking_generation;
         cntx->conn()->SendInvalidationMessageAsync(x);
       }
     }

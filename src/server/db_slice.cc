@@ -1776,14 +1776,16 @@ void DbSlice::QueueInvalidationTrackingMessageAtomic(std::string_view key) {
 void DbSlice::SendQueuedInvalidationMessagesCb(const TrackingMap& track_map,
                                                unsigned calling_thread_id) const {
   for (auto& [key, client_list] : track_map) {
-    for (auto& weak_ref : client_list) {
+    for (auto& tracking_ref : client_list) {
+      const auto& weak_ref = tracking_ref.conn_ref;
       if (weak_ref.IsExpired() || (weak_ref.LastKnownThreadId() != calling_thread_id)) {
         continue;  // Expired or migrated.
       }
       auto* conn = weak_ref.Get();
       auto* cntx = static_cast<ConnectionContext*>(conn->cntx());
-      if (cntx && cntx->conn_state.tracking_info_.IsTrackingOn()) {
-        conn->SendInvalidationMessageAsync({key});
+      if (cntx && cntx->conn_state.tracking_info_.IsTrackingOn() &&
+          cntx->tracking_generation == tracking_ref.generation) {
+        conn->SendInvalidationMessageAsync({key, false, tracking_ref.generation});
       }
     }
   }

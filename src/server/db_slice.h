@@ -504,9 +504,10 @@ class DbSlice {
     expire_allowed_ = is_allowed;
   }
 
-  // Track keys for the client represented by the the weak reference to its connection.
-  void TrackKey(const facade::ConnectionRef& conn_ref, std::string_view key) {
-    client_tracking_map_[key].insert(conn_ref);
+  // Track keys for the client represented by the weak reference to its connection.
+  void TrackKey(const facade::ConnectionRef& conn_ref, uint64_t tracking_generation,
+                std::string_view key) {
+    client_tracking_map_[key].insert({conn_ref, tracking_generation});
   }
 
   // Does not check for non supported events. Callers must parse the string and reject it
@@ -659,9 +660,18 @@ class DbSlice {
 
   bool journal_omit_redundant_writes_ = true;
 
+  struct TrackingRef {
+    facade::ConnectionRef conn_ref;
+    uint64_t generation;
+
+    bool operator==(const TrackingRef& other) const {
+      return generation == other.generation && conn_ref == other.conn_ref;
+    }
+  };
+
   struct Hash {
-    size_t operator()(const facade::ConnectionRef& c) const {
-      return std::hash<uint32_t>()(c.GetClientId());
+    size_t operator()(const TrackingRef& c) const {
+      return std::hash<uint32_t>()(c.conn_ref.GetClientId()) ^ std::hash<uint64_t>()(c.generation);
     }
   };
 
@@ -670,13 +680,12 @@ class DbSlice {
   // and polymorphic allocator (new C++ features)
   // the declarations below meant to say:
   // absl::flat_hash_map<std::string,
-  //                    absl::flat_hash_set<facade::Connection::WeakRef, Hash>>
+  //                    absl::flat_hash_set<TrackingRef, Hash>>
   //                    client_tracking_map_
-  using HashSetAllocator = PMR_NS::polymorphic_allocator<facade::ConnectionRef>;
+  using HashSetAllocator = PMR_NS::polymorphic_allocator<TrackingRef>;
 
   using ConnectionHashSet =
-      absl::flat_hash_set<facade::ConnectionRef, Hash,
-                          absl::container_internal::hash_default_eq<facade::ConnectionRef>,
+      absl::flat_hash_set<TrackingRef, Hash, absl::container_internal::hash_default_eq<TrackingRef>,
                           HashSetAllocator>;
 
   using AllocatorType = PMR_NS::polymorphic_allocator<std::pair<std::string, ConnectionHashSet>>;

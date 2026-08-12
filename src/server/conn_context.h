@@ -281,6 +281,14 @@ struct ConnectionState {
       return option_ == option;
     }
 
+    void Reset() {
+      tracking_enabled_ = false;
+      noloop_ = false;
+      option_ = NONE;
+      seq_num_ = 0;
+      caching_seq_num_ = 1;
+    }
+
    private:
     // a flag indicating whether the client has turned on client tracking.
     bool tracking_enabled_ = false;

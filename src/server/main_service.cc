@@ -785,7 +785,7 @@ string_view CommandOptName(CO::CommandOpt opt, bool enabled) {
 }
 
 OpResult<void> OpTrackKeys(const OpArgs slice_args, const facade::Connection::WeakRef& conn_ref,
-                           const ShardArgs& args) {
+                           uint64_t tracking_generation, const ShardArgs& args) {
   if (conn_ref.IsExpired()) {
     DVLOG(2) << "Connection expired, exiting TrackKey function.";
     return OpStatus::OK;
@@ -796,7 +796,7 @@ OpResult<void> OpTrackKeys(const OpArgs slice_args, const facade::Connection::We
   // TODO: There is a bug here that we track all arguments instead of tracking only keys.
   auto& db_slice = slice_args.GetDbSlice();
   for (auto key : args)
-    db_slice.TrackKey(conn_ref, key);
+    db_slice.TrackKey(conn_ref, tracking_generation, key);
 
   return OpStatus::OK;
 }
@@ -816,9 +816,11 @@ void TrackIfNeeded(CommandContext* cmd_cntx) {
     tx->SetTrackingCallback({});
     if (cmd_cntx->cid()->IsReadOnly() && info.ShouldTrackKeys()) {
       auto conn = cntx->conn()->Borrow();
-      tx->SetTrackingCallback([conn](Transaction* trans) {
+      uint64_t tracking_generation = cntx->tracking_generation;
+      tx->SetTrackingCallback([conn, tracking_generation](Transaction* trans) {
         auto* shard = EngineShard::tlocal();
-        OpTrackKeys(trans->GetOpArgs(shard), conn, trans->GetShardArgs(shard->shard_id()));
+        OpTrackKeys(trans->GetOpArgs(shard), conn, tracking_generation,
+                    trans->GetShardArgs(shard->shard_id()));
       });
     }
   }
@@ -1390,7 +1392,7 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId& cid,
   string_view cmd_name{cid.name()};
 
   if (dfly_cntx.req_auth && !dfly_cntx.authenticated) {
-    if (cmd_name != "AUTH" && !cid.IsQuit() && cmd_name != "HELLO") {
+    if (cmd_name != "AUTH" && cmd_name != "RESET" && !cid.IsQuit() && cmd_name != "HELLO") {
       return ErrorReply{"-NOAUTH Authentication required.", facade::kNoAuthErrType};
     }
   }
@@ -1551,7 +1553,7 @@ DispatchResult Service::DispatchCommand(facade::ParsedArgs args, facade::ParsedC
 
   // If inside MULTI block, store command
   bool is_trans_cmd = cid->IsExecGroup();
-  if (dfly_cntx->conn_state.exec_info.IsCollecting() && !is_trans_cmd) {
+  if (dfly_cntx->conn_state.exec_info.IsCollecting() && !is_trans_cmd && cid->name() != "RESET") {
     uint8_t tail_index = args.size() - args_no_cmd.size();
     StoreInMultiBlock(dfly_cntx, cid, parsed_cmd, tail_index);
     cmd_cntx->SendSimpleString("QUEUED");
@@ -1798,7 +1800,7 @@ uint32_t Service::DispatchSquashedBatch(facade::ParsedCommand* first, unsigned c
     const bool is_multi = dfly_cntx->conn_state.exec_info.IsCollecting() || cid->IsExecGroup();
     const bool is_eval = cid->IsEvalGroup();
     if (is_multi || is_eval || cid->IsBlocking() || (cid->opt_mask() & CO::ADMIN) ||
-        cid->IsQuit() || cid->IsSubscribeFamily())
+        cid->IsQuit() || cid->IsSubscribeFamily() || cid->name() == "RESET")
       break;
 
     if (auto err = VerifyCommandState(*cid, tail_args, *dfly_cntx); err) {
@@ -1880,6 +1882,58 @@ facade::ParsedCommand* Service::AllocateParsedCommand() {
 
 const CommandId* Service::FindCmd(std::string_view cmd) const {
   return registry_.Find(cmd);
+}
+
+void Service::Reset(CmdArgParser, CommandContext* cmd_cntx) {
+  auto* cntx = cmd_cntx->server_conn_cntx();
+  auto& conn_state = cntx->conn_state;
+  auto* conn = cmd_cntx->conn();
+
+  MultiCleanup(cntx);
+
+  if (conn_state.subscribe_info) {
+    if (!conn_state.subscribe_info->channels.empty())
+      cntx->UnsubscribeAll(false, nullptr);
+    if (conn_state.subscribe_info)
+      cntx->PUnsubscribeAll(false, nullptr);
+  }
+
+  DeactivateMonitoring(cntx);
+  conn_state.tracking_info_.Reset();
+  ++cntx->tracking_generation;
+  cntx->subscriptions = 0;
+
+  auto cred = user_registry_.GetCredentials("default");
+  cntx->authed_username = "default";
+  cntx->acl_commands = std::move(cred.acl_commands);
+  cntx->keys = std::move(cred.keys);
+  cntx->pub_sub = std::move(cred.pub_sub);
+  cntx->acl_db_idx = cred.db;
+  cntx->ns = &namespaces->GetOrInsert(cred.ns);
+  conn_state.db_index = 0;
+
+  cntx->authenticated = false;
+  cntx->req_auth = false;
+  cntx->skip_acl_validation = conn->IsPrivileged();
+  if (conn->socket()->IsUDS()) {
+    cntx->skip_acl_validation = true;
+  } else if (conn->IsPrivileged() && RequirePrivilegedAuth()) {
+    cntx->req_auth = !GetPassword().empty();
+  } else if (!conn->IsPrivileged()) {
+    if (conn->GetProtocol() == Protocol::MEMCACHE) {
+      cntx->authenticated = true;
+    } else {
+      cntx->req_auth = !user_registry_.AuthUser("default", "");
+    }
+  }
+
+  conn->SetName({});
+  conn->SetLibName({});
+  conn->SetLibVersion({});
+
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
+  rb->SetRespVersion(RespVersion::kResp2);
+  rb->SendSimpleString("RESET");
 }
 
 bool Service::IsLocked(Namespace* ns, DbIndex db_index, std::string_view key) const {
@@ -2980,6 +3034,7 @@ Service::ContextInfo Service::GetContextInfo(facade::ConnectionContext* cntx) co
 
 namespace acl {
 constexpr uint32_t kQuit = FAST | CONNECTION;
+constexpr uint32_t kReset = FAST | CONNECTION;
 constexpr uint32_t kMulti = FAST | TRANSACTION;
 constexpr uint32_t kWatch = FAST | TRANSACTION;
 constexpr uint32_t kUnwatch = FAST | TRANSACTION;
@@ -3005,6 +3060,7 @@ void Service::Register(CommandRegistry* registry) {
   registry->StartFamily();
   *registry
       << CI{"QUIT", CO::FAST, 1, 0, 0, acl::kQuit}.HFUNC(Quit)
+      << CI{"RESET", CO::NOSCRIPT | CO::FAST | CO::LOADING, 1, 0, 0, acl::kReset}.MFUNC(Reset)
       << CI{"MULTI", CO::NOSCRIPT | CO::FAST | CO::LOADING, 1, 0, 0, acl::kMulti}.HFUNC(Multi)
       << CI{"WATCH", CO::LOADING, -2, 1, -1, acl::kWatch}.HFUNC(Watch)
       << CI{"UNWATCH", CO::LOADING, 1, 0, 0, acl::kUnwatch}.HFUNC(Unwatch)

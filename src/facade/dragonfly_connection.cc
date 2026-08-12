@@ -707,7 +707,9 @@ void Connection::AsyncOperations::operator()(CheckpointMessage msg) {
 
 void Connection::AsyncOperations::operator()(const InvalidationMessage& msg) {
   RedisReplyBuilder* rbuilder = (RedisReplyBuilder*)builder;
-  DCHECK(rbuilder->IsResp3());
+  if (!rbuilder->IsResp3() || msg.tracking_generation != self->cntx()->tracking_generation)
+    return;
+
   rbuilder->StartCollection(2, facade::CollectionType::PUSH);
   rbuilder->SendBulkString("invalidate");
   if (msg.invalidate_due_to_flush) {

@@ -129,6 +129,7 @@ class Connection : public util::Connection {
   struct InvalidationMessage {
     std::string key;
     bool invalidate_due_to_flush = false;
+    uint64_t tracking_generation = 0;
   };
 
   // Pipeline message, accumulated Redis command to be executed.

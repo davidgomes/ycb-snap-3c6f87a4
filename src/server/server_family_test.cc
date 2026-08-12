@@ -380,6 +380,57 @@ TEST_F(ServerFamilyTest, ToggleTrackingOnAndOff) {
   EXPECT_EQ(InvalidationMessagesLen("IO0"), 0);
 }
 
+TEST_F(ServerFamilyTest, ResetClearsConnectionState) {
+  EXPECT_THAT(Run({"RESET", "unexpected"}),
+              ErrArg("wrong number of arguments for 'reset' command"));
+
+  Run({"HELLO", "3"});
+  EXPECT_THAT(Run({"CLIENT", "TRACKING", "ON"}), "OK");
+  EXPECT_EQ(NumSubscriptions("IO0"), 1u);
+  Run({"GET", "tracked-before-reset"});
+  EXPECT_THAT(Run({"SELECT", "2"}), "OK");
+  EXPECT_THAT(Run({"CLIENT", "SETNAME", "needs-reset"}), "OK");
+  EXPECT_THAT(Run({"WATCH", "watched"}), "OK");
+  EXPECT_THAT(Run({"MULTI"}), "OK");
+  EXPECT_THAT(Run({"SET", "discarded", "value"}), "QUEUED");
+
+  EXPECT_THAT(Run({"RESET"}), "RESET");
+  EXPECT_EQ(NumSubscriptions("IO0"), 0u);
+  EXPECT_THAT(Run({"EXEC"}), ErrArg("EXEC without MULTI"));
+  EXPECT_THAT(Run({"CLIENT", "GETNAME"}), ArgType(RespExpr::NIL));
+  EXPECT_THAT(Run({"CLIENT", "TRACKING", "ON"}),
+              ErrArg("Client tracking is currently not supported for RESP2"));
+  EXPECT_THAT(Run({"GET", "discarded"}), ArgType(RespExpr::NIL));
+
+  // The WATCH from DB 2 must not affect a new transaction after RESET.
+  EXPECT_THAT(Run("watch-mutator", {"SELECT", "2"}), "OK");
+  EXPECT_THAT(Run("watch-mutator", {"SET", "watched", "changed"}), "OK");
+  EXPECT_THAT(Run({"MULTI"}), "OK");
+  EXPECT_THAT(Run({"SET", "after-reset", "value"}), "QUEUED");
+  EXPECT_THAT(Run({"EXEC"}), RespElementsAre("OK"));
+
+  // Re-enabling tracking must not revive keys tracked before RESET.
+  Run({"HELLO", "3"});
+  EXPECT_THAT(Run({"CLIENT", "TRACKING", "ON"}), "OK");
+  EXPECT_THAT(Run({"SET", "tracked-before-reset", "changed-again"}), "OK");
+  EXPECT_EQ(InvalidationMessagesLen("IO0"), 0u);
+}
+
+TEST_F(ServerFamilyTest, ResetUnsubscribesAndExitsMonitor) {
+  Run({"SUBSCRIBE", "channel"});
+  Run({"PSUBSCRIBE", "pattern*"});
+  EXPECT_EQ(NumSubscriptions("IO0"), 1u);
+
+  EXPECT_THAT(Run({"RESET"}), "RESET");
+  EXPECT_EQ(NumSubscriptions("IO0"), 0u);
+  EXPECT_THAT(Run({"PUBLISH", "channel", "message"}), IntArg(0));
+
+  EXPECT_THAT(Run({"MONITOR"}), "OK");
+  EXPECT_EQ(NumSubscriptions("IO0"), 1u);
+  EXPECT_THAT(Run({"RESET"}), "RESET");
+  EXPECT_EQ(NumSubscriptions("IO0"), 0u);
+}
+
 TEST_F(ServerFamilyTest, ClientTrackingReadKey) {
   // case 1. only read the keys doesn't trigger any notification.
   Run({"HELLO", "3"});

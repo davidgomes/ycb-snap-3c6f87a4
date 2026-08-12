@@ -88,6 +88,10 @@ class ConnectionContext {
   // How many async subscription sources are active: monitor and/or pubsub - at most 2.
   uint8_t subscriptions;
 
+  // Incremented when connection-local client tracking is reset. Invalidation messages carry the
+  // generation that registered the tracked key, so stale registrations cannot survive RESET.
+  uint64_t tracking_generation = 0;
+
  private:
   Connection* owner_;
 };
