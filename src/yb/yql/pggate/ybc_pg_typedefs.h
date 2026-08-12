@@ -894,6 +894,13 @@ typedef struct {
   bool is_hash_partitioned;
   const char* tablet_state;
   YbcPgOid pg_table_oid;
+  /*
+   * Human-readable DocDB representation of the partition bounds for
+   * range-sharded tablets (same rendering as the master UI tablet listing).
+   * NULL for hash-sharded tablets and for unbounded edges.
+   */
+  const char* start_range;
+  const char* end_range;
 } YbcPgGlobalTabletsDescriptor;
 
 typedef struct {
