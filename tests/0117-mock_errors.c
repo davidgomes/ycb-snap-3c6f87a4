@@ -43,6 +43,35 @@
  */
 
 /**
+ * @brief Verify partition request error configuration and topic creation.
+ */
+static void do_test_partition_request_errors(void) {
+        rd_kafka_mock_cluster_t *mcluster;
+        const char *bootstraps;
+
+        SUB_TEST();
+
+        mcluster = test_mock_cluster_new(1, &bootstraps);
+
+        TEST_ASSERT(rd_kafka_mock_partition_push_request_errors(
+                        mcluster, "partition-errors", 2, RD_KAFKAP_Produce, 2,
+                        RD_KAFKA_RESP_ERR_INVALID_REQUEST,
+                        RD_KAFKA_RESP_ERR_KAFKA_STORAGE_ERROR) ==
+                        RD_KAFKA_RESP_ERR_NO_ERROR,
+                    "Failed to configure partition request errors");
+
+        /* The unknown topic was auto-created with partitions 0 through 2. */
+        TEST_ASSERT(rd_kafka_mock_partition_push_request_errors(
+                        mcluster, "partition-errors", 3, RD_KAFKAP_Produce, 1,
+                        RD_KAFKA_RESP_ERR_INVALID_REQUEST) ==
+                        RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART,
+                    "Expected out-of-range partition to be rejected");
+
+        test_mock_cluster_destroy(mcluster);
+        SUB_TEST_PASS();
+}
+
+/**
  * @brief Test producer handling (retry) of ERR_KAFKA_STORAGE_ERROR.
  */
 static void do_test_producer_storage_error(rd_bool_t too_few_retries) {
@@ -317,6 +346,7 @@ int main_0117_mock_errors(int argc, char **argv) {
 
         TEST_SKIP_MOCK_CLUSTER(0);
 
+        do_test_partition_request_errors();
         do_test_producer_storage_error(rd_false);
         do_test_producer_storage_error(rd_true);
 
