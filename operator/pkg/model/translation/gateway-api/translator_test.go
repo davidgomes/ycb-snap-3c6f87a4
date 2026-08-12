@@ -9,9 +9,12 @@ import (
 	"strings"
 	"testing"
 
+	envoy_config_listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	envoy_extensions_filters_network_tcp_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -107,6 +110,89 @@ func Test_translator_Translate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTranslatorTranslateMultiPortTLSPassthrough(t *testing.T) {
+	gateway := model.FullyQualifiedResource{
+		Group:     gatewayv1.GroupVersion.Group,
+		Version:   gatewayv1.GroupVersion.Version,
+		Kind:      "Gateway",
+		Name:      "my-gateway",
+		Namespace: "default",
+	}
+	input := &model.Model{
+		TLSPassthrough: []model.TLSPassthroughListener{
+			tlsPassthroughListener(gateway, 443, "backend-443", 8080),
+			tlsPassthroughListener(gateway, 8443, "backend-8443", 8443),
+		},
+	}
+	translator := &gatewayAPITranslator{
+		cecTranslator: translation.NewCECTranslator(translation.Config{}),
+	}
+
+	cec, service, _, err := translator.Translate(input)
+
+	require.NoError(t, err)
+	require.Equal(t, []corev1.ServicePort{
+		{Name: "port-443", Port: 443, Protocol: corev1.ProtocolTCP},
+		{Name: "port-8443", Port: 8443, Protocol: corev1.ProtocolTCP},
+	}, service.Spec.Ports)
+	require.Equal(t, map[uint16]string{
+		443:  "listener-443",
+		8443: "listener-8443",
+	}, serviceListenersByPort(cec))
+
+	listeners := envoyListeners(t, cec)
+	require.Len(t, listeners, 2)
+	require.Equal(t, "default:backend-443:8080", tlsPassthroughCluster(t, listeners["listener-443"]))
+	require.Equal(t, "default:backend-8443:8443", tlsPassthroughCluster(t, listeners["listener-8443"]))
+}
+
+func TestTranslatorTranslateCatchAllHTTPSWithMultiPortTLSPassthrough(t *testing.T) {
+	gateway := model.FullyQualifiedResource{
+		Group:     gatewayv1.GroupVersion.Group,
+		Version:   gatewayv1.GroupVersion.Version,
+		Kind:      "Gateway",
+		Name:      "my-gateway",
+		Namespace: "default",
+	}
+	input := &model.Model{
+		HTTP: []model.HTTPListener{
+			{
+				Hostname: "*",
+				Port:     443,
+				Sources:  []model.FullyQualifiedResource{gateway},
+				TLS:      []model.TLSSecret{{Name: "catch-all-tls", Namespace: "default"}},
+			},
+		},
+		TLSPassthrough: []model.TLSPassthroughListener{
+			tlsPassthroughListener(gateway, 8443, "backend-8443", 8443),
+			tlsPassthroughListener(gateway, 9443, "backend-9443", 9443),
+		},
+	}
+	translator := &gatewayAPITranslator{
+		cecTranslator: translation.NewCECTranslator(translation.Config{}),
+	}
+
+	cec, service, _, err := translator.Translate(input)
+
+	require.NoError(t, err)
+	require.Equal(t, []corev1.ServicePort{
+		{Name: "port-443", Port: 443, Protocol: corev1.ProtocolTCP},
+		{Name: "port-8443", Port: 8443, Protocol: corev1.ProtocolTCP},
+		{Name: "port-9443", Port: 9443, Protocol: corev1.ProtocolTCP},
+	}, service.Spec.Ports)
+	require.Equal(t, map[uint16]string{
+		443:  "listener",
+		8443: "listener-8443",
+		9443: "listener-9443",
+	}, serviceListenersByPort(cec))
+
+	listeners := envoyListeners(t, cec)
+	require.Len(t, listeners, 3)
+	require.NotEqual(t, "envoy.filters.network.tcp_proxy", listeners["listener"].FilterChains[0].Filters[0].Name)
+	require.Equal(t, "default:backend-8443:8443", tlsPassthroughCluster(t, listeners["listener-8443"]))
+	require.Equal(t, "default:backend-9443:9443", tlsPassthroughCluster(t, listeners["listener-9443"]))
 }
 
 func Test_translator_Translate_HostNetwork(t *testing.T) {
@@ -485,6 +571,67 @@ func Test_translator_Translate_ShortensCECName(t *testing.T) {
 	require.Equal(t, shortener.ShortenK8sResourceName(CiliumGatewayPrefix+longName), cec.Name)
 	require.Equal(t, svc.Name, cec.Name)
 	require.LessOrEqual(t, len(cec.Name), 63, "CiliumEnvoyConfig name is too long")
+}
+
+func tlsPassthroughListener(gateway model.FullyQualifiedResource, port uint32, backendName string, backendPort uint32) model.TLSPassthroughListener {
+	return model.TLSPassthroughListener{
+		Hostname: "*",
+		Port:     port,
+		Sources:  []model.FullyQualifiedResource{gateway},
+		Routes: []model.TLSPassthroughRoute{
+			{
+				Hostnames: []string{"shared.example.com"},
+				Backends: []model.Backend{
+					{
+						Name:      backendName,
+						Namespace: "default",
+						Port:      &model.BackendPort{Port: backendPort},
+					},
+				},
+			},
+		},
+	}
+}
+
+func serviceListenersByPort(cec *ciliumv2.CiliumEnvoyConfig) map[uint16]string {
+	listenersByPort := make(map[uint16]string)
+	for _, serviceListener := range cec.Spec.Services {
+		for _, port := range serviceListener.Ports {
+			listenersByPort[port] = serviceListener.Listener
+		}
+	}
+	return listenersByPort
+}
+
+func envoyListeners(t *testing.T, cec *ciliumv2.CiliumEnvoyConfig) map[string]*envoy_config_listener.Listener {
+	t.Helper()
+
+	const envoyListenerTypeURL = "type.googleapis.com/envoy.config.listener.v3.Listener"
+	listeners := make(map[string]*envoy_config_listener.Listener)
+	for _, resource := range cec.Spec.Resources {
+		if resource.GetTypeUrl() != envoyListenerTypeURL {
+			continue
+		}
+
+		listener := &envoy_config_listener.Listener{}
+		require.NoError(t, proto.Unmarshal(resource.Value, listener))
+		listeners[listener.Name] = listener
+	}
+	return listeners
+}
+
+func tlsPassthroughCluster(t *testing.T, listener *envoy_config_listener.Listener) string {
+	t.Helper()
+
+	require.NotNil(t, listener)
+	require.Len(t, listener.FilterChains, 1)
+	require.Len(t, listener.FilterChains[0].Filters, 1)
+	filter := listener.FilterChains[0].Filters[0]
+	require.Equal(t, "envoy.filters.network.tcp_proxy", filter.Name)
+
+	tcpProxy := &envoy_extensions_filters_network_tcp_v3.TcpProxy{}
+	require.NoError(t, filter.GetTypedConfig().UnmarshalTo(tcpProxy))
+	return tcpProxy.GetCluster()
 }
 
 func readInput(t *testing.T, file string, obj any) {
