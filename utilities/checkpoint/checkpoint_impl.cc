@@ -19,7 +19,13 @@
 #include <vector>
 
 #include "db/wal_manager.h"
+#include "db/column_family.h"
+#include "db/db_impl/db_impl.h"
+#include "db/log_reader.h"
+#include "db/log_writer.h"
+#include "db/version_edit.h"
 #include "file/file_util.h"
+#include "file/filename.h"
 #include "file/filename.h"
 #include "logging/logging.h"
 #include "port/port.h"
@@ -84,7 +90,7 @@ class CheckpointEngineImpl : public CheckpointEngine {
     const bool use_link = options_.use_link_file_when_available;
     CheckpointImpl impl(source_db);
     return status_to_io_status(impl.CreateCheckpointImpl(
-        destination_dir, create_options.log_size_for_flush, sequence_number_ptr,
+        destination_dir, std::vector<ColumnFamilyHandle*>(), create_options.log_size_for_flush, sequence_number_ptr,
         copy_engine_.get(), use_link, options_.backup_rate_limiter.get()));
   }
 
@@ -274,6 +280,13 @@ Status Checkpoint::CreateCheckpoint(const std::string& /*checkpoint_dir*/,
   return Status::NotSupported("");
 }
 
+Status Checkpoint::CreateCheckpoint(const std::string& /*checkpoint_dir*/,
+                                    const std::vector<ColumnFamilyHandle*>& /*column_families*/,
+                                    uint64_t /*log_size_for_flush*/,
+                                    uint64_t* /*sequence_number_ptr*/) {
+  return Status::NotSupported("");
+}
+
 Status CheckpointImpl::CleanStagingDirectory(
     const std::string& full_private_path, Logger* info_log) {
   std::vector<std::string> subchildren;
@@ -318,15 +331,17 @@ Status Checkpoint::ExportColumnFamily(
 }
 
 // Builds an openable snapshot of RocksDB
-Status CheckpointImpl::CreateCheckpoint(const std::string& checkpoint_dir,
-                                        uint64_t log_size_for_flush,
-                                        uint64_t* sequence_number_ptr) {
-  return CreateCheckpointImpl(checkpoint_dir, log_size_for_flush,
+Status CheckpointImpl::CreateCheckpoint(
+    const std::string& checkpoint_dir,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    uint64_t log_size_for_flush, uint64_t* sequence_number_ptr) {
+  return CreateCheckpointImpl(checkpoint_dir, column_families, log_size_for_flush,
                               sequence_number_ptr, /*engine=*/nullptr,
                               /*use_link=*/true, /*copy_rate_limiter=*/nullptr);
 }
 
 Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
+                                            const std::vector<ColumnFamilyHandle*>& column_families,
                                             uint64_t log_size_for_flush,
                                             uint64_t* sequence_number_ptr,
                                             CopyEngine* engine, bool use_link,
@@ -374,6 +389,44 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
         " needed before checkpoint creation : " + s.ToString());
   }
 
+  std::unordered_set<std::string> included_cf_names;
+  std::unordered_set<uint64_t> excluded_file_numbers;
+  bool is_subset = !column_families.empty();
+  if (is_subset) {
+    DBImpl* db_impl = static_cast_with_check<DBImpl>(db_);
+    for (auto handle : column_families) {
+      if (handle == nullptr) {
+        return Status::InvalidArgument("Null column family handle");
+      }
+      auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(handle);
+      if (cfh->db() != db_impl) {
+        return Status::InvalidArgument("Column family handle does not belong to this DB");
+      }
+      if (cfh->cfd()->IsDropped()) {
+        return Status::InvalidArgument("Column family dropped");
+      }
+      included_cf_names.insert(handle->GetName());
+    }
+    // Always include default CF
+    included_cf_names.insert(db_->DefaultColumnFamily()->GetName());
+
+    std::vector<ColumnFamilyMetaData> all_meta;
+    db_->GetAllColumnFamilyMetaData(&all_meta);
+
+    for (const auto& meta : all_meta) {
+      if (included_cf_names.find(meta.name) == included_cf_names.end()) {
+        for (const auto& level : meta.levels) {
+          for (const auto& file : level.files) {
+            excluded_file_numbers.insert(file.file_number);
+          }
+        }
+        for (const auto& blob : meta.blob_files) {
+          excluded_file_numbers.insert(blob.blob_file_number);
+        }
+      }
+    }
+  }
+
   std::unique_ptr<CheckpointFileMover> mover;
   if (engine == nullptr) {
     mover = std::make_unique<SerialFileMover>(fs, db_options.use_fsync,
@@ -395,15 +448,35 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
     if (s.ok() || s.IsNotSupported()) {
       s = CreateCustomCheckpoint(
           [&](const std::string& src_dirname, const std::string& fname,
-              FileType, const Temperature temperature) -> Status {
+              FileType type, const Temperature temperature) -> Status {
+            if (is_subset && (type == kTableFile || type == kBlobFile)) {
+              uint64_t number;
+              FileType parsed_type;
+              if (ParseFileName(fname, &number, &parsed_type) &&
+                  (parsed_type == kTableFile || parsed_type == kBlobFile)) {
+                if (excluded_file_numbers.find(number) != excluded_file_numbers.end()) {
+                  return Status::OK();
+                }
+              }
+            }
             return mover->Link(src_dirname + "/" + fname,
                                full_private_path + "/" + fname, temperature);
           } /* link_file_cb */,
           [&](const std::string& src_dirname, const std::string& fname,
-              uint64_t size_limit_bytes, FileType,
+              uint64_t size_limit_bytes, FileType type,
               const std::string& /* checksum_func_name */,
               const std::string& /* checksum_val */,
               const Temperature temperature) -> Status {
+            if (is_subset && (type == kTableFile || type == kBlobFile)) {
+              uint64_t number;
+              FileType parsed_type;
+              if (ParseFileName(fname, &number, &parsed_type) &&
+                  (parsed_type == kTableFile || parsed_type == kBlobFile)) {
+                if (excluded_file_numbers.find(number) != excluded_file_numbers.end()) {
+                  return Status::OK();
+                }
+              }
+            }
             return mover->Copy(src_dirname + "/" + fname,
                                full_private_path + "/" + fname,
                                size_limit_bytes, temperature);
@@ -421,6 +494,75 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
         s = finish_s;
       } else {
         finish_s.PermitUncheckedError();
+      }
+
+      if (is_subset && s.ok()) {
+        std::vector<std::string> children;
+        s = env->GetChildren(full_private_path, &children);
+        std::string manifest_fname;
+        if (s.ok()) {
+          for (const auto& child : children) {
+            if (child.find("MANIFEST-") == 0) {
+              manifest_fname = child;
+              break;
+            }
+          }
+          if (manifest_fname.empty()) {
+            s = Status::Corruption("MANIFEST file not found in checkpoint");
+          }
+        }
+
+        if (s.ok()) {
+          std::string manifest_path = full_private_path + "/" + manifest_fname;
+          std::unique_ptr<FSSequentialFile> manifest_file;
+          IOStatus io_s = fs->NewSequentialFile(manifest_path, FileOptions(), &manifest_file, nullptr);
+          s = io_s;
+          std::vector<uint32_t> cf_ids_to_drop;
+          if (s.ok()) {
+            std::unique_ptr<SequentialFileReader> manifest_file_reader(
+                new SequentialFileReader(std::move(manifest_file), manifest_path));
+            log::Reader reader(nullptr, std::move(manifest_file_reader), nullptr, true, 0);
+            Slice record;
+            std::string scratch;
+            std::unordered_map<uint32_t, std::string> id_to_name;
+            while (reader.ReadRecord(&record, &scratch)) {
+              VersionEdit edit;
+              if (edit.DecodeFrom(record).ok()) {
+                if (edit.IsColumnFamilyAdd()) {
+                  id_to_name[edit.GetColumnFamily()] = edit.GetColumnFamilyName();
+                } else if (edit.IsColumnFamilyDrop()) {
+                  id_to_name.erase(edit.GetColumnFamily());
+                }
+              }
+            }
+            for (const auto& [id, name] : id_to_name) {
+              if (included_cf_names.find(name) == included_cf_names.end()) {
+                cf_ids_to_drop.push_back(id);
+              }
+            }
+          }
+
+          if (s.ok() && !cf_ids_to_drop.empty()) {
+            std::unique_ptr<FSWritableFile> manifest_writable;
+            io_s = fs->ReopenWritableFile(manifest_path, FileOptions(), &manifest_writable, nullptr);
+            s = io_s;
+            if (s.ok()) {
+              std::unique_ptr<WritableFileWriter> manifest_writer(
+                  new WritableFileWriter(std::move(manifest_writable), manifest_path, FileOptions()));
+              log::Writer log_writer(std::move(manifest_writer), 0, false, false, kNoCompression, false, 0);
+              for (uint32_t id : cf_ids_to_drop) {
+                VersionEdit edit;
+                edit.SetColumnFamily(id);
+                edit.DropColumnFamily();
+                std::string record;
+                edit.EncodeTo(&record);
+                s = log_writer.AddRecord(WriteOptions(), record);
+                if (!s.ok()) break;
+              }
+              if (s.ok()) s = log_writer.file()->Sync(IOOptions(), false);
+            }
+          }
+        }
       }
 
       // we copied all the files, enable file deletions

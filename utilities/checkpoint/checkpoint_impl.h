@@ -21,16 +21,25 @@ class CheckpointImpl : public Checkpoint {
   explicit CheckpointImpl(DB* db) : db_(db) {}
 
   Status CreateCheckpoint(const std::string& checkpoint_dir,
+                          const std::vector<ColumnFamilyHandle*>& column_families,
                           uint64_t log_size_for_flush,
                           uint64_t* sequence_number_ptr) override;
+
+  Status CreateCheckpoint(const std::string& checkpoint_dir,
+                          uint64_t log_size_for_flush,
+                          uint64_t* sequence_number_ptr) override {
+    return CreateCheckpoint(checkpoint_dir, std::vector<ColumnFamilyHandle*>(), log_size_for_flush, sequence_number_ptr);
+  }
 
   // Shared by the legacy Checkpoint API and CheckpointEngine. engine == nullptr
   // links/copies serially; otherwise work runs on the pool, awaited before the
   // staging dir is committed.
   Status CreateCheckpointImpl(const std::string& checkpoint_dir,
+                              const std::vector<ColumnFamilyHandle*>& column_families,
                               uint64_t log_size_for_flush,
                               uint64_t* sequence_number_ptr, CopyEngine* engine,
                               bool use_link, RateLimiter* copy_rate_limiter);
+
 
   Status ExportColumnFamily(ColumnFamilyHandle* handle,
                             const std::string& export_dir,
