@@ -25,6 +25,7 @@ pub async fn install_local(
   flags: Arc<Flags>,
   install_flags: InstallFlagsLocal,
 ) -> Result<(), AnyError> {
+  maybe_seed_lockfile_from_package_lock(&flags)?;
   match install_flags {
     InstallFlagsLocal::Add(add_flags) => {
       crate::tools::pm::add(
@@ -38,7 +39,6 @@ pub async fn install_local(
       super::install_from_entrypoints(flags, entrypoints).await
     }
     InstallFlagsLocal::TopLevel(top_level_flags) => {
-      maybe_seed_lockfile_from_package_lock(&flags)?;
       install_top_level(flags, top_level_flags).await
     }
   }
