@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
+	"github.com/prometheus/common/model"
 )
 
 // supplierFunc should return either a non-nil body or a non-nil error. The returned cleanup function can be nil.
@@ -38,6 +39,8 @@ type Request struct {
 	// uncompressedBodySize is the uncompressed request body size (wire bytes before any conversion).
 	// It may be 0 if unknown.
 	uncompressedBodySize int
+
+	validationSchemeOverride *model.ValidationScheme
 }
 
 func newRequest(p supplierFunc) *Request {

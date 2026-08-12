@@ -1632,6 +1632,9 @@ func (d *Distributor) prePushValidationMiddleware(next PushFunc) PushFunc {
 
 		pushReq.group = d.activeGroups.UpdateActiveGroupTimestamp(userID, validation.GroupLabel(d.limits, userID, req.Timeseries), now)
 		cfg := newValidationConfig(userID, limitsKey, d.limits)
+		if pushReq.validationSchemeOverride != nil {
+			cfg.labels.nameValidationScheme = *pushReq.validationSchemeOverride
+		}
 
 		// A WriteRequest can only contain series or metadata but not both. This might change in the future.
 		validatedMetadata := 0
