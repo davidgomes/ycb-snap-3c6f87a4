@@ -155,7 +155,7 @@ pub fn package_lock_to_deno_lockfile(
 
   let mut lockfile = Lockfile::new_empty(deno_lock_path.to_path_buf(), false);
   for (path, package) in &packages {
-    let dependencies = package
+    let dependencies: Vec<NpmPackageDependencyLockfileInfo> = package
       .dependencies
       .iter()
       .filter(|(_, specifier)| !is_non_registry_specifier(specifier))
