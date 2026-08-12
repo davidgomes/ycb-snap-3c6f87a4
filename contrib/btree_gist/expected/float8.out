@@ -5,13 +5,13 @@ SET enable_seqscan=on;
 SELECT count(*) FROM float8tmp WHERE a <  -1890.0;
  count 
 -------
-  238
+   238
 (1 row)
 
 SELECT count(*) FROM float8tmp WHERE a <= -1890.0;
  count 
 -------
-  239
+   239
 (1 row)
 
 SELECT count(*) FROM float8tmp WHERE a  = -1890.0;
@@ -23,19 +23,19 @@ SELECT count(*) FROM float8tmp WHERE a  = -1890.0;
 SELECT count(*) FROM float8tmp WHERE a >= -1890.0;
  count 
 -------
-  309
+   309
 (1 row)
 
 SELECT count(*) FROM float8tmp WHERE a >  -1890.0;
  count 
 -------
-  308
+   308
 (1 row)
 
 SELECT a, a <-> '-1890.0' FROM float8tmp ORDER BY a <-> '-1890.0' LIMIT 3;
-      a       |      ?column? 
+      a       |      ?column?      
 --------------+--------------------
-        -1890 | 0
+        -1890 |                  0
  -2003.634512 | 113.63451200000009
   -1769.73634 | 120.26366000000007
 (3 rows)
@@ -45,13 +45,13 @@ SET enable_seqscan=off;
 SELECT count(*) FROM float8tmp WHERE a <  -1890.0::float8;
  count 
 -------
-  238
+   238
 (1 row)
 
 SELECT count(*) FROM float8tmp WHERE a <= -1890.0::float8;
  count 
 -------
-  239
+   239
 (1 row)
 
 SELECT count(*) FROM float8tmp WHERE a  = -1890.0::float8;
@@ -63,13 +63,13 @@ SELECT count(*) FROM float8tmp WHERE a  = -1890.0::float8;
 SELECT count(*) FROM float8tmp WHERE a >= -1890.0::float8;
  count 
 -------
-  309
+   309
 (1 row)
 
 SELECT count(*) FROM float8tmp WHERE a >  -1890.0::float8;
  count 
 -------
-  308
+   308
 (1 row)
 
 EXPLAIN (COSTS OFF)
@@ -82,9 +82,9 @@ SELECT a, a <-> '-1890.0' FROM float8tmp ORDER BY a <-> '-1890.0' LIMIT 3;
 (3 rows)
 
 SELECT a, a <-> '-1890.0' FROM float8tmp ORDER BY a <-> '-1890.0' LIMIT 3;
-      a       |      ?column? 
+      a       |      ?column?      
 --------------+--------------------
-        -1890 | 0
+        -1890 |                  0
  -2003.634512 | 113.63451200000009
   -1769.73634 | 120.26366000000007
 (3 rows)
@@ -106,8 +106,8 @@ SELECT count(*) FROM float8excl;
 CREATE INDEX float8idx2 ON float8tmp USING gist ( a, abs(a) );
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM float8tmp WHERE abs(a) = 1890.0::float8;
-                         QUERY PLAN                          
--------------------------------------------------------------
+                          QUERY PLAN                           
+---------------------------------------------------------------
  Aggregate
    ->  Bitmap Heap Scan on float8tmp
          Recheck Cond: (abs(a) = '1890'::double precision)
@@ -124,4 +124,3 @@ SELECT count(*) FROM float8tmp WHERE abs(a) = 1890.0::float8;
 RESET enable_seqscan;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
-
