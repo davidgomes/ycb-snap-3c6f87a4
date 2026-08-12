@@ -65,6 +65,7 @@ ProcessJsonFieldData(
                 error_recorder(
                     *json_column, nested_path, simdjson::NO_SUCH_FIELD);
                 non_exist_adder(offset);
+                null_adder(offset);
                 data_adder(nullptr, 0, offset++);
                 continue;
             }
@@ -76,6 +77,7 @@ ProcessJsonFieldData(
                 if (array_res.error() != simdjson::SUCCESS) {
                     error_recorder(
                         *json_column, nested_path, array_res.error());
+                    null_adder(offset);
                 } else {
                     auto array_values = array_res.value();
                     for (auto value : array_values) {
@@ -92,12 +94,15 @@ ProcessJsonFieldData(
                         cast_function, *json_column, nested_path);
                     if (res.has_value()) {
                         values.push_back(res.value());
+                    } else {
+                        null_adder(offset);
                     }
                 } else {
                     value_result<SIMDJSON_T> res =
                         json_column->at<SIMDJSON_T>(nested_path);
                     if (res.error() != simdjson::SUCCESS) {
                         error_recorder(*json_column, nested_path, res.error());
+                        null_adder(offset);
                     } else {
                         values.push_back(static_cast<T>(res.value()));
                     }
