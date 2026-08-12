@@ -4,9 +4,14 @@
 
 # CommuteVar ensures that variable references are on the left side of
 # commutative comparison and binary operators. Other patterns don't need to
-# handle both combinations.
+# handle both combinations. VectorDistance, VectorCosDistance, and
+# VectorNegInnerProduct are included because they are symmetric distance
+# metrics (e.g., the distance between vectors a and b is the same as the
+# distance between b and a), so exploration rules like GenerateVectorSearch
+# only need to match the vector column on the left.
 [CommuteVar, Normalize]
 (Eq | Ne | Is | IsNot | Plus | Mult | Bitand | Bitor | Bitxor
+    | VectorDistance | VectorCosDistance | VectorNegInnerProduct
     $left:^(Variable)
     $right:(Variable)
 )
