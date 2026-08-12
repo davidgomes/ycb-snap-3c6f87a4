@@ -1,0 +1,120 @@
+#************************************************************
+# WL6045:Improve Innochecksum
+#************************************************************
+--source include/innodb_page_size_small.inc
+--source include/have_debug.inc
+# Avoid CrashReporter popup on Mac.
+--source include/not_crashrep.inc
+
+--source include/not_embedded.inc
+-- source include/big_test.inc
+
+let MYSQLD_BASEDIR= `SELECT @@basedir`;
+let MYSQLD_DATADIR= `SELECT @@datadir`;
+let SEARCH_FILE= $MYSQLTEST_VARDIR/log/my_restart.err;
+let $restart_noprint=2;
+
+SET GLOBAL innodb_compression_level=0;
+SELECT @@innodb_compression_level;
+
+CREATE TABLE t1 (j LONGBLOB) ENGINE = InnoDB ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=1;
+INSERT INTO t1 VALUES (repeat('abcdefghijklmnopqrstuvwxyz',200));
+let $i=10;
+while ($i > 0) {
+  INSERT INTO t1 SELECT * from t1;
+  dec $i;
+}
+
+CREATE TABLE t2 (j LONGBLOB) ENGINE = InnoDB
+ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=2;
+
+CREATE TABLE t3 (j LONGBLOB) ENGINE = InnoDB
+ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=4;
+
+CREATE TABLE t4(c1 INT PRIMARY KEY,c2 VARCHAR(20),
+		INDEX(c2(10))) ENGINE=InnoDB;
+
+let FLAG= `SELECT flag FROM INFORMATION_SCHEMA.INNODB_SYS_TABLESPACES WHERE NAME="test/t1"`;
+
+let FLAG2= `SELECT flag FROM INFORMATION_SCHEMA.INNODB_SYS_TABLESPACES WHERE NAME="test/t2"`;
+
+let FLAG3= `SELECT flag FROM INFORMATION_SCHEMA.INNODB_SYS_TABLESPACES WHERE NAME="test/t3"`;
+
+let FLAG4= `SELECT flag FROM INFORMATION_SCHEMA.INNODB_SYS_TABLESPACES WHERE NAME="test/t4"`;
+
+--echo # stop the server
+--source include/shutdown_mysqld.inc
+
+# Page_type_dump for t1
+--replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR
+--exec $INNOCHECKSUM -v --page-type-dump $MYSQLTEST_VARDIR/tmp/dump.txt $MYSQLD_DATADIR/test/t1.ibd
+--file_exists $MYSQLTEST_VARDIR/tmp/dump.txt
+--remove_file $MYSQLTEST_VARDIR/tmp/dump.txt
+
+--echo [1]:# check the both short and long options for "help"
+--exec $INNOCHECKSUM --help $MYSQLD_DATADIR/test/t1.ibd > $MYSQLTEST_VARDIR/tmp/help_output_long.txt
+--exec $INNOCHECKSUM -I $MYSQLD_DATADIR/test/t1.ibd > $MYSQLTEST_VARDIR/tmp/help_output_short.txt
+--diff_files $MYSQLTEST_VARDIR/tmp/help_output_long.txt $MYSQLTEST_VARDIR/tmp/help_output_short.txt
+
+--echo [2]:# Run the innochecksum when file isn't provided.
+--echo # It will print the innochecksum usage similar to --help option.
+--error 1
+--exec $INNOCHECKSUM > $MYSQLTEST_VARDIR/tmp/usage.txt
+--diff_files $MYSQLTEST_VARDIR/tmp/help_output_long.txt $MYSQLTEST_VARDIR/tmp/usage.txt
+--remove_file $MYSQLTEST_VARDIR/tmp/usage.txt
+
+perl;
+use strict;
+use warnings;
+use File::Copy;
+my $dir = $ENV{'MYSQLTEST_VARDIR'};
+my $file= 'help_output_long.txt';
+# open file in write mode
+open IN_FILE,"<", "$dir/tmp/$file" or die $!;
+open OUT_FILE, ">", "$dir/tmp/tmpfile" or die $!;
+while(<IN_FILE>) {
+ unless ($_=~ /^debug.*$/ || $_=~ /\-#, \-\-debug.*$/ || $_=~ /http:.*html/) {
+    $_=~ s/^\S*innochecksum.* from .+$/innochecksum Ver #.#.#/g;
+    $_=~ s/(Copyright\s\(c\))\s([0-9]*),\s([0-9]*)(.*)/$1 YEAR, YEAR $4/g;
+    $_=~ s/Usage:.*\[-c/Usage: innochecksum [-c/g;
+    print OUT_FILE $_;
+ }
+}
+close(IN_FILE);
+close(OUT_FILE);
+# move the new content from tmp file to the original file.
+move ("$dir/tmp/tmpfile", "$dir/tmp/$file");
+EOF
+
+--cat_file $MYSQLTEST_VARDIR/tmp/help_output_long.txt
+--remove_file $MYSQLTEST_VARDIR/tmp/help_output_long.txt
+--remove_file $MYSQLTEST_VARDIR/tmp/help_output_short.txt
+
+--echo [3]:# check the both short and long options for "count" and exit
+--replace_regex /[0-9]+/#/
+--exec $INNOCHECKSUM --count $MYSQLD_DATADIR/test/t1.ibd
+--replace_regex /[0-9]+/#/
+--exec $INNOCHECKSUM -c $MYSQLD_DATADIR/test/t1.ibd
+
+--echo [4]:# Print the version of innochecksum and exit
+--replace_regex /for \S+/for OS/ /\d+/#/ /#[-_A-Za-z0-9]*-MariaDB,/#-MariaDB,/ /\(.*\)/(ARCH)/ /^.*innochecksum(\.exe)?/innochecksum/
+--exec $INNOCHECKSUM -V
+
+--echo [5]:# check t1.ibd and t2.ibd summary with and without tablespace_flags
+let $resultlog=$MYSQLTEST_VARDIR/tmp/result.log;
+--exec $INNOCHECKSUM -S $MYSQLD_DATADIR/test/t1.ibd -s 3 -e 5 > $resultlog
+--exec $INNOCHECKSUM -S $MYSQLD_DATADIR/test/t2.ibd -s 3 -e 5 > $resultlog
+--exec $INNOCHECKSUM -S $MYSQLD_DATADIR/test/t3.ibd -s 3 -e 5 > $resultlog
+--exec $INNOCHECKSUM -S $MYSQLD_DATADIR/test/t4.ibd -s 3 -e 5 > $resultlog
+
+
+--exec $INNOCHECKSUM -S $MYSQLD_DATADIR/test/t1.ibd --tablespace_flags=$FLAG -s 3 -e 5 > $resultlog
+--exec $INNOCHECKSUM -S $MYSQLD_DATADIR/test/t2.ibd --tablespace_flags=$FLAG2 -s 3 -e 5 > $resultlog
+--exec $INNOCHECKSUM -S $MYSQLD_DATADIR/test/t3.ibd --tablespace_flags=$FLAG3 -s 3 -e 5 > $resultlog
+--exec $INNOCHECKSUM -S $MYSQLD_DATADIR/test/t4.ibd --tablespace_flags=$FLAG4 -s 3 -e 5 > $resultlog
+
+remove_file $resultlog;
+--echo # Restart the DB server
+--source include/start_mysqld.inc
+
+DROP TABLE t4, t3, t2, t1;

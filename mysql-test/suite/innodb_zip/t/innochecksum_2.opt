@@ -1,0 +1,2 @@
+--skip-innodb-doublewrite
+--innodb_sys_tablespaces

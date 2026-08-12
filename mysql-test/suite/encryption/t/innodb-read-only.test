@@ -1,0 +1,52 @@
+--source suite/encryption/include/have_file_key_management_plugin.inc
+--source include/have_innodb.inc
+--source include/not_embedded.inc
+
+--echo # Wait max 10 min for key encryption threads to encrypt all spaces
+let $cnt=600;
+while ($cnt)
+{
+    let $success=`SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.INNODB_TABLESPACES_ENCRYPTION WHERE MIN_KEY_VERSION = 0`;
+    if ($success)
+    {
+        let $cnt=0;
+    }
+    if (!$success)
+    {
+        real_sleep 1;
+        dec $cnt;
+    }
+}
+if (!$success)
+{
+    SELECT * FROM INFORMATION_SCHEMA.INNODB_TABLESPACES_ENCRYPTION;
+    SHOW STATUS LIKE 'innodb_encryption%';
+    -- die Timeout waiting for encryption threads
+}
+--echo # Success!
+
+# Server in normal mode
+SET GLOBAL innodb_encryption_threads=4;
+SET @encryption_threads_running=4;
+--error 0,ER_NO_SUCH_TABLE
+SELECT COUNT(*) INTO @encrypt_threads_running
+FROM performance_schema.threads
+WHERE NAME LIKE '%encrypt%';
+SELECT @encryption_threads_running;
+
+#
+# MDEV-11835: InnoDB: Failing assertion: free_slot != NULL on
+# restarting server with encryption and read-only
+#
+--let $restart_parameters= --innodb-read-only=1 --innodb-encrypt-tables=1
+--source include/restart_mysqld.inc
+
+# Server read-only mode
+SET GLOBAL innodb_encryption_threads=4;
+SET @encryption_threads_running=0;
+--error 0,ER_NO_SUCH_TABLE
+SELECT COUNT(*) INTO @encryption_threads_running
+FROM performance_schema.threads
+WHERE NAME LIKE '%encrypt%';
+SELECT @encryption_threads_running;
+--echo # All done

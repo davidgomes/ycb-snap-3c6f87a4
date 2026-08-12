@@ -1,0 +1,33 @@
+include/master-slave.inc
+[connection master]
+CREATE TABLE t1 (n INT);
+connection slave;
+include/stop_slave.inc
+connection master;
+include/kill_binlog_dump_threads.inc
+RESET MASTER;
+connection slave;
+include/reset_slave.inc
+connection master;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+5000
+connection slave;
+LOCK TABLES t1 READ;
+START SLAVE;
+UNLOCK TABLES;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+5000
+connection master;
+DROP TABLE t1;
+CREATE TABLE t1 (n INT);
+INSERT INTO t1 VALUES(3456);
+connection slave;
+SELECT n FROM t1;
+n
+3456
+connection master;
+DROP TABLE t1;
+connection slave;
+include/rpl_end.inc

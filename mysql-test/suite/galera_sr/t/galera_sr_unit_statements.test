@@ -1,0 +1,56 @@
+#
+# Test wsrep_fragment_unit = statements
+#
+
+--source include/galera_cluster.inc
+--source include/have_innodb.inc
+
+--connection node_1
+CREATE TABLE t1 (f1 INTEGER) ENGINE=InnoDB;
+
+SET SESSION wsrep_trx_fragment_size = 3;
+SHOW WARNINGS;
+SET SESSION wsrep_trx_fragment_unit = 'statements';
+SHOW WARNINGS;
+
+--connection node_1
+SET AUTOCOMMIT=OFF;
+START TRANSACTION;
+INSERT INTO t1 VALUES (1);
+
+--echo # Expect nothing is replicated yet, so far we have 2 statements
+--connection node_2
+SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SELECT COUNT(*) AS EXPECT_0 FROM t1;
+SELECT COUNT(*) AS EXPECT_0 FROM mysql.wsrep_streaming_log;
+
+--connection node_1
+INSERT INTO t1 VALUES (2);
+
+--echo # Expect 2 rows in t1 and 1 fragment in SR table
+--connection node_2
+SELECT COUNT(*) AS EXPECT_2 FROM t1;
+SELECT COUNT(*) AS EXPECT_1 FROM mysql.wsrep_streaming_log;
+
+ --connection node_1
+INSERT INTO t1 VALUES (3);
+INSERT INTO t1 VALUES (4);
+INSERT INTO t1 VALUES (5);
+
+--echo # Expect 5 rows in t1 and 2 fragments in SR table
+--connection node_2
+SELECT COUNT(*) AS EXPECT_5 FROM t1;
+SELECT COUNT(*) AS EXPECT_2 FROM mysql.wsrep_streaming_log;
+
+--connection node_1
+COMMIT;
+
+--echo # Expect 5 rows in t1 and empty SR table
+SELECT COUNT(*) AS EXPECT_5 FROM t1;
+SELECT COUNT(*) AS EXPECT_0 FROM mysql.wsrep_streaming_log;
+
+--connection node_2
+SELECT COUNT(*) AS EXPECT_5 FROM t1;
+SELECT COUNT(*) AS EXPECT_0 FROM mysql.wsrep_streaming_log;
+
+DROP TABLE t1;

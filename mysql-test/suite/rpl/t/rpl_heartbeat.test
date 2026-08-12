@@ -1,0 +1,7 @@
+-- source include/have_log_bin.inc
+-- source include/master-slave.inc
+
+--source include/rpl_heartbeat.inc
+
+--source include/rpl_end.inc
+--echo End of tests

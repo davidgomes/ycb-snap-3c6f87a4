@@ -1,0 +1,28 @@
+-- source include/not_embedded.inc
+-- source ../include/ps_truncate_all_tables.inc
+-- source include/have_innodb.inc
+
+# Tests for sys schema
+# Verify the sys.innodb_buffer_stats_by_table view
+
+# Ensure structure changes don't slip in
+DESC sys.innodb_buffer_stats_by_table;
+
+# Create an Empty table
+CREATE TABLE t1(a INT PRIMARY KEY) ENGINE=InnoDB;
+
+# Make sure view select does not error and
+# is_hashed & is_old is 0 for empty table
+SELECT * FROM sys.innodb_buffer_stats_by_table
+where object_schema = 'test' and object_name = 't1';
+
+# Ensure structure changes don't slip in
+DESC sys.x$innodb_buffer_stats_by_table;
+
+# Make sure view select does not error and
+# is_hashed & is_old is 0 for empty table
+SELECT * FROM sys.x$innodb_buffer_stats_by_table
+where object_schema = 'test' and object_name = 't1';
+
+# Drop the table
+DROP TABLE t1;

@@ -1,0 +1,40 @@
+#
+# Assertion `inited == NONE || update_handler != this' failed in
+# handler::ha_write_row
+#
+CREATE TABLE t1 (f VARCHAR(4096), s DATE, e DATE, PERIOD FOR app(s,e), UNIQUE(f)) ENGINE=MyISAM;
+INSERT INTO t1 VALUES ('foo', '2023-08-30', '2025-07-09'),('bar', '2021-01-01', '2021-12-31');
+DELETE FROM t1 FOR PORTION OF app FROM '2023-08-29' TO '2025-07-01';
+DROP TABLE t1;
+#
+# MDEV-21819 Assertion `inited == NONE || update_handler != this'
+# failed in handler::ha_write_row
+#
+CREATE OR REPLACE TABLE t1 (a INT, b BLOB, s DATE, e DATE, PERIOD FOR app(s,e), UNIQUE(b)) ENGINE=MyISAM PARTITION BY HASH(a) PARTITIONS 2;
+INSERT INTO t1 VALUES (1,'foo','2022-01-01', '2025-01-01');
+DELETE FROM t1 FOR PORTION OF app FROM '2023-01-01' TO '2024-01-01';
+ERROR 23000: Duplicate entry 'foo' for key 'b'
+DROP TABLE t1;
+# End of 10.5 tests
+#
+# MDEV-37312 ASAN errors or assertion failure upon attempt to UPDATE FOR PORTION violating long unique under READ COMMITTED
+#
+create table t1 (a int, f text unique, s datetime, e datetime, period for p(s,e)) engine=innodb;
+insert into t1 values (1,'foo','1900-01-01','2000-01-01'),(2,'bar','1900-01-01','2000-01-01');
+set transaction isolation level read committed;
+update t1 for portion of p from '1980-01-01' to '1980-01-02' set a = 1;
+ERROR 23000: Duplicate entry 'foo' for key 'f'
+drop table t1;
+create table t1 (a int, f text unique, s datetime, e datetime, period for p(s,e)) engine=innodb partition by hash (a);
+insert into t1 values (1,'foo','1900-01-01','2000-01-01'),(2,'bar','1900-01-01','2000-01-01');
+set transaction isolation level read committed;
+update t1 for portion of p from '1980-01-01' to '1980-01-02' set a = 1;
+ERROR 23000: Duplicate entry 'foo' for key 'f'
+drop table t1;
+#
+# MDEV-37397 Assertion `bitmap_is_set(&read_partitions, next->id)' failed in int partition_info::vers_set_hist_part(THD *)
+#
+create table t (f int,s date,e date,period for p (s,e),unique (f,p without overlaps)) with system versioning partition by system_time limit+1 (partition p history,partition pn current);
+delete from t;
+drop table t;
+# End of 10.6 tests

@@ -1,0 +1,10 @@
+--- suite/storage_engine/trx/cons_snapshot_serializable.result
++++ suite/storage_engine/trx/cons_snapshot_serializable.reject
+@@ -11,6 +11,7 @@
+ # If consistent read works on this isolation level (SERIALIZABLE), the following SELECT should not return the value we inserted (1)
+ SELECT a FROM t1;
+ a
++1
+ COMMIT;
+ connection default;
+ disconnect con1;

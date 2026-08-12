@@ -1,0 +1,109 @@
+#
+# MDEV-27228 Deprecate Spider plugin variables that result in excessive tweak
+#
+for master_1
+for child2
+child2_1
+child2_2
+child2_3
+for child3
+child3_1
+child3_2
+child3_3
+connection master_1;
+CREATE DATABASE auto_test_local;
+USE auto_test_local;
+# MDEV-28297 Deprecate spider_internal_offset
+CREATE TABLE tbl_a (a INT) ENGINE=Spider COMMENT='ios "1"';
+ERROR HY000: The connect info 'ios "1' is invalid
+CREATE TABLE tbl_b (a INT) ENGINE=Spider COMMENT='internal_offset "1"';
+ERROR HY000: The connect info 'internal_offset "1' is invalid
+# MDEV-27981 Deprecate spider_internal_limit 
+CREATE TABLE tbl_a (a INT) ENGINE=Spider COMMENT='ilm "1"';
+ERROR HY000: The connect info 'ilm "1' is invalid
+CREATE TABLE tbl_b (a INT) ENGINE=Spider COMMENT='internal_limit "1"';
+ERROR HY000: The connect info 'internal_limit "1' is invalid
+# MDEV-28244 Deprecate spider_xa_register_mode
+SET spider_xa_register_mode = 0;
+Warnings:
+Warning	1287	'@@spider_xa_register_mode' is deprecated and will be removed in a future release
+SHOW VARIABLES LIKE "spider_xa_register_mode";
+Variable_name	Value
+spider_xa_register_mode	0
+# MDEV-28007 Deprecate Spider plugin variables regarding statistics persistence
+SET GLOBAL spider_store_last_sts = 0;
+Warnings:
+Warning	1287	'@@spider_store_last_sts' is deprecated and will be removed in a future release
+SHOW VARIABLES LIKE "spider_store_last_sts";
+Variable_name	Value
+spider_store_last_sts	0
+SET GLOBAL spider_store_last_crd = 0;
+Warnings:
+Warning	1287	'@@spider_store_last_crd' is deprecated and will be removed in a future release
+SHOW VARIABLES LIKE "spider_store_last_crd";
+Variable_name	Value
+spider_store_last_crd	0
+SET GLOBAL spider_load_sts_at_startup = 0;
+Warnings:
+Warning	1287	'@@spider_load_sts_at_startup' is deprecated and will be removed in a future release
+SHOW VARIABLES LIKE "spider_load_sts_at_startup";
+Variable_name	Value
+spider_load_sts_at_startup	0
+SET GLOBAL spider_load_crd_at_startup = 0;
+Warnings:
+Warning	1287	'@@spider_load_crd_at_startup' is deprecated and will be removed in a future release
+SHOW VARIABLES LIKE "spider_load_crd_at_startup";
+Variable_name	Value
+spider_load_crd_at_startup	0
+# MDEV-28008 Deprecate spider_crd_mode and spider_sts_mode
+CREATE TABLE tbl_a (a INT) ENGINE=Spider COMMENT='cmd "3"';
+ERROR HY000: The connect info 'cmd "3' is invalid
+CREATE TABLE tbl_b (a INT) ENGINE=Spider COMMENT='crd_mode "3"';
+ERROR HY000: The connect info 'crd_mode "3' is invalid
+CREATE TABLE tbl_a (a INT) ENGINE=Spider COMMENT='smd "3"';
+ERROR HY000: The connect info 'smd "3' is invalid
+CREATE TABLE tbl_b (a INT) ENGINE=Spider COMMENT='sts_mode "3"';
+ERROR HY000: The connect info 'sts_mode "3' is invalid
+# MDEV-28010 Deprecate spider_crd_type and spider_crd_weight
+CREATE TABLE tbl_a (a INT) ENGINE=Spider COMMENT='ctp "1"';
+ERROR HY000: The connect info 'ctp "1' is invalid
+CREATE TABLE tbl_b (a INT) ENGINE=Spider COMMENT='crd_type "1"';
+ERROR HY000: The connect info 'crd_type "1' is invalid
+CREATE TABLE tbl_a (a INT) ENGINE=Spider COMMENT='cwg "1"';
+ERROR HY000: The connect info 'cwg "1' is invalid
+CREATE TABLE tbl_b (a INT) ENGINE=Spider COMMENT='crd_weight "1"';
+ERROR HY000: The connect info 'crd_weight "1' is invalid
+# MDEV-28560 Deprecate spider_buffer_size
+CREATE TABLE tbl_a (a INT) ENGINE=Spider COMMENT='bfz "1"';
+ERROR HY000: The connect info 'bfz "1' is invalid
+CREATE TABLE tbl_b (a INT) ENGINE=Spider COMMENT='buffer_size "1"';
+ERROR HY000: The connect info 'buffer_size "1' is invalid
+# MDEV-27926 Deprecate spider_init_sql_alloc_size
+CREATE TABLE tbl_a (a INT) ENGINE=Spider COMMENT='isa "1"';
+ERROR HY000: The connect info 'isa "1' is invalid
+CREATE TABLE tbl_b (a INT) ENGINE=Spider COMMENT='init_sql_alloc_size "1"';
+ERROR HY000: The connect info 'init_sql_alloc_size "1' is invalid
+# MDEV-28829 Deprecate spider_semi_table_lock and spider_semi_table_lock_connection
+CREATE TABLE tbl_a (a INT) ENGINE=Spider COMMENT='stl "1"';
+ERROR HY000: The connect info 'stl "1' is invalid
+CREATE TABLE tbl_b (a INT) ENGINE=Spider COMMENT='semi_table_lock "1"';
+ERROR HY000: The connect info 'semi_table_lock "1' is invalid
+CREATE TABLE tbl_a (a INT) ENGINE=Spider COMMENT='stc "0"';
+ERROR HY000: The connect info 'stc "0' is invalid
+CREATE TABLE tbl_b (a INT) ENGINE=Spider COMMENT='semi_table_lock_connection "0"';
+ERROR HY000: The connect info 'semi_table_lock_connection "0' is invalid
+# MDEV-28795 Deprecate spider_bka_table_name_type
+CREATE TABLE tbl_a (a INT) ENGINE=Spider COMMENT='btt "1"';
+ERROR HY000: The connect info 'btt "1' is invalid
+CREATE TABLE tbl_b (a INT) ENGINE=Spider COMMENT='bka_table_name_type "1"';
+ERROR HY000: The connect info 'bka_table_name_type "1' is invalid
+DROP DATABASE auto_test_local;
+for master_1
+for child2
+child2_1
+child2_2
+child2_3
+for child3
+child3_1
+child3_2
+child3_3

@@ -1,0 +1,150 @@
+#
+# Tests for window functions and ORDER BY 
+#
+
+--disable_warnings
+drop table if exists t0,t1;
+--enable_warnings
+
+create table t0(a int primary key);
+insert into t0 values (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);
+
+create table t1(
+  pk int,
+  a int,
+  key(pk)
+);
+
+insert into t1
+select 
+  A.a + B.a* 10 + C.a * 100,
+  1
+from t0 A, t0 B, t0 C;
+
+select 
+  pk,
+  count(a) over (order by pk rows between 2 preceding and 2 following) as exp
+from t1
+where pk between 1 and 30
+order by pk desc
+limit 4;
+
+drop table t0,t1;
+
+
+--echo #
+--echo # MDEV-30052: Crash with a query containing nested WINDOW clauses
+--echo #
+
+CREATE TABLE t1 (c INT);
+insert into t1 values (1),(2);
+UPDATE t1 SET c=1
+WHERE c=2
+ORDER BY
+  (1 IN ((
+      SELECT *
+      FROM (SELECT * FROM t1) AS v1
+      GROUP BY c
+      WINDOW v2 AS (ORDER BY
+                      (SELECT *
+                       FROM t1
+                       GROUP BY c
+                       WINDOW v3 AS (PARTITION BY c)
+                      )
+                    )
+    ))
+  );
+drop table t1;
+
+--echo #
+--echo # MDEV-29359: Server crashed with heap-use-after-free in
+--echo # Field::is_null(long long) const (Just testcase)
+--echo #
+
+CREATE TABLE t1 (id int);
+INSERT INTO t1 VALUES (-1),(0),(84);
+
+SELECT
+  id IN (SELECT id
+         FROM t1
+         WINDOW w AS (ORDER BY (SELECT  1
+                                FROM t1
+                                WHERE
+                                  EXISTS ( SELECT id
+                                           FROM t1
+                                           GROUP BY id
+                                           WINDOW w2 AS (ORDER BY id)
+                                          )
+                                )
+                      )
+         ) as exp
+FROM t1;
+
+DROP TABLE t1;
+
+--echo # End of 10.3 tests
+
+--echo #
+--echo # MDEV-32317 ref_ptrs exhaust on multiple ORDER by func from winfunc
+--echo #
+# Primitive tests, just know how reserve/occupation works
+# 2 elements
+select row_number() over () x;
+select row_number() over (order by 1) x;
+select row_number() over (order by 1, 1) x;
+select row_number() over (partition by 1) x;
+select row_number() over (partition by 1, 1) x;
+select row_number() over (partition by 1 order by 1) x;
+# 3 elements
+select row_number() over (partition by 1, 2) x;
+select row_number() over (partition by 1, 2 order by 1, 1) x;
+# 1 element
+select row_number() over () x order by x;
+select row_number() over () order by 1;
+# 2 elements
+select row_number() over (order by 1) order by 1;
+select row_number() over (order by 1, 1) order by 1;
+select row_number() over (order by 1) order by 1, 1;
+select row_number() over (order by 1, 1) order by 1, 1;
+# 3 elements
+select row_number() over (partition by 1, 2 order by 1, 1) order by 1;
+select row_number() over (partition by 1, 2 order by 1, 1) order by 1, 1;
+# 1 element
+select nullif(1, 0) order by 1;
+select nullif(1, 0) order by 1, 1;
+
+# Now interesting, winfunc inside func
+# 7 elements (reserves 11)
+select nullif(avg(1) over (), 0) order by 1;
+# 8 elements (reserves 12)
+select nullif(avg(1) over (order by 1), 0) order by 1;
+# 8 elements (reserves 13)
+select nullif(avg(1) over (order by 1, 1), 0) order by 1;
+# 8 elements (reserves 12)
+select nullif(avg(1) over (partition by 1), 0) order by 1;
+# 9 elements (reserves 13)
+select nullif(avg(1) over (partition by 1, 2), 0) order by 1;
+# 11 elements (reserves 15)
+select nullif(avg(1) over (), 0) order by 1, 1;
+# 13 elements (reserves 17)
+select nullif(avg(1) over (partition by 1, 2), 0) order by 1, 1;
+# 17 elements (reserves 21)
+select nullif(avg(1) over (partition by 1, 2), 0) order by 1, 1, 1;
+# 24 elements (reserves 36)
+select nullif(avg(1) over (partition by 1, 2), avg(1) over ()) order by 1, 1, 1;
+
+# Extinguishing tests, let's break the code
+# 17 elements (reserves 25)
+select avg ( '1' ) over ( ) x where ( 1 , 1 , ( 1 , null ) ) in ( ( 1 , 1 , ( 1 , 1 ) ) ) order by x between 25 and ( ( x = x ) / x ) or x = x = avg ( null ) or x = 94 ;
+# 14 elements (reserves 20)
+select row_number() over () x order by x between 1 and (( x = x ) / x) or x = x = 1  ;
+# 16 elements (reserves 20)
+select nullif(avg(1) over (order by 1), 0) order by 1, 1, 1;
+# 41 elements (reserves 72)
+select nullif(avg(1) over (order by 1, 1, 1, 1, 1, 1, 1), avg(2) over (order by 1, 1, 1, 1, 1, 1, 1)) x order by 1, 1, 1, 1, 1, 1;
+# 50 elements (reserves 92)
+select nullif(avg(1) over (partition by -1,1,0,2,3,4,5,6,7,8 order by 1, 1, 1, 1, 1, 1, 1), avg(2) over (partition by -1,1,0,2,3,4,5,6,7,8 order by 1, 1, 1, 1, 1, 1, 1)) x order by 1, 1, 1, 1, 1, 1;
+# 63 elements (reserves 124)
+select nullif(avg(1) over (partition by -1,1,0,2,3,4,5,6,7,8 order by 1, 1, 1, 1, 1, 1, 1), avg(2) over (partition by -1,1,0,2,3,4,5,6,7,8 order by 1, 1, 1, 1, 1, 1, 1)) x order by 1, 1, 1, 1, 1, 1, x between 1 and (( x = x ) / x) or x = x = 1  ;
+
+--echo # End of 10.6 tests

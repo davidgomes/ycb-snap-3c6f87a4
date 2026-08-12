@@ -1,0 +1,105 @@
+--source ../include/direct_join_by_pkey_key_init.inc
+--echo
+--echo this test is for MDEV-18995
+--echo
+--echo drop and create databases
+
+--connection master_1
+--disable_warnings
+CREATE DATABASE auto_test_local;
+USE auto_test_local;
+
+--connection child2_1
+SET @old_log_output = @@global.log_output;
+SET GLOBAL log_output = 'TABLE,FILE';
+CREATE DATABASE auto_test_remote;
+USE auto_test_remote;
+--enable_warnings
+
+--echo
+--echo create table and insert
+
+--connection child2_1
+--disable_query_log
+--disable_ps_protocol
+echo CHILD2_1_CREATE_TABLES;
+CREATE TABLE tbl_a (
+akey int NOT NULL,
+val int NOT NULL,
+KEY idx1 (akey)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8 ;
+CREATE TABLE tbl_b (
+bkey int NOT NULL,
+akey int NOT NULL,
+PRIMARY KEY (bkey)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+--enable_ps_protocol
+--enable_query_log
+TRUNCATE TABLE mysql.general_log;
+
+--connection master_1
+--disable_query_log
+echo CREATE TABLE tbl_a (
+    akey int NOT NULL,
+    val int NOT NULL,
+    KEY idx1 (akey)
+) MASTER_1_ENGINE MASTER_1_CHARSET MASTER_1_COMMENT_2_1;
+CREATE TABLE tbl_a (
+    akey int NOT NULL,
+    val int NOT NULL,
+    KEY idx1 (akey)
+) ENGINE=Spider DEFAULT CHARSET=utf8 COMMENT='table "tbl_a", srv "s_2_1"';
+echo CREATE TABLE tbl_b (
+    bkey int NOT NULL,
+    akey int NOT NULL,
+    PRIMARY KEY (bkey)
+) MASTER_1_ENGINE MASTER_1_CHARSET MASTER_1_COMMENT_2_1_2;
+CREATE TABLE tbl_b (
+    bkey int NOT NULL,
+    akey int NOT NULL,
+    PRIMARY KEY (bkey)
+) ENGINE=Spider DEFAULT CHARSET=utf8 COMMENT='table "tbl_b", srv "s_2_1"';
+--enable_query_log
+--disable_ps_protocol
+INSERT INTO tbl_a (akey,val) VALUES (0,0),(1,1),(2,2),(3,3),(4,4),(5,5),(6,6),(7,7),(8,8),(9,9);
+INSERT INTO tbl_b (bkey,akey) VALUES (0,0),(1,1),(2,2),(3,3),(4,4),(5,4),(6,3),(7,2),(8,1),(9,0);
+--enable_ps_protocol
+
+--echo
+--echo select test 1
+
+--connection child2_1
+TRUNCATE TABLE mysql.general_log;
+
+--disable_view_protocol
+--connection master_1
+--disable_ps2_protocol
+SELECT a.val, a.akey FROM tbl_a a, tbl_b b WHERE a.akey = b.akey AND b.bkey = 5;
+--enable_ps2_protocol
+
+--connection child2_1
+--disable_ps_protocol
+eval
+SELECT argument FROM mysql.general_log WHERE command_type != 'Execute' AND argument LIKE '%`tbl_a`%' $STR_SEMICOLON
+SELECT argument FROM mysql.general_log WHERE command_type != 'Execute' AND argument LIKE '%`tbl_b`%';
+eval
+SELECT akey, val FROM tbl_a ORDER BY akey $STR_SEMICOLON
+SELECT bkey, akey FROM tbl_b ORDER BY bkey;
+--enable_ps_protocol
+--enable_view_protocol
+
+--echo
+--echo deinit
+--disable_warnings
+
+--connection master_1
+DROP DATABASE IF EXISTS auto_test_local;
+
+--connection child2_1
+DROP DATABASE IF EXISTS auto_test_remote;
+SET GLOBAL log_output = @old_log_output;
+
+--enable_warnings
+--source ../include/direct_join_by_pkey_key_deinit.inc
+--echo
+--echo end of test

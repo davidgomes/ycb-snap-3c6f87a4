@@ -1,0 +1,101 @@
+--echo #
+--echo # MDEV-27228 Deprecate Spider plugin variables that result in excessive tweak
+--echo #
+
+--disable_query_log
+--disable_result_log
+--source test_init.inc
+--enable_result_log
+--enable_query_log
+
+--connection master_1
+CREATE DATABASE auto_test_local;
+USE auto_test_local;
+
+--echo # MDEV-28297 Deprecate spider_internal_offset
+--error 12501
+eval CREATE TABLE tbl_a (a INT) $MASTER_1_ENGINE COMMENT='ios "1"';
+--error 12501
+eval CREATE TABLE tbl_b (a INT) $MASTER_1_ENGINE COMMENT='internal_offset "1"';
+
+--echo # MDEV-27981 Deprecate spider_internal_limit 
+--error 12501
+eval CREATE TABLE tbl_a (a INT) $MASTER_1_ENGINE COMMENT='ilm "1"';
+--error 12501
+eval CREATE TABLE tbl_b (a INT) $MASTER_1_ENGINE COMMENT='internal_limit "1"';
+
+--echo # MDEV-28244 Deprecate spider_xa_register_mode
+SET spider_xa_register_mode = 0;
+SHOW VARIABLES LIKE "spider_xa_register_mode";
+
+--echo # MDEV-28007 Deprecate Spider plugin variables regarding statistics persistence
+SET GLOBAL spider_store_last_sts = 0;
+SHOW VARIABLES LIKE "spider_store_last_sts";
+
+SET GLOBAL spider_store_last_crd = 0;
+SHOW VARIABLES LIKE "spider_store_last_crd";
+
+SET GLOBAL spider_load_sts_at_startup = 0;
+SHOW VARIABLES LIKE "spider_load_sts_at_startup";
+
+SET GLOBAL spider_load_crd_at_startup = 0;
+SHOW VARIABLES LIKE "spider_load_crd_at_startup";
+
+--echo # MDEV-28008 Deprecate spider_crd_mode and spider_sts_mode
+--error 12501
+eval CREATE TABLE tbl_a (a INT) $MASTER_1_ENGINE COMMENT='cmd "3"';
+--error 12501
+eval CREATE TABLE tbl_b (a INT) $MASTER_1_ENGINE COMMENT='crd_mode "3"';
+
+--error 12501
+eval CREATE TABLE tbl_a (a INT) $MASTER_1_ENGINE COMMENT='smd "3"';
+--error 12501
+eval CREATE TABLE tbl_b (a INT) $MASTER_1_ENGINE COMMENT='sts_mode "3"';
+
+--echo # MDEV-28010 Deprecate spider_crd_type and spider_crd_weight
+--error 12501
+eval CREATE TABLE tbl_a (a INT) $MASTER_1_ENGINE COMMENT='ctp "1"';
+--error 12501
+eval CREATE TABLE tbl_b (a INT) $MASTER_1_ENGINE COMMENT='crd_type "1"';
+
+--error 12501
+eval CREATE TABLE tbl_a (a INT) $MASTER_1_ENGINE COMMENT='cwg "1"';
+--error 12501
+eval CREATE TABLE tbl_b (a INT) $MASTER_1_ENGINE COMMENT='crd_weight "1"';
+
+--echo # MDEV-28560 Deprecate spider_buffer_size
+--error 12501
+eval CREATE TABLE tbl_a (a INT) $MASTER_1_ENGINE COMMENT='bfz "1"';
+--error 12501
+eval CREATE TABLE tbl_b (a INT) $MASTER_1_ENGINE COMMENT='buffer_size "1"';
+
+--echo # MDEV-27926 Deprecate spider_init_sql_alloc_size
+--error 12501
+eval CREATE TABLE tbl_a (a INT) $MASTER_1_ENGINE COMMENT='isa "1"';
+--error 12501
+eval CREATE TABLE tbl_b (a INT) $MASTER_1_ENGINE COMMENT='init_sql_alloc_size "1"';
+
+--echo # MDEV-28829 Deprecate spider_semi_table_lock and spider_semi_table_lock_connection
+--error 12501
+eval CREATE TABLE tbl_a (a INT) $MASTER_1_ENGINE COMMENT='stl "1"';
+--error 12501
+eval CREATE TABLE tbl_b (a INT) $MASTER_1_ENGINE COMMENT='semi_table_lock "1"';
+
+--error 12501
+eval CREATE TABLE tbl_a (a INT) $MASTER_1_ENGINE COMMENT='stc "0"';
+--error 12501
+eval CREATE TABLE tbl_b (a INT) $MASTER_1_ENGINE COMMENT='semi_table_lock_connection "0"';
+
+--echo # MDEV-28795 Deprecate spider_bka_table_name_type
+--error 12501
+eval CREATE TABLE tbl_a (a INT) $MASTER_1_ENGINE COMMENT='btt "1"';
+--error 12501
+eval CREATE TABLE tbl_b (a INT) $MASTER_1_ENGINE COMMENT='bka_table_name_type "1"';
+
+DROP DATABASE auto_test_local;
+
+--disable_query_log
+--disable_result_log
+--source test_deinit.inc
+--enable_result_log
+--enable_query_log

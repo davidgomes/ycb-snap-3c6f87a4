@@ -1,0 +1,60 @@
+--source include/galera_cluster.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+
+--disable_ps2_protocol
+
+# NEXTVAL
+
+--connection node_1
+
+CREATE SEQUENCE seq NOCACHE ENGINE=InnoDB;
+
+SELECT NEXTVAL(seq);
+
+--connection node_2
+
+SELECT NEXTVAL(seq);
+
+--connection node_1
+
+SELECT NEXTVAL(seq);
+
+
+# SETVAL
+
+SELECT SETVAL(seq, 100);
+
+--connection node_2
+
+SELECT NEXTVAL(seq);
+
+--connection node_1
+
+SELECT NEXTVAL(seq);
+
+DROP SEQUENCE seq;
+
+# TRANSACTIONS
+
+CREATE TABLE t1(f1 INT);
+CREATE SEQUENCE seq_transaction NOCACHE ENGINE=InnoDB;
+
+START TRANSACTION;
+INSERT INTO t1 VALUES (0);
+SELECT NEXTVAL(seq_transaction);
+INSERT INTO t1 VALUES (NEXTVAL(seq_transaction));
+COMMIT;
+
+--connection node_2
+
+SELECT COUNT(*) FROM t1;
+SELECT NEXTVAL(seq_transaction);
+
+--connection node_1
+SELECT NEXTVAL(seq_transaction);
+
+DROP SEQUENCE seq_transaction;
+DROP TABLE t1;
+
+--enable_ps2_protocol
