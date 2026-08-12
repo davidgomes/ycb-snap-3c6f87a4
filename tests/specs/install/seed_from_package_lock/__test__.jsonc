@@ -1,0 +1,72 @@
+{
+  "tempDir": true,
+  "tests": {
+    // a local `deno install` without a deno.lock should seed the resolution
+    // from the sibling package-lock.json, preserving the pinned versions
+    // (^0.1.0 would otherwise resolve to 0.1.1)
+    "install_seeds_from_package_lock": {
+      "steps": [
+        {
+          "args": "install",
+          "output": "install.out"
+        },
+        {
+          "args": [
+            "eval",
+            "console.log(Deno.readTextFileSync('deno.lock').trim())"
+          ],
+          "output": "deno.lock.out"
+        },
+        {
+          // ensure the pinned version was actually set up in node_modules
+          "args": [
+            "eval",
+            "console.log(JSON.parse(Deno.readTextFileSync('node_modules/@denotest/has-patch-versions/package.json')).version)"
+          ],
+          "output": "0.1.0\n"
+        }
+      ]
+    },
+    // other commands keep starting from an empty lockfile and resolve
+    // the latest matching versions
+    "other_commands_do_not_seed": {
+      "steps": [
+        {
+          "args": "add npm:@denotest/esm-basic",
+          "output": "[WILDCARD]"
+        },
+        {
+          "args": [
+            "eval",
+            "console.log(Deno.readTextFileSync('deno.lock').trim())"
+          ],
+          "output": "deno.lock.not_seeded.out"
+        }
+      ]
+    },
+    // an unusable package-lock.json falls back to an empty lockfile
+    // without failing the install
+    "unusable_package_lock_is_ignored": {
+      "steps": [
+        {
+          "args": [
+            "eval",
+            "Deno.writeTextFileSync('package-lock.json', 'not json')"
+          ],
+          "output": ""
+        },
+        {
+          "args": "install",
+          "output": "[WILDCARD]"
+        },
+        {
+          "args": [
+            "eval",
+            "console.log(Deno.readTextFileSync('deno.lock').trim())"
+          ],
+          "output": "deno.lock.not_seeded_install.out"
+        }
+      ]
+    }
+  }
+}
