@@ -62,9 +62,10 @@ import java.lang.annotation.Target;
  *
  * <pre>{@code
  * public class PrefixResolver implements SymbolResolver {
- *     public MemorySegment resolve(String symbolName, SymbolLookup lookup) {
- *         return lookup.find("mylib_" + symbolName).orElseThrow(
- *             () -> new UnsatisfiedLinkError(symbolName));
+ *     public ResolvedSymbol resolve(String symbolName, SymbolLookup lookup) {
+ *         String prefixed = "mylib_" + symbolName;
+ *         return new ResolvedSymbol(prefixed, lookup.find(prefixed).orElseThrow(
+ *             () -> new UnsatisfiedLinkError(symbolName)));
  *     }
  * }
  *
@@ -74,6 +75,11 @@ import java.lang.annotation.Target;
  *     int compress(MemorySegment src, int len);
  * }
  * }</pre>
+ *
+ * <p>To customize how the downcall {@code MethodHandle} is created from a resolved symbol —
+ * for example adjusting the {@link java.lang.foreign.FunctionDescriptor} or applying
+ * {@link java.lang.invoke.MethodHandles#insertArguments} based on which symbol variant was
+ * resolved — specify a custom {@link MethodHandleResolver} via {@link #methodHandleResolver()}.
  */
 @Retention(RetentionPolicy.SOURCE)
 @Target(ElementType.TYPE)
@@ -95,4 +101,12 @@ public @interface LibrarySpecification {
      * Defaults to {@link DefaultSymbolResolver}, which looks up symbols by their exact name.
      */
     Class<? extends SymbolResolver> symbolResolver() default DefaultSymbolResolver.class;
+
+    /**
+     * Custom method handle resolver for this library. Creates the downcall {@code MethodHandle}
+     * from the symbol resolved by {@link #symbolResolver()} at class-init time. Defaults to
+     * {@link DefaultMethodHandleResolver}, which creates a plain downcall handle from the
+     * resolved address.
+     */
+    Class<? extends MethodHandleResolver> methodHandleResolver() default DefaultMethodHandleResolver.class;
 }

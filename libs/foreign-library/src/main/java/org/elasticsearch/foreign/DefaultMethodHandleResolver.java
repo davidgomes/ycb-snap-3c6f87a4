@@ -9,18 +9,19 @@
 
 package org.elasticsearch.foreign;
 
-import java.lang.foreign.SymbolLookup;
+import java.lang.foreign.FunctionDescriptor;
+import java.lang.foreign.Linker;
+import java.lang.invoke.MethodHandle;
 
 /**
- * Default symbol resolver that looks up a symbol by its exact name.
- * Used when no custom {@link SymbolResolver} is specified on a
+ * Default method handle resolver that creates a plain downcall handle from the resolved symbol's
+ * address. Used when no custom {@link MethodHandleResolver} is specified on a
  * {@link LibrarySpecification @LibrarySpecification}.
  */
-public final class DefaultSymbolResolver implements SymbolResolver {
+public final class DefaultMethodHandleResolver implements MethodHandleResolver {
 
     @Override
-    public ResolvedSymbol resolve(String symbolName, SymbolLookup lookup) {
-        var address = lookup.find(symbolName).orElseThrow(() -> new UnsatisfiedLinkError("Symbol not found: " + symbolName));
-        return new ResolvedSymbol(symbolName, address);
+    public MethodHandle resolve(ResolvedSymbol symbol, FunctionDescriptor descriptor, Linker linker, Linker.Option... options) {
+        return linker.downcallHandle(symbol.address(), descriptor, options);
     }
 }
