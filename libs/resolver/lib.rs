@@ -58,6 +58,7 @@ pub mod import_map;
 pub mod loader;
 pub mod lockfile;
 pub mod npm;
+mod npm_lockfile_seed;
 pub mod npmrc;
 #[cfg(feature = "sync")]
 mod rt;

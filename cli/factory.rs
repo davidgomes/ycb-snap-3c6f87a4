@@ -1506,6 +1506,14 @@ fn new_workspace_factory_options(
     lock_arg: flags.lock.as_ref().map(|l| initial_cwd.join(l)),
     lockfile_skip_write: flags.internal.lockfile_skip_write,
     no_npm: flags.no_npm,
+    // Local `deno install` is the entry point for projects migrating from
+    // npm: seed a brand new lockfile from a sibling `package-lock.json` (if
+    // any) so their pinned versions and integrity hashes aren't lost. Other
+    // commands keep starting from an empty lockfile when one doesn't exist.
+    seed_lockfile_from_npm_lockfile: matches!(
+      flags.subcommand,
+      DenoSubcommand::Install(InstallFlags::Local(..))
+    ),
     node_modules_dir: flags.node_modules_dir,
     node_modules_linker: flags.node_modules_linker,
     npm_process_state: npm_process_state(&CliSys::default()).as_ref().map(

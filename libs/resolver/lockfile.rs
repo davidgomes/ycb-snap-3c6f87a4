@@ -144,6 +144,8 @@ pub struct LockfileReadFromPathOptions {
   pub frozen: bool,
   /// Causes the lockfile to only be read from, but not written to.
   pub skip_write: bool,
+  /// See `LockfileFlags::seed_from_npm_lockfile`.
+  pub seed_from_npm_lockfile: bool,
 }
 
 #[sys_traits::auto_impl]
@@ -181,6 +183,11 @@ pub struct LockfileFlags {
   pub skip_write: bool,
   pub no_config: bool,
   pub no_npm: bool,
+  /// When no `deno.lock` exists yet, seed the new lockfile's npm section
+  /// from a sibling `package-lock.json` (if any) instead of starting empty.
+  /// Only local `deno install` sets this — other commands must keep
+  /// starting from an empty lockfile when one doesn't exist.
+  pub seed_from_npm_lockfile: bool,
 }
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
@@ -349,6 +356,7 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
         file_path,
         frozen,
         skip_write: flags.skip_write,
+        seed_from_npm_lockfile: flags.seed_from_npm_lockfile,
       },
       api,
     )
@@ -513,7 +521,24 @@ impl<TSys: LockfileSys> LockfileLock<TSys> {
         .await?
       }
       Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-        Lockfile::new_empty(opts.file_path, false)
+        if opts.seed_from_npm_lockfile
+          && let Some(content) =
+            crate::npm_lockfile_seed::seed_npm_lockfile_content(
+              &sys,
+              &opts.file_path,
+            )
+        {
+          Lockfile {
+            overwrite: false,
+            // there's no file on disk yet, so this seeded content needs to
+            // be written out on the first `write_if_changed` call
+            has_content_changed: true,
+            content,
+            filename: opts.file_path,
+          }
+        } else {
+          Lockfile::new_empty(opts.file_path, false)
+        }
       }
       Err(err) => {
         return Err(err).with_context(|| {
