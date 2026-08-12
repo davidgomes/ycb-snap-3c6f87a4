@@ -1299,3 +1299,102 @@ async def test_ft_aggregate_addscores(async_client: aioredis.Redis):
         assert float(results[0]["__score"]) >= float(results[1]["__score"])
 
     await async_client.execute_command("FT.DROPINDEX", "agg_score_idx")
+
+
+def _make_scoring_corpus():
+    """Deterministic, diverse TEXT corpus of ~200 docs with varied lengths and term mixes."""
+    words = [
+        "red", "green", "blue", "fox", "dog", "tree", "river", "cloud",
+        "stone", "light", "shadow", "wind", "fire", "water", "earth", "metal",
+        "wood", "glass", "paper", "sound", "storm", "valley", "meadow", "harbor",
+    ]  # fmt: skip
+    docs = []
+    for i in range(200):
+        content = [words[(i * 7 + j * 5) % len(words)] for j in range(1 + (i % 9))]
+        if i % 3 == 0:
+            content.append("fox")
+        if i % 5 == 0:
+            content.extend(["storm", "storm"])
+        docs.append(" ".join(content))
+    return docs
+
+
+@pytest.mark.parametrize("scorer", ["BM25STD", "TFIDF", "TFIDF.DOCNORM"])
+async def test_ft_scorer_shard_independent(df_factory: DflyInstanceFactory, scorer):
+    """Text scores and top-K ordering must not depend on the proactor/shard count."""
+    queries = ["fox", "storm valley", "st*"]
+    top_k = 15
+
+    async def run(threads):
+        inst = df_factory.create(proactor_threads=threads)
+        inst.start()
+        client = inst.client()
+        await client.execute_command(
+            "FT.CREATE", "idx", "ON", "HASH",
+            "SCHEMA", "content", "TEXT", "num", "NUMERIC", "SORTABLE",
+        )  # fmt: skip
+        for i, content in enumerate(_make_scoring_corpus()):
+            await client.hset(f"doc:{i}", mapping={"content": content, "num": i})
+
+        out = {}
+        for query in queries:
+            search = await client.execute_command(
+                "FT.SEARCH", "idx", query, "WITHSCORES", "SCORER", scorer,
+                "RETURN", "0", "LIMIT", "0", str(top_k),
+            )  # fmt: skip
+            search_hits = [
+                (search[i], float(search[i + 1])) for i in range(1, len(search), 2)
+            ]
+
+            aggregate = await client.execute_command(
+                "FT.AGGREGATE", "idx", query, "LOAD", "1", "@num",
+                "SCORER", scorer, "ADDSCORES", "SORTBY", "2", "@__score", "DESC",
+            )  # fmt: skip
+            agg_rows = []
+            for row in aggregate[1:]:
+                fields = {row[j]: row[j + 1] for j in range(0, len(row), 2)}
+                agg_rows.append((float(fields["__score"]), int(float(fields["num"]))))
+
+            sortby = await client.execute_command(
+                "FT.SEARCH", "idx", query, "WITHSCORES", "SCORER", scorer,
+                "SORTBY", "num", "DESC", "RETURN", "0", "LIMIT", "0", str(top_k),
+            )  # fmt: skip
+            sortby_hits = [
+                (sortby[i], float(sortby[i + 1])) for i in range(1, len(sortby), 2)
+            ]
+
+            out[query] = (search[0], search_hits, agg_rows, sortby[0], sortby_hits)
+
+        inst.stop()
+        return out
+
+    single = await run(1)
+    multi = await run(4)
+
+    for query in queries:
+        s_total, s_hits, s_agg, s_sort_total, s_sort = single[query]
+        m_total, m_hits, m_agg, m_sort_total, m_sort = multi[query]
+
+        # 1. FT.SEARCH: same totals, same top-K keys in the same order, same scores.
+        assert s_total == m_total, f"{query}: total {s_total} != {m_total}"
+        assert [k for k, _ in s_hits] == [k for k, _ in m_hits], f"{query}: top-K keys differ"
+        for (key, s_score), (_, m_score) in zip(s_hits, m_hits):
+            assert s_score == pytest.approx(m_score, rel=1e-4), f"{query}/{key}: score differs"
+
+        # 2. FT.AGGREGATE: same rows and scores. Rows sharing a score may come back
+        # in any order, so compare with a deterministic (score, num) tie-break.
+        assert len(s_agg) == len(m_agg), f"{query}: aggregate row count differs"
+        s_agg_sorted = sorted(s_agg, key=lambda r: (-r[0], r[1]))
+        m_agg_sorted = sorted(m_agg, key=lambda r: (-r[0], r[1]))
+        for (s_score, s_num), (m_score, m_num) in zip(s_agg_sorted, m_agg_sorted):
+            assert s_num == m_num, f"{query}: aggregate rows differ"
+            assert s_score == pytest.approx(m_score, rel=1e-4), f"{query}: agg score differs"
+        # Sorted order must respect scores in both runs.
+        for rows in (s_agg, m_agg):
+            assert all(rows[i][0] >= rows[i + 1][0] for i in range(len(rows) - 1))
+
+        # 3. SORTBY on a sortable field + WITHSCORES: identical keys, ranks and scores.
+        assert s_sort_total == m_sort_total
+        assert [k for k, _ in s_sort] == [k for k, _ in m_sort], f"{query}: SORTBY keys differ"
+        for (key, s_score), (_, m_score) in zip(s_sort, m_sort):
+            assert s_score == pytest.approx(m_score, rel=1e-4), f"{query}/{key}: score differs"

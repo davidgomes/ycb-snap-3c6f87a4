@@ -150,6 +150,10 @@ class FieldIndices {
   BaseSortIndex* GetSortIndex(std::string_view field) const;
   std::vector<TextIndex*> GetAllTextIndices() const;
 
+  // Same as GetAllTextIndices, but pairs each index with its field identifier.
+  // Identifiers are stable across shards, unlike index pointers.
+  std::vector<std::pair<std::string_view, TextIndex*>> GetAllTextIndicesWithIdents() const;
+
   const std::vector<DocId>& GetAllDocs() const;
   const Schema& GetSchema() const;
 
@@ -245,9 +249,19 @@ class SearchAlgorithm {
 
   void SetScorer(ScorerFn scorer);
 
+  // Collect shard-local corpus statistics needed to score this query. Runs the
+  // query against the index to discover matched terms (including prefix/suffix
+  // and synonym expansion). Requires a scorer to be set.
+  TextScoringStats GatherScoringStats(const FieldIndices* index) const;
+
+  // Use corpus-wide statistics (merged across all shards) instead of shard-local
+  // ones during scoring. The stats object must outlive all Search() calls.
+  void SetScoringStats(const TextScoringStats* stats);
+
  private:
   bool profiling_enabled_ = false;
   ScorerFn scorer_ = nullptr;
+  const TextScoringStats* scoring_stats_ = nullptr;
   std::unique_ptr<AstNode> query_;
   std::optional<KnnScoreSortOption> knn_hnsw_score_sort_option_;
 };

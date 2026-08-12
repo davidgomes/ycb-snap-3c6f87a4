@@ -1156,6 +1156,17 @@ void SearchReply(const SearchParams& params,
     knn_score_ret_field = string{inject_score_alias};
   }
 
+  // Text scoring without KNN ordering or an explicit SORTBY: shards return docs
+  // in their local score order, so merge into a single global score order. Ties
+  // are broken by key, which is stable regardless of the shard count.
+  if ((params.scorer || params.with_scores) && !knn_sort_option && !params.sort_option) {
+    sort(docs.begin(), docs.end(), [](SerializedSearchDoc* l, SerializedSearchDoc* r) {
+      if (l->text_score != r->text_score)
+        return l->text_score > r->text_score;
+      return l->key < r->key;
+    });
+  }
+
   // Apply LIMIT
   size_t offset = 0;
   size_t limit = 0;
@@ -1201,6 +1212,29 @@ void SearchReply(const SearchParams& params,
       SendSerializedDoc(*docs[i], builder);
     }
   }
+}
+
+// Collect corpus statistics for text scoring from all shards as a non-concluding
+// transaction hop and merge them. Text scorers (BM25STD, TFIDF, ...) depend on
+// corpus statistics — total document count, per-term document frequency and
+// average field length — so they must be aggregated across all shards to make
+// scores independent of how documents are distributed.
+search::TextScoringStats GatherGlobalScoringStats(std::string_view index_name,
+                                                  search::SearchAlgorithm* search_algo,
+                                                  Transaction* tx) {
+  std::vector<search::TextScoringStats> shard_stats(shard_set->size());
+  tx->Execute(
+      [&](Transaction* t, EngineShard* es) {
+        if (auto* index = es->search_indices()->GetIndex(index_name); index)
+          shard_stats[es->shard_id()] = index->GatherScoringStats(search_algo);
+        return OpStatus::OK;
+      },
+      false);
+
+  search::TextScoringStats merged;
+  for (const auto& stats : shard_stats)
+    merged.Merge(stats);
+  return merged;
 }
 
 // Warms up the query parser to avoid first-call slowness
@@ -2017,15 +2051,26 @@ void CmdFtSearch(CmdArgList args, CommandContext* cmd_cntx) {
 
   // If the query does not contain knn component, or it is a hybrid query.
   // HNSW vector range has no prefilter, so skip per-shard search entirely.
+  search::TextScoringStats scoring_stats;
   if ((!knn || knn_has_prefilter) && !hnsw_range) {
-    cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
+    const bool use_global_scoring = params->scorer || params->with_scores;
+    if (use_global_scoring) {
+      scoring_stats = GatherGlobalScoringStats(index_name, &search_algo, cmd_cntx->tx());
+      search_algo.SetScoringStats(&scoring_stats);
+    }
+
+    auto search_cb = [&](Transaction* t, EngineShard* es) {
       if (auto* index = es->search_indices()->GetIndex(index_name); index)
         docs[es->shard_id()] =
             index->Search(t->GetOpArgs(es), *params, &search_algo, knn_has_prefilter);
       else
         index_not_found.store(true, memory_order_relaxed);
       return OpStatus::OK;
-    });
+    };
+    if (use_global_scoring)
+      cmd_cntx->tx()->Execute(search_cb, true);  // finalize multi-hop
+    else
+      cmd_cntx->tx()->ScheduleSingleHop(search_cb);
 
     if (index_not_found.load(memory_order_relaxed))
       return cmd_cntx->SendError(string{index_name} + ": no such index");
@@ -2122,7 +2167,15 @@ void CmdFtProfile(CmdArgList args, CommandContext* cmd_cntx) {
   std::vector<SearchResult> search_results(shards_count);
   std::vector<absl::Duration> profile_results(shards_count);
 
-  cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
+  // Merge corpus statistics across shards first so text scores are shard-independent.
+  search::TextScoringStats scoring_stats;
+  const bool use_global_scoring = params->scorer || params->with_scores;
+  if (use_global_scoring) {
+    scoring_stats = GatherGlobalScoringStats(index_name, &search_algo, cmd_cntx->tx());
+    search_algo.SetScoringStats(&scoring_stats);
+  }
+
+  auto profile_cb = [&](Transaction* t, EngineShard* es) {
     auto* index = es->search_indices()->GetIndex(index_name);
     if (!index) {
       index_not_found.store(true, memory_order_relaxed);
@@ -2136,7 +2189,11 @@ void CmdFtProfile(CmdArgList args, CommandContext* cmd_cntx) {
     profile_results[shard_id] = {absl::Now() - shard_start};
 
     return OpStatus::OK;
-  });
+  };
+  if (use_global_scoring)
+    cmd_cntx->tx()->Execute(profile_cb, true);  // finalize multi-hop
+  else
+    cmd_cntx->tx()->ScheduleSingleHop(profile_cb);
 
   if (index_not_found.load())
     return rb->SendError(std::string{index_name} + ": no such index");
@@ -2297,6 +2354,10 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
 
     auto [knn_node, knn] = TryPopHnswKnnNode(search_algo, params->index);
 
+    // Merge corpus statistics across shards first so text scores are shard-independent.
+    search::TextScoringStats scoring_stats;
+    const bool use_global_scoring = params->scorer || params->add_scores;
+
     // Per-shard text scores from prefilter for __score injection in ADDSCORES mode.
     // Indexed by shard_id because local DocIds are not unique across shards.
     // Always allocated to shard_set->size() so the callback can index unconditionally.
@@ -2333,6 +2394,11 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
       std::optional<std::vector<search::GlobalDocId>> prefilter_global_ids;
 
       if (knn_has_prefilter) {
+        if (use_global_scoring) {
+          scoring_stats = GatherGlobalScoringStats(params->index, &search_algo, cmd_cntx->tx());
+          search_algo.SetScoringStats(&scoring_stats);
+        }
+
         vector<SearchResult> prefilter_docs(shard_set->size());
         cmd_cntx->tx()->Execute(
             [&](Transaction* t, EngineShard* es) {
@@ -2388,13 +2454,20 @@ void CmdFtAggregate(CmdArgList args, CommandContext* cmd_cntx) {
       cmd_cntx->tx()->ScheduleSingleHop(
           make_load_cb(shard_docs, hnsw_range->score_alias, prefilter_text_scores));
     } else {
-      cmd_cntx->tx()->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
+      auto search_cb = [&](Transaction* t, EngineShard* es) {
         if (auto* index = es->search_indices()->GetIndex(params->index); index) {
           query_results[es->shard_id()] =
               index->SearchForAggregator(t->GetOpArgs(es), params.value(), &search_algo);
         }
         return OpStatus::OK;
-      });
+      };
+      if (use_global_scoring) {
+        scoring_stats = GatherGlobalScoringStats(params->index, &search_algo, cmd_cntx->tx());
+        search_algo.SetScoringStats(&scoring_stats);
+        cmd_cntx->tx()->Execute(search_cb, true);  // finalize multi-hop
+      } else {
+        cmd_cntx->tx()->ScheduleSingleHop(search_cb);
+      }
     }
 
     // ResultContainer is absl::flat_hash_map<std::string, search::SortableValue>

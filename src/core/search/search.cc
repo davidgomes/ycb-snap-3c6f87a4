@@ -117,8 +117,9 @@ struct ProfileBuilder {
 struct BasicSearch {
   using LogicOp = AstLogicalNode::LogicOp;
 
-  BasicSearch(const FieldIndices* indices, ScorerFn scorer = nullptr)
-      : indices_{indices}, scorer_{scorer} {
+  BasicSearch(const FieldIndices* indices, ScorerFn scorer = nullptr,
+              const TextScoringStats* global_scoring_stats = nullptr)
+      : indices_{indices}, scorer_{scorer}, global_scoring_stats_{global_scoring_stats} {
   }
 
   void EnableProfiling() {
@@ -697,12 +698,36 @@ struct BasicSearch {
                         {},         std::move(profile), std::move(error_)};
   }
 
+  // Run the query against this shard only to collect the corpus statistics needed
+  // for scoring: total document count, per-term document frequencies and per-field
+  // length sums. Merged across shards, these make text scores shard-independent.
+  TextScoringStats GatherScoringStats(const AstNode& query) {
+    DCHECK(scorer_);
+    SearchGeneric(query, "", true);
+
+    TextScoringStats stats;
+    stats.num_docs = indices_->GetAllDocs().size();
+
+    absl::flat_hash_map<TextIndex*, string_view> field_idents;
+    for (auto [ident, index] : indices_->GetAllTextIndicesWithIdents()) {
+      stats.fields[string{ident}] = {index->GetFieldTotalDocsLen(), index->GetFieldNumDocs()};
+      field_idents[index] = ident;
+    }
+
+    for (auto& [index, term] : matched_text_terms_) {
+      auto* container = index->Matching(term, /*strip_whitespace=*/false);
+      stats.term_docs[{string{field_idents[index]}, term}] = container ? container->Size() : 0;
+    }
+    return stats;
+  }
+
  private:
   // Cursor for sequential freq lookup in a posting list.
   // Advances forward only - amortized O(1) per doc when docs are sorted.
   struct TermCursor {
     TextIndex* index;
     size_t term_docs;
+    double field_avg_doc_len;
     TextIndex::Container::BlockListIterator it;
     TextIndex::Container::BlockListIterator end;
   };
@@ -726,17 +751,40 @@ struct BasicSearch {
     // Ensure sorted for cursor-based scoring
     sort(all_docs.begin(), all_docs.end());
 
-    // Open cursors on posting lists for each matched term
+    // Open cursors on posting lists for each matched term. Corpus statistics
+    // (term document frequency, average field length, total doc count) come from
+    // the merged cross-shard stats when available, so that scores do not depend
+    // on how documents are distributed across shards.
+    absl::flat_hash_map<TextIndex*, string_view> field_idents;
+    if (global_scoring_stats_) {
+      for (auto [ident, index] : indices_->GetAllTextIndicesWithIdents())
+        field_idents[index] = ident;
+    }
+
     vector<TermCursor> cursors;
     cursors.reserve(matched_text_terms_.size());
     for (auto& [index, term] : matched_text_terms_) {
       auto* container = index->Matching(term, /*strip_whitespace=*/false);
       if (!container)
         continue;
-      cursors.push_back({index, container->Size(), container->begin(), container->end()});
+
+      size_t term_docs = container->Size();
+      double field_avg_doc_len = index->GetFieldAvgDocLen();
+      if (global_scoring_stats_) {
+        string ident{field_idents[index]};
+        if (auto it = global_scoring_stats_->term_docs.find(std::pair{ident, term});
+            it != global_scoring_stats_->term_docs.end())
+          term_docs = it->second;
+        if (auto it = global_scoring_stats_->fields.find(ident);
+            it != global_scoring_stats_->fields.end())
+          field_avg_doc_len = it->second.AvgLen();
+      }
+      cursors.push_back(
+          {index, term_docs, field_avg_doc_len, container->begin(), container->end()});
     }
 
-    ScoringContext ctx{indices_->GetAllDocs().size()};
+    ScoringContext ctx{global_scoring_stats_ ? global_scoring_stats_->num_docs
+                                             : indices_->GetAllDocs().size()};
 
     // Score all docs - reuse term_infos buffer across iterations
     vector<pair<float, DocId>> scored;
@@ -749,7 +797,7 @@ struct BasicSearch {
         term_infos[t].term_freq = SeekCursor(cursors[t], doc);
         if (cursors[t].index) {
           term_infos[t].field_doc_len = cursors[t].index->GetFieldDocLength(doc);
-          term_infos[t].field_avg_doc_len = cursors[t].index->GetFieldAvgDocLen();
+          term_infos[t].field_avg_doc_len = cursors[t].field_avg_doc_len;
         }
       }
       scored.emplace_back(static_cast<float>(ScoreDocument(scorer_, ctx, term_infos)), doc);
@@ -757,16 +805,24 @@ struct BasicSearch {
 
     // Top-K by score (skip sort when no actual cutoff, e.g. FT.AGGREGATE)
     size_t k = min(limit, scored.size());
-    if (k < scored.size()) {
+    if (k == 0) {
+      scored.clear();
+    } else if (k < scored.size()) {
       partial_sort(scored.begin(), scored.begin() + k, scored.end(), greater<>());
-      scored.resize(k);
+      // Keep docs tied with the k-th score. Cutting them here would make the
+      // cross-shard merge depend on shard-local tie order (DocIds are not
+      // comparable across shards); the coordinator tie-breaks by key instead.
+      float boundary = scored[k - 1].first;
+      auto tied_end = partition(scored.begin() + k, scored.end(),
+                                [boundary](const auto& p) { return p.first == boundary; });
+      scored.erase(tied_end, scored.end());
     }
 
     // Build output: docs in score order, paired scores
     vector<DocId> out;
     vector<pair<DocId, float>> text_scores;
-    out.reserve(k);
-    text_scores.reserve(k);
+    out.reserve(scored.size());
+    text_scores.reserve(scored.size());
     for (auto& [score, doc] : scored) {
       out.push_back(doc);
       text_scores.emplace_back(doc, score);
@@ -782,6 +838,8 @@ struct BasicSearch {
 
   const FieldIndices* indices_;
   ScorerFn scorer_ = nullptr;
+  // Corpus statistics merged across all shards; nullptr means use shard-local stats.
+  const TextScoringStats* global_scoring_stats_ = nullptr;
 
   string error_;
   optional<ProfileBuilder> profile_builder_ = ProfileBuilder{};
@@ -972,6 +1030,19 @@ std::vector<TextIndex*> FieldIndices::GetAllTextIndices() const {
   return out;
 }
 
+std::vector<std::pair<std::string_view, TextIndex*>> FieldIndices::GetAllTextIndicesWithIdents()
+    const {
+  vector<std::pair<std::string_view, TextIndex*>> out;
+  for (const auto& [field_name, field_info] : schema_.fields) {
+    if (field_info.type != SchemaField::TEXT || (field_info.flags & SchemaField::NOINDEX) > 0)
+      continue;
+    auto* index = dynamic_cast<TextIndex*>(GetIndex(field_name));
+    DCHECK(index);
+    out.emplace_back(field_name, index);
+  }
+  return out;
+}
+
 const vector<DocId>& FieldIndices::GetAllDocs() const {
   return all_ids_;
 }
@@ -1046,10 +1117,18 @@ bool SearchAlgorithm::Init(string_view query, const QueryParams* params,
 SearchResult SearchAlgorithm::Search(const FieldIndices* index, size_t cuttoff_limit) const {
   DCHECK(query_);
 
-  auto bs = BasicSearch{index, scorer_};
+  auto bs = BasicSearch{index, scorer_, scoring_stats_};
   if (profiling_enabled_)
     bs.EnableProfiling();
   return bs.Search(*query_, cuttoff_limit);
+}
+
+TextScoringStats SearchAlgorithm::GatherScoringStats(const FieldIndices* index) const {
+  DCHECK(query_);
+  DCHECK(scorer_);
+
+  auto bs = BasicSearch{index, scorer_};
+  return bs.GatherScoringStats(*query_);
 }
 
 std::optional<KnnScoreSortOption> SearchAlgorithm::GetKnnScoreSortOption() const {
@@ -1097,6 +1176,10 @@ void SearchAlgorithm::EnableProfiling() {
 
 void SearchAlgorithm::SetScorer(ScorerFn scorer) {
   scorer_ = scorer;
+}
+
+void SearchAlgorithm::SetScoringStats(const TextScoringStats* stats) {
+  scoring_stats_ = stats;
 }
 
 const AstVectorRangeNode* SearchAlgorithm::GetVectorRangeNode() const {

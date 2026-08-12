@@ -3194,6 +3194,146 @@ TEST_F(ScoringTest, BM25StdAfterDocRemoval) {
   }
 }
 
+TEST_F(ScoringTest, GatherScoringStatsBasic) {
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+  FieldIndices index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+
+  MockedDocument doc1("hello world hello");  // 3 tokens, "hello" TF=2
+  MockedDocument doc2("hello there");        // 2 tokens
+  MockedDocument doc3("goodbye world");      // 2 tokens
+
+  index.Add(0, doc1);
+  index.Add(1, doc2);
+  index.Add(2, doc3);
+  index.FinalizeInitialization();
+
+  QueryParams params;
+  SearchAlgorithm algo;
+  ASSERT_TRUE(algo.Init("hello", &params));
+  algo.SetScorer(&BM25Std);
+
+  TextScoringStats stats = algo.GatherScoringStats(&index);
+
+  EXPECT_EQ(stats.num_docs, 3u);
+  ASSERT_TRUE(stats.fields.contains("field"));
+  EXPECT_EQ(stats.fields.at("field").total_len, 7u);
+  EXPECT_EQ(stats.fields.at("field").num_docs, 3u);
+  EXPECT_DOUBLE_EQ(stats.fields.at("field").AvgLen(), 7.0 / 3);
+  ASSERT_TRUE((stats.term_docs.contains(std::pair<std::string, std::string>{"field", "hello"})));
+  EXPECT_EQ((stats.term_docs.at(std::pair<std::string, std::string>{"field", "hello"})), 2u);
+}
+
+TEST_F(ScoringTest, ScoringStatsMerge) {
+  TextScoringStats a, b;
+  a.num_docs = 3;
+  a.fields["field"] = {7, 3};
+  a.term_docs[{"field", "hello"}] = 2;
+
+  b.num_docs = 2;
+  b.fields["field"] = {5, 2};
+  b.term_docs[{"field", "hello"}] = 1;
+  b.term_docs[{"field", "world"}] = 2;
+
+  a.Merge(b);
+
+  EXPECT_EQ(a.num_docs, 5u);
+  EXPECT_EQ(a.fields.at("field").total_len, 12u);
+  EXPECT_EQ(a.fields.at("field").num_docs, 5u);
+  EXPECT_EQ((a.term_docs.at({"field", "hello"})), 3u);
+  EXPECT_EQ((a.term_docs.at({"field", "world"})), 2u);
+}
+
+// Distributing the same corpus over multiple "shards" must produce the same
+// per-document scores as a single index, once cross-shard statistics are
+// gathered, merged and installed via SetScoringStats.
+TEST_F(ScoringTest, ScoresShardIndependent) {
+  const vector<string> corpus = {
+      "hello world hello",  "hello there",         "hello universe today",
+      "world of wonders",   "hello hello hello",   "quick brown fox",
+      "world peace hello",  "quick hello fix",     "wonders never cease",
+      "fox jumps over dog", "hello world program", "quick brown hello world",
+  };
+
+  Schema schema = MakeSimpleSchema({{"field", SchemaField::TEXT}});
+
+  // Reference: all docs in one index.
+  FieldIndices full_index{schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr};
+  vector<MockedDocument> full_docs;
+  full_docs.reserve(corpus.size());
+  for (size_t i = 0; i < corpus.size(); i++) {
+    full_docs.emplace_back(corpus[i]);
+    full_index.Add(i, full_docs.back());
+  }
+  full_index.FinalizeInitialization();
+
+  // "Shards": docs distributed round-robin over two indices.
+  constexpr size_t kNumShards = 2;
+  vector<FieldIndices> shards;
+  vector<vector<MockedDocument>> shard_docs(kNumShards);
+  vector<vector<size_t>> shard_to_corpus(kNumShards);  // local DocId -> corpus idx
+  for (size_t s = 0; s < kNumShards; s++)
+    shards.emplace_back(schema, kEmptyOptions, PMR_NS::get_default_resource(), nullptr);
+  for (size_t i = 0; i < corpus.size(); i++) {
+    size_t s = i % kNumShards;
+    DocId local_id = static_cast<DocId>(shard_to_corpus[s].size());
+    shard_docs[s].emplace_back(corpus[i]);
+    shards[s].Add(local_id, shard_docs[s].back());
+    shard_to_corpus[s].push_back(i);
+  }
+  for (auto& shard : shards)
+    shard.FinalizeInitialization();
+
+  struct NamedScorer {
+    ScorerFn fn;
+    string_view name;
+  };
+  const NamedScorer scorers[] = {
+      {&BM25Std, "BM25STD"}, {&TfIdf, "TFIDF"}, {&TfIdfDocNorm, "TFIDF.DOCNORM"}};
+  const string_view queries[] = {"hello", "hel*", "hello world"};
+
+  for (const auto& scorer : scorers) {
+    for (string_view query : queries) {
+      QueryParams params;
+
+      // Single-index reference scores by corpus position.
+      SearchAlgorithm ref_algo;
+      ASSERT_TRUE(ref_algo.Init(query, &params));
+      ref_algo.SetScorer(scorer.fn);
+      auto ref_result = ref_algo.Search(&full_index);
+      absl::flat_hash_map<size_t, float> ref_scores;
+      for (auto& [doc, score] : ref_result.text_scores)
+        ref_scores[doc] = score;
+
+      // Sharded run: gather stats from all shards, merge, then search each shard.
+      SearchAlgorithm algo;
+      ASSERT_TRUE(algo.Init(query, &params));
+      algo.SetScorer(scorer.fn);
+
+      TextScoringStats merged;
+      for (auto& shard : shards)
+        merged.Merge(algo.GatherScoringStats(&shard));
+      EXPECT_EQ(merged.num_docs, corpus.size());
+      algo.SetScoringStats(&merged);
+
+      absl::flat_hash_map<size_t, float> sharded_scores;
+      for (size_t s = 0; s < kNumShards; s++) {
+        auto result = algo.Search(&shards[s]);
+        for (auto& [doc, score] : result.text_scores)
+          sharded_scores[shard_to_corpus[s][doc]] = score;
+      }
+
+      EXPECT_EQ(ref_scores.size(), sharded_scores.size())
+          << "scorer=" << scorer.name << " query=" << query;
+      for (auto& [corpus_idx, ref_score] : ref_scores) {
+        ASSERT_TRUE(sharded_scores.contains(corpus_idx))
+            << "scorer=" << scorer.name << " query=" << query << " doc=" << corpus_idx;
+        EXPECT_NEAR(ref_score, sharded_scores[corpus_idx], 1e-5)
+            << "scorer=" << scorer.name << " query=" << query << " doc=" << corpus_idx;
+      }
+    }
+  }
+}
+
 // Verify that with a scorer active and a cutoff limit, the search returns the
 // highest-scoring documents (top-K by score), not arbitrary ones.
 TEST_F(ScoringTest, ScorerTopKCutoff) {

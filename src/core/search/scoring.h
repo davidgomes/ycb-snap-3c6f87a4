@@ -4,10 +4,13 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+
 #include <algorithm>
 #include <cmath>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "core/search/base.h"
@@ -16,6 +19,31 @@ namespace dfly::search {
 
 class FieldIndices;
 struct TextIndex;
+
+// Corpus-wide statistics used by text scorers: IDF inputs (document counts) and
+// average field lengths. Collected per shard and merged by the coordinator, so
+// that scores do not depend on how documents are distributed across shards.
+struct TextScoringStats {
+  struct FieldStats {
+    size_t total_len = 0;  // sum of per-document field lengths (sum of TF)
+    size_t num_docs = 0;   // documents with non-empty content in this field
+
+    double AvgLen() const {
+      return num_docs > 0 ? static_cast<double>(total_len) / num_docs : 0.0;
+    }
+  };
+
+  size_t num_docs = 0;  // total documents in the index
+
+  // field identifier -> aggregated field length stats
+  absl::flat_hash_map<std::string, FieldStats> fields;
+
+  // (field identifier, term) -> number of documents containing the term
+  absl::flat_hash_map<std::pair<std::string, std::string>, size_t> term_docs;
+
+  // Merge statistics collected on another shard into this instance.
+  void Merge(const TextScoringStats& other);
+};
 
 // Per-term information needed for scoring a single document
 struct ScoringTermInfo {

@@ -854,6 +854,11 @@ vector<search::SortableValue> ShardDocIndex::KeepTopKSorted(vector<DocId>* ids, 
   return out;
 }
 
+search::TextScoringStats ShardDocIndex::GatherScoringStats(
+    search::SearchAlgorithm* search_algo) const {
+  return search_algo->GatherScoringStats(&*indices_);
+}
+
 SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& params,
                                    search::SearchAlgorithm* search_algo,
                                    bool is_knn_prefilter) const {
@@ -918,8 +923,11 @@ SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& pa
     }
   }
 
-  // Cut off unnecessary items
-  result.ids.resize(min(result.ids.size(), limit));
+  // Cut off unnecessary items. When text scoring is active without an explicit
+  // sort, the search core already cut to the limit but kept boundary-score ties;
+  // preserve them so the coordinator can tie-break consistently across shards.
+  if (result.text_scores.empty() || params.sort_option)
+    result.ids.resize(min(result.ids.size(), limit));
 
   // Build text score lookup (DocId -> score) if available
   absl::flat_hash_map<search::DocId, float> text_score_map;

@@ -146,6 +146,11 @@ template <typename C> struct BaseStringIndex : public BaseIndex {
     return field_num_docs_;
   }
 
+  // Total length of this field summed over all documents (sum of TF).
+  size_t GetFieldTotalDocsLen() const {
+    return field_total_docs_len_;
+  }
+
  protected:
   using StringList = DocumentAccessor::StringList;
 

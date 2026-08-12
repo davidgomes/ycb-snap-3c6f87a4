@@ -121,7 +121,9 @@ void Aggregator::DoSort(const SortParams& sort_params) {
 
   auto& values = result.values;
   if (sort_params.SortAll()) {
-    rng::sort(values, comparator);
+    // Stable sort keeps the incoming row order for ties, so results with equal
+    // sort keys (e.g. tied __score values) stay deterministic.
+    rng::stable_sort(values, comparator);
   } else {
     DCHECK_GE(sort_params.max, 0);
     const size_t limit = std::min(values.size(), size_t(sort_params.max));
