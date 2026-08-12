@@ -539,9 +539,11 @@ impl<'a> Persist<'a> for MMIODeviceManager {
 
         // Initialize MMDS if MMDS state is included.
         if let Some(mmds) = &state.mmds {
-            constructor_args
-                .vm_resources
-                .set_mmds_basic_config(mmds.version, mmds.imds_compat, constructor_args.instance_id)?;
+            constructor_args.vm_resources.set_mmds_basic_config(
+                mmds.version,
+                mmds.imds_compat,
+                constructor_args.instance_id,
+            )?;
         }
 
         for net_state in &state.net_devices {

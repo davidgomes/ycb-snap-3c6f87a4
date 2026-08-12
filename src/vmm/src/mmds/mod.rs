@@ -491,7 +491,10 @@ mod tests {
               Accept: application/json\r\n\r\n",
             MediaType::PlainText,
         );
-        assert_eq!(convert_to_response(mmds.clone(), request), expected_response);
+        assert_eq!(
+            convert_to_response(mmds.clone(), request),
+            expected_response
+        );
 
         let request = Request::try_from(
             b"GET http://169.254.169.254/age HTTP/1.0\r\n\

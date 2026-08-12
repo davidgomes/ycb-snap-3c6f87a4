@@ -56,10 +56,7 @@ mod tests {
             serde_json::from_str(r#"{"network_interfaces":["eth0"]}"#).unwrap();
 
         assert!(!config.imds_compat());
-        assert_eq!(
-            serde_json::to_value(config).unwrap()["imds_compat"],
-            false
-        );
+        assert_eq!(serde_json::to_value(config).unwrap()["imds_compat"], false);
     }
 }
 
