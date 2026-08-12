@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "envoy/http/codec.h"
+#include "envoy/http/client_codec_factory.h"
 
 #include "source/common/common/enum_to_int.h"
 #include "source/common/config/utility.h"
@@ -291,7 +292,14 @@ CodecClientProd::CodecClientProd(CodecType type, Network::ClientConnectionPtr&& 
                                  const Network::TransportSocketOptionsConstSharedPtr& options,
                                  bool should_connect)
     : CodecClient(type, std::move(connection), host, dispatcher) {
-  switch (type) {
+  auto factory = host->cluster().upstreamHttpClientCodecFactory();
+  if (factory.has_value()) {
+    Http::ClientCodecFactory::Context context{type, *connection_, *this, host->cluster(), random_generator, options};
+    codec_ = factory->createClientCodec(context);
+  }
+
+  if (!codec_) {
+    switch (type) {
   case CodecType::HTTP1: {
     // If the transport socket indicates this is being proxied, inform the HTTP/1.1 codec. It will
     // send fully qualified URLs iff the underlying transport is plaintext.
@@ -304,7 +312,6 @@ CodecClientProd::CodecClientProd(CodecType type, Network::ClientConnectionPtr&& 
         host->cluster().httpProtocolOptions().http1Settings(),
         host->cluster().maxResponseHeadersKb(), host->cluster().maxResponseHeadersCount(), proxied);
     break;
-  }
   case CodecType::HTTP2:
     codec_ = std::make_unique<Http2::ClientConnectionImpl>(
         *connection_, *this, host->cluster().http2CodecStats(), random_generator,
@@ -328,7 +335,7 @@ CodecClientProd::CodecClientProd(CodecType type, Network::ClientConnectionPtr&& 
     // Should be blocked by configuration checking at an earlier point.
     PANIC("unexpected");
 #endif
-  }
+    }
   }
   if (should_connect) {
     connect();

@@ -1,4 +1,5 @@
 #include "source/common/upstream/upstream_impl.h"
+#include "envoy/http/client_codec_factory.h"
 
 #include <chrono>
 #include <cstdint>
@@ -35,6 +36,7 @@
 #include "envoy/stats/scope.h"
 #include "envoy/upstream/health_checker.h"
 #include "envoy/upstream/upstream.h"
+#include "envoy/http/client_codec_factory.h"
 
 #include "source/common/common/dns_utils.h"
 #include "source/common/common/enum_to_int.h"
@@ -1404,6 +1406,17 @@ ClusterInfoImpl::ClusterInfoImpl(
             callback, proto_config.name()));
   }
 
+  for (const auto& [name, options] : extension_protocol_options_) {
+    auto codec_factory = std::dynamic_pointer_cast<const Http::ClientCodecFactory>(options);
+    if (codec_factory) {
+      if (upstream_http_client_codec_factory_ != nullptr) {
+        creation_status = absl::InvalidArgumentError(
+            "multiple upstream HTTP client codec factories configured on a single cluster via typed_extension_protocol_options; at most one is allowed");
+        return;
+      }
+      upstream_http_client_codec_factory_ = codec_factory.get();
+    }
+  }
   if (http_protocol_options_) {
     if (!http_protocol_options_->http_filters_.empty()) {
       creation_status = Http::FilterChainUtility::checkUpstreamHttpFiltersList(

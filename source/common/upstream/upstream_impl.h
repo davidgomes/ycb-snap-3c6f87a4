@@ -898,6 +898,13 @@ public:
     return buffer_high_watermark_timeout_;
   }
   uint64_t features() const override { return features_; }
+  OptRef<const Http::ClientCodecFactory> upstreamHttpClientCodecFactory() const override {
+    if (upstream_http_client_codec_factory_ != nullptr) {
+      return *upstream_http_client_codec_factory_;
+    }
+    return {};
+  }
+
   const HttpProtocolOptionsConfig& httpProtocolOptions() const override {
     return *http_protocol_options_;
   }
@@ -1088,6 +1095,7 @@ private:
   const absl::flat_hash_map<std::string, ProtocolOptionsConfigConstSharedPtr>
       extension_protocol_options_;
   const std::shared_ptr<const HttpProtocolOptionsConfigImpl> http_protocol_options_;
+  const Http::ClientCodecFactory* upstream_http_client_codec_factory_{};
   const std::shared_ptr<const TcpProtocolOptionsConfigImpl> tcp_protocol_options_;
   const uint32_t max_requests_per_connection_;
   const std::chrono::milliseconds connect_timeout_;

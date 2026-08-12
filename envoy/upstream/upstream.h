@@ -35,6 +35,7 @@
 namespace Envoy {
 namespace Http {
 class FilterChainManager;
+class ClientCodecFactory;
 class HashPolicy;
 } // namespace Http
 
@@ -916,6 +917,14 @@ using ClusterTimeoutBudgetStatsOptRef =
 class ProtocolOptionsConfig {
 public:
   virtual ~ProtocolOptionsConfig() = default;
+
+  /**
+   * @return OptRef<const Http::ClientCodecFactory> the upstream HTTP client codec factory to use
+   *         for this cluster, or empty if none is configured.
+   */
+  virtual OptRef<const Http::ClientCodecFactory> upstreamHttpClientCodecFactory() const {
+    return {};
+  }
 };
 using ProtocolOptionsConfigConstSharedPtr = std::shared_ptr<const ProtocolOptionsConfig>;
 
@@ -1009,6 +1018,12 @@ using AddressSelectFn = std::function<const Network::Address::InstanceConstShare
  */
 class ClusterInfo : public Http::FilterChainFactory {
 public:
+  /**
+   * @return OptRef<const Http::ClientCodecFactory> the upstream HTTP client codec factory to use
+   *         for this cluster, or empty if none is configured.
+   */
+  virtual OptRef<const Http::ClientCodecFactory> upstreamHttpClientCodecFactory() const PURE;
+
   struct Features {
     // Whether the upstream supports HTTP2. This is used when creating connection pools.
     static constexpr uint64_t HTTP2 = 0x1;
