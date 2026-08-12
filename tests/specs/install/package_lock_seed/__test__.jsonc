@@ -10,7 +10,10 @@
       "output": "[WILDCARD]"
     },
     {
-      "args": ["eval", "console.log(Deno.readTextFileSync('deno.lock').trim());"],
+      "args": [
+        "eval",
+        "console.log(Deno.readTextFileSync('deno.lock').trim());"
+      ],
       "output": "lock.out"
     }
   ]
