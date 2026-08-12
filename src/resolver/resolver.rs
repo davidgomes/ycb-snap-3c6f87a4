@@ -1649,6 +1649,9 @@ impl<'a> Resolver<'a> {
                 result.flags.set_experimental_decorators(
                     result.flags.experimental_decorators() || tsconfig.experimental_decorators,
                 );
+                if let Some(val) = tsconfig.use_define_for_class_fields {
+                    result.flags.set_use_define_for_class_fields(val);
+                }
             }
 
             // If you use mjs or mts, then you're using esm
@@ -6426,6 +6429,11 @@ impl<'a> Resolver<'a> {
                         let mc = unsafe { &mut *merged_config };
                         mc.emit_decorator_metadata =
                             mc.emit_decorator_metadata || parent_config.emit_decorator_metadata;
+                        mc.experimental_decorators =
+                            mc.experimental_decorators || parent_config.experimental_decorators;
+                        if let Some(val) = parent_config.use_define_for_class_fields {
+                            mc.use_define_for_class_fields = Some(val);
+                        }
                         if !parent_config.base_url.is_empty() {
                             mc.base_url = core::mem::take(&mut parent_config.base_url);
                         }

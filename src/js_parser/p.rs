@@ -6479,7 +6479,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                 }
 
                 if !TYPESCRIPT {
-                    if !s_class.class.has_decorators {
+                    if !s_class.class.has_decorators && self.options.use_define_for_class_fields {
                         return self.arena.alloc_slice_copy(&[stmt]);
                     }
                 }
@@ -6624,7 +6624,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                             prop.key.map(|k| k.data),
                             Some(js_ast::ExprData::EPrivateIdentifier(_))
                         )
-                        && prop.ts_decorators.len_u32() > 0
+                        && (prop.ts_decorators.len_u32() > 0 || (!self.options.use_define_for_class_fields && !prop.flags.contains(Flags::Property::IsStatic)))
                     {
                         // remove decorated fields without initializers to avoid assigning undefined.
                         let Some(initializer) = prop.initializer else {
@@ -8582,6 +8582,177 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             }
         }
         false
+    }
+    pub(crate) fn lower_class_fields_for_expr(&mut self, class: &mut js_ast::g::Class, loc: bun_ast::Loc) {
+        use js_ast::g::PropertyKind;
+        let mut instance_members = BumpVec::<Stmt>::new_in(self.arena);
+        let mut class_properties = BumpVec::<G::Property>::new_in(self.arena);
+        let mut constructor_function: Option<bun_ast::StoreRef<E::Function>> = None;
+
+        for prop in class.properties.slice_mut().iter_mut() {
+            if prop.flags.contains(Flags::Property::IsMethod) {
+                if let Some(prop_value) = prop.value {
+                    if let js_ast::ExprData::EFunction(func) = prop_value.data {
+                        if matches!(prop.key, Some(k) if matches!(k.data, js_ast::ExprData::EString(s) if s.eql_comptime(b"constructor"))) {
+                            constructor_function = Some(func);
+                        }
+                    }
+                }
+            }
+
+            if prop.kind != PropertyKind::ClassStaticBlock
+                && !prop.flags.contains(Flags::Property::IsMethod)
+                && !prop.flags.contains(Flags::Property::IsStatic)
+                && !matches!(
+                    prop.key.map(|k| k.data),
+                    Some(js_ast::ExprData::EPrivateIdentifier(_))
+                )
+            {
+                let Some(initializer) = prop.initializer else {
+                    continue;
+                };
+
+                let target = self.new_expr(
+                    E::This {},
+                    prop.key.expect("infallible: prop has key").loc,
+                );
+
+                let key = prop.key.expect("infallible: prop has key");
+                let target = match &key.data {
+                    js_ast::ExprData::EString(s)
+                        if s.is_utf8()
+                            && !prop.flags.contains(Flags::Property::IsComputed) =>
+                    {
+                        self.new_expr(
+                            E::Dot {
+                                target,
+                                name: s.data,
+                                name_loc: key.loc,
+                                ..Default::default()
+                            },
+                            key.loc,
+                        )
+                    }
+                    _ => self.new_expr(
+                        E::Index {
+                            target,
+                            index: key,
+                            optional_chain: None,
+                        },
+                        key.loc,
+                    ),
+                };
+
+                instance_members.push(Stmt::assign(target, initializer));
+                continue;
+            }
+
+            class_properties.push(core::mem::take(prop));
+        }
+
+        class.properties =
+            bun_ast::StoreSlice::new_mut(class_properties.into_bump_slice_mut());
+
+        if !instance_members.is_empty() {
+            if let Some(mut cf) = constructor_function {
+                let old_stmts: &[Stmt] = cf.func.body.stmts.slice();
+                let mut super_index: Option<usize> = None;
+                for (index, item) in old_stmts.iter().enumerate() {
+                    if !matches!(item.data, js_ast::StmtData::SExpr(se) if matches!(se.value.data, js_ast::ExprData::ECall(c) if matches!(c.target.data, js_ast::ExprData::ESuper(_))))
+                    {
+                        continue;
+                    }
+                    super_index = Some(index);
+                    break;
+                }
+
+                let i = super_index.map(|j| j + 1).unwrap_or(0);
+                let mut constructor_stmts = BumpVec::<Stmt>::with_capacity_in(
+                    old_stmts.len() + instance_members.len(),
+                    self.arena,
+                );
+                constructor_stmts.extend_from_slice(&old_stmts[..i]);
+                constructor_stmts.extend_from_slice(&instance_members);
+                constructor_stmts.extend_from_slice(&old_stmts[i..]);
+
+                cf.func.body.stmts =
+                    bun_ast::StoreSlice::new_mut(constructor_stmts.into_bump_slice_mut());
+            } else {
+                let old_props: bun_ast::StoreSlice<G::Property> = class.properties;
+                let old_len = old_props.len();
+                let mut properties =
+                    BumpVec::<G::Property>::with_capacity_in(old_len + 1, self.arena);
+                let mut constructor_stmts = BumpVec::<Stmt>::new_in(self.arena);
+
+                if class.extends.is_some() {
+                    let target = self.new_expr(E::Super {}, loc);
+                    let arguments_ref =
+                        self.new_symbol(js_ast::symbol::Kind::Unbound, b"arguments");
+                    VecExt::append(&mut self.current_scope_mut().generated, arguments_ref);
+
+                    let spread_inner =
+                        self.new_expr(E::Identifier::init(arguments_ref), loc);
+                    let super_ = self.new_expr(
+                        E::Spread {
+                            value: spread_inner,
+                        },
+                        loc,
+                    );
+                    let args = ExprNodeList::init_one(super_);
+
+                    let call_value = self.new_expr(
+                        E::Call {
+                            target,
+                            args,
+                            ..Default::default()
+                        },
+                        loc,
+                    );
+                    constructor_stmts.push(self.s(
+                        S::SExpr {
+                            value: call_value,
+                            ..Default::default()
+                        },
+                        loc,
+                    ));
+                }
+
+                constructor_stmts.extend_from_slice(&instance_members);
+
+                let key_expr =
+                    self.new_expr(E::EString::from_static(b"constructor"), loc);
+                let value_expr = self.new_expr(
+                    E::Function {
+                        func: G::Fn {
+                            name: None,
+                            open_parens_loc: bun_ast::Loc::EMPTY,
+                            args: bun_ast::StoreSlice::EMPTY,
+                            body: G::FnBody {
+                                loc,
+                                stmts: bun_ast::StoreSlice::new_mut(
+                                    constructor_stmts.into_bump_slice_mut(),
+                                ),
+                            },
+                            flags: Flags::FUNCTION_NONE,
+                            ..Default::default()
+                        },
+                    },
+                    loc,
+                );
+                properties.push(G::Property {
+                    flags: Flags::Property::IsMethod.into(),
+                    key: Some(key_expr),
+                    value: Some(value_expr),
+                    ..Default::default()
+                });
+                for old in old_props.slice_mut().iter_mut() {
+                    properties.push(core::mem::take(old));
+                }
+
+                class.properties =
+                    bun_ast::StoreSlice::new_mut(properties.into_bump_slice_mut());
+            }
+        }
     }
 }
 

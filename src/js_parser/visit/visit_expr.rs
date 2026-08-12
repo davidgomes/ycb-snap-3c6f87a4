@@ -2633,6 +2633,10 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             return;
         }
 
+        if !p.options.use_define_for_class_fields {
+            p.lower_class_fields_for_expr(&mut e_, expr.loc);
+        }
+
         // Remove unused class names when minifying (only when bundling is enabled)
         // unless --keep-names is specified
         if p.options.features.minify_syntax

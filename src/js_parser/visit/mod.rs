@@ -1139,14 +1139,16 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                                 },
                                 bind_loc,
                             );
-                            class_body.insert(
-                                j,
-                                G::Property {
-                                    key: Some(field_ident),
-                                    ..Default::default()
-                                },
-                            );
-                            j += 1;
+                            if self.options.use_define_for_class_fields {
+                                class_body.insert(
+                                    j,
+                                    G::Property {
+                                        key: Some(field_ident),
+                                        ..Default::default()
+                                    },
+                                );
+                                j += 1;
+                            }
                         }
 
                         class.properties = bun_ast::StoreSlice::from_bump(class_body);
