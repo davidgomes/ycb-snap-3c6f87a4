@@ -149,5 +149,6 @@ mongo_cc_unit_test(
         ":update_cmd_shape",
         "//src/mongo/db/pipeline:expression_context_for_test",
         "//src/mongo/db/query:query_test_service_context",
+        "//src/mongo/db/shard_role/shard_catalog:raw_data_operation",
     ],
 )
