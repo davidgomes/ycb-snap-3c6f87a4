@@ -215,5 +215,132 @@ start_server {tags {"tls"}} {
 	            catch {r ACL DELUSER {Client-only}}
 	        }
 	    }
+
+        test {TLS: tls-expected-peer-name rejects invalid values at config time} {
+            # Whitespace-only values are rejected
+            assert_error "*at least one name*" {r CONFIG SET tls-expected-peer-name " "}
+            assert_error "*at least one name*" {r CONFIG SET tls-expected-peer-name "   "}
+
+            # Non-space whitespace inside the value is rejected
+            assert_error "*whitespace*" {r CONFIG SET tls-expected-peer-name "foo\tbar"}
+            assert_error "*whitespace*" {r CONFIG SET tls-expected-peer-name "foo\nbar"}
+            assert_error "*whitespace*" {r CONFIG SET tls-expected-peer-name "redis.local\t"}
+
+            # Valid single name and multi-name lists are accepted
+            r CONFIG SET tls-expected-peer-name "redis.local"
+            assert_equal {redis.local} [lindex [r CONFIG GET tls-expected-peer-name] 1]
+            r CONFIG SET tls-expected-peer-name "a.example b.example"
+            assert_equal {a.example b.example} [lindex [r CONFIG GET tls-expected-peer-name] 1]
+
+            # An empty value clears the setting
+            r CONFIG SET tls-expected-peer-name ""
+            assert_equal {} [lindex [r CONFIG GET tls-expected-peer-name] 1]
+        }
+
+        test {TLS: tls-expected-peer-name enforced on replication} {
+            # Master presents the certificate carrying the shared SANs
+            # (DNS:redis.local, DNS:cluster.local).
+            set san_crt [format "%s/tests/tls/san.crt" [pwd]]
+            set san_key [format "%s/tests/tls/san.key" [pwd]]
+
+            start_server [list overrides [list tls-cert-file $san_crt tls-key-file $san_key]] {
+                set master [srv 0 client]
+                set master_host [srv 0 host]
+                set master_port [srv 0 port]
+
+                start_server {} {
+                    set replica [srv 0 client]
+
+                    # A mismatching expected name must keep the link down: the
+                    # master cert is CA-signed but does not carry this name.
+                    $replica CONFIG SET tls-expected-peer-name wrong.name
+                    $replica replicaof $master_host $master_port
+                    wait_for_log_messages 0 {"*SYNC*certificate verify failed*"} 0 100 100
+                    assert_match {*master_link_status:down*} [$replica INFO replication]
+
+                    # Runtime CONFIG SET of a multi-name list that includes one
+                    # of the master's SANs lets replication establish (any name
+                    # in the list may match).
+                    $replica CONFIG SET tls-expected-peer-name "foo.example redis.local"
+                    wait_for_sync $replica
+                    assert_match {*master_link_status:up*} [$replica INFO replication]
+
+                    # A single exact SAN name also matches on a fresh link.
+                    $replica replicaof no one
+                    $replica CONFIG SET tls-expected-peer-name redis.local
+                    $replica replicaof $master_host $master_port
+                    wait_for_sync $replica
+
+                    # Clearing the option preserves plain CA-only verification.
+                    $replica replicaof no one
+                    $replica CONFIG SET tls-expected-peer-name ""
+                    $replica replicaof $master_host $master_port
+                    wait_for_sync $replica
+                }
+            }
+        }
+
+        test {TLS: tls-expected-peer-name falls back to CN when the cert has no SAN} {
+            # The default test master cert (server.crt) has CN=Server-only and
+            # no SubjectAltName entries, so the CN is used for matching.
+            set master_host [srv 0 host]
+            set master_port [srv 0 port]
+
+            start_server {} {
+                set replica [srv 0 client]
+
+                $replica CONFIG SET tls-expected-peer-name wrong.name
+                $replica replicaof $master_host $master_port
+                wait_for_log_messages 0 {"*SYNC*certificate verify failed*"} 0 100 100
+                assert_match {*master_link_status:down*} [$replica INFO replication]
+
+                $replica CONFIG SET tls-expected-peer-name Server-only
+                wait_for_sync $replica
+            }
+        }
+
+        test {TLS: tls-expected-peer-name enforced on MIGRATE} {
+            # MIGRATE uses the cluster connection type, which is TLS here since
+            # the test suite runs all servers with tls-cluster yes. The target
+            # presents the certificate carrying the shared SANs.
+            set san_crt [format "%s/tests/tls/san.crt" [pwd]]
+            set san_key [format "%s/tests/tls/san.key" [pwd]]
+
+            start_server [list overrides [list tls-cert-file $san_crt tls-key-file $san_key]] {
+                set target_host [srv 0 host]
+                set target_port [srv 0 port]
+
+                start_server {} {
+                    r SET migkey somevalue
+
+                    # With a mismatching expected name the blocking connect to
+                    # the target must fail, so the key stays local.
+                    r CONFIG SET tls-expected-peer-name wrong.name
+                    catch {r MIGRATE $target_host $target_port migkey 0 1000} e
+                    assert_match {*IOERR*} $e
+                    assert_equal {somevalue} [r GET migkey]
+
+                    # With an expected name matching one of the target's SANs
+                    # the migration succeeds.
+                    r CONFIG SET tls-expected-peer-name cluster.local
+                    assert_equal {OK} [r MIGRATE $target_host $target_port migkey 0 1000]
+                    assert_equal {} [r GET migkey]
+                }
+            }
+        }
+
+        test {TLS: tls-expected-peer-name does not affect ordinary clients} {
+            # Data port client certificates are not name-checked; AUTH/ACL
+            # remain responsible for client identity.
+            r CONFIG SET tls-expected-peer-name some.other.name
+
+            # The test client certificate (client.crt) does not carry that
+            # name, yet a new data port connection must still be accepted.
+            set s [redis [srv 0 host] [srv 0 port] 0 1]
+            assert_equal {PONG} [$s PING]
+            $s close
+
+            r CONFIG SET tls-expected-peer-name ""
+        }
     }
 }
