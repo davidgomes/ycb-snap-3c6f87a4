@@ -589,6 +589,21 @@ class DBImpl : public DB {
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override;
 
+  Status GetLiveFilesStorageInfoForColumnFamilies(
+      const LiveFilesStorageInfoOptions& opts,
+      const std::set<uint32_t>& column_family_ids,
+      std::vector<LiveFileStorageInfo>* files,
+      std::vector<uint32_t>* excluded_column_family_ids);
+
+  Status AppendManifestRecords(const std::string& manifest_path,
+                               const std::vector<std::string>& records);
+
+  Status GetLiveFilesStorageInfoImpl(
+      const LiveFilesStorageInfoOptions& opts,
+      const std::set<uint32_t>* column_family_ids,
+      std::vector<LiveFileStorageInfo>* files,
+      std::vector<uint32_t>* excluded_column_family_ids);
+
   Status GetPreparedFileInfoForExternalSstIngestion(
       const std::string& file_path,
       std::shared_ptr<const PreparedFileInfo>* file_info) override;

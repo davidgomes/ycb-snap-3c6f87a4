@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -198,10 +199,32 @@ Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
+  return GetLiveFilesStorageInfoImpl(
+      opts, /*column_family_ids=*/nullptr, files,
+      /*excluded_column_family_ids=*/nullptr);
+}
+
+Status DBImpl::GetLiveFilesStorageInfoForColumnFamilies(
+    const LiveFilesStorageInfoOptions& opts,
+    const std::set<uint32_t>& column_family_ids,
+    std::vector<LiveFileStorageInfo>* files,
+    std::vector<uint32_t>* excluded_column_family_ids) {
+  assert(!column_family_ids.empty());
+  assert(excluded_column_family_ids != nullptr);
+  return GetLiveFilesStorageInfoImpl(opts, &column_family_ids, files,
+                                     excluded_column_family_ids);
+}
+
+Status DBImpl::GetLiveFilesStorageInfoImpl(
+    const LiveFilesStorageInfoOptions& opts,
+    const std::set<uint32_t>* column_family_ids,
+    std::vector<LiveFileStorageInfo>* files,
+    std::vector<uint32_t>* excluded_column_family_ids) {
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
   std::vector<LiveFileStorageInfo> results;
+  std::vector<uint32_t> excluded_ids;
 
   // NOTE: This implementation was largely migrated from Checkpoint.
 
@@ -278,10 +301,20 @@ Status DBImpl::GetLiveFilesStorageInfo(
   }
 
   // Make a set of all of the live table and blob files
+  std::set<uint32_t> missing_column_family_ids;
+  if (column_family_ids != nullptr) {
+    missing_column_family_ids = *column_family_ids;
+  }
   for (auto cfd : *versions_->GetColumnFamilySet()) {
     if (cfd->IsDropped()) {
       continue;
     }
+    if (column_family_ids != nullptr &&
+        column_family_ids->find(cfd->GetID()) == column_family_ids->end()) {
+      excluded_ids.push_back(cfd->GetID());
+      continue;
+    }
+    missing_column_family_ids.erase(cfd->GetID());
     VersionStorageInfo& vsi = *cfd->current()->storage_info();
     auto& cf_paths = cfd->ioptions().cf_paths;
 
@@ -341,6 +374,11 @@ Status DBImpl::GetLiveFilesStorageInfo(
       }
       // TODO?: info.temperature
     }
+  }
+  if (!missing_column_family_ids.empty()) {
+    mutex_.Unlock();
+    return Status::InvalidArgument(
+        "Column family was dropped while creating checkpoint");
   }
 
   // Capture some final info before releasing mutex
@@ -512,6 +550,60 @@ Status DBImpl::GetLiveFilesStorageInfo(
   if (s.ok()) {
     // Only move results to output on success.
     *files = std::move(results);
+    if (excluded_column_family_ids != nullptr) {
+      *excluded_column_family_ids = std::move(excluded_ids);
+    }
+  }
+  return s;
+}
+
+Status DBImpl::AppendManifestRecords(
+    const std::string& manifest_path,
+    const std::vector<std::string>& records) {
+  if (records.empty()) {
+    return Status::OK();
+  }
+
+  FileOptions file_options = versions_->GetFileOptionsForManifestWrite();
+  uint64_t manifest_size = 0;
+  IOStatus io_s = fs_->GetFileSize(manifest_path, IOOptions(), &manifest_size,
+                                   /*dbg=*/nullptr);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+
+  std::unique_ptr<FSWritableFile> manifest_file;
+  io_s = fs_->ReopenWritableFile(manifest_path, file_options, &manifest_file,
+                                 /*dbg=*/nullptr);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+
+  std::unique_ptr<log::Writer> manifest_log = versions_->CreateManifestWriter(
+      std::move(manifest_file), manifest_path, file_options,
+      /*preallocation_size=*/0, manifest_size);
+  const WriteOptions write_options;
+  Status s;
+  for (const std::string& record : records) {
+    io_s = manifest_log->AddRecord(write_options, record);
+    if (!io_s.ok()) {
+      s = io_s;
+      break;
+    }
+  }
+  if (s.ok()) {
+    io_s = SyncManifest(&immutable_db_options_, write_options,
+                        manifest_log->file());
+    if (!io_s.ok()) {
+      s = io_s;
+    }
+  }
+
+  IOStatus close_s = manifest_log->Close(write_options);
+  if (s.ok()) {
+    s = close_s;
+  } else {
+    close_s.PermitUncheckedError();
   }
   return s;
 }
