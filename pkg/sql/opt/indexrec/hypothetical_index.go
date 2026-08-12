@@ -45,6 +45,9 @@ type hypotheticalIndex struct {
 
 	// typ indicates the type of the index - forward, inverted, or vector.
 	typ idxtype.T
+
+	// vecConfig describes the vector index. It is nil for non-vector indexes.
+	vecConfig *vecpb.Config
 }
 
 var _ cat.Index = &hypotheticalIndex{}
@@ -56,6 +59,7 @@ func (hi *hypotheticalIndex) init(
 	indexOrd int,
 	typ idxtype.T,
 	zone cat.Zone,
+	vecConfig *vecpb.Config,
 ) {
 	hi.tab = tab
 	hi.name = name
@@ -63,6 +67,7 @@ func (hi *hypotheticalIndex) init(
 	hi.indexOrdinal = indexOrd
 	hi.typ = typ
 	hi.zone = zone
+	hi.vecConfig = vecConfig
 
 	// Build an index column ordinal set.
 	var colsOrdSet intsets.Fast
@@ -178,7 +183,10 @@ func (hi *hypotheticalIndex) InvertedColumn() cat.IndexColumn {
 
 // VectorColumn is part of the cat.Index interface.
 func (hi *hypotheticalIndex) VectorColumn() cat.IndexColumn {
-	panic(errors.AssertionFailedf("hypothetical indexes do not have vector columns"))
+	if hi.Type() != idxtype.VECTOR {
+		panic(errors.AssertionFailedf("non-vector indexes do not have vector columns"))
+	}
+	return hi.cols[len(hi.cols)-1]
 }
 
 // Predicate is part of the cat.Index interface.
@@ -232,7 +240,7 @@ func (hi *hypotheticalIndex) GeoConfig() geopb.Config {
 
 // VecConfig is part of the cat.Index interface.
 func (hi *hypotheticalIndex) VecConfig() *vecpb.Config {
-	return nil
+	return hi.vecConfig
 }
 
 // Version is part of the cat.Index interface.
@@ -257,9 +265,9 @@ func (hi *hypotheticalIndex) IsTemporaryIndexForBackfill() bool {
 
 // hasSameExplicitCols checks whether the given existing index has identical
 // explicit columns as the hypothetical index. To be identical, they need to
-// have the exact same list, length, and order. If the index is inverted, it
-// also checks to make sure that the inverted column has the same source column.
-// If so, it returns true.
+// have the same type and exact same list, length, and order. Inverted indexes
+// must have the same source column, and vector indexes must use the same
+// distance metric. If so, it returns true.
 func (hi *hypotheticalIndex) hasSameExplicitCols(existingIndex cat.Index) bool {
 	indexCols := hi.cols
 	if existingIndex.ExplicitColumnCount() != len(indexCols) {
@@ -272,6 +280,13 @@ func (hi *hypotheticalIndex) hasSameExplicitCols(existingIndex cat.Index) bool {
 // hypothetical index are a prefix of the explicit columns in the given existing
 // index.
 func (hi *hypotheticalIndex) hasPrefixOfExplicitCols(existingIndex cat.Index) bool {
+	if hi.Type() != existingIndex.Type() {
+		return false
+	}
+	if hi.Type() == idxtype.VECTOR &&
+		hi.VecConfig().DistanceMetric != existingIndex.VecConfig().DistanceMetric {
+		return false
+	}
 	indexCols := hi.cols
 	if existingIndex.ExplicitColumnCount() < len(indexCols) {
 		return false

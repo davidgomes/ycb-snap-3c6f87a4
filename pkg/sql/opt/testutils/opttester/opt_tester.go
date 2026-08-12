@@ -2248,12 +2248,16 @@ func (ot *OptTester) IndexCandidates() (string, error) {
 		for i, index := range indexes {
 			var indexSb strings.Builder
 			indexSb.WriteString(" (")
-			for j, indexCol := range index {
+			for j, indexCol := range index.Columns {
 				if j > 0 {
 					indexSb.WriteString(", ")
 				}
 				colName := indexCol.Column.ColName()
 				indexSb.WriteString(colName.String())
+				if index.IsVector && j == len(index.Columns)-1 {
+					indexSb.WriteByte(' ')
+					indexSb.WriteString(string(indexrec.VectorIndexOpClass(index.VectorMetric)))
+				}
 				if indexCol.Descending {
 					indexSb.WriteString(" DESC")
 				}

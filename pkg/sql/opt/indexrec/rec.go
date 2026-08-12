@@ -81,6 +81,8 @@ func (rc recCollector) addIndexRec(md *opt.Metadata, expr opt.Expr) {
 		rc.addIndex(md, expr.Index, expr.Cols, expr.Table)
 	case *memo.InvertedJoinExpr:
 		rc.addIndex(md, expr.Index, expr.Cols, expr.Table)
+	case *memo.VectorSearchExpr:
+		rc.addIndex(md, expr.Index, expr.Cols, expr.Table)
 	case *memo.ZigzagJoinExpr:
 		rc.addIndex(md, expr.LeftIndex, expr.Cols, expr.LeftTable)
 		rc.addIndex(md, expr.RightIndex, expr.Cols, expr.RightTable)
@@ -184,9 +186,10 @@ func findBestExistingIndexToReplace(
 		}
 
 		existingIndexStoredCols := getStoredCols(existingIndex)
-		// hasSameExplicitCols returns true iff the existing index and hypIndex has
-		// the same explicit columns. If hypIndex is inverted, it also makes sure
-		// that their inverted column comes from the same source column.
+		// hasSameExplicitCols returns true iff the existing index and hypIndex
+		// have the same type and explicit columns. Inverted indexes must use the
+		// same source column, and vector indexes must use the same distance
+		// metric.
 		hasSameExplicitCols := hypIndex.hasSameExplicitCols(existingIndex)
 		if hasSameExplicitCols {
 			// If hasSameExplicitCols, this existing index is a candidate for
@@ -466,6 +469,9 @@ func (ir *indexRecommendation) indexCols() []tree.IndexElem {
 		}
 
 		indexCols[i] = tree.IndexElem{Column: colName, Direction: direction}
+		if ir.index.Type() == idxtype.VECTOR && i == len(ir.index.cols)-1 {
+			indexCols[i].OpClass = VectorIndexOpClass(ir.index.VecConfig().DistanceMetric)
+		}
 	}
 
 	return indexCols

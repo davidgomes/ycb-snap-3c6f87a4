@@ -2655,3 +2655,360 @@ delete t109974b
            │    └── t109974a.crdb_internal_mvcc_timestamp:13
            └── first-agg [as=t109974a.tableoid:14, outer=(14)]
                 └── t109974a.tableoid:14
+
+# Vector nearest-neighbor queries produce metric-aware vector candidates and
+# recommendations.
+exec-ddl
+CREATE TABLE vector_rec (
+  id INT PRIMARY KEY,
+  prefix1 INT,
+  prefix2 INT,
+  v VECTOR(3)
+)
+----
+
+exec-ddl
+ALTER TABLE vector_rec INJECT STATISTICS '[
+  {
+    "columns": ["prefix1"],
+    "created_at": "2026-01-01 00:00:00+00:00",
+    "row_count": 1000000,
+    "distinct_count": 10,
+    "null_count": 0,
+    "avg_size": 4
+  }
+]'
+----
+
+index-candidates
+SELECT id FROM vector_rec
+WHERE prefix1 = 1 AND prefix2 = 2
+ORDER BY v <=> '[1,2,3]' LIMIT 5
+----
+vector_rec:
+ (prefix1)
+ (prefix1, prefix2)
+ (prefix1, prefix2, v vector_cosine_ops)
+ (prefix1, v vector_cosine_ops)
+ (prefix2)
+ (prefix2, v vector_cosine_ops)
+ (v vector_cosine_ops)
+
+index-recommendations
+SELECT id FROM vector_rec ORDER BY v <-> '[1,2,3]' LIMIT 5
+----
+creation: CREATE VECTOR INDEX ON t.public.vector_rec (v vector_l2_ops);
+--
+optimal plan:
+top-k
+ ├── columns: id:1!null  [hidden: column7:7]
+ ├── internal-ordering: +7
+ ├── k: 5
+ ├── cardinality: [0 - 5]
+ ├── immutable
+ ├── cost: 65.7343856
+ ├── cost-flags: unbounded-cardinality
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── ordering: +7
+ └── project
+      ├── columns: column7:7 id:1!null
+      ├── immutable
+      ├── cost: 64.96
+      ├── cost-flags: unbounded-cardinality
+      ├── key: (1)
+      ├── fd: (1)-->(7)
+      ├── inner-join (lookup vector_rec)
+      │    ├── columns: id:1!null v:4
+      │    ├── key columns: [1] = [1]
+      │    ├── lookup columns are key
+      │    ├── cost: 64.74
+      │    ├── cost-flags: unbounded-cardinality
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(4)
+      │    ├── vector-search vector_rec@_hyp_1,vector
+      │    │    ├── columns: id:1!null
+      │    │    ├── target nearest neighbors: 5
+      │    │    ├── cost: 0.12
+      │    │    ├── cost-flags: unbounded-cardinality
+      │    │    ├── key: (1)
+      │    │    └── '[1,2,3]'
+      │    └── filters (true)
+      └── projections
+           └── v:4 <-> '[1,2,3]' [as=column7:7, outer=(4), immutable]
+
+# The vector operand order does not affect the recommendation.
+index-recommendations
+SELECT id FROM vector_rec ORDER BY '[1,2,3]' <=> v LIMIT 5
+----
+creation: CREATE VECTOR INDEX ON t.public.vector_rec (v vector_cosine_ops);
+--
+optimal plan:
+top-k
+ ├── columns: id:1!null  [hidden: column7:7]
+ ├── internal-ordering: +7
+ ├── k: 5
+ ├── cardinality: [0 - 5]
+ ├── immutable
+ ├── cost: 65.7343856
+ ├── cost-flags: unbounded-cardinality
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── ordering: +7
+ └── project
+      ├── columns: column7:7 id:1!null
+      ├── immutable
+      ├── cost: 64.96
+      ├── cost-flags: unbounded-cardinality
+      ├── key: (1)
+      ├── fd: (1)-->(7)
+      ├── inner-join (lookup vector_rec)
+      │    ├── columns: id:1!null v:4
+      │    ├── key columns: [1] = [1]
+      │    ├── lookup columns are key
+      │    ├── cost: 64.74
+      │    ├── cost-flags: unbounded-cardinality
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(4)
+      │    ├── vector-search vector_rec@_hyp_1,vector
+      │    │    ├── columns: id:1!null
+      │    │    ├── target nearest neighbors: 5
+      │    │    ├── cost: 0.12
+      │    │    ├── cost-flags: unbounded-cardinality
+      │    │    ├── key: (1)
+      │    │    └── '[1,2,3]'
+      │    └── filters (true)
+      └── projections
+           └── v:4 <=> '[1,2,3]' [as=column7:7, outer=(4), immutable]
+
+index-recommendations
+SELECT id FROM vector_rec ORDER BY v <#> '[1,2,3]' LIMIT 5
+----
+creation: CREATE VECTOR INDEX ON t.public.vector_rec (v vector_ip_ops);
+--
+optimal plan:
+top-k
+ ├── columns: id:1!null  [hidden: column7:7]
+ ├── internal-ordering: +7
+ ├── k: 5
+ ├── cardinality: [0 - 5]
+ ├── immutable
+ ├── cost: 65.7343856
+ ├── cost-flags: unbounded-cardinality
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── ordering: +7
+ └── project
+      ├── columns: column7:7 id:1!null
+      ├── immutable
+      ├── cost: 64.96
+      ├── cost-flags: unbounded-cardinality
+      ├── key: (1)
+      ├── fd: (1)-->(7)
+      ├── inner-join (lookup vector_rec)
+      │    ├── columns: id:1!null v:4
+      │    ├── key columns: [1] = [1]
+      │    ├── lookup columns are key
+      │    ├── cost: 64.74
+      │    ├── cost-flags: unbounded-cardinality
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(4)
+      │    ├── vector-search vector_rec@_hyp_1,vector
+      │    │    ├── columns: id:1!null
+      │    │    ├── target nearest neighbors: 5
+      │    │    ├── cost: 0.12
+      │    │    ├── cost-flags: unbounded-cardinality
+      │    │    ├── key: (1)
+      │    │    └── '[1,2,3]'
+      │    └── filters (true)
+      └── projections
+           └── v:4 <#> '[1,2,3]' [as=column7:7, outer=(4), immutable]
+
+# Equality predicates can become prefix columns in a vector index.
+index-recommendations
+SELECT id FROM vector_rec
+WHERE prefix1 = 1
+ORDER BY v <-> '[1,2,3]' LIMIT 5
+----
+creation: CREATE VECTOR INDEX ON t.public.vector_rec (prefix1, v vector_l2_ops);
+--
+optimal plan:
+top-k
+ ├── columns: id:1!null  [hidden: column7:7]
+ ├── internal-ordering: +7
+ ├── k: 5
+ ├── cardinality: [0 - 5]
+ ├── immutable
+ ├── cost: 65.8343856
+ ├── cost-flags: unbounded-cardinality
+ ├── key: (1)
+ ├── fd: (1)-->(7)
+ ├── ordering: +7
+ └── project
+      ├── columns: column7:7 id:1!null
+      ├── immutable
+      ├── cost: 65.06
+      ├── cost-flags: unbounded-cardinality
+      ├── key: (1)
+      ├── fd: (1)-->(7)
+      ├── inner-join (lookup vector_rec)
+      │    ├── columns: id:1!null prefix1:2 v:4
+      │    ├── key columns: [1] = [1]
+      │    ├── lookup columns are key
+      │    ├── cost: 64.84
+      │    ├── cost-flags: unbounded-cardinality
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(2,4)
+      │    ├── vector-search vector_rec@_hyp_3,vector
+      │    │    ├── columns: id:1!null
+      │    │    ├── target nearest neighbors: 5
+      │    │    ├── prefix constraint: /2
+      │    │    │    └── [/1 - /1]
+      │    │    ├── cost: 0.12
+      │    │    ├── cost-flags: unbounded-cardinality
+      │    │    ├── key: (1)
+      │    │    └── '[1,2,3]'
+      │    └── filters (true)
+      └── projections
+           └── v:4 <-> '[1,2,3]' [as=column7:7, outer=(4), immutable]
+
+# Existing vector indexes are only equivalent when their distance metrics
+# match. A matching invisible index can be made visible, while an index with a
+# different metric does not suppress a creation recommendation.
+exec-ddl
+CREATE TABLE vector_existing (
+  id INT PRIMARY KEY,
+  v VECTOR(3),
+  VECTOR INDEX l2_visible (v vector_l2_ops),
+  VECTOR INDEX cosine_invisible (v vector_cosine_ops) NOT VISIBLE
+)
+----
+
+index-recommendations
+SELECT id FROM vector_existing ORDER BY v <-> '[1,2,3]' LIMIT 5
+----
+no index recommendations
+--
+optimal plan:
+top-k
+ ├── columns: id:1!null  [hidden: column5:5]
+ ├── internal-ordering: +5
+ ├── k: 5
+ ├── cardinality: [0 - 5]
+ ├── immutable
+ ├── cost: 65.5343856
+ ├── cost-flags: unbounded-cardinality
+ ├── key: (1)
+ ├── fd: (1)-->(5)
+ ├── ordering: +5
+ └── project
+      ├── columns: column5:5 id:1!null
+      ├── immutable
+      ├── cost: 64.76
+      ├── cost-flags: unbounded-cardinality
+      ├── key: (1)
+      ├── fd: (1)-->(5)
+      ├── inner-join (lookup vector_existing)
+      │    ├── columns: id:1!null v:2
+      │    ├── key columns: [1] = [1]
+      │    ├── lookup columns are key
+      │    ├── cost: 64.54
+      │    ├── cost-flags: unbounded-cardinality
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(2)
+      │    ├── vector-search vector_existing@l2_visible,vector
+      │    │    ├── columns: id:1!null
+      │    │    ├── target nearest neighbors: 5
+      │    │    ├── cost: 0.12
+      │    │    ├── cost-flags: unbounded-cardinality
+      │    │    ├── key: (1)
+      │    │    └── '[1,2,3]'
+      │    └── filters (true)
+      └── projections
+           └── v:2 <-> '[1,2,3]' [as=column5:5, outer=(2), immutable]
+
+index-recommendations
+SELECT id FROM vector_existing ORDER BY v <=> '[1,2,3]' LIMIT 5
+----
+alteration: ALTER INDEX t.public.vector_existing@cosine_invisible VISIBLE;
+--
+optimal plan:
+top-k
+ ├── columns: id:1!null  [hidden: column5:5]
+ ├── internal-ordering: +5
+ ├── k: 5
+ ├── cardinality: [0 - 5]
+ ├── immutable
+ ├── cost: 65.5343856
+ ├── cost-flags: unbounded-cardinality
+ ├── key: (1)
+ ├── fd: (1)-->(5)
+ ├── ordering: +5
+ └── project
+      ├── columns: column5:5 id:1!null
+      ├── immutable
+      ├── cost: 64.76
+      ├── cost-flags: unbounded-cardinality
+      ├── key: (1)
+      ├── fd: (1)-->(5)
+      ├── inner-join (lookup vector_existing)
+      │    ├── columns: id:1!null v:2
+      │    ├── key columns: [1] = [1]
+      │    ├── lookup columns are key
+      │    ├── cost: 64.54
+      │    ├── cost-flags: unbounded-cardinality
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(2)
+      │    ├── vector-search vector_existing@_hyp_3,vector
+      │    │    ├── columns: id:1!null
+      │    │    ├── target nearest neighbors: 5
+      │    │    ├── cost: 0.12
+      │    │    ├── cost-flags: unbounded-cardinality
+      │    │    ├── key: (1)
+      │    │    └── '[1,2,3]'
+      │    └── filters (true)
+      └── projections
+           └── v:2 <=> '[1,2,3]' [as=column5:5, outer=(2), immutable]
+
+index-recommendations
+SELECT id FROM vector_existing ORDER BY v <#> '[1,2,3]' LIMIT 5
+----
+creation: CREATE VECTOR INDEX ON t.public.vector_existing (v vector_ip_ops);
+--
+optimal plan:
+top-k
+ ├── columns: id:1!null  [hidden: column5:5]
+ ├── internal-ordering: +5
+ ├── k: 5
+ ├── cardinality: [0 - 5]
+ ├── immutable
+ ├── cost: 65.5343856
+ ├── cost-flags: unbounded-cardinality
+ ├── key: (1)
+ ├── fd: (1)-->(5)
+ ├── ordering: +5
+ └── project
+      ├── columns: column5:5 id:1!null
+      ├── immutable
+      ├── cost: 64.76
+      ├── cost-flags: unbounded-cardinality
+      ├── key: (1)
+      ├── fd: (1)-->(5)
+      ├── inner-join (lookup vector_existing)
+      │    ├── columns: id:1!null v:2
+      │    ├── key columns: [1] = [1]
+      │    ├── lookup columns are key
+      │    ├── cost: 64.54
+      │    ├── cost-flags: unbounded-cardinality
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(2)
+      │    ├── vector-search vector_existing@_hyp_3,vector
+      │    │    ├── columns: id:1!null
+      │    │    ├── target nearest neighbors: 5
+      │    │    ├── cost: 0.12
+      │    │    ├── cost-flags: unbounded-cardinality
+      │    │    ├── key: (1)
+      │    │    └── '[1,2,3]'
+      │    └── filters (true)
+      └── projections
+           └── v:2 <#> '[1,2,3]' [as=column5:5, outer=(2), immutable]

@@ -1239,6 +1239,137 @@ index recommendations: 1
 1. type: index creation
    SQL command: CREATE INDEX ON test.public.t (v);
 
+statement ok
+CREATE TABLE vector_rec (id INT PRIMARY KEY, v VECTOR(3))
+
+query T
+EXPLAIN SELECT id FROM vector_rec ORDER BY v <-> '[1,2,3]' LIMIT 5
+----
+distribution: local
+·
+• top-k
+│ order: +column7
+│ k: 5
+│
+└── • render
+    │
+    └── • scan
+          missing stats
+          table: vector_rec@vector_rec_pkey
+          spans: FULL SCAN
+·
+index recommendations: 1
+1. type: index creation
+   SQL command: CREATE VECTOR INDEX ON test.public.vector_rec (v vector_l2_ops);
+
+query T
+EXPLAIN SELECT id FROM vector_rec ORDER BY '[1,2,3]' <=> v LIMIT 5
+----
+distribution: local
+·
+• top-k
+│ order: +column7
+│ k: 5
+│
+└── • render
+    │
+    └── • scan
+          missing stats
+          table: vector_rec@vector_rec_pkey
+          spans: FULL SCAN
+·
+index recommendations: 1
+1. type: index creation
+   SQL command: CREATE VECTOR INDEX ON test.public.vector_rec (v vector_cosine_ops);
+
+query T
+EXPLAIN SELECT id FROM vector_rec ORDER BY v <#> '[1,2,3]' LIMIT 5
+----
+distribution: local
+·
+• top-k
+│ order: +column7
+│ k: 5
+│
+└── • render
+    │
+    └── • scan
+          missing stats
+          table: vector_rec@vector_rec_pkey
+          spans: FULL SCAN
+·
+index recommendations: 1
+1. type: index creation
+   SQL command: CREATE VECTOR INDEX ON test.public.vector_rec (v vector_ip_ops);
+
+statement ok
+CREATE TABLE vector_rec_existing (
+  id INT PRIMARY KEY,
+  v VECTOR(3),
+  VECTOR INDEX l2_visible (v vector_l2_ops),
+  VECTOR INDEX cosine_invisible (v vector_cosine_ops) NOT VISIBLE
+)
+
+query T
+EXPLAIN SELECT id FROM vector_rec_existing ORDER BY v <-> '[1,2,3]' LIMIT 5
+----
+distribution: local
+·
+• top-k
+│ order: +column7
+│ k: 5
+│
+└── • render
+    │
+    └── • lookup join
+        │ table: vector_rec_existing@vector_rec_existing_pkey
+        │ equality: (id) = (id)
+        │ equality cols are key
+        │
+        └── • vector search
+              table: vector_rec_existing@l2_visible
+              target count: 5
+
+query T
+EXPLAIN SELECT id FROM vector_rec_existing ORDER BY v <=> '[1,2,3]' LIMIT 5
+----
+distribution: local
+·
+• top-k
+│ order: +column7
+│ k: 5
+│
+└── • render
+    │
+    └── • scan
+          missing stats
+          table: vector_rec_existing@vector_rec_existing_pkey
+          spans: FULL SCAN
+·
+index recommendations: 1
+1. type: index alteration
+   SQL command: ALTER INDEX test.public.vector_rec_existing@cosine_invisible VISIBLE;
+
+query T
+EXPLAIN SELECT id FROM vector_rec_existing ORDER BY v <#> '[1,2,3]' LIMIT 5
+----
+distribution: local
+·
+• top-k
+│ order: +column7
+│ k: 5
+│
+└── • render
+    │
+    └── • scan
+          missing stats
+          table: vector_rec_existing@vector_rec_existing_pkey
+          spans: FULL SCAN
+·
+index recommendations: 1
+1. type: index creation
+   SQL command: CREATE VECTOR INDEX ON test.public.vector_rec_existing (v vector_ip_ops);
+
 query T
 EXPLAIN (TYPES) VALUES (1, 2, 3), (4, 5, 6)
 ----
