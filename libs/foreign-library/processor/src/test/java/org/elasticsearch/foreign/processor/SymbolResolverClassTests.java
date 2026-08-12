@@ -330,7 +330,9 @@ public class SymbolResolverClassTests extends ProcessorTestCase {
         Class<?> implClass = result.loadClass("test.MyLib$Impl");
         assertNotNull("Generated MyLib$Impl class not found", implClass);
 
-        Class<?> recorderClass = result.loadClass("test.MyLib$RecordingMhResolver");
+        // Load the recorder through the impl's own class loader — each loadClass call creates a
+        // fresh loader, and the static written during <clinit> lives in the impl's loader.
+        Class<?> recorderClass = implClass.getClassLoader().loadClass("test.MyLib$RecordingMhResolver");
         String observedName = (String) recorderClass.getDeclaredField("observedName").get(null);
         assertEquals("native_add_v2", observedName);
     }
