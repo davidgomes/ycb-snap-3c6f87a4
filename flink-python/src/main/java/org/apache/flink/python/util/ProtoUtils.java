@@ -133,6 +133,19 @@ public enum ProtoUtils {
 
     // function utilities
 
+    public static FlinkFnApi.TaskInfo createTaskInfoProto(RuntimeContext runtimeContext) {
+        return FlinkFnApi.TaskInfo.newBuilder()
+                .setTaskName(runtimeContext.getTaskInfo().getTaskName())
+                .setTaskNameWithSubtasks(runtimeContext.getTaskInfo().getTaskNameWithSubtasks())
+                .setNumberOfParallelSubtasks(
+                        runtimeContext.getTaskInfo().getNumberOfParallelSubtasks())
+                .setMaxNumberOfParallelSubtasks(
+                        runtimeContext.getTaskInfo().getMaxNumberOfParallelSubtasks())
+                .setIndexOfThisSubtask(runtimeContext.getTaskInfo().getIndexOfThisSubtask())
+                .setAttemptNumber(runtimeContext.getTaskInfo().getAttemptNumber())
+                .build();
+    }
+
     public static FlinkFnApi.UserDefinedFunctions createUserDefinedFunctionsProto(
             RuntimeContext runtimeContext,
             PythonFunctionInfo[] userDefinedFunctions,
@@ -154,6 +167,7 @@ public enum ProtoUtils {
                                                 .setValue(entry.getValue())
                                                 .build())
                         .collect(Collectors.toList()));
+        builder.setTaskInfo(createTaskInfoProto(runtimeContext));
         return builder.build();
     }
 

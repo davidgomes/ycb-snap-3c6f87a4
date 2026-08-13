@@ -41,6 +41,7 @@ import java.util.stream.Collectors;
 import static org.apache.flink.python.PythonOptions.PYTHON_METRIC_ENABLED;
 import static org.apache.flink.python.PythonOptions.PYTHON_PROFILE_ENABLED;
 import static org.apache.flink.python.util.ProtoUtils.createOverWindowArrowTypeCoderInfoDescriptorProto;
+import static org.apache.flink.python.util.ProtoUtils.createTaskInfoProto;
 import static org.apache.flink.python.util.ProtoUtils.createUserDefinedFunctionProto;
 
 /** The Batch Arrow Python {@link AggregateFunction} Operator for Over Window Aggregation. */
@@ -273,6 +274,7 @@ public class BatchArrowPythonOverWindowAggregateFunctionOperator
                                                 .setValue(entry.getValue())
                                                 .build())
                         .collect(Collectors.toList()));
+        builder.setTaskInfo(createTaskInfoProto(getRuntimeContext()));
         // add windows
         for (int i = 0; i < lowerBoundary.length; i++) {
             FlinkFnApi.OverWindow.Builder windowBuilder = FlinkFnApi.OverWindow.newBuilder();
