@@ -3330,6 +3330,8 @@ TEST_F(PgMiniTest, TabletMetadataOidMatchesPgClass) {
 
 TEST_F(PgMiniTest, TabletMetadataStateColumn) {
   auto pg_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(pg_conn.Execute("CREATE ROLE metadata_user LOGIN"));
+  auto user_conn = ASSERT_RESULT(ConnectToDBAsUser("yugabyte", "metadata_user"));
 
   // ======== RUNNING ========
   // Create a table and verify all its tablets report RUNNING.
@@ -3366,6 +3368,13 @@ TEST_F(PgMiniTest, TabletMetadataStateColumn) {
       },
       30s * kTimeMultiplier, "Wait for DELETED tablet state after DROP TABLE"));
   LOG(INFO) << "DELETED state verified for tablet " << deleted_tablet_id;
+
+  // The master can briefly retain metadata whose stable PG OID has already
+  // disappeared from pg_class. ACL lookup must mask that row instead of failing.
+  ASSERT_TRUE(ASSERT_RESULT(user_conn.FetchRow<bool>(Format(
+      "SELECT object_name = '<insufficient privilege>' "
+      "AND start_range IS NULL AND end_range IS NULL "
+      "FROM yb_get_tablet_metadata() WHERE tablet_id = '$0'", deleted_tablet_id))));
 
   // ======== REPLACED via creation timeout ========
   // Set a very low creation timeout, shut down 2 of 3 tservers so new tablets can't

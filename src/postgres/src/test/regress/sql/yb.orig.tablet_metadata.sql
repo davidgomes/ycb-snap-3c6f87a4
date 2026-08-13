@@ -8,7 +8,7 @@ CREATE TABLE range_bounds (
 CREATE TABLE hash_with_range (
     h INT,
     r INT,
-    PRIMARY KEY ((h) HASH, r ASC)
+    PRIMARY KEY (h HASH, r ASC)
 ) SPLIT INTO 2 TABLETS;
 
 SELECT
