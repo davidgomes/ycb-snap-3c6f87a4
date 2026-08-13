@@ -73,15 +73,49 @@ func (r *MetricsData) marshalProtobuf(mm *easyproto.MessageMarshaler) {
 	}
 }
 
+// DecodeMetricsOptions controls how OTel resource attributes and instrumentation scope metadata
+// are promoted to metric labels during decoding.
+type DecodeMetricsOptions struct {
+	// DisableScopeMetadata disables promotion of OTel instrumentation scope metadata
+	// (name, version, schema URL, attributes) to metric labels.
+	DisableScopeMetadata bool
+
+	// DisableResourceAttributes changes the meaning of ResourceAttributesList from an ignore-list to a promote-list.
+	//
+	// When DisableResourceAttributes is false, all the resource attributes are promoted to metric labels
+	// except the ones listed in ResourceAttributesList.
+	//
+	// When DisableResourceAttributes is true, only the resource attributes listed in ResourceAttributesList
+	// are promoted to metric labels, while all the other resource attributes are skipped.
+	DisableResourceAttributes bool
+
+	// ResourceAttributesList contains the list of resource attribute names.
+	//
+	// See DisableResourceAttributes for details on how this list is interpreted.
+	ResourceAttributesList map[string]struct{}
+}
+
+// shouldPromoteResourceAttribute returns true if the resource attribute with the given key
+// must be promoted to a metric label according to o.
+func (o *DecodeMetricsOptions) shouldPromoteResourceAttribute(key string) bool {
+	_, inList := o.ResourceAttributesList[key]
+	if o.DisableResourceAttributes {
+		// ResourceAttributesList contains the keys, which must be promoted.
+		return inList
+	}
+	// ResourceAttributesList contains the keys, which must be ignored.
+	return !inList
+}
+
 // DecodeMetricsData decodes metricsData from src and sends the decoded data to mp.
-func DecodeMetricsData(src []byte, mp MetricPusher) (err error) {
+func DecodeMetricsData(src []byte, mp MetricPusher, options DecodeMetricsOptions) (err error) {
 	// See https://github.com/open-telemetry/opentelemetry-proto/blob/049d4332834935792fd4dbd392ecd31904f99ba2/opentelemetry/proto/metrics/v1/metrics.proto#L56
 	//
 	// message MetricsData {
 	//   repeated ResourceMetrics resource_metrics = 1;
 	// }
 
-	dctx := getDecoderContext(mp)
+	dctx := getDecoderContext(mp, options)
 	defer putDecoderContext(dctx)
 
 	var fc easyproto.FieldContext
@@ -198,6 +232,13 @@ func (dctx *decoderContext) decodeResource(src []byte) (err error) {
 			data, ok := fc.MessageData()
 			if !ok {
 				return fmt.Errorf("cannot read Attributes")
+			}
+			key, ok, err := easyproto.GetString(data, 1)
+			if err != nil {
+				return fmt.Errorf("cannot find Key in KeyValue: %w", err)
+			}
+			if ok && !dctx.options.shouldPromoteResourceAttribute(key) {
+				continue
 			}
 			if err := decodeKeyValue(data, &dctx.ls, &dctx.fb, ""); err != nil {
 				return fmt.Errorf("cannot unmarshal Attributes: %w", err)
@@ -524,6 +565,11 @@ func (dctx *decoderContext) decodeInstrumentationScope(src []byte) error {
 	//   string version = 2;
 	//   repeated KeyValue attributes = 3;
 	// }
+
+	if dctx.options.DisableScopeMetadata {
+		// Scope metadata promotion is disabled - skip it entirely.
+		return nil
+	}
 
 	nameStr, ok, err := easyproto.GetString(src, 1)
 	if err != nil {
@@ -1723,6 +1769,8 @@ type decoderContext struct {
 	mm MetricMetadata
 
 	mp MetricPusher
+
+	options DecodeMetricsOptions
 }
 
 func (dctx *decoderContext) reset() {
@@ -1737,6 +1785,7 @@ func (dctx *decoderContext) reset() {
 	dctx.mm.reset()
 
 	dctx.mp = nil
+	dctx.options = DecodeMetricsOptions{}
 }
 
 func (dctx *decoderContext) getSnapshot() decoderContextSnapshot {
@@ -1756,13 +1805,14 @@ type decoderContextSnapshot struct {
 	fbLen     int
 }
 
-func getDecoderContext(mp MetricPusher) *decoderContext {
+func getDecoderContext(mp MetricPusher, options DecodeMetricsOptions) *decoderContext {
 	v := dctxPool.Get()
 	if v == nil {
 		v = &decoderContext{}
 	}
 	dctx := v.(*decoderContext)
 	dctx.mp = mp
+	dctx.options = options
 
 	return dctx
 }

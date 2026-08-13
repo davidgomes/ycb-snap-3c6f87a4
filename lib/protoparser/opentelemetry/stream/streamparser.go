@@ -47,7 +47,7 @@ func parseData(data []byte, callback func(tss []prompb.TimeSeries, mms []prompb.
 	// the flushFunc will be called multiple time if the request is big, to avoid over allocating memory for such request.
 	wctx.flushFunc = callback
 
-	if err := pb.DecodeMetricsData(data, wctx); err != nil {
+	if err := pb.DecodeMetricsData(data, wctx, getDecodeMetricsOptions()); err != nil {
 		return fmt.Errorf("cannot unmarshal request from %d bytes: %w", len(data), err)
 	}
 

@@ -41,6 +41,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/opentelemetry/firehose"
+	otelstream "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/opentelemetry/stream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/protoparserutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/stringsutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeserieslimits"
@@ -87,6 +88,7 @@ var staticServer = http.FileServer(http.FS(staticFiles))
 
 // Init initializes vminsert.
 func Init() {
+	otelstream.CheckFlags()
 	relabel.Init()
 	common.InitStreamAggr()
 	protoparserutil.StartUnmarshalWorkers()
