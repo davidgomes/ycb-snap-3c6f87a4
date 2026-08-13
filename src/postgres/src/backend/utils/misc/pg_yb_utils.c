@@ -131,8 +131,8 @@
 #include "storage/procarray.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
-#include "utils/array.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
@@ -9239,8 +9239,9 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
-		can_view_sensitive_metadata = yb_can_view_tablet_metadata(
-			tablet, current_db_name, has_admin_privileges);
+		can_view_sensitive_metadata = yb_can_view_tablet_metadata(tablet,
+																 current_db_name,
+																 has_admin_privileges);
 
 		values[0] = CStringGetTextDatum(tablet_descriptor->tablet_id);
 		values[1] = CStringGetTextDatum(tablet_descriptor->table_id);
