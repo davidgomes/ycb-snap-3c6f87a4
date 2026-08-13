@@ -6618,15 +6618,27 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                         }
                     }
 
+                    // `useDefineForClassFields: false` only changes TypeScript output (it
+                    // never affects private fields, which TypeScript always emits with
+                    // native `[[Define]]` semantics regardless of this option).
+                    let lower_as_legacy_class_field = TYPESCRIPT
+                        && !self.options.use_define_for_class_fields
+                        && !matches!(
+                            prop.key.map(|k| k.data),
+                            Some(js_ast::ExprData::EPrivateIdentifier(_))
+                        );
+
                     if prop.kind != PropertyKind::ClassStaticBlock
                         && !prop.flags.contains(Flags::Property::IsMethod)
                         && !matches!(
                             prop.key.map(|k| k.data),
                             Some(js_ast::ExprData::EPrivateIdentifier(_))
                         )
-                        && prop.ts_decorators.len_u32() > 0
+                        && (prop.ts_decorators.len_u32() > 0 || lower_as_legacy_class_field)
                     {
-                        // remove decorated fields without initializers to avoid assigning undefined.
+                        // remove decorated fields (or, under `useDefineForClassFields:
+                        // false`, all fields) without initializers to avoid assigning
+                        // undefined — TypeScript emits no code at all for these.
                         let Some(initializer) = prop.initializer else {
                             continue;
                         };
@@ -6702,7 +6714,24 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                             break;
                         }
 
-                        let i = super_index.map(|j| j + 1).unwrap_or(0);
+                        // TypeScript parameter-property assignments (`constructor(public
+                        // x) {}` → `this.x = x;`) are synthesized as a contiguous run of
+                        // statements immediately after `super()` (or at the very start),
+                        // before any field initializers or user-written statements — see
+                        // the ctor-field lowering above in `visit_class`. Skip past them so
+                        // field initializers land after parameter properties, matching
+                        // TypeScript/esbuild's own emit order.
+                        let ctor_field_count = cf
+                            .func
+                            .args
+                            .iter()
+                            .filter(|arg| {
+                                arg.is_typescript_ctor_field
+                                    && matches!(arg.binding.data, js_ast::b::B::BIdentifier(_))
+                            })
+                            .count();
+
+                        let i = super_index.map(|j| j + 1).unwrap_or(0) + ctor_field_count;
                         let mut constructor_stmts = BumpVec::<Stmt>::with_capacity_in(
                             old_stmts.len() + instance_members.len(),
                             self.arena,

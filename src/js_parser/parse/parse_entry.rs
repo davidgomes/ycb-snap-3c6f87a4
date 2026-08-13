@@ -118,7 +118,7 @@ impl<'a> Default for Options<'a> {
             keep_names: true,
             ignore_dce_annotations: false,
             preserve_unused_imports_ts: false,
-            use_define_for_class_fields: false,
+            use_define_for_class_fields: true,
             suppress_warnings_about_weird_code: true,
             features: RuntimeFeatures::default(),
             tree_shaking: false,
@@ -239,6 +239,11 @@ impl<'a> Options<'a> {
 
         if self.ts {
             hasher.update(b"TS");
+            // `useDefineForClassFields` only affects TypeScript output (it's
+            // ignored for plain JS), so only fold it into the cache key here.
+            if !self.use_define_for_class_fields {
+                hasher.update(b"no_define_fields");
+            }
         } else {
             hasher.update(b"NO_TS");
         }
@@ -265,7 +270,7 @@ impl<'a> Options<'a> {
             keep_names: true,
             ignore_dce_annotations: false,
             preserve_unused_imports_ts: false,
-            use_define_for_class_fields: false,
+            use_define_for_class_fields: true,
             suppress_warnings_about_weird_code: true,
             features: RuntimeFeatures::default(),
             tree_shaking: false,

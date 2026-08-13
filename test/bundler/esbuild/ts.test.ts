@@ -1553,6 +1553,37 @@ describe("bundler", () => {
       file: "/test.js",
     },
   });
+  itBundled("ts/UseDefineForClassFieldsFalseParameterPropertyOrdering", {
+    // `useDefineForClassFields: false` must lower field initializers to
+    // constructor assignments so they run after parameter properties,
+    // matching tsc/esbuild's [[Set]] semantics.
+    files: {
+      "/entry.ts": /* ts */ `
+        class Logger {
+          createChildContext(n: string) { return new Logger(); }
+        }
+        class PlayerManager {
+          constructor(public log: Logger) {}
+        }
+        export class GameServer {
+          private _playerManager = new PlayerManager(this._log.createChildContext("pm"));
+          constructor(private _log: Logger) {}
+        }
+        const server = new GameServer(new Logger());
+        assert(server["_playerManager"] instanceof PlayerManager, "field initializer ran after parameter property assignment");
+      `,
+    },
+    runtimeFiles: {
+      "/test.js": /* js */ `
+        globalThis.assert = (await import('assert')).default;
+        import('./out')
+      `,
+    },
+    run: {
+      file: "/test.js",
+    },
+    useDefineForClassFields: false,
+  });
   itBundled("ts/ComputedClassFieldUseDefineFalse", {
     todo: true,
     files: {

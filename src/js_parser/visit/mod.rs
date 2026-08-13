@@ -1015,7 +1015,10 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                 self.fn_only_data_visit.class_name_ref = old_class_name_ref;
             }
 
-            // note: our version assumes useDefineForClassFields is true
+            // TypeScript parameter properties (`constructor(public x) {}`) always
+            // lower to a plain `this.x = x;` assignment — this is unaffected by
+            // `useDefineForClassFields`, which only changes how ordinary class field
+            // declarations are emitted (see the `lower_class` pass in p.rs).
             if Self::IS_TYPESCRIPT_ENABLED {
                 if let Some(mut constructor) = constructor_function {
                     // `constructor` is a `StoreRef<E::Function>` arena slot captured from

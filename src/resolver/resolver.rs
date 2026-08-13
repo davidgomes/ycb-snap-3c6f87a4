@@ -1649,6 +1649,9 @@ impl<'a> Resolver<'a> {
                 result.flags.set_experimental_decorators(
                     result.flags.experimental_decorators() || tsconfig.experimental_decorators,
                 );
+                result.flags.set_use_define_for_class_fields_disabled(
+                    tsconfig.use_define_for_class_fields == Some(false),
+                );
             }
 
             // If you use mjs or mts, then you're using esm
@@ -6434,6 +6437,12 @@ impl<'a> Resolver<'a> {
 
                         if let Some(value) = parent_config.preserve_imports_not_used_as_values {
                             mc.preserve_imports_not_used_as_values = Some(value);
+                        }
+
+                        // More-specific configs override the inherited value entirely
+                        // (matching TypeScript's extends semantics), not OR-merge.
+                        if let Some(value) = parent_config.use_define_for_class_fields {
+                            mc.use_define_for_class_fields = Some(value);
                         }
 
                         // TypeScript replaces paths across extends (child overrides parent
