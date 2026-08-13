@@ -3,6 +3,8 @@
 #include <memory>
 #include <string>
 
+#include "envoy/access_log/access_log.h"
+#include "envoy/common/time.h"
 #include "envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3/downstream_reverse_connection_socket_interface.pb.h"
 #include "envoy/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/v3/downstream_reverse_connection_socket_interface.pb.validate.h"
 #include "envoy/server/bootstrap_extension_config.h"
@@ -33,27 +35,7 @@ public:
   ReverseTunnelInitiatorExtension(
       Server::Configuration::ServerFactoryContext& context,
       const envoy::extensions::bootstrap::reverse_tunnel::downstream_socket_interface::v3::
-          DownstreamReverseConnectionSocketInterface& config)
-      : context_(context), config_(config) {
-    stat_prefix_ = PROTOBUF_GET_STRING_OR_DEFAULT(config, stat_prefix, "reverse_tunnel_initiator");
-    // Configure detailed stats flag (defaults to false).
-    enable_detailed_stats_ = config.enable_detailed_stats();
-    if (config.has_http_handshake() && !config.http_handshake().request_path().empty()) {
-      handshake_request_path_ = config.http_handshake().request_path();
-    } else {
-      handshake_request_path_ =
-          std::string(ReverseConnectionUtility::DEFAULT_REVERSE_TUNNEL_REQUEST_PATH);
-    }
-    if (config.has_http_handshake()) {
-      additional_headers_ = {config.http_handshake().additional_headers().begin(),
-                             config.http_handshake().additional_headers().end()};
-      use_http_upgrade_ = config.http_handshake().use_http_upgrade();
-    }
-    ENVOY_LOG(debug,
-              "ReverseTunnelInitiatorExtension: creating downstream reverse connection "
-              "socket interface with stat_prefix: {}",
-              stat_prefix_);
-  }
+          DownstreamReverseConnectionSocketInterface& config);
 
   void onServerInitialized(Server::Instance&) override;
   void onWorkerThreadInitialized() override;
@@ -134,6 +116,33 @@ public:
                                const std::string& failure_reason = "");
 
   /**
+   * @return the access loggers configured for reverse tunnel lifecycle events.
+   */
+  const AccessLog::InstanceSharedPtrVector& accessLogs() const { return access_logs_; }
+
+  /**
+   * Emit an access log entry for a reverse tunnel lifecycle event. This is a no-op when no
+   * access loggers are configured. The reverse-tunnel metadata is exposed to loggers as dynamic
+   * metadata under the ``envoy.reverse_tunnel.initiator`` namespace so it can be referenced via
+   * ``%DYNAMIC_METADATA(envoy.reverse_tunnel.initiator:...)%`` format strings.
+   * @param time_source time source used to create the ephemeral StreamInfo.
+   * @param event the lifecycle event name, e.g. "handshake_success", "handshake_failure", or
+   *              "connection_closed".
+   * @param node_id the local node identifier used to initiate the reverse tunnel.
+   * @param cluster_id the local cluster identifier used to initiate the reverse tunnel.
+   * @param tenant_id the local tenant identifier used to initiate the reverse tunnel.
+   * @param upstream_cluster the remote cluster to which the reverse tunnel is established.
+   * @param host_address the resolved remote host address for the connection.
+   * @param connection_key the connection key identifying the reverse tunnel connection.
+   * @param error_message the failure reason for "handshake_failure" events; empty otherwise.
+   */
+  void emitAccessLog(TimeSource& time_source, const std::string& event,
+                     const std::string& node_id, const std::string& cluster_id,
+                     const std::string& tenant_id, const std::string& upstream_cluster,
+                     const std::string& host_address, const std::string& connection_key,
+                     const std::string& error_message);
+
+  /**
    * Test-only method to set the thread local slot for testing purposes.
    * This allows tests to inject a custom thread local registry and is used
    * in unit tests to simulate different worker threads.
@@ -154,6 +163,7 @@ private:
   std::string handshake_request_path_;
   std::vector<envoy::config::core::v3::HeaderValueOption> additional_headers_;
   bool use_http_upgrade_{false};
+  AccessLog::InstanceSharedPtrVector access_logs_;
 
   /**
    * Update per-worker connection stats for debugging purposes.
