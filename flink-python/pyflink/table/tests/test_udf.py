@@ -266,6 +266,20 @@ class UserDefinedFunctionTests(object):
         actual = source_sink_utils.results()
         self.assert_equals(actual, ["+I[1, 1]", "+I[2, 4]", "+I[3, 3]"])
 
+    def test_task_info(self):
+        check_task_info = udf(TaskInfoCheckingFunction(), result_type=DataTypes.BIGINT())
+
+        sink_table = generate_random_table_name()
+        sink_table_ddl = f"""
+            CREATE TABLE {sink_table}(a BIGINT) WITH ('connector'='test-sink')
+        """
+        self.t_env.execute_sql(sink_table_ddl)
+
+        t = self.t_env.from_elements([(1,), (2,), (3,)], ['a'])
+        t.select(check_task_info(t.a)).execute_insert(sink_table).wait()
+        actual = source_sink_utils.results()
+        self.assert_equals(actual, ["+I[1]", "+I[2]", "+I[3]"])
+
     def test_udf_without_arguments(self):
         one = udf(lambda: 1, result_type=DataTypes.BIGINT(), deterministic=True)
         two = udf(lambda: 2, result_type=DataTypes.BIGINT(), deterministic=False)
@@ -1099,6 +1113,35 @@ class PyFlinkEmbeddedThreadTests(UserDefinedFunctionTests, PyFlinkBatchTableTest
         self.t_env.get_config().set("python.execution-mode", "thread")
 
 
+class FunctionContextTests(unittest.TestCase):
+
+    def test_task_info_getters_return_none_when_unset(self):
+        function_context = FunctionContext(None, {})
+        self.assertIsNone(function_context.get_task_name())
+        self.assertIsNone(function_context.get_task_name_with_subtasks())
+        self.assertIsNone(function_context.get_number_of_parallel_subtasks())
+        self.assertIsNone(function_context.get_max_number_of_parallel_subtasks())
+        self.assertIsNone(function_context.get_index_of_this_subtask())
+        self.assertIsNone(function_context.get_attempt_number())
+
+    def test_task_info_getters(self):
+        function_context = FunctionContext(
+            None,
+            {},
+            task_name="MyTask",
+            task_name_with_subtasks="MyTask (3/6)#0",
+            number_of_parallel_subtasks=6,
+            max_number_of_parallel_subtasks=128,
+            index_of_this_subtask=2,
+            attempt_number=0)
+        self.assertEqual("MyTask", function_context.get_task_name())
+        self.assertEqual("MyTask (3/6)#0", function_context.get_task_name_with_subtasks())
+        self.assertEqual(6, function_context.get_number_of_parallel_subtasks())
+        self.assertEqual(128, function_context.get_max_number_of_parallel_subtasks())
+        self.assertEqual(2, function_context.get_index_of_this_subtask())
+        self.assertEqual(0, function_context.get_attempt_number())
+
+
 # test specify the input_types
 @udf(input_types=[DataTypes.BIGINT(), DataTypes.BIGINT()], result_type=DataTypes.BIGINT())
 def add(i, j):
@@ -1118,6 +1161,26 @@ class SubtractWithParameters(ScalarFunction):
 
     def eval(self, i):
         return i - self.subtract_value
+
+
+class TaskInfoCheckingFunction(ScalarFunction):
+
+    def open(self, function_context: FunctionContext):
+        task_name = function_context.get_task_name()
+        task_name_with_subtasks = function_context.get_task_name_with_subtasks()
+        parallelism = function_context.get_number_of_parallel_subtasks()
+        max_parallelism = function_context.get_max_number_of_parallel_subtasks()
+        subtask_index = function_context.get_index_of_this_subtask()
+        attempt_number = function_context.get_attempt_number()
+        assert task_name is not None and len(task_name) > 0
+        assert task_name_with_subtasks is not None and len(task_name_with_subtasks) > 0
+        assert parallelism is not None and parallelism > 0
+        assert max_parallelism is not None and max_parallelism > 0
+        assert subtask_index is not None and 0 <= subtask_index < parallelism
+        assert attempt_number is not None and attempt_number >= 0
+
+    def eval(self, i):
+        return i
 
 
 class SubtractWithMetrics(ScalarFunction, unittest.TestCase):
