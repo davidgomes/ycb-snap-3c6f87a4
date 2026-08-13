@@ -3331,7 +3331,9 @@ TEST_F(PgMiniTest, TabletMetadataOidMatchesPgClass) {
 TEST_F(PgMiniTest, TabletMetadataStateColumn) {
   auto pg_conn = ASSERT_RESULT(Connect());
   ASSERT_OK(pg_conn.Execute("CREATE ROLE metadata_user LOGIN"));
-  auto user_conn = ASSERT_RESULT(ConnectToDBAsUser("yugabyte", "metadata_user"));
+  auto user_conn_settings = MakeConnSettings("yugabyte");
+  user_conn_settings.user = "metadata_user";
+  auto user_conn = ASSERT_RESULT(PGConnBuilder(user_conn_settings).Connect());
 
   // ======== RUNNING ========
   // Create a table and verify all its tablets report RUNNING.
