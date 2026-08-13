@@ -18,7 +18,7 @@
 import abc
 import functools
 import inspect
-from typing import Union, List, Type, Callable, TypeVar, Generic, Iterable
+from typing import Union, List, Type, Callable, TypeVar, Generic, Iterable, Optional
 
 from pyflink.java_gateway import get_gateway
 from pyflink.metrics import MetricGroup
@@ -39,9 +39,18 @@ class FunctionContext(object):
     and global job parameters, etc.
     """
 
-    def __init__(self, base_metric_group, job_parameters):
+    def __init__(self, base_metric_group, job_parameters, task_name=None,
+                 task_name_with_subtasks=None, number_of_parallel_subtasks=None,
+                 max_number_of_parallel_subtasks=None, index_of_this_subtask=None,
+                 attempt_number=None):
         self._base_metric_group = base_metric_group
         self._job_parameters = job_parameters
+        self._task_name = task_name
+        self._task_name_with_subtasks = task_name_with_subtasks
+        self._number_of_parallel_subtasks = number_of_parallel_subtasks
+        self._max_number_of_parallel_subtasks = max_number_of_parallel_subtasks
+        self._index_of_this_subtask = index_of_this_subtask
+        self._attempt_number = attempt_number
 
     def get_metric_group(self) -> MetricGroup:
         """
@@ -65,6 +74,63 @@ class FunctionContext(object):
         .. versionadded:: 1.17.0
         """
         return self._job_parameters[key] if key in self._job_parameters else default_value
+
+    def get_task_name(self) -> Optional[str]:
+        """
+        Returns the name of the task in which the user-defined function runs, as assigned during
+        plan construction. Returns None if the information is not available.
+
+        .. versionadded:: 2.3.0
+        """
+        return self._task_name
+
+    def get_task_name_with_subtasks(self) -> Optional[str]:
+        """
+        Returns the name of the task, appended with the subtask indicator, such as "MyTask (3/6)",
+        where 3 would be (:func:`get_index_of_this_subtask` + 1), and 6 would be
+        :func:`get_number_of_parallel_subtasks`. Returns None if the information is not
+        available.
+
+        .. versionadded:: 2.3.0
+        """
+        return self._task_name_with_subtasks
+
+    def get_number_of_parallel_subtasks(self) -> Optional[int]:
+        """
+        Gets the parallelism with which the parallel task runs. Returns None if the information
+        is not available.
+
+        .. versionadded:: 2.3.0
+        """
+        return self._number_of_parallel_subtasks
+
+    def get_max_number_of_parallel_subtasks(self) -> Optional[int]:
+        """
+        Gets the number of max-parallelism with which the parallel task runs. Returns None if the
+        information is not available.
+
+        .. versionadded:: 2.3.0
+        """
+        return self._max_number_of_parallel_subtasks
+
+    def get_index_of_this_subtask(self) -> Optional[int]:
+        """
+        Gets the number of this parallel subtask. The numbering starts from 0 and goes up to
+        parallelism-1 (parallelism as returned by :func:`get_number_of_parallel_subtasks`).
+        Returns None if the information is not available.
+
+        .. versionadded:: 2.3.0
+        """
+        return self._index_of_this_subtask
+
+    def get_attempt_number(self) -> Optional[int]:
+        """
+        Gets the attempt number of this parallel subtask. First attempt is numbered 0. Returns
+        None if the information is not available.
+
+        .. versionadded:: 2.3.0
+        """
+        return self._attempt_number
 
 
 @PublicEvolving()

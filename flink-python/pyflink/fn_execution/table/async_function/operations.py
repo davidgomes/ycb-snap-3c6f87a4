@@ -24,7 +24,6 @@ from pyflink.fn_execution.datastream.process.async_function.operation import Emi
 from pyflink.fn_execution.datastream.process.async_function.queue import OrderedStreamElementQueue
 from pyflink.fn_execution.metrics.process.metric_impl import GenericMetricGroup
 from pyflink.fn_execution.utils import operation_utils
-from pyflink.table import FunctionContext
 
 ASYNC_SCALAR_FUNCTION_URN = "flink:transform:async_scalar_function:v1"
 
@@ -75,6 +74,9 @@ class AsyncScalarFunctionOperation(Operation, AsyncOperationMixin):
         # Job parameters
         self._job_parameters = {p.key: p.value for p in serialized_fn.job_parameters}
 
+        # Runtime task information, None if not provided by the Java operator
+        self._task_info = operation_utils.extract_task_info(serialized_fn)
+
     def set_output_processor(self, output_processor):
         """Set the output processor for emitting results.
 
@@ -86,8 +88,8 @@ class AsyncScalarFunctionOperation(Operation, AsyncOperationMixin):
         # Open user defined functions
         for user_defined_func in self.user_defined_funcs:
             if hasattr(user_defined_func, 'open'):
-                user_defined_func.open(
-                    FunctionContext(self.base_metric_group, self._job_parameters))
+                user_defined_func.open(operation_utils.create_function_context(
+                    self.base_metric_group, self._job_parameters, self._task_info))
 
         # Start emitter thread to collect async results
         self._emitter = Emitter(self._mark_exception, self._output_processor, self._queue)

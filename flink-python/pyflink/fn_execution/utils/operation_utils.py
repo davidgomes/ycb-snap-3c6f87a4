@@ -29,10 +29,35 @@ from pyflink.fn_execution import pickle
 from pyflink.serializers import PickleSerializer
 from pyflink.table import functions
 from pyflink.table.udf import DelegationTableFunction, DelegatingScalarFunction, \
-    ImperativeAggregateFunction, PandasAggregateFunctionWrapper
+    ImperativeAggregateFunction, PandasAggregateFunctionWrapper, FunctionContext
 
 _func_num = 0
 _constant_num = 0
+
+
+def extract_task_info(serialized_fn):
+    """
+    Extracts the task info proto from the serialized function if it has been provided by the
+    Java operator, otherwise returns None.
+    """
+    return serialized_fn.task_info if serialized_fn.HasField("task_info") else None
+
+
+def create_function_context(base_metric_group, job_parameters, task_info) -> FunctionContext:
+    """
+    Creates a FunctionContext carrying the runtime task information when it is available.
+    """
+    if task_info is None:
+        return FunctionContext(base_metric_group, job_parameters)
+    return FunctionContext(
+        base_metric_group,
+        job_parameters,
+        task_name=task_info.task_name,
+        task_name_with_subtasks=task_info.task_name_with_subtasks,
+        number_of_parallel_subtasks=task_info.number_of_parallel_subtasks,
+        max_number_of_parallel_subtasks=task_info.max_number_of_parallel_subtasks,
+        index_of_this_subtask=task_info.index_of_this_subtask,
+        attempt_number=task_info.attempt_number)
 
 
 def normalize_table_function_result(it):
