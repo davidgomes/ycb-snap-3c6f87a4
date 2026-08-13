@@ -132,6 +132,7 @@
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/array.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
@@ -9136,6 +9137,28 @@ string_list_compare(const ListCell *a, const ListCell *b)
 	return strcmp((char *) lfirst(a), (char *) lfirst(b));
 }
 
+static bool
+yb_can_view_tablet_metadata(const YbcPgGlobalTabletsDescriptor *tablet,
+							const char *current_db_name,
+							bool has_admin_privileges)
+{
+	const YbcPgTabletsDescriptor *descriptor = &tablet->tablet_descriptor;
+	bool		is_missing = false;
+
+	if (has_admin_privileges ||
+		(strcmp(descriptor->namespace_name, "system") == 0 &&
+		 strcmp(descriptor->table_name, "transactions") == 0))
+		return true;
+
+	if (strcmp(descriptor->namespace_name, current_db_name) != 0 ||
+		!OidIsValid(tablet->pg_table_oid))
+		return false;
+
+	return pg_class_aclcheck_ext(tablet->pg_table_oid, GetUserId(),
+								 ACL_SELECT, &is_missing) == ACLCHECK_OK &&
+		!is_missing;
+}
+
 /*
  * Returns the metadata for all tablets in the cluster.
  * The returned data structure is a row type with the following columns:
@@ -9200,6 +9223,9 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 
 	YbcPgGlobalTabletsDescriptor *tablets = NULL;
 	size_t		num_tablets = 0;
+	const char *current_db_name = get_database_name(MyDatabaseId);
+	const bool	has_admin_privileges =
+		superuser() || IsYbDbAdminUser(GetUserId());
 
 	HandleYBStatus(YBCTabletsMetadata(&tablets, &num_tablets));
 
@@ -9209,9 +9235,12 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 		YbcPgTabletsDescriptor *tablet_descriptor = &tablet->tablet_descriptor;
 		Datum		values[ncols];
 		bool		nulls[ncols];
+		bool		can_view_sensitive_metadata;
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
+		can_view_sensitive_metadata = yb_can_view_tablet_metadata(
+			tablet, current_db_name, has_admin_privileges);
 
 		values[0] = CStringGetTextDatum(tablet_descriptor->tablet_id);
 		values[1] = CStringGetTextDatum(tablet_descriptor->table_id);
@@ -9228,7 +9257,9 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 
 		values[3] = CStringGetTextDatum(tablet_descriptor->namespace_name);
-		values[4] = CStringGetTextDatum(tablet_descriptor->table_name);
+		values[4] = CStringGetTextDatum(can_view_sensitive_metadata ?
+									   tablet_descriptor->table_name :
+									   "<insufficient privilege>");
 		values[5] = CStringGetTextDatum(tablet_descriptor->table_type);
 
 		if (tablet->is_hash_partitioned)
@@ -9274,9 +9305,29 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[9] = true;
 		}
 
-		/* TODO (#28172): start_range, end_range, tablet_attrs are populated in a follow-up change. */
-		nulls[10] = true;
-		nulls[11] = true;
+		if (tablet->is_hash_partitioned)
+		{
+			nulls[10] = true;
+			nulls[11] = true;
+		}
+		else if (!can_view_sensitive_metadata)
+		{
+			values[10] = CStringGetTextDatum("<insufficient privilege>");
+			values[11] = CStringGetTextDatum("<insufficient privilege>");
+		}
+		else
+		{
+			if (tablet->start_range)
+				values[10] = CStringGetTextDatum(tablet->start_range);
+			else
+				nulls[10] = true;
+			if (tablet->end_range)
+				values[11] = CStringGetTextDatum(tablet->end_range);
+			else
+				nulls[11] = true;
+		}
+
+		/* TODO (#28172): tablet_attrs is populated in a follow-up change. */
 		nulls[12] = true;
 
 		if (tablet->tablet_state)

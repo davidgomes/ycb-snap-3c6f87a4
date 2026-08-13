@@ -37,6 +37,13 @@ The following table describes the columns of the `yb_tablet_metadata` view.
 | end_hash_code | int | Ending hash code (exclusive) for the tablet. (NULL for range-sharded tables.) |
 | leader | text | IP address, port of the leader node for the tablet. |
 | replicas | text[] | A list of replica IP addresses and port (includes leader) associated with the tablet. |
+| start_range | text | Starting range partition bound in DocDB debug format. (NULL for hash-sharded tables and the first unbounded range.) |
+| end_range | text | Ending range partition bound in DocDB debug format. (NULL for hash-sharded tables and the last unbounded range.) |
+
+Superusers and members of `yb_db_admin` can see relation names and range bounds for
+all databases. Other users see these fields only for tables in the current database
+on which they have `SELECT`; inaccessible values are shown as
+`<insufficient privilege>`. Scope table lookups by both `db_name` and `relname`.
 
 ## Examples
 
@@ -152,7 +159,8 @@ Use the [yb_hash_code()](../../../api/ysql/exprs/func_yb_hash_code/) function to
         t.end_hash_code,
         t.leader
     FROM yb_tablet_metadata t
-    WHERE t.relname = 'test_table'
+    WHERE t.db_name = current_database()
+      AND t.relname = 'test_table'
       AND yb_hash_code('k1'::text) >= t.start_hash_code
       AND yb_hash_code('k1'::text) < t.end_hash_code;
     ```
@@ -179,7 +187,9 @@ Use the [yb_hash_code()](../../../api/ysql/exprs/func_yb_hash_code/) function to
         ytm.leader
     FROM test_table tt
     JOIN yb_tablet_metadata ytm
-      ON yb_hash_code(tt.a) >= ytm.start_hash_code
+      ON ytm.db_name = current_database()
+        AND ytm.relname = 'test_table'
+        AND yb_hash_code(tt.a) >= ytm.start_hash_code
         AND yb_hash_code(tt.a) < ytm.end_hash_code
     ORDER BY tt.a;
     ```
