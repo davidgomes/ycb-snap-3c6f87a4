@@ -35,6 +35,7 @@
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
+#include "yb/dockv/doc_key.h"
 #include "yb/dockv/pg_key_decoder.h"
 #include "yb/dockv/pg_row.h"
 #include "yb/dockv/reader_projection.h"
@@ -3157,6 +3158,23 @@ YbcStatus YBCTabletsMetadata(YbcPgGlobalTabletsDescriptor** tablets, size_t* cou
         }
       }
 
+      // Decode range partition bounds into the same DocDB debug form the master UI
+      // tablet listing uses (e.g. DocKey([], [100])). Hash-sharded tablets expose
+      // their bounds via hash codes only, and unbounded edges stay NULL.
+      const char* start_range = nullptr;
+      const char* end_range = nullptr;
+      if (!tablet_metadata.is_hash_partitioned()) {
+        const auto& partition = tablet_metadata.partition();
+        if (!partition.partition_key_start().empty()) {
+          start_range = YBCPAllocStdString(
+              dockv::DocKey::DebugSliceToString(partition.partition_key_start()));
+        }
+        if (!partition.partition_key_end().empty()) {
+          end_range = YBCPAllocStdString(
+              dockv::DocKey::DebugSliceToString(partition.partition_key_end()));
+        }
+      }
+
       new (dest) YbcPgGlobalTabletsDescriptor {
         .tablet_descriptor = MakeYbcPgTabletsDescriptor(tablet_metadata),
         .replicas = replicas_array,
@@ -3166,7 +3184,9 @@ YbcStatus YBCTabletsMetadata(YbcPgGlobalTabletsDescriptor** tablets, size_t* cou
             ? YBCPAllocStdString(tablet_metadata.tablet_state())
             : nullptr,
         .pg_table_oid = tablet_metadata.has_pg_table_oid() ? tablet_metadata.pg_table_oid()
-                                                           : kPgInvalidOid
+                                                           : kPgInvalidOid,
+        .start_range = start_range,
+        .end_range = end_range
       };
       ++dest;
     }

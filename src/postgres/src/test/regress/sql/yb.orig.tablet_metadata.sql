@@ -26,6 +26,42 @@ JOIN yb_servers() ys
 WHERE ytm.relname IN ('test_table_1', 'test_table_2')
 ORDER BY ytm.start_hash_code NULLS FIRST;
 
+-- Test range partition bounds. Range-sharded tablets report their bounds
+-- decoded in DocDB debug form; unbounded edges stay NULL. Hash-sharded
+-- tablets (including composite HASH + ASC keys) keep NULL ranges and report
+-- their bounds through the hash code columns only.
+CREATE TABLE range_split (k INT, v TEXT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((10), (20));
+CREATE TABLE range_multi (k1 INT, k2 TEXT COLLATE "C", PRIMARY KEY (k1 ASC, k2 ASC)) SPLIT AT VALUES ((5, 'foo'));
+CREATE TABLE range_ts (t TIMESTAMP, PRIMARY KEY (t ASC)) SPLIT AT VALUES (('2024-01-01 00:00:00'));
+CREATE TABLE hash_asc_composite (k1 INT, k2 INT, PRIMARY KEY (k1 HASH, k2 ASC)) SPLIT INTO 2 TABLETS;
+
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND relname = 'range_split'
+ORDER BY start_range NULLS FIRST;
+
+SELECT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND relname = 'range_multi'
+ORDER BY start_range NULLS FIRST;
+
+-- Timestamps render as int64 microseconds since the PostgreSQL epoch.
+SELECT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND relname = 'range_ts'
+ORDER BY start_range NULLS FIRST;
+
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND relname = 'hash_asc_composite'
+ORDER BY start_hash_code;
+
+-- Purely hash-sharded tables keep NULL ranges too.
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND relname = 'test_table_1'
+ORDER BY start_hash_code;
+
 -- Test that data from multiple databases is returned
 CREATE DATABASE test_db;
 \c test_db
@@ -75,6 +111,21 @@ WHERE
     db_name = 'colocated_db'
     AND relname LIKE '%.colocation.parent.tablename';
 
+-- For regular users the colocation parent row stays masked -- it has no
+-- grantable pg_class relation -- even with SELECT on every colocated table.
+-- Tables with their own tablets are gated by per-table SELECT as usual.
+CREATE ROLE yb_tmeta_coloc_user LOGIN;
+GRANT SELECT ON colocated_hash, colocated_asc, non_colocated_split TO yb_tmeta_coloc_user;
+
+\c colocated_db yb_tmeta_coloc_user
+
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = 'colocated_db'
+ORDER BY relname, start_hash_code NULLS FIRST;
+
+\c colocated_db yugabyte
+
 -- Test that yb_tablet_metadata is independent of the connected database
 CREATE DATABASE yb_tmeta_a;
 CREATE DATABASE yb_tmeta_b;
@@ -116,8 +167,16 @@ WHERE
     AND db_name IN ('yb_tmeta_a', 'yb_tmeta_b')
 ORDER BY db_name, relname;
 
--- Test that non-superusers can see cluster-wide tablet metadata
+-- Test that non-superusers still see cluster-wide tablet metadata: rows are
+-- never dropped, but relname (and range bounds) are masked for tables the
+-- caller cannot SELECT from. A grant only reveals rows of the current
+-- database, so the yb_tmeta_b rows -- including its own same_name table --
+-- stay masked while connected to yb_tmeta_a.
 CREATE ROLE yb_tmeta_user LOGIN;
+
+\c yb_tmeta_a yugabyte
+
+GRANT SELECT ON same_name TO yb_tmeta_user;
 
 \c yb_tmeta_a yb_tmeta_user
 
@@ -125,14 +184,97 @@ SELECT
     relname,
     db_name
 FROM yb_tablet_metadata
-WHERE
-    relname IN ('only_in_b', 'same_name')
-    AND db_name = 'yb_tmeta_b'
-ORDER BY relname;
+WHERE db_name IN ('yb_tmeta_a', 'yb_tmeta_b')
+ORDER BY db_name, relname;
+
+-- Masked range-sharded rows show the placeholder on every range cell --
+-- including edges that would have been NULL -- so tablet boundaries do not
+-- leak. Hash codes are never masked (these tables have none).
+SELECT db_name, start_hash_code, end_hash_code, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = 'yb_tmeta_b'
+ORDER BY db_name;
+
+-- The granted table of the current database keeps its natural NULL range
+-- edges (single tablet, unbounded on both sides).
+SELECT relname, db_name, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = 'same_name'::regclass;
+
+-- Test masking of sensitive columns in detail: superusers and yb_db_admin
+-- members always see real values; other roles see them only for tables of
+-- the current database they have SELECT on.
+\c yugabyte yugabyte
+
+CREATE ROLE yb_tmeta_masking_user LOGIN;
+CREATE ROLE yb_tmeta_db_admin LOGIN;
+GRANT yb_db_admin TO yb_tmeta_db_admin;
+
+\c yugabyte yb_tmeta_masking_user
+
+-- Masked range-sharded rows: placeholder relname and placeholder on every
+-- range cell. The unmasked oid column still allows locating the rows.
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = 'range_split'::regclass;
+
+-- Masked hash-sharded rows: placeholder relname, real hash codes, and the
+-- natural NULL ranges.
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = 'test_table_1'::regclass
+ORDER BY start_hash_code;
+
+-- The system 'transactions' tablets are always unmasked.
+SELECT DISTINCT relname, db_name
+FROM yb_tablet_metadata
+WHERE db_name = 'system';
+
+-- Granting SELECT reveals the rows.
+\c yugabyte yugabyte
+GRANT SELECT ON range_split TO yb_tmeta_masking_user;
+
+\c yugabyte yb_tmeta_masking_user
+
+SELECT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = 'range_split'::regclass
+ORDER BY start_range NULLS FIRST;
+
+-- Revoking SELECT masks the rows again.
+\c yugabyte yugabyte
+REVOKE SELECT ON range_split FROM yb_tmeta_masking_user;
+
+\c yugabyte yb_tmeta_masking_user
+
+SELECT count(*) AS masked_rows
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = 'range_split'::regclass
+    AND relname = '<insufficient privilege>';
+
+-- yb_db_admin members see everything, in any database.
+\c yugabyte yb_tmeta_db_admin
+
+SELECT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = 'range_split'::regclass
+ORDER BY start_range NULLS FIRST;
+
+SELECT relname, db_name
+FROM yb_tablet_metadata
+WHERE db_name IN ('yb_tmeta_a', 'yb_tmeta_b')
+ORDER BY db_name, relname;
 
 -- Cleanup
 \c yugabyte yugabyte
+DROP TABLE range_split;
+DROP TABLE range_multi;
+DROP TABLE range_ts;
+DROP TABLE hash_asc_composite;
 DROP DATABASE colocated_db;
 DROP DATABASE yb_tmeta_a;
 DROP DATABASE yb_tmeta_b;
 DROP ROLE yb_tmeta_user;
+DROP ROLE yb_tmeta_coloc_user;
+DROP ROLE yb_tmeta_masking_user;
+DROP ROLE yb_tmeta_db_admin;

@@ -894,6 +894,10 @@ typedef struct {
   bool is_hash_partitioned;
   const char* tablet_state;
   YbcPgOid pg_table_oid;
+  // Range partition bounds decoded into DocDB debug form. NULL for hash-sharded
+  // tablets and for unbounded edges of range-sharded tablets.
+  const char* start_range;
+  const char* end_range;
 } YbcPgGlobalTabletsDescriptor;
 
 typedef struct {

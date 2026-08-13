@@ -49,6 +49,11 @@ CREATE VIEW yb_servers_metrics AS
     SELECT *
     FROM yb_servers_metrics();
 
+-- Note: yb_get_tablet_metadata() masks the sensitive columns (relname,
+-- start_range, end_range) with '<insufficient privilege>' unless the caller
+-- is a superuser or yb_db_admin member, the row belongs to the system
+-- 'transactions' table, or the row's table is in the current database and
+-- the caller has SELECT on it.
 CREATE VIEW yb_tablet_metadata AS
     SELECT
         t.tablet_id,

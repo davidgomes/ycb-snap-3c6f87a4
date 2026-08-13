@@ -131,6 +131,7 @@
 #include "storage/procarray.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -9137,6 +9138,60 @@ string_list_compare(const ListCell *a, const ListCell *b)
 }
 
 /*
+ * Placeholder reported in place of the sensitive columns of
+ * yb_get_tablet_metadata() rows the caller may not inspect. Matches the
+ * literal upstream PG uses for e.g. pg_stat_activity.query.
+ */
+#define YB_TABLET_METADATA_MASKED_VALUE "<insufficient privilege>"
+
+/*
+ * Decide whether the current user may see the sensitive columns (object_name,
+ * start_range, end_range) of the given yb_get_tablet_metadata() row.
+ *
+ * Superusers and yb_db_admin members are exempted by the caller and never
+ * reach this function.
+ */
+static bool
+YbTabletMetadataSensitiveColumnsVisible(const YbcPgGlobalTabletsDescriptor *tablet,
+										const char *current_db_name)
+{
+	const YbcPgTabletsDescriptor *tablet_descriptor = &tablet->tablet_descriptor;
+	bool		aclcheck_is_missing = false;
+
+	/*
+	 * Tablets of the system 'transactions' table carry no user data and are
+	 * always shown unmasked. Match on the DocDB table type: user relations
+	 * can never take the 'System' (transaction status) type, so this cannot
+	 * be spoofed by e.g. a YSQL table named "transactions" in a database
+	 * named "system".
+	 */
+	if (strcmp(tablet_descriptor->table_type, "System") == 0)
+		return true;
+
+	/*
+	 * Rows without a stable PG table oid (colocation parents and non-YSQL
+	 * tables) cannot be matched against any grantable relation: mask them.
+	 */
+	if (!OidIsValid(tablet->pg_table_oid))
+		return false;
+
+	/* Tables of other databases stay masked for regular users. */
+	if (strcmp(tablet_descriptor->namespace_name, current_db_name) != 0)
+		return false;
+
+	/*
+	 * The caller must have SELECT on the table. The oid reported by the
+	 * master is the stable pg_class oid, which survives table rewrites, so
+	 * privileges granted on the relation keep applying after a rewrite. A
+	 * tablet whose pg_class row is gone (e.g. the table was concurrently
+	 * dropped) must not fail the query; the ACL miss simply masks the row.
+	 */
+	return pg_class_aclcheck_ext(tablet->pg_table_oid, GetUserId(),
+								 ACL_SELECT,
+								 &aclcheck_is_missing) == ACLCHECK_OK;
+}
+
+/*
  * Returns the metadata for all tablets in the cluster.
  * The returned data structure is a row type with the following columns:
  * - tablet_id: text
@@ -9157,6 +9212,19 @@ string_list_compare(const ListCell *a, const ListCell *b)
  * The start_hash_code and end_hash_code are the hash codes of the start and end
  * keys of the tablet for hash sharded tables. Leader is provided as a separate
  * column for simpler querying and self-explanatory access.
+ *
+ * start_range and end_range are the range partition bounds of range sharded
+ * tablets, decoded into the DocDB debug form the master UI tablet listing
+ * uses (e.g. timestamps render as int64 microseconds since epoch). They are
+ * NULL for hash sharded tablets and for unbounded range edges.
+ *
+ * Any user may call this function, so the sensitive columns (object_name,
+ * start_range, end_range) are masked with '<insufficient privilege>' unless
+ * the caller is a superuser or a yb_db_admin member, the row belongs to the
+ * system 'transactions' table, or the row's table lives in the current
+ * database and the caller has SELECT on it. Masked range sharded rows show
+ * the placeholder on both range cells -- including edges that would have
+ * been NULL -- so the tablet layout of the table does not leak.
  */
 Datum
 yb_get_tablet_metadata(PG_FUNCTION_ARGS)
@@ -9201,6 +9269,14 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 	YbcPgGlobalTabletsDescriptor *tablets = NULL;
 	size_t		num_tablets = 0;
 
+	/*
+	 * Superusers and yb_db_admin members always see the sensitive columns;
+	 * everyone else is checked row by row against the current database and
+	 * the SELECT privilege on the row's table.
+	 */
+	bool		mask_exempt = superuser() || IsYbDbAdminUser(GetUserId());
+	const char *current_db_name = get_database_name(MyDatabaseId);
+
 	HandleYBStatus(YBCTabletsMetadata(&tablets, &num_tablets));
 
 	for (int i = 0; i < num_tablets; ++i)
@@ -9209,6 +9285,8 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 		YbcPgTabletsDescriptor *tablet_descriptor = &tablet->tablet_descriptor;
 		Datum		values[ncols];
 		bool		nulls[ncols];
+		bool		masked = !mask_exempt &&
+			!YbTabletMetadataSensitiveColumnsVisible(tablet, current_db_name);
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
@@ -9228,7 +9306,8 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 
 		values[3] = CStringGetTextDatum(tablet_descriptor->namespace_name);
-		values[4] = CStringGetTextDatum(tablet_descriptor->table_name);
+		values[4] = CStringGetTextDatum(masked ? YB_TABLET_METADATA_MASKED_VALUE
+										: tablet_descriptor->table_name);
 		values[5] = CStringGetTextDatum(tablet_descriptor->table_type);
 
 		if (tablet->is_hash_partitioned)
@@ -9274,9 +9353,40 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[9] = true;
 		}
 
-		/* TODO (#28172): start_range, end_range, tablet_attrs are populated in a follow-up change. */
-		nulls[10] = true;
-		nulls[11] = true;
+		if (tablet->is_hash_partitioned)
+		{
+			/*
+			 * Hash sharded tablets (including composite HASH + range keys)
+			 * only expose their bounds through the hash code columns, masked
+			 * or not.
+			 */
+			nulls[10] = true;
+			nulls[11] = true;
+		}
+		else if (masked)
+		{
+			/*
+			 * Mask every range cell of range sharded rows -- including edges
+			 * that would have been NULL -- so the table's tablet count and
+			 * boundaries do not leak.
+			 */
+			values[10] = CStringGetTextDatum(YB_TABLET_METADATA_MASKED_VALUE);
+			values[11] = CStringGetTextDatum(YB_TABLET_METADATA_MASKED_VALUE);
+		}
+		else
+		{
+			if (tablet->start_range)
+				values[10] = CStringGetTextDatum(tablet->start_range);
+			else
+				nulls[10] = true;
+
+			if (tablet->end_range)
+				values[11] = CStringGetTextDatum(tablet->end_range);
+			else
+				nulls[11] = true;
+		}
+
+		/* TODO (#28172): tablet_attrs is populated in a follow-up change. */
 		nulls[12] = true;
 
 		if (tablet->tablet_state)

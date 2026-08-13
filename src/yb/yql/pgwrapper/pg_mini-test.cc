@@ -3241,10 +3241,12 @@ TEST_F(PgMiniTest, TabletMetadataCorrectnessWithHashPartitioning) {
       yb::Format("SELECT yb_hash_code($0)", test_key)));
   LOG(INFO) << "Hash code for key " << test_key << " is: " << hash_code;
 
-  // Find which tablet this hash falls into using yb_tablet_metadata
+  // Find which tablet this hash falls into using yb_tablet_metadata. Scope by
+  // db_name as well: relnames are not unique across databases and can be
+  // masked for unprivileged callers.
   auto tablet_from_metadata = ASSERT_RESULT(pg_conn.FetchRow<std::string>(
       yb::Format("SELECT tablet_id FROM yb_tablet_metadata "
-             "WHERE relname = 'hash_test_table' "
+             "WHERE db_name = current_database() AND relname = 'hash_test_table' "
              "AND $0 >= start_hash_code AND $0 < end_hash_code", hash_code)));
   LOG(INFO) << "Tablet ID from yb_tablet_metadata: " << tablet_from_metadata;
 
@@ -3326,6 +3328,74 @@ TEST_F(PgMiniTest, TabletMetadataOidMatchesPgClass) {
         "WHERE db_name = current_database() AND relname = 'test_table' "
         "AND oid = $0)", pg_class_oid));
   }, 30s, "yb_tablet_metadata exposes test_table's stable oid"));
+}
+
+// yb_tablet_metadata masks the sensitive columns (relname, start_range,
+// end_range) for roles lacking SELECT on the row's table. The gate is keyed
+// on the stable pg_class oid reported by the master, so a SELECT grant keeps
+// revealing the rows after a table rewrite (which changes the relfilenode but
+// not the oid), and rows whose table was dropped (orphaned oids) mask cleanly
+// instead of failing the query.
+TEST_F(PgMiniTest, TabletMetadataMaskingRewriteAndOrphanedOid) {
+  constexpr auto kMaskedValue = "<insufficient privilege>";
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE USER tmeta_masking_user"));
+  // No primary key, so ALTER TABLE ADD PRIMARY KEY below forces a rewrite.
+  ASSERT_OK(conn.Execute("CREATE TABLE granted_table (k INT, v INT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE ungranted_table (k INT, v INT)"));
+  ASSERT_OK(conn.Execute("GRANT SELECT ON granted_table TO tmeta_masking_user"));
+
+  auto settings = MakeConnSettings();
+  settings.user = "tmeta_masking_user";
+  auto user_conn = ASSERT_RESULT(PGConnBuilder(settings).Connect());
+
+  // The grant reveals granted_table's rows while ungranted_table's rows are
+  // present but masked.
+  ASSERT_TRUE(ASSERT_RESULT(user_conn.FetchRow<bool>(
+      "SELECT EXISTS (SELECT 1 FROM yb_tablet_metadata "
+      "WHERE db_name = current_database() AND relname = 'granted_table')")));
+  ASSERT_TRUE(ASSERT_RESULT(user_conn.FetchRow<bool>(Format(
+      "SELECT bool_and(relname = '$0') FROM yb_tablet_metadata "
+      "WHERE db_name = current_database() AND oid = 'ungranted_table'::regclass",
+      kMaskedValue))));
+
+  // Rewrite the granted table; its pg_class oid stays put while the
+  // relfilenode diverges.
+  ASSERT_OK(conn.Execute("ALTER TABLE granted_table ADD PRIMARY KEY (k ASC)"));
+  const auto pg_class_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(
+      "SELECT oid FROM pg_class WHERE relname = 'granted_table'"));
+  const auto pg_class_relfilenode = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(
+      "SELECT relfilenode FROM pg_class WHERE relname = 'granted_table'"));
+  ASSERT_NE(pg_class_oid, pg_class_relfilenode)
+      << "ALTER TABLE ADD PRIMARY KEY did not rewrite granted_table";
+
+  // The pre-rewrite grant still reveals the rewritten table's rows, which now
+  // carry decoded range bounds (the rewritten table is range sharded and
+  // unsplit, so both edges are naturally NULL).
+  ASSERT_OK(WaitFor([&user_conn, pg_class_oid]() -> Result<bool> {
+    return user_conn.FetchRow<bool>(Format(
+        "SELECT EXISTS (SELECT 1 FROM yb_tablet_metadata "
+        "WHERE db_name = current_database() AND relname = 'granted_table' "
+        "AND oid = $0 AND start_range IS NULL AND end_range IS NULL "
+        "AND tablet_state = 'RUNNING')", pg_class_oid));
+  }, 30s * kTimeMultiplier, "grant keeps applying to the rewritten table"));
+
+  // Drop the ungranted table. The master keeps its tablet in DELETED state
+  // until the background cleanup task erases it, so the view briefly reports
+  // rows whose oid no longer exists in pg_class. Those rows must not fail the
+  // unprivileged query and must stay masked.
+  const auto ungranted_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(
+      "SELECT 'ungranted_table'::regclass::oid"));
+  ASSERT_OK(conn.Execute("DROP TABLE ungranted_table"));
+
+  auto orphaned_relnames = ASSERT_RESULT(user_conn.FetchRows<std::string>(Format(
+      "SELECT relname FROM yb_tablet_metadata WHERE oid = $0", ungranted_oid)));
+  for (const auto& relname : orphaned_relnames) {
+    ASSERT_EQ(relname, kMaskedValue);
+  }
+
+  // The whole view stays queryable for the unprivileged user.
+  ASSERT_OK(user_conn.FetchRow<int64_t>("SELECT count(*) FROM yb_tablet_metadata"));
 }
 
 TEST_F(PgMiniTest, TabletMetadataStateColumn) {
