@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"sync"
@@ -10,13 +11,64 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/opentelemetry/pb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/protoparserutil"
 )
 
-var maxRequestSize = flagutil.NewBytes("opentelemetry.maxRequestSize", 64*1024*1024, "The maximum size in bytes of a single OpenTelemetry request")
+var (
+	maxRequestSize = flagutil.NewBytes("opentelemetry.maxRequestSize", 64*1024*1024, "The maximum size in bytes of a single OpenTelemetry request")
+
+	promoteScopeMetadata = flag.Bool("opentelemetry.promoteScopeMetadata", true, "Whether to promote OpenTelemetry instrumentation scope metadata (name, version, attributes) to metric labels. "+
+		"See https://docs.victoriametrics.com/victoriametrics/integrations/opentelemetry/")
+	promoteAllResourceAttributes = flag.Bool("opentelemetry.promoteAllResourceAttributes", true, "Whether to promote all OpenTelemetry resource attributes to labels except those listed in -opentelemetry.ignoreResourceAttributes. "+
+		"Cannot be set together with -opentelemetry.promoteResourceAttributes. See https://docs.victoriametrics.com/victoriametrics/integrations/opentelemetry/")
+	promoteResourceAttributes = flagutil.NewArrayString("opentelemetry.promoteResourceAttributes", "Comma-separated list of OpenTelemetry resource attribute keys to promote to labels. "+
+		"Cannot be set together with -opentelemetry.promoteAllResourceAttributes. See https://docs.victoriametrics.com/victoriametrics/integrations/opentelemetry/")
+	ignoreResourceAttributes = flagutil.NewArrayString("opentelemetry.ignoreResourceAttributes", "Comma-separated list of OpenTelemetry resource attribute keys to skip when -opentelemetry.promoteAllResourceAttributes is enabled. "+
+		"See https://docs.victoriametrics.com/victoriametrics/integrations/opentelemetry/")
+)
+
+// Init validates OpenTelemetry ingest flags. Must be called after flag.Parse.
+func Init() {
+	if err := validatePromoteFlags(); err != nil {
+		logger.Fatalf("%s", err)
+	}
+}
+
+func validatePromoteFlags() error {
+	if *promoteAllResourceAttributes && len(*promoteResourceAttributes) > 0 {
+		return fmt.Errorf("-opentelemetry.promoteAllResourceAttributes and -opentelemetry.promoteResourceAttributes cannot be set simultaneously")
+	}
+	if !*promoteAllResourceAttributes && len(*ignoreResourceAttributes) > 0 {
+		return fmt.Errorf("-opentelemetry.ignoreResourceAttributes cannot be set unless -opentelemetry.promoteAllResourceAttributes is true")
+	}
+	return nil
+}
+
+func getDecodeMetricsOptions() pb.DecodeMetricsOptions {
+	opts := pb.DecodeMetricsOptions{
+		DisableScopeMetadata:      !*promoteScopeMetadata,
+		DisableResourceAttributes: !*promoteAllResourceAttributes,
+	}
+	keys := *ignoreResourceAttributes
+	if opts.DisableResourceAttributes {
+		keys = *promoteResourceAttributes
+	}
+	if len(keys) == 0 {
+		return opts
+	}
+	opts.ResourceAttributesList = make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		opts.ResourceAttributesList[k] = struct{}{}
+	}
+	return opts
+}
 
 // ParseStream parses OpenTelemetry protobuf or json data from r and calls callback for the parsed rows.
 //
@@ -41,13 +93,16 @@ func ParseStream(r io.Reader, encoding string, processBody func(data []byte) ([]
 }
 
 func parseData(data []byte, callback func(tss []prompb.TimeSeries, mms []prompb.MetricMetadata) error) error {
+	if err := validatePromoteFlags(); err != nil {
+		return err
+	}
 	wctx := getWriteRequestContext()
 	defer putWriteRequestContext(wctx)
 
 	// the flushFunc will be called multiple time if the request is big, to avoid over allocating memory for such request.
 	wctx.flushFunc = callback
 
-	if err := pb.DecodeMetricsData(data, wctx); err != nil {
+	if err := pb.DecodeMetricsData(data, wctx, getDecodeMetricsOptions()); err != nil {
 		return fmt.Errorf("cannot unmarshal request from %d bytes: %w", len(data), err)
 	}
 

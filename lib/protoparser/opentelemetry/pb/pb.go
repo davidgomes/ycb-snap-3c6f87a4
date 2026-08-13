@@ -73,15 +73,31 @@ func (r *MetricsData) marshalProtobuf(mm *easyproto.MessageMarshaler) {
 	}
 }
 
+// DecodeMetricsOptions controls promotion of OpenTelemetry resource attributes
+// and instrumentation scope metadata to metric labels.
+type DecodeMetricsOptions struct {
+	// DisableScopeMetadata skips promoting instrumentation scope metadata
+	// (name, version, attributes) to metric labels.
+	DisableScopeMetadata bool
+
+	// DisableResourceAttributes switches ResourceAttributesList from an ignore
+	// list (when false) to a promote list (when true).
+	DisableResourceAttributes bool
+
+	// ResourceAttributesList is ignore-keys when DisableResourceAttributes is false
+	// and promote-keys when DisableResourceAttributes is true.
+	ResourceAttributesList map[string]struct{}
+}
+
 // DecodeMetricsData decodes metricsData from src and sends the decoded data to mp.
-func DecodeMetricsData(src []byte, mp MetricPusher) (err error) {
+func DecodeMetricsData(src []byte, mp MetricPusher, options DecodeMetricsOptions) (err error) {
 	// See https://github.com/open-telemetry/opentelemetry-proto/blob/049d4332834935792fd4dbd392ecd31904f99ba2/opentelemetry/proto/metrics/v1/metrics.proto#L56
 	//
 	// message MetricsData {
 	//   repeated ResourceMetrics resource_metrics = 1;
 	// }
 
-	dctx := getDecoderContext(mp)
+	dctx := getDecoderContext(mp, options)
 	defer putDecoderContext(dctx)
 
 	var fc easyproto.FieldContext
@@ -198,6 +214,18 @@ func (dctx *decoderContext) decodeResource(src []byte) (err error) {
 			data, ok := fc.MessageData()
 			if !ok {
 				return fmt.Errorf("cannot read Attributes")
+			}
+			key, ok, err := easyproto.GetString(data, 1)
+			if err != nil {
+				return fmt.Errorf("cannot find Key in KeyValue: %w", err)
+			}
+			if !ok {
+				// Key is missing, skip it.
+				// See https://github.com/VictoriaMetrics/VictoriaLogs/issues/869#issuecomment-3631307996
+				continue
+			}
+			if !dctx.shouldPromoteResourceAttribute(key) {
+				continue
 			}
 			if err := decodeKeyValue(data, &dctx.ls, &dctx.fb, ""); err != nil {
 				return fmt.Errorf("cannot unmarshal Attributes: %w", err)
@@ -464,7 +492,7 @@ func (dctx *decoderContext) decodeScopeMetrics(src []byte) error {
 	if err != nil {
 		return fmt.Errorf("cannot read InstrumentationScope: %w", err)
 	}
-	if ok {
+	if ok && !dctx.options.DisableScopeMetadata {
 		if err := dctx.decodeInstrumentationScope(scopeData); err != nil {
 			return fmt.Errorf("cannot decode InstrumentationScope: %w", err)
 		}
@@ -1722,7 +1750,16 @@ type decoderContext struct {
 
 	mm MetricMetadata
 
-	mp MetricPusher
+	mp      MetricPusher
+	options DecodeMetricsOptions
+}
+
+func (dctx *decoderContext) shouldPromoteResourceAttribute(key string) bool {
+	_, exists := dctx.options.ResourceAttributesList[key]
+	if dctx.options.DisableResourceAttributes {
+		return exists
+	}
+	return !exists
 }
 
 func (dctx *decoderContext) reset() {
@@ -1737,6 +1774,7 @@ func (dctx *decoderContext) reset() {
 	dctx.mm.reset()
 
 	dctx.mp = nil
+	dctx.options = DecodeMetricsOptions{}
 }
 
 func (dctx *decoderContext) getSnapshot() decoderContextSnapshot {
@@ -1756,13 +1794,14 @@ type decoderContextSnapshot struct {
 	fbLen     int
 }
 
-func getDecoderContext(mp MetricPusher) *decoderContext {
+func getDecoderContext(mp MetricPusher, options DecodeMetricsOptions) *decoderContext {
 	v := dctxPool.Get()
 	if v == nil {
 		v = &decoderContext{}
 	}
 	dctx := v.(*decoderContext)
 	dctx.mp = mp
+	dctx.options = options
 
 	return dctx
 }

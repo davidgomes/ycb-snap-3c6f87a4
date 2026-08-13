@@ -16,6 +16,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/opentelemetry/pb"
@@ -893,4 +894,129 @@ func TestPutBigWriteRequestContext(t *testing.T) {
 	f(1, 4*1024*1024+1, 0)
 	f(1, 4*1024*1024+1, 0)
 	f(1024*1024, 4*1024*1024+1, 0) // diff > 4x
+}
+
+func TestValidatePromoteFlags(t *testing.T) {
+	prevPromoteAll := *promoteAllResourceAttributes
+	prevPromote := append(flagutil.ArrayString(nil), *promoteResourceAttributes...)
+	prevIgnore := append(flagutil.ArrayString(nil), *ignoreResourceAttributes...)
+	defer func() {
+		*promoteAllResourceAttributes = prevPromoteAll
+		*promoteResourceAttributes = prevPromote
+		*ignoreResourceAttributes = prevIgnore
+	}()
+
+	*promoteAllResourceAttributes = true
+	*promoteResourceAttributes = nil
+	*ignoreResourceAttributes = nil
+	if err := validatePromoteFlags(); err != nil {
+		t.Fatalf("unexpected error for default flags: %s", err)
+	}
+
+	*promoteAllResourceAttributes = true
+	*promoteResourceAttributes = flagutil.ArrayString{"job"}
+	*ignoreResourceAttributes = nil
+	if err := validatePromoteFlags(); err == nil {
+		t.Fatalf("expected error when promote-all and promote list are both set")
+	}
+
+	*promoteAllResourceAttributes = false
+	*promoteResourceAttributes = nil
+	*ignoreResourceAttributes = flagutil.ArrayString{"job"}
+	if err := validatePromoteFlags(); err == nil {
+		t.Fatalf("expected error when ignore list is set without promote-all")
+	}
+
+	*promoteAllResourceAttributes = false
+	*promoteResourceAttributes = flagutil.ArrayString{"job"}
+	*ignoreResourceAttributes = nil
+	if err := validatePromoteFlags(); err != nil {
+		t.Fatalf("unexpected error for promote list: %s", err)
+	}
+}
+
+func TestParseStreamPromotionFlags(t *testing.T) {
+	prevScope := *promoteScopeMetadata
+	prevPromoteAll := *promoteAllResourceAttributes
+	prevPromote := append(flagutil.ArrayString(nil), *promoteResourceAttributes...)
+	prevIgnore := append(flagutil.ArrayString(nil), *ignoreResourceAttributes...)
+	defer func() {
+		*promoteScopeMetadata = prevScope
+		*promoteAllResourceAttributes = prevPromoteAll
+		*promoteResourceAttributes = prevPromote
+		*ignoreResourceAttributes = prevIgnore
+	}()
+
+	req := &pb.MetricsData{
+		ResourceMetrics: []*pb.ResourceMetrics{
+			generateOTLPSamples([]*pb.Metric{generateGauge("my-gauge", "")}),
+		},
+	}
+	pbData := req.MarshalProtobuf(nil)
+
+	collect := func() []prompb.Label {
+		t.Helper()
+		var got []prompb.Label
+		err := ParseStream(bytes.NewBuffer(pbData), "", nil, func(tss []prompb.TimeSeries, _ []prompb.MetricMetadata) error {
+			if len(tss) != 1 {
+				return fmt.Errorf("unexpected series count: %d", len(tss))
+			}
+			got = append([]prompb.Label(nil), tss[0].Labels...)
+			sortLabels(got)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("cannot parse: %s", err)
+		}
+		return got
+	}
+
+	hasLabel := func(labels []prompb.Label, name, value string) bool {
+		for _, l := range labels {
+			if l.Name == name && l.Value == value {
+				return true
+			}
+		}
+		return false
+	}
+
+	*promoteScopeMetadata = true
+	*promoteAllResourceAttributes = true
+	*promoteResourceAttributes = nil
+	*ignoreResourceAttributes = nil
+	got := collect()
+	if !hasLabel(got, "job", "vm") || !hasLabel(got, "scope.name", "foo") || !hasLabel(got, "label1", "value1") {
+		t.Fatalf("default flags must keep resource, scope and datapoint labels; got %s", prettifyLabels(got))
+	}
+
+	*promoteScopeMetadata = false
+	got = collect()
+	if hasLabel(got, "scope.name", "foo") || hasLabel(got, "scope.version", "bar") || hasLabel(got, "scope.attributes.abc", "qwe") {
+		t.Fatalf("disabled scope metadata must not appear as labels; got %s", prettifyLabels(got))
+	}
+	if !hasLabel(got, "job", "vm") || !hasLabel(got, "label1", "value1") {
+		t.Fatalf("resource and datapoint labels must remain; got %s", prettifyLabels(got))
+	}
+
+	*promoteScopeMetadata = true
+	*promoteAllResourceAttributes = false
+	*promoteResourceAttributes = flagutil.ArrayString{"job"}
+	got = collect()
+	if !hasLabel(got, "job", "vm") {
+		t.Fatalf("selected resource attribute must be promoted; got %s", prettifyLabels(got))
+	}
+	if !hasLabel(got, "scope.name", "foo") || !hasLabel(got, "label1", "value1") {
+		t.Fatalf("scope metadata and datapoint attrs must remain; got %s", prettifyLabels(got))
+	}
+
+	*promoteAllResourceAttributes = true
+	*promoteResourceAttributes = nil
+	*ignoreResourceAttributes = flagutil.ArrayString{"job"}
+	got = collect()
+	if hasLabel(got, "job", "vm") {
+		t.Fatalf("ignored resource attribute must not appear; got %s", prettifyLabels(got))
+	}
+	if !hasLabel(got, "label1", "value1") {
+		t.Fatalf("datapoint attrs must remain; got %s", prettifyLabels(got))
+	}
 }

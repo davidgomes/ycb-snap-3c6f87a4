@@ -30,7 +30,20 @@ The following label sanitization options can be enabled:
 
 ## Resource Attributes
 
-By default, VictoriaMetrics promotes all [OpenTelemetry resource](https://opentelemetry.io/docs/specs/otel/resource/data-model/) attributes to labels and attaches them to all ingested OTLP metrics.
+By default, VictoriaMetrics promotes all [OpenTelemetry resource](https://opentelemetry.io/docs/specs/otel/resource/data-model/) attributes
+and [instrumentation scope](https://opentelemetry.io/docs/specs/otel/glossary/#instrumentation-scope) metadata (name, version, attributes)
+to labels and attaches them to all ingested OTLP metrics.
+
+Use the following flags to change that without affecting other ingestion protocols:
+
+* `-opentelemetry.promoteScopeMetadata` - whether to promote instrumentation scope metadata to labels. Enabled by default.
+* `-opentelemetry.promoteAllResourceAttributes` - whether to promote all resource attributes except those listed in `-opentelemetry.ignoreResourceAttributes`. Enabled by default.
+* `-opentelemetry.promoteResourceAttributes` - comma-separated list of resource attribute keys to promote. Cannot be set together with `-opentelemetry.promoteAllResourceAttributes`.
+* `-opentelemetry.ignoreResourceAttributes` - comma-separated list of resource attribute keys to skip. Valid only when `-opentelemetry.promoteAllResourceAttributes` is enabled.
+
+Invalid combinations of these flags cause the process to exit at startup.
+
+Datapoint attributes are always stored as labels.
 
 ## Exponential histograms
 
