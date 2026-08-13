@@ -136,11 +136,10 @@ public:
    * @param connection_key the connection key identifying the reverse tunnel connection.
    * @param error_message the failure reason for "handshake_failure" events; empty otherwise.
    */
-  void emitAccessLog(TimeSource& time_source, const std::string& event,
-                     const std::string& node_id, const std::string& cluster_id,
-                     const std::string& tenant_id, const std::string& upstream_cluster,
-                     const std::string& host_address, const std::string& connection_key,
-                     const std::string& error_message);
+  void emitAccessLog(TimeSource& time_source, const std::string& event, const std::string& node_id,
+                     const std::string& cluster_id, const std::string& tenant_id,
+                     const std::string& upstream_cluster, const std::string& host_address,
+                     const std::string& connection_key, const std::string& error_message);
 
   /**
    * Test-only method to set the thread local slot for testing purposes.

@@ -54,8 +54,7 @@ ReverseTunnelInitiatorExtension::ReverseTunnelInitiatorExtension(
   }
 
   // Instantiate the configured access loggers for reverse tunnel lifecycle events.
-  Server::GenericFactoryContextImpl generic_context(context_,
-                                                    context_.messageValidationVisitor());
+  Server::GenericFactoryContextImpl generic_context(context_, context_.messageValidationVisitor());
   for (const auto& access_log_config : config.access_log()) {
     access_logs_.push_back(
         AccessLog::AccessLogFactory::fromProto(access_log_config, generic_context));
