@@ -37,6 +37,7 @@ envoy_cc_test(
     size = "medium",
     srcs = ["reverse_tunnel_initiator_extension_test.cc"],
     deps = [
+        "//source/common/formatter:formatter_extension_lib",
         "//source/extensions/access_loggers/stream:config",
         "//source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface:reverse_tunnel_extension_lib",
         "//source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface:reverse_tunnel_initiator_lib",

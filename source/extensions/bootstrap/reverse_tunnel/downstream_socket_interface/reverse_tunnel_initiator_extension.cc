@@ -8,6 +8,7 @@
 #include "source/common/access_log/access_log_impl.h"
 #include "source/common/common/logger.h"
 #include "source/common/protobuf/protobuf.h"
+#include "source/common/protobuf/utility.h"
 #include "source/common/stats/symbol_table.h"
 #include "source/common/stats/utility.h"
 #include "source/common/stream_info/stream_info_impl.h"

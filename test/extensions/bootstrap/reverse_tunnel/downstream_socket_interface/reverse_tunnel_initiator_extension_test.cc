@@ -4,6 +4,7 @@
 #include "envoy/server/factory_context.h"
 #include "envoy/thread_local/thread_local.h"
 
+#include "source/common/protobuf/protobuf.h"
 #include "source/extensions/bootstrap/reverse_tunnel/common/reverse_connection_utility.h"
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator.h"
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_tunnel_initiator_extension.h"
@@ -688,7 +689,7 @@ TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogNoOpWithoutLoggers) {
 // emitAccessLog populates dynamic metadata under the expected namespace with all fields.
 TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogPopulatesDynamicMetadata) {
   auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
-  ProtobufWkt::Struct captured_metadata;
+  Protobuf::Struct captured_metadata;
   bool found_namespace = false;
   EXPECT_CALL(*access_log, log(_, _))
       .WillOnce(
@@ -723,7 +724,7 @@ TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogPopulatesDynamicMetadat
 // identity fields present as empty strings.
 TEST_F(ReverseTunnelInitiatorExtensionTest, EmitAccessLogPopulatesErrorOnFailure) {
   auto access_log = std::make_shared<NiceMock<AccessLog::MockInstance>>();
-  ProtobufWkt::Struct captured_metadata;
+  Protobuf::Struct captured_metadata;
   EXPECT_CALL(*access_log, log(_, _))
       .WillOnce(
           Invoke([&](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
