@@ -805,6 +805,14 @@ void ReverseConnectionIOHandle::onDownstreamConnectionClosed(const std::string& 
   // Remove connection state tracking.
   removeConnectionState(host_address, cluster_name, connection_key);
 
+  // Emit an access log entry for the closed reverse tunnel connection. Guard on configured
+  // access logs to avoid resolving a time source when logging is disabled.
+  if (extension_ != nullptr && !extension_->accessLogs().empty()) {
+    extension_->emitAccessLog(getTimeSource(), "connection_closed", config_.src_node_id,
+                              config_.src_cluster_id, config_.src_tenant_id, cluster_name,
+                              host_address, connection_key, /*error_message=*/"");
+  }
+
   // The next call to maintainClusterConnections() will detect the missing connection
   // and re-initiate it automatically.
   ENVOY_LOG(debug,
@@ -1106,6 +1114,14 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
     ENVOY_LOG(error, "reverse_tunnel: Connection failed - error '{}', cleaning up host {}", error,
               host_address);
 
+    // Emit an access log entry for the handshake failure. Guard on configured access logs to
+    // avoid resolving a time source when logging is disabled.
+    if (extension_ != nullptr && !extension_->accessLogs().empty()) {
+      extension_->emitAccessLog(getTimeSource(), "handshake_failure", config_.src_node_id,
+                                config_.src_cluster_id, config_.src_tenant_id, cluster_name,
+                                host_address, connection_key, error);
+    }
+
     updateConnectionState(host_address, cluster_name, connection_key,
                           ReverseConnectionState::Failed);
 
@@ -1122,6 +1138,14 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
   } else {
     // Handle connection success.
     ENVOY_LOG(debug, "reverse_tunnel: Connection succeeded for host {}", host_address);
+
+    // Emit an access log entry for the successful handshake. Guard on configured access logs to
+    // avoid resolving a time source when logging is disabled.
+    if (extension_ != nullptr && !extension_->accessLogs().empty()) {
+      extension_->emitAccessLog(getTimeSource(), "handshake_success", config_.src_node_id,
+                                config_.src_cluster_id, config_.src_tenant_id, cluster_name,
+                                host_address, connection_key, /*error_message=*/"");
+    }
 
     resetHostBackoff(host_address);
     updateConnectionState(host_address, cluster_name, connection_key,
