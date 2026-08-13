@@ -3328,6 +3328,94 @@ TEST_F(PgMiniTest, TabletMetadataOidMatchesPgClass) {
   }, 30s, "yb_tablet_metadata exposes test_table's stable oid"));
 }
 
+TEST_F(PgMiniTest, TabletMetadataPrivilegeMasking) {
+  constexpr auto kMasked = "<insufficient privilege>";
+
+  auto conn = ASSERT_RESULT(Connect());
+  const auto db_name = ASSERT_RESULT(conn.FetchRow<std::string>("SELECT current_database()"));
+  ASSERT_OK(conn.Execute("CREATE ROLE mask_test_user LOGIN"));
+
+  // Table that gets rewritten: created without a primary key, granted, then
+  // rewritten into a range-sharded table by ADD PRIMARY KEY. The rewrite
+  // keeps the stable pg_class oid but assigns a new relfilenode (a new DocDB
+  // table), so the pre-rewrite grant must still unmask the new tablets.
+  ASSERT_OK(conn.Execute("CREATE TABLE rewrite_test (id INT, v TEXT)"));
+  ASSERT_OK(conn.Execute("GRANT SELECT ON rewrite_test TO mask_test_user"));
+  ASSERT_OK(conn.Execute("ALTER TABLE rewrite_test ADD PRIMARY KEY (id ASC)"));
+
+  const auto pg_class_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(
+      "SELECT oid FROM pg_class WHERE relname = 'rewrite_test'"));
+  const auto pg_class_relfilenode = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(
+      "SELECT relfilenode FROM pg_class WHERE relname = 'rewrite_test'"));
+  ASSERT_NE(pg_class_oid, pg_class_relfilenode)
+      << "ALTER TABLE ADD PRIMARY KEY did not rewrite rewrite_test";
+
+  auto settings = MakeConnSettings(db_name);
+  settings.user = "mask_test_user";
+  auto user_conn = ASSERT_RESULT(PGConnBuilder(settings).Connect());
+
+  // The grantee sees the rewritten table's RUNNING tablet unmasked, keyed by
+  // the stable pg_class oid the grant was made against.
+  ASSERT_OK(WaitFor([&user_conn, pg_class_oid]() -> Result<bool> {
+    return user_conn.FetchRow<bool>(Format(
+        "SELECT EXISTS (SELECT 1 FROM yb_tablet_metadata "
+        "WHERE db_name = current_database() AND oid = $0 "
+        "AND relname = 'rewrite_test' AND tablet_state = 'RUNNING')", pg_class_oid));
+  }, 30s * kTimeMultiplier, "grantee sees rewritten table unmasked"));
+
+  // An ungranted range-sharded table is masked for the user: relname and
+  // every range cell (including the NULL unbounded edges) report the
+  // placeholder, while the row itself is not dropped.
+  ASSERT_OK(conn.Execute(
+      "CREATE TABLE masked_range_test (id INT, PRIMARY KEY (id ASC)) SPLIT AT VALUES ((100))"));
+  const auto masked_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(
+      "SELECT oid FROM pg_class WHERE relname = 'masked_range_test'"));
+
+  const auto masked_rows =
+      ASSERT_RESULT((user_conn.FetchRows<std::string, std::string, std::string>(Format(
+          "SELECT relname, start_range, end_range FROM yb_tablet_metadata "
+          "WHERE db_name = current_database() AND oid = $0", masked_oid))));
+  ASSERT_EQ(masked_rows.size(), 2);
+  for (const auto& [relname, start_range, end_range] : masked_rows) {
+    ASSERT_EQ(relname, kMasked);
+    ASSERT_EQ(start_range, kMasked);
+    ASSERT_EQ(end_range, kMasked);
+  }
+
+  // The superuser sees the same rows with the decoded range bounds and the
+  // NULL unbounded edges.
+  using OptString = std::optional<std::string>;
+  const auto super_rows = ASSERT_RESULT((conn.FetchRows<OptString, OptString>(Format(
+      "SELECT start_range, end_range FROM yb_tablet_metadata "
+      "WHERE db_name = current_database() AND oid = $0 "
+      "ORDER BY start_range NULLS FIRST", masked_oid))));
+  ASSERT_EQ(super_rows.size(), 2);
+  ASSERT_EQ(super_rows[0], (decltype(super_rows)::value_type{
+      std::nullopt, "DocKey([], [100])"}));
+  ASSERT_EQ(super_rows[1], (decltype(super_rows)::value_type{
+      "DocKey([], [100])", std::nullopt}));
+
+  // Orphaned OIDs -- tablets of dropped tables that the master still reports
+  // in DELETED state -- must not fail the unprivileged query; the row is
+  // simply masked.
+  ASSERT_OK(conn.Execute("CREATE TABLE orphan_test (id INT PRIMARY KEY) SPLIT INTO 1 TABLETS"));
+  auto orphan_table_id = ASSERT_RESULT(GetTableIDFromTableName("orphan_test"));
+  auto orphan_peers = ListTableActiveTabletLeadersPeers(cluster_.get(), orphan_table_id);
+  ASSERT_EQ(orphan_peers.size(), 1);
+  auto orphan_tablet_id = orphan_peers[0]->tablet_id();
+  ASSERT_OK(conn.Execute("DROP TABLE orphan_test"));
+
+  ASSERT_OK(LoggedWaitFor(
+      [&user_conn, &orphan_tablet_id]() -> Result<bool> {
+        auto count = VERIFY_RESULT(user_conn.FetchRow<int64_t>(Format(
+            "SELECT count(*) FROM yb_get_tablet_metadata() "
+            "WHERE tablet_id = '$0' AND tablet_state = 'DELETED' "
+            "AND object_name = '$1'", orphan_tablet_id, kMasked)));
+        return count > 0;
+      },
+      30s * kTimeMultiplier, "orphaned tablet row is masked without erroring"));
+}
+
 TEST_F(PgMiniTest, TabletMetadataStateColumn) {
   auto pg_conn = ASSERT_RESULT(Connect());
 

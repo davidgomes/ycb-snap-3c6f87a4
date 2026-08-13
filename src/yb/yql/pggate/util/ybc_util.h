@@ -174,6 +174,11 @@ void YBCUpdateInitPostgresMetrics();
 uint16_t YBCDecodeMultiColumnHashLeftBound(const char* partition_key, size_t key_len);
 uint16_t YBCDecodeMultiColumnHashRightBound(const char* partition_key, size_t key_len);
 
+// Decode a range partition key into the DocDB debug representation, e.g.
+// 'DocKey([], [100])'. Uses the same rendering as the master UI tablet listing.
+// The returned string is allocated with YBCPAlloc (i.e. palloc'd).
+const char* YBCDecodeRangePartitionKey(const char* partition_key, size_t key_len);
+
 bool YBCIsObjectLockingEnabled();
 void YBCPgSetClampUncertaintyWindow(bool clamp);
 

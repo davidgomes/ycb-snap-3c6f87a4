@@ -26,6 +26,7 @@
 #include "yb/common/transaction_error.h"
 #include "yb/common/wire_protocol.h"
 
+#include "yb/dockv/doc_key.h"
 #include "yb/dockv/partition.h"
 
 #include "yb/gutil/stringprintf.h"
@@ -903,6 +904,13 @@ uint16_t YBCDecodeMultiColumnHashRightBound(const char* partition_key, size_t ke
   yb::Slice slice(partition_key, key_len);
   return CHECK_RESULT(
       dockv::PartitionSchema::DecodePartitionKeyEndAsHashRightBoundInclusive(slice));
+}
+
+const char* YBCDecodeRangePartitionKey(const char* partition_key, size_t key_len) {
+  // Same rendering as PartitionSchema::RangePartitionDebugString on the master
+  // UI tablet listing (e.g. timestamps as their int64 key representation).
+  return YBCPAllocStdString(
+      dockv::DocKey::DebugSliceToString(yb::Slice(partition_key, key_len)));
 }
 
 bool YBCIsObjectLockingEnabled() {
