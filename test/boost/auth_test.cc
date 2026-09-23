@@ -27,6 +27,7 @@
 
 #include "auth/allow_all_authenticator.hh"
 #include "auth/authenticator.hh"
+#include "auth/certificate_or_password_authenticator.hh"
 #include "auth/password_authenticator.hh"
 #include "auth/service.hh"
 #include "auth/authenticated_user.hh"
@@ -139,6 +140,46 @@ SEASTAR_TEST_CASE(test_password_authenticator_operations) {
                     exceptions::authentication_exception);
         });
     }, auth_on(false));
+}
+
+static auth::session_dn_func session_without_certificate() {
+    return [] {
+        return make_ready_future<std::optional<auth::certificate_info>>(std::nullopt);
+    };
+}
+
+static auth::session_dn_func session_with_certificate(std::string subject) {
+    return [subject = std::move(subject)] {
+        return make_ready_future<std::optional<auth::certificate_info>>(auth::certificate_info{subject, {}});
+    };
+}
+
+SEASTAR_TEST_CASE(test_certificate_or_password_authenticator) {
+    cql_test_config cfg;
+    cfg.db_config->authenticator("CertificateOrPasswordAuthenticator");
+    cfg.db_config->auth_certificate_role_queries({ { { "source", "SUBJECT" }, { "query", "CN=([^,]+)" } } });
+    co_await do_with_cql_env_thread([](cql_test_env& env) {
+        auto& a = env.local_auth_service().underlying_authenticator();
+        BOOST_REQUIRE(a.require_authentication());
+        BOOST_REQUIRE_EQUAL(a.qualified_java_name(), auth::certificate_or_password_authenticator_name);
+
+        // Without a client certificate, the client is asked for a password.
+        BOOST_REQUIRE(!a.authenticate(auth::session_dn_func()).get());
+        BOOST_REQUIRE(!a.authenticate(session_without_certificate()).get());
+
+        const auto cert_user = a.authenticate(session_with_certificate("CN=cert_user,O=ScyllaDB")).get();
+        BOOST_REQUIRE(cert_user);
+        BOOST_REQUIRE_EQUAL(*cert_user->name, sstring("cert_user"));
+
+        // A certificate that maps to no role must not fall back to password authentication.
+        BOOST_REQUIRE_THROW(a.authenticate(session_with_certificate("O=ScyllaDB")).get(),
+                exceptions::authentication_exception);
+
+        cquery_nofail(env, "CREATE ROLE password_user WITH PASSWORD = 'secret' AND LOGIN = true");
+        BOOST_REQUIRE_EQUAL(*authenticate(env, "password_user", "secret").get().name, sstring("password_user"));
+        BOOST_REQUIRE_THROW(authenticate(env, "password_user", "wrong").get(),
+                exceptions::authentication_exception);
+    }, cfg);
 }
 
 namespace {
