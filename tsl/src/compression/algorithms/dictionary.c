@@ -58,6 +58,13 @@ dictionary_compressed_has_nulls(const CompressedDataHeader *header)
 	return dc->has_nulls;
 }
 
+Oid
+dictionary_compressed_get_element_type(const CompressedDataHeader *header)
+{
+	const DictionaryCompressed *dc = (const DictionaryCompressed *) header;
+	return dc->element_type;
+}
+
 static void
 pg_attribute_unused() assertions(void)
 {
