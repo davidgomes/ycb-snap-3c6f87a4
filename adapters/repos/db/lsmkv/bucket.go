@@ -505,7 +505,10 @@ func (b *Bucket) ApplyToObjectDigests(ctx context.Context,
 ) error {
 	var onDiskCursor *CursorReplace
 
-	inmemProcessedDocIDs := make(map[uint64]struct{})
+	// Keys (including tombstones) whose newest version lives in a memtable; any
+	// on-disk version of them is stale. Keyed by UUID rather than docID, since
+	// an update or resurrection may assign the memtable version a new docID.
+	inmemProcessedKeys := make(map[string]struct{})
 
 	// note: read-write access to active and flushing memtable will be blocked only during the scope of this inner function
 	err := func() error {
@@ -513,6 +516,9 @@ func (b *Bucket) ApplyToObjectDigests(ctx context.Context,
 
 		inMemCursor := b.CursorInMem()
 		defer inMemCursor.Close()
+		inMemCursor.onDeleted = func(key []byte) {
+			inmemProcessedKeys[string(key)] = struct{}{}
+		}
 
 		// created under the in-mem cursor's flush lock, so it is consistent with the
 		// memtable view: no flush can run between the two snapshots.
@@ -531,7 +537,7 @@ func (b *Bucket) ApplyToObjectDigests(ctx context.Context,
 					return fmt.Errorf("callback on object '%d' failed: %w", docID, err)
 				}
 
-				inmemProcessedDocIDs[docID] = struct{}{}
+				inmemProcessedKeys[string(k)] = struct{}{}
 			}
 		}
 
@@ -549,13 +555,13 @@ func (b *Bucket) ApplyToObjectDigests(ctx context.Context,
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+			if _, ok := inmemProcessedKeys[string(k)]; ok {
+				continue
+			}
+
 			docID, updateTime, err := storobj.DocIDAndTimeFromBinary(v)
 			if err != nil {
 				return fmt.Errorf("cannot unmarshal object: %w", err)
-			}
-
-			if _, ok := inmemProcessedDocIDs[docID]; ok {
-				continue
 			}
 
 			if err := f(k, updateTime); err != nil {

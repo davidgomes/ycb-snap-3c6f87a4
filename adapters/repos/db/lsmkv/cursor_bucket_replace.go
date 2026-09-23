@@ -26,6 +26,10 @@ type CursorReplace struct {
 	serveCache   cursorStateReplace
 
 	reusableIDList []int
+
+	// onDeleted, if set, is called with the key of every tombstone the cursor
+	// skips. The key is only valid for the duration of the call.
+	onDeleted func(key []byte)
 }
 
 type innerCursorReplace interface {
@@ -307,6 +311,9 @@ func (c *CursorReplace) serveCurrentStateAndAdvance() ([]byte, []byte) {
 		}
 
 		if errors.Is(c.serveCache.err, lsmkv.Deleted) {
+			if c.onDeleted != nil {
+				c.onDeleted(c.serveCache.key)
+			}
 			// element was deleted, proceed with next round
 			continue
 		}
