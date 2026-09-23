@@ -11,6 +11,7 @@ set(TEST_FILES
     cagg_errors.sql
     cagg_invalidation.sql
     cagg_invalidation_variable_bucket.sql
+    cagg_skip_invalidation.sql
     cagg_policy.sql
     cagg_refresh_using_trigger.sql
     cagg_refresh_using_merge.sql

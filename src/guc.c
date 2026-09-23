@@ -151,6 +151,7 @@ TSDLLEXPORT bool ts_guc_enable_job_execution_logging = false;
 bool ts_guc_enable_tss_callbacks = true;
 TSDLLEXPORT bool ts_guc_enable_delete_after_compression = false;
 TSDLLEXPORT bool ts_guc_enable_merge_on_cagg_refresh = false;
+TSDLLEXPORT bool ts_guc_skip_cagg_invalidation = false;
 
 bool ts_guc_enable_partitioned_hypertables = false;
 #if PG16_GE
@@ -1050,6 +1051,26 @@ _guc_init(void)
 							 "Enable MERGE statement on cagg refresh",
 							 "Enable MERGE statement on cagg refresh",
 							 &ts_guc_enable_merge_on_cagg_refresh,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	/*
+	 * Bulk-load tools that copy both hypertable data and continuous-aggregate
+	 * materializations own the refresh lifecycle. While this is on, DML and
+	 * invalidating DDL do not append continuous-aggregate invalidation log
+	 * entries. SET LOCAL keeps the opt-out inside one transaction. Misuse can
+	 * leave continuous aggregates stale until an explicit refresh.
+	 */
+	DefineCustomBoolVariable(MAKE_EXTOPTION("skip_cagg_invalidation"),
+							 "Skip continuous aggregate invalidation logging",
+							 "Do not append continuous aggregate invalidation log entries for "
+							 "DML and invalidating DDL. Intended for SET LOCAL during bulk loads "
+							 "whose caller refreshes continuous aggregates.",
+							 &ts_guc_skip_cagg_invalidation,
 							 false,
 							 PGC_USERSET,
 							 0,
