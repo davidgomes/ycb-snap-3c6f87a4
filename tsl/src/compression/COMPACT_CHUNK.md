@@ -137,3 +137,12 @@ other value.
  │ ..., (08:20,NULL)│  │(08:20,1001), ... │  ──▶  │ merged + correctly sorted│
  └──────────────────┘  └──────────────────┘       └──────────────────────────┘
 ```
+
+### 9. Bounded work across calls
+
+`max_batches` caps how many compressed batches one call decompresses. `0` means
+unlimited. The cap is checked only after a merge group has been fully flushed,
+so one overlapping set is never left half-rewritten and may itself decompress
+more batches than the limit. A later call continues with the groups that remain.
+The compaction policy stores the same limit as config key `max_batches` when it
+is greater than zero and passes it into each `compact_chunk` call.

@@ -1052,3 +1052,133 @@ FROM :NO_FL_CHUNK ORDER BY _ts_meta_min_1;
 SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_no_firstlast') chunk;
 
 DROP TABLE metrics_no_firstlast;
+
+----------------------------------------------------------------------
+-- max_batches limits decompression work between merge groups
+----------------------------------------------------------------------
+-- Two disjoint overlap groups in one chunk. The first group is three
+-- chained batches, so a limit of 2 still rewrites that whole group. The
+-- second group is left for a later call. Zero means unlimited and merges
+-- every group in one call.
+
+SET timezone = 'UTC';
+-- One compressed batch per insert. Direct compress stays enabled at 10 rows.
+SET timescaledb.compression_batch_size_limit = 10;
+SET timescaledb.enable_direct_compress_insert = true;
+SET timescaledb.enable_direct_compress_insert_sort_batches = true;
+SET timescaledb.enable_direct_compress_insert_client_sorted = false;
+
+CREATE TABLE limit_metrics (time TIMESTAMPTZ NOT NULL, value int)
+WITH (tsdb.hypertable, tsdb.orderby='time');
+SELECT set_chunk_time_interval('limit_metrics', INTERVAL '1 month');
+
+-- Group 1: minutes 0..9 overlap 5..14 overlap 12..21.
+INSERT INTO limit_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(0, 9) i;
+INSERT INTO limit_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(5, 14) i;
+INSERT INTO limit_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(12, 21) i;
+-- Group 2: a later pair that does not overlap the merged first group.
+INSERT INTO limit_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(100, 109) i;
+INSERT INTO limit_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(105, 114) i;
+
+SELECT count(*) FROM show_chunks('limit_metrics');
+SELECT _timescaledb_functions.chunk_status_text(c) FROM show_chunks('limit_metrics') c;
+
+SELECT cs.compress_relid::regclass::text AS "LIMIT_CHUNK"
+FROM _timescaledb_catalog.chunk ch
+    JOIN _timescaledb_catalog.compression_settings cs ON cs.relid = ch.relid
+    JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+WHERE ht.table_name = 'limit_metrics'
+ORDER BY ch.id LIMIT 1 \gset
+
+-- Five batches: three chained overlaps, then a separate overlapping pair.
+SELECT _ts_meta_count,
+       to_char(_ts_meta_min_1 AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS min_time,
+       to_char(_ts_meta_max_1 AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS max_time
+FROM :LIMIT_CHUNK
+ORDER BY min_time, max_time;
+
+-- Negative limits are rejected.
+\set ON_ERROR_STOP 0
+SELECT _timescaledb_functions.compact_chunk('limit_metrics', -1);
+\set ON_ERROR_STOP 1
+
+-- max_batches = 2 finishes the 3-batch group (over the limit) and stops
+-- before the later pair. The chunk stays UNORDERED.
+SELECT _timescaledb_functions.compact_chunk(c, 2) = c FROM show_chunks('limit_metrics') c;
+SELECT _timescaledb_functions.chunk_status_text(c) FROM show_chunks('limit_metrics') c;
+SELECT _ts_meta_count,
+       to_char(_ts_meta_min_1 AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS min_time,
+       to_char(_ts_meta_max_1 AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS max_time
+FROM :LIMIT_CHUNK
+ORDER BY min_time, max_time;
+
+-- The next call rewrites the remaining group and clears UNORDERED.
+SELECT _timescaledb_functions.compact_chunk(c, 2) = c FROM show_chunks('limit_metrics') c;
+SELECT _timescaledb_functions.chunk_status_text(c) FROM show_chunks('limit_metrics') c;
+SELECT _ts_meta_count,
+       to_char(_ts_meta_min_1 AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS min_time,
+       to_char(_ts_meta_max_1 AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS max_time
+FROM :LIMIT_CHUNK
+ORDER BY min_time, max_time;
+SELECT count(*), min(value), max(value) FROM limit_metrics;
+
+-- max_batches = 0 is unlimited: both groups are merged in one call.
+CREATE TABLE unlimit_metrics (time TIMESTAMPTZ NOT NULL, value int)
+WITH (tsdb.hypertable, tsdb.orderby='time');
+SELECT set_chunk_time_interval('unlimit_metrics', INTERVAL '1 month');
+INSERT INTO unlimit_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(0, 9) i;
+INSERT INTO unlimit_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(5, 14) i;
+INSERT INTO unlimit_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(12, 21) i;
+INSERT INTO unlimit_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(100, 109) i;
+INSERT INTO unlimit_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(105, 114) i;
+
+SELECT cs.compress_relid::regclass::text AS "UNLIMIT_CHUNK"
+FROM _timescaledb_catalog.chunk ch
+    JOIN _timescaledb_catalog.compression_settings cs ON cs.relid = ch.relid
+    JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+WHERE ht.table_name = 'unlimit_metrics'
+ORDER BY ch.id LIMIT 1 \gset
+
+SELECT _timescaledb_functions.compact_chunk(c, 0) = c FROM show_chunks('unlimit_metrics') c;
+SELECT _timescaledb_functions.chunk_status_text(c) FROM show_chunks('unlimit_metrics') c;
+SELECT _ts_meta_count,
+       to_char(_ts_meta_min_1 AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS min_time,
+       to_char(_ts_meta_max_1 AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS max_time
+FROM :UNLIMIT_CHUNK
+ORDER BY min_time, max_time;
+SELECT count(*), min(value), max(value) FROM unlimit_metrics;
+
+-- The default argument is also unlimited.
+CREATE TABLE default_metrics (time TIMESTAMPTZ NOT NULL, value int)
+WITH (tsdb.hypertable, tsdb.orderby='time');
+SELECT set_chunk_time_interval('default_metrics', INTERVAL '1 month');
+INSERT INTO default_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(0, 9) i;
+INSERT INTO default_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(5, 14) i;
+INSERT INTO default_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(12, 21) i;
+INSERT INTO default_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(100, 109) i;
+INSERT INTO default_metrics
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(105, 114) i;
+SELECT _timescaledb_functions.compact_chunk(c) = c FROM show_chunks('default_metrics') c;
+SELECT _timescaledb_functions.chunk_status_text(c) FROM show_chunks('default_metrics') c;
+SELECT count(*) FROM show_chunks('default_metrics') c
+WHERE NOT ('UNORDERED' = ANY(_timescaledb_functions.chunk_status_text(c)));
+
+DROP TABLE limit_metrics;
+DROP TABLE unlimit_metrics;
+DROP TABLE default_metrics;
+RESET timescaledb.compression_batch_size_limit;
+RESET timezone;

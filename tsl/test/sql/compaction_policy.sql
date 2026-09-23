@@ -28,6 +28,8 @@ SELECT create_hypertable('plain', 'time');
 SELECT add_compaction_policy('plain');
 -- Negative max_chunks is rejected.
 SELECT add_compaction_policy('metrics', max_chunks => -1);
+-- Negative max_batches is rejected.
+SELECT add_compaction_policy('metrics', max_batches => -1);
 \set ON_ERROR_STOP 1
 DROP TABLE plain;
 
@@ -35,6 +37,7 @@ DROP TABLE plain;
 \set ON_ERROR_STOP 0
 SELECT _timescaledb_functions.policy_compaction_check('{"max_chunks": 1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_chunks": -1}');
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": -1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "-1 hour"}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "not an interval"}');
 \set ON_ERROR_STOP 1
@@ -192,5 +195,66 @@ SELECT remove_compaction_policy('m2');
 \set ON_ERROR_STOP 1
 SELECT remove_compaction_policy('m2', if_exists => true);
 DROP TABLE m2;
+
+----------------------------------------------------------------------
+-- max_batches is stored when > 0 and passed through to compact_chunk
+----------------------------------------------------------------------
+
+SET timezone = 'UTC';
+-- One compressed batch per insert. Direct compress stays enabled at 10 rows.
+SET timescaledb.compression_batch_size_limit = 10;
+
+CREATE TABLE capped (time TIMESTAMPTZ NOT NULL, value int)
+WITH (tsdb.hypertable, tsdb.orderby='time');
+SELECT set_chunk_time_interval('capped', INTERVAL '1 month');
+
+-- Same two overlap groups as compact_chunk: a 3-batch chain, then a pair.
+INSERT INTO capped
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(0, 9) i;
+INSERT INTO capped
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(5, 14) i;
+INSERT INTO capped
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(12, 21) i;
+INSERT INTO capped
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(100, 109) i;
+INSERT INTO capped
+SELECT '2025-01-01'::timestamptz + (i || ' minute')::interval, i FROM generate_series(105, 114) i;
+SELECT unordered_count('capped');
+
+-- A positive max_batches is persisted. Zero is not.
+SELECT add_compaction_policy('capped', max_batches => 2) AS job_id \gset
+SELECT config ? 'max_batches' AS has_max_batches, config->>'max_batches' AS max_batches
+FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+
+SELECT cs.compress_relid::regclass::text AS "CAPPED_CHUNK"
+FROM _timescaledb_catalog.chunk ch
+    JOIN _timescaledb_catalog.compression_settings cs ON cs.relid = ch.relid
+    JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+WHERE ht.table_name = 'capped'
+ORDER BY ch.id LIMIT 1 \gset
+
+-- One policy run passes max_batches = 2, so only the first merge group is rewritten.
+CALL run_job(:job_id);
+SELECT unordered_count('capped');
+SELECT _ts_meta_count,
+       to_char(_ts_meta_min_1 AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS min_time,
+       to_char(_ts_meta_max_1 AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS max_time
+FROM :CAPPED_CHUNK
+ORDER BY min_time, max_time;
+
+-- The next run finishes the remaining group.
+CALL run_job(:job_id);
+SELECT unordered_count('capped');
+SELECT count(*), min(value), max(value) FROM capped;
+
+SELECT remove_compaction_policy('capped');
+SELECT add_compaction_policy('capped', max_batches => 0) AS job_id \gset
+SELECT config ? 'max_batches' AS has_max_batches
+FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+SELECT remove_compaction_policy('capped');
+
+DROP TABLE capped;
+RESET timescaledb.compression_batch_size_limit;
+RESET timezone;
 
 DROP FUNCTION unordered_count(regclass);

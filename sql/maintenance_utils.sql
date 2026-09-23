@@ -89,8 +89,12 @@ CREATE OR REPLACE FUNCTION _timescaledb_functions.recompress_chunk_segmentwise(
     if_compressed BOOLEAN = true
 ) RETURNS REGCLASS AS '@MODULE_PATHNAME@', 'ts_recompress_chunk_segmentwise' LANGUAGE C STRICT VOLATILE;
 
+-- max_batches limits how many compressed batches one call will decompress.
+-- Zero means unlimited. The limit is applied only between fully flushed merge
+-- groups, so one overlapping set may decompress more batches than the limit.
 CREATE OR REPLACE FUNCTION _timescaledb_functions.compact_chunk(
-    uncompressed_chunk REGCLASS
+    uncompressed_chunk REGCLASS,
+    max_batches INTEGER = 0
 ) RETURNS REGCLASS AS '@MODULE_PATHNAME@', 'ts_compact_chunk' LANGUAGE C STRICT VOLATILE;
 
 -- find the index on the compressed chunk that can be used to recompress efficiently
