@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -26,11 +28,13 @@ import (
 	"go.temporal.io/sdk/workflow"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/headers"
+	"go.temporal.io/server/common/nexus/nexusrpc"
 	"go.temporal.io/server/common/payload"
 	"go.temporal.io/server/common/payloads"
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/searchattribute/sadefs"
 	"go.temporal.io/server/common/testing/protorequire"
+	"go.temporal.io/server/components/callbacks"
 	"go.temporal.io/server/service/worker/scheduler"
 	"go.temporal.io/server/tests/testcore"
 	"google.golang.org/grpc/metadata"
@@ -1507,6 +1511,209 @@ func (s *ScheduleCHASMFunctionalSuite) TestPatchRejectsExcessBackfillers() {
 	var failedPrecondition *serviceerror.FailedPrecondition
 	s.ErrorAs(err, &failedPrecondition)
 	s.Contains(err.Error(), "too many concurrent backfillers")
+}
+
+// TestCompletionAfterReset verifies that a scheduled workflow that is reset (twice) still reports its completion
+// back to the scheduler, since the scheduler matches completions by the original start request ID.
+func (s *ScheduleCHASMFunctionalSuite) TestCompletionAfterReset() {
+	s.OverrideDynamicConfig(
+		callbacks.AllowedAddresses,
+		[]any{map[string]any{"Pattern": "*", "AllowInsecure": true}},
+	)
+
+	testCases := []struct {
+		name           string
+		chasmCallbacks bool
+		attachCallback bool
+	}{
+		{name: "HSMCallbacks", chasmCallbacks: false},
+		{name: "CHASMCallbacks", chasmCallbacks: true},
+		{name: "HSMCallbacksWithAttachedCallback", chasmCallbacks: false, attachCallback: true},
+		{name: "CHASMCallbacksWithAttachedCallback", chasmCallbacks: true, attachCallback: true},
+	}
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			s.OverrideDynamicConfig(dynamicconfig.EnableCHASMCallbacks, tc.chasmCallbacks)
+			s.testCompletionAfterReset(tc.attachCallback)
+		})
+	}
+}
+
+func (s *ScheduleCHASMFunctionalSuite) testCompletionAfterReset(attachCallback bool) {
+	sid := testcore.RandomizeStr("sched-test-reset")
+	wid := testcore.RandomizeStr("sched-test-reset-wf")
+	wt := testcore.RandomizeStr("sched-test-reset-wt")
+	resumeSignal := "resume"
+
+	workflowFn := func(ctx workflow.Context) error {
+		workflow.GetSignalChannel(ctx, resumeSignal).Receive(ctx, nil)
+		return nil
+	}
+	s.worker.RegisterWorkflowWithOptions(workflowFn, workflow.RegisterOptions{Name: wt})
+
+	schedule := &schedulepb.Schedule{
+		Spec: &schedulepb.ScheduleSpec{
+			Interval: []*schedulepb.IntervalSpec{
+				{Interval: durationpb.New(1 * time.Hour)},
+			},
+		},
+		Action: &schedulepb.ScheduleAction{
+			Action: &schedulepb.ScheduleAction_StartWorkflow{
+				StartWorkflow: &workflowpb.NewWorkflowExecutionInfo{
+					WorkflowId:   wid,
+					WorkflowType: &commonpb.WorkflowType{Name: wt},
+					TaskQueue:    &taskqueuepb.TaskQueue{Name: s.taskQueue, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
+				},
+			},
+		},
+	}
+	_, err := s.FrontendClient().CreateSchedule(s.newContext(), &workflowservice.CreateScheduleRequest{
+		Namespace:  s.Namespace().String(),
+		ScheduleId: sid,
+		Schedule:   schedule,
+		InitialPatch: &schedulepb.SchedulePatch{
+			TriggerImmediately: &schedulepb.TriggerImmediatelyRequest{},
+		},
+		Identity:  "test",
+		RequestId: uuid.NewString(),
+	})
+	s.NoError(err)
+	s.cleanup(sid)
+
+	listEntry := s.getScheduleEntryFomVisibility(sid, func(ent *schedulepb.ScheduleListEntry) bool {
+		return len(ent.Info.RecentActions) >= 1 &&
+			ent.Info.RecentActions[0].StartWorkflowStatus == enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING
+	})
+	s.Len(listEntry.Info.RecentActions, 1)
+	startResult := listEntry.Info.RecentActions[0].StartWorkflowResult
+	latestRun := &commonpb.WorkflowExecution{
+		WorkflowId: startResult.WorkflowId,
+		RunId:      startResult.RunId,
+	}
+	s.waitForWorkflowTaskCompleted(latestRun)
+	startRequestID := s.getStartRequestID(latestRun)
+
+	var ch *completionHandler
+	attachRequestID := uuid.NewString()
+	if attachCallback {
+		ch = &completionHandler{
+			requestCh:         make(chan *nexusrpc.CompletionRequest, 2),
+			requestCompleteCh: make(chan error, 2),
+		}
+		ch.requestCompleteCh <- nil
+		srv := httptest.NewServer(nexusrpc.NewCompletionHTTPHandler(nexusrpc.CompletionHandlerOptions{Handler: ch}))
+		s.T().Cleanup(srv.Close)
+
+		startResp, err := s.FrontendClient().StartWorkflowExecution(s.newContext(), &workflowservice.StartWorkflowExecutionRequest{
+			RequestId:                attachRequestID,
+			Namespace:                s.Namespace().String(),
+			WorkflowId:               latestRun.WorkflowId,
+			WorkflowType:             &commonpb.WorkflowType{Name: wt},
+			TaskQueue:                &taskqueuepb.TaskQueue{Name: s.taskQueue, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
+			Identity:                 "test",
+			WorkflowIdConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+			OnConflictOptions: &workflowpb.OnConflictOptions{
+				AttachRequestId:           true,
+				AttachCompletionCallbacks: true,
+			},
+			CompletionCallbacks: []*commonpb.Callback{{
+				Variant: &commonpb.Callback_Nexus_{
+					Nexus: &commonpb.Callback_Nexus{Url: srv.URL + "/cb"},
+				},
+			}},
+		})
+		s.NoError(err)
+		s.False(startResp.Started)
+		s.Equal(latestRun.RunId, startResp.RunId)
+	}
+
+	for range 2 {
+		s.waitForWorkflowTaskCompleted(latestRun)
+		resetResp, err := s.FrontendClient().ResetWorkflowExecution(s.newContext(), &workflowservice.ResetWorkflowExecutionRequest{
+			Namespace:                 s.Namespace().String(),
+			WorkflowExecution:         latestRun,
+			Reason:                    "test",
+			WorkflowTaskFinishEventId: 3,
+			RequestId:                 uuid.NewString(),
+		})
+		s.NoError(err)
+		latestRun = &commonpb.WorkflowExecution{
+			WorkflowId: latestRun.WorkflowId,
+			RunId:      resetResp.RunId,
+		}
+		s.Equal(startRequestID, s.getStartRequestID(latestRun))
+	}
+
+	if attachCallback {
+		descResp, err := s.FrontendClient().DescribeWorkflowExecution(s.newContext(), &workflowservice.DescribeWorkflowExecutionRequest{
+			Namespace: s.Namespace().String(),
+			Execution: latestRun,
+		})
+		s.NoError(err)
+		s.Len(descResp.Callbacks, 2)
+		requestIDInfos := descResp.GetWorkflowExtendedInfo().GetRequestIdInfos()
+		s.Contains(requestIDInfos, attachRequestID)
+		s.Equal(enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED, requestIDInfos[attachRequestID].GetEventType())
+		s.NotEqual(startRequestID, attachRequestID)
+	}
+
+	_, err = s.FrontendClient().SignalWorkflowExecution(s.newContext(), &workflowservice.SignalWorkflowExecutionRequest{
+		Namespace:         s.Namespace().String(),
+		WorkflowExecution: latestRun,
+		SignalName:        resumeSignal,
+		Identity:          "test",
+		RequestId:         uuid.NewString(),
+	})
+	s.NoError(err)
+
+	if attachCallback {
+		select {
+		case completion := <-ch.requestCh:
+			s.Equal(nexus.OperationStateSucceeded, completion.State)
+		case <-time.After(15 * time.Second):
+			s.Fail("timeout waiting for attached callback")
+		}
+	}
+
+	listEntry = s.getScheduleEntryFomVisibility(sid, func(ent *schedulepb.ScheduleListEntry) bool {
+		return len(ent.Info.RecentActions) >= 1 &&
+			ent.Info.RecentActions[0].StartWorkflowStatus == enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED
+	})
+	s.Len(listEntry.Info.RecentActions, 1)
+	s.Equal(startResult.RunId, listEntry.Info.RecentActions[0].StartWorkflowResult.RunId)
+}
+
+func (s *ScheduleCHASMFunctionalSuite) waitForWorkflowTaskCompleted(execution *commonpb.WorkflowExecution) {
+	s.EventuallyWithT(func(t *assert.CollectT) {
+		histResp, err := s.FrontendClient().GetWorkflowExecutionHistory(s.newContext(), &workflowservice.GetWorkflowExecutionHistoryRequest{
+			Namespace: s.Namespace().String(),
+			Execution: execution,
+		})
+		require.NoError(t, err)
+		var completed bool
+		for _, event := range histResp.GetHistory().GetEvents() {
+			if event.GetEventType() == enumspb.EVENT_TYPE_WORKFLOW_TASK_COMPLETED {
+				completed = true
+			}
+		}
+		require.True(t, completed)
+	}, 15*time.Second, 200*time.Millisecond)
+}
+
+func (s *ScheduleCHASMFunctionalSuite) getStartRequestID(execution *commonpb.WorkflowExecution) string {
+	descResp, err := s.FrontendClient().DescribeWorkflowExecution(s.newContext(), &workflowservice.DescribeWorkflowExecutionRequest{
+		Namespace: s.Namespace().String(),
+		Execution: execution,
+	})
+	s.NoError(err)
+	var startRequestIDs []string
+	for requestID, info := range descResp.GetWorkflowExtendedInfo().GetRequestIdInfos() {
+		if info.GetEventType() == enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED {
+			startRequestIDs = append(startRequestIDs, requestID)
+		}
+	}
+	s.Len(startRequestIDs, 1)
+	return startRequestIDs[0]
 }
 
 func (s *scheduleFunctionalSuiteBase) TestCountSchedules() {

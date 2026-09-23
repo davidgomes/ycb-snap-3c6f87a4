@@ -288,12 +288,15 @@ func (s *workflowResetterSuite) TestReplayResetWorkflow() {
 
 	resetBranchToken := []byte("some random reset branch token")
 	resetRequestID := uuid.NewString()
+	startRequestID := uuid.NewString()
 	resetStats := RebuildStats{
 		HistorySize:          4411,
 		ExternalPayloadSize:  1234,
 		ExternalPayloadCount: 56,
 	}
 	resetMutableState := historyi.NewMockMutableState(s.controller)
+	resetExecutionState := &persistencespb.WorkflowExecutionState{CreateRequestId: startRequestID}
+	resetMutableState.EXPECT().GetExecutionState().Return(resetExecutionState).AnyTimes()
 
 	s.mockExecutionMgr.EXPECT().ForkHistoryBranch(gomock.Any(), gomock.Any()).Return(
 		&persistence.ForkHistoryBranchResponse{NewBranchToken: resetBranchToken}, nil,
@@ -316,7 +319,7 @@ func (s *workflowResetterSuite) TestReplayResetWorkflow() {
 			s.resetRunID,
 		),
 		resetBranchToken,
-		resetRequestID,
+		startRequestID,
 	).Return(resetMutableState, resetStats, nil)
 	resetMutableState.EXPECT().SetBaseWorkflow(
 		s.baseRunID,
@@ -337,9 +340,11 @@ func (s *workflowResetterSuite) TestReplayResetWorkflow() {
 		baseRebuildLastEventVersion,
 		s.resetRunID,
 		resetRequestID,
+		startRequestID,
 	)
 	s.NoError(err)
 	s.Equal(resetMutableState, resetWorkflow.GetMutableState())
+	s.Equal(resetRequestID, resetExecutionState.GetCreateRequestId())
 }
 
 func (s *workflowResetterSuite) TestFailWorkflowTask_NoWorkflowTask() {
@@ -1481,6 +1486,7 @@ func (s *workflowResetterSuite) TestWorkflowRestartAfterExecutionTimeout() {
 
 	resetBranchToken := []byte("some random reset branch token")
 	resetRequestID := uuid.NewString()
+	startRequestID := uuid.NewString()
 	resetStats := RebuildStats{
 		HistorySize:          4411,
 		ExternalPayloadSize:  1234,
@@ -1512,7 +1518,7 @@ func (s *workflowResetterSuite) TestWorkflowRestartAfterExecutionTimeout() {
 		util.Ptr(baseRebuildLastEventVersion),
 		definition.NewWorkflowKey(s.namespaceID.String(), s.workflowID, s.resetRunID),
 		resetBranchToken,
-		resetRequestID,
+		startRequestID,
 	).Return(resetMutableState, resetStats, nil)
 
 	resetMutableState.EXPECT().SetBaseWorkflow(s.baseRunID, baseRebuildLastEventID, baseRebuildLastEventVersion)
@@ -1576,6 +1582,7 @@ func (s *workflowResetterSuite) TestWorkflowRestartAfterExecutionTimeout() {
 		baseRebuildLastEventVersion,
 		s.resetRunID,
 		resetRequestID,
+		startRequestID,
 		resetWorkflowVersion,
 		resetReason,
 		false, // allowResetWithPendingChildren

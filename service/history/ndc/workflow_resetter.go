@@ -213,6 +213,7 @@ func (r *workflowResetterImpl) ResetWorkflow(
 		baseRebuildLastEventVersion,
 		resetRunID,
 		resetRequestID,
+		workflow.GetStartRequestID(baseWorkflow.GetMutableState().GetExecutionState()),
 		resetWorkflowVersion,
 		resetReason,
 		allowResetWithPendingChildren,
@@ -264,6 +265,7 @@ func (r *workflowResetterImpl) prepareResetWorkflow(
 	baseRebuildLastEventVersion int64,
 	resetRunID string,
 	resetRequestID string,
+	startRequestID string,
 	resetWorkflowVersion int64,
 	resetReason string,
 	allowResetWithPendingChildren bool,
@@ -279,6 +281,7 @@ func (r *workflowResetterImpl) prepareResetWorkflow(
 		baseRebuildLastEventVersion,
 		resetRunID,
 		resetRequestID,
+		startRequestID,
 	)
 	if err != nil {
 		return nil, err
@@ -435,6 +438,7 @@ func (r *workflowResetterImpl) replayResetWorkflow(
 	baseRebuildLastEventVersion int64,
 	resetRunID string,
 	resetRequestID string,
+	startRequestID string,
 ) (Workflow, error) {
 
 	resetBranchToken, err := r.forkAndGenerateBranchToken(
@@ -479,11 +483,15 @@ func (r *workflowResetterImpl) replayResetWorkflow(
 			resetRunID,
 		),
 		resetBranchToken,
-		resetRequestID,
+		// Completion callbacks attached at start (e.g. by the scheduler) are matched by the start request ID, so it
+		// must survive resets.
+		startRequestID,
 	)
 	if err != nil {
 		return nil, err
 	}
+	// CreateRequestId is used to dedup reset requests.
+	resetMutableState.GetExecutionState().CreateRequestId = resetRequestID
 
 	resetMutableState.SetBaseWorkflow(
 		baseRunID,

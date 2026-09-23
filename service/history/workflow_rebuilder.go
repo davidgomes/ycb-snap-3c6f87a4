@@ -196,7 +196,7 @@ func (r *workflowRebuilderImpl) getRebuildSpecFromMutableState(
 		branchToken:          currentVersionHistory.BranchToken,
 		stateTransitionCount: mutableState.ExecutionInfo.StateTransitionCount,
 		dbRecordVersion:      resp.DBRecordVersion,
-		requestID:            mutableState.ExecutionState.CreateRequestId,
+		requestID:            workflow.GetStartRequestID(mutableState.ExecutionState),
 		mutableState:         resp.State,
 	}, nil
 }
@@ -229,6 +229,8 @@ func (r *workflowRebuilderImpl) replayResetWorkflow(
 	// note: this is an admin API, for operator to recover a corrupted mutable state, so state transition count
 	// should remain the same, the -= 1 exists here since later CloseTransactionAsSnapshot will += 1 to state transition count
 	rebuildMutableState.GetExecutionInfo().StateTransitionCount = stateTransitionCount - 1
+	// For reset runs the create request ID differs from the start request ID used to rebuild.
+	rebuildMutableState.GetExecutionState().CreateRequestId = mutableState.GetExecutionState().GetCreateRequestId()
 	rebuildMutableState.AddHistorySize(rebuildStats.HistorySize)
 	rebuildMutableState.AddExternalPayloadSize(rebuildStats.ExternalPayloadSize)
 	rebuildMutableState.AddExternalPayloadCount(rebuildStats.ExternalPayloadCount)

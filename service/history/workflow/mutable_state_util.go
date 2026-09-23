@@ -3,11 +3,23 @@ package workflow
 import (
 	"time"
 
+	enumspb "go.temporal.io/api/enums/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/service/history/tasks"
 )
+
+// GetStartRequestID returns the request ID associated with the WorkflowExecutionStarted event. For runs created by a
+// reset this is the original start request ID, while CreateRequestId is the reset request ID.
+func GetStartRequestID(executionState *persistencespb.WorkflowExecutionState) string {
+	for requestID, info := range executionState.GetRequestIds() {
+		if info.GetEventType() == enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED {
+			return requestID
+		}
+	}
+	return executionState.GetCreateRequestId()
+}
 
 func convertSyncActivityInfos(
 	now time.Time,
