@@ -415,7 +415,8 @@ class Repairer {
             reader.GetRecordedTimestampSize();
         record_status = HandleWriteBatchTimestampSizeDifference(
             &batch, running_ts_sz, record_ts_sz,
-            TimestampSizeConsistencyMode::kVerifyConsistency);
+            TimestampSizeConsistencyMode::kVerifyConsistency,
+            /*seq_per_batch=*/false, /*batch_per_txn=*/true);
         if (record_status.ok()) {
           record_status =
               WriteBatchInternal::InsertInto(&batch, cf_mems, nullptr, nullptr);
