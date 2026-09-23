@@ -27,6 +27,7 @@
 
 #include "auth/allow_all_authenticator.hh"
 #include "auth/authenticator.hh"
+#include "auth/certificate_or_password_authenticator.hh"
 #include "auth/password_authenticator.hh"
 #include "auth/service.hh"
 #include "auth/authenticated_user.hh"
@@ -42,6 +43,19 @@ cql_test_config auth_on(bool with_authorizer = true) {
         cfg.db_config->authorizer("CassandraAuthorizer");
     }
     cfg.db_config->authenticator("PasswordAuthenticator");
+    return cfg;
+}
+
+cql_test_config cert_or_password_auth() {
+    cql_test_config cfg;
+    // Both the short name and the qualified name are selectable. Setting the
+    // qualified name first rejects a config list that omitted it.
+    cfg.db_config->authenticator(sstring(auth::certificate_or_password_authenticator_name));
+    cfg.db_config->authenticator("CertificateOrPasswordAuthenticator");
+    cfg.db_config->auth_certificate_role_queries({
+        {{"source", "SUBJECT"}, {"query", "CN=([^,]+)"}},
+        {{"source", "ALTNAME"}, {"query", "email:([^,]+)"}},
+    });
     return cfg;
 }
 
@@ -139,6 +153,104 @@ SEASTAR_TEST_CASE(test_password_authenticator_operations) {
                     exceptions::authentication_exception);
         });
     }, auth_on(false));
+}
+
+// One CQL authenticator accepts either a trusted client certificate or a
+// username/password. A certificate that cannot be mapped to a role must fail
+// closed: returning nullopt would tell the server to continue with SASL.
+SEASTAR_TEST_CASE(test_certificate_or_password_authenticator) {
+    co_await do_with_cql_env_thread([] (cql_test_env& env) {
+        auto& a = env.local_auth_service().underlying_authenticator();
+        BOOST_REQUIRE(a.require_authentication());
+        BOOST_REQUIRE_EQUAL(a.qualified_java_name(), auth::certificate_or_password_authenticator_name);
+        BOOST_REQUIRE(a.supported_options().contains(auth::authentication_option::password));
+        BOOST_REQUIRE(a.uses_password_hashes());
+
+        cquery_nofail(env, "CREATE ROLE pwuser WITH PASSWORD = 'secret' AND LOGIN = true");
+        cquery_nofail(env, "CREATE ROLE cert_only WITH LOGIN = true");
+        cquery_nofail(env, "CREATE ROLE altuser WITH LOGIN = true");
+
+        auto with_cert = [] (std::string subject, std::string alt = {}) {
+            return auth::session_dn_func([subject = std::move(subject), alt = std::move(alt)] {
+                return make_ready_future<std::optional<auth::certificate_info>>(auth::certificate_info{
+                    subject,
+                    [alt] {
+                        return make_ready_future<std::string>(alt);
+                    },
+                });
+            });
+        };
+        auto without_cert = [] {
+            return auth::session_dn_func([] {
+                return make_ready_future<std::optional<auth::certificate_info>>(std::nullopt);
+            });
+        };
+
+        // Plain connection, and TLS with no client certificate: password SASL.
+        BOOST_REQUIRE(!a.authenticate(auth::session_dn_func{}).get());
+        BOOST_REQUIRE(!a.authenticate(without_cert()).get());
+
+        auto pw = authenticate(env, "pwuser", "secret").get();
+        BOOST_REQUIRE_EQUAL(*pw.name, "pwuser");
+        BOOST_REQUIRE_EXCEPTION(authenticate(env, "pwuser", "wrong-password").get(),
+                exceptions::authentication_exception,
+                exception_predicate::message_contains("incorrect"));
+
+        auto plain_token = [] (std::string_view username, std::string_view password) {
+            bytes b;
+            int8_t nul = 0;
+            b.append(&nul, 1);
+            b.insert(b.end(), username.begin(), username.end());
+            b.append(&nul, 1);
+            b.insert(b.end(), password.begin(), password.end());
+            return b;
+        };
+
+        auto sasl_ok = a.new_sasl_challenge();
+        sasl_ok->evaluate_response(plain_token("pwuser", "secret"));
+        BOOST_REQUIRE(sasl_ok->is_complete());
+        auto sasl_user = sasl_ok->get_authenticated_user().get();
+        BOOST_REQUIRE_EQUAL(*sasl_user.name, "pwuser");
+
+        auto sasl_bad = a.new_sasl_challenge();
+        sasl_bad->evaluate_response(plain_token("pwuser", "wrong-password"));
+        BOOST_REQUIRE(sasl_bad->is_complete());
+        try {
+            sasl_bad->get_authenticated_user().get();
+            BOOST_FAIL("wrong password must fail authentication");
+        } catch (const exceptions::authentication_exception& e) {
+            BOOST_REQUIRE(e.code() == exceptions::exception_code::BAD_CREDENTIALS);
+            BOOST_REQUIRE(e.get_message().find("incorrect") != sstring::npos);
+        }
+
+        // Trusted certificate, including one for a role that has no password.
+        auto cert_user = a.authenticate(with_cert("CN=cert_only")).get();
+        BOOST_REQUIRE(cert_user);
+        BOOST_REQUIRE_EQUAL(*cert_user->name, "cert_only");
+        env.local_client_state().set_login(*cert_user);
+        env.local_client_state().check_user_can_login().get();
+
+        auto cert_pw_role = a.authenticate(with_cert("CN=pwuser")).get();
+        BOOST_REQUIRE(cert_pw_role);
+        BOOST_REQUIRE_EQUAL(*cert_pw_role->name, "pwuser");
+
+        // Subject is tried before SAN. A matching subject does not fall through.
+        auto prefer_subject = a.authenticate(with_cert("CN=cert_only", "email:altuser")).get();
+        BOOST_REQUIRE(prefer_subject);
+        BOOST_REQUIRE_EQUAL(*prefer_subject->name, "cert_only");
+
+        auto alt = a.authenticate(with_cert("O=no-cn", "DNS:example,email:altuser")).get();
+        BOOST_REQUIRE(alt);
+        BOOST_REQUIRE_EQUAL(*alt->name, "altuser");
+        env.local_client_state().set_login(*alt);
+        env.local_client_state().check_user_can_login().get();
+
+        // Trusted cert that matches no role query. nullopt would start SASL and
+        // let pwuser's password succeed; the certificate path must throw instead.
+        BOOST_REQUIRE_EXCEPTION(a.authenticate(with_cert("O=not-a-cn", "DNS:example")).get(),
+                exceptions::authentication_exception,
+                exception_predicate::message_contains("does not match"));
+    }, cert_or_password_auth());
 }
 
 namespace {

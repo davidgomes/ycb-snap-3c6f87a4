@@ -53,6 +53,14 @@ This procedure is to be done on **every** ScyllaDB node, one node at a time (one
           require_client_auth: ...
           priority_string: SECURE128:-VERS-TLS1.0:-VERS-TLS1.1
 
+   ``require_client_auth`` controls client certificates on the encrypted CQL port:
+
+   * ``false`` (default) — do not request a client certificate.
+   * ``optional`` — request a client certificate, but allow the handshake to finish when the client does not send one. Use this with ``com.scylladb.auth.CertificateOrPasswordAuthenticator`` so certificate clients and password-only clients can share the port. A certificate that is presented is still checked against the trust store. An untrusted certificate fails the handshake, and password authentication cannot accept that connection.
+   * ``true`` — require a client certificate. Password-only clients are rejected during the TLS handshake, before a password can be checked.
+
+   See :doc:`certificate-authentication` for certificate authentication and for running certificate and password authentication together.
+
 #. Start ScyllaDB: 
 
    .. include:: /rst_include/scylla-commands-start-index.rst
