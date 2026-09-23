@@ -1071,11 +1071,11 @@ func (s *scheduleFunctionalSuiteBase) TestListSchedulesReturnsWorkflowStatus() {
 	s.assertSameRecentActions(descResp, listResp)
 }
 
-func (s *scheduleFunctionalSuiteBase) TestScheduledWorkflowDoubleReset_SchedulerSeesCompletion() {
+func (s *ScheduleCHASMFunctionalSuite) TestScheduledWorkflowDoubleReset_SchedulerSeesCompletion() {
 	s.scheduledWorkflowDoubleResetSeesCompletion()
 }
 
-func (s *scheduleFunctionalSuiteBase) TestScheduledWorkflowDoubleReset_SchedulerSeesCompletion_CHASMCallbacks() {
+func (s *ScheduleCHASMFunctionalSuite) TestScheduledWorkflowDoubleReset_SchedulerSeesCompletion_CHASMCallbacks() {
 	s.OverrideDynamicConfig(dynamicconfig.EnableCHASMCallbacks, true)
 	s.scheduledWorkflowDoubleResetSeesCompletion()
 }
