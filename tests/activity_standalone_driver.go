@@ -299,6 +299,7 @@ func (a *saaHandle) rpc(_ testing.TB, e model.Event) error {
 	case model.ResetType:
 		_, err := fc.ResetActivityExecution(a.d.ctx, &workflowservice.ResetActivityExecutionRequest{
 			Namespace: ns, ActivityId: a.activityID, RunId: a.runID, Identity: a.d.env.Tv().ClientIdentity(), KeepPaused: e.KeepPaused,
+			ResetHeartbeat: e.ResetHeartbeat,
 		})
 		return err
 	case model.UpdateOptionsType:

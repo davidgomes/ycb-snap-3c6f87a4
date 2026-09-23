@@ -14,6 +14,7 @@ import (
 	"go.temporal.io/server/chasm/lib/activity"
 	"go.temporal.io/server/chasm/lib/activity/model"
 	"go.temporal.io/server/common/dynamicconfig"
+	"go.temporal.io/server/common/payloads"
 	"go.temporal.io/server/common/retrypolicy"
 	"go.temporal.io/server/common/testing/parallelsuite"
 	"go.temporal.io/server/service/history/consts"
@@ -458,6 +459,92 @@ func (s *activityParityTestSuite) TestPauseRequestedAfterResetKeepPaused() {
 		require.Equal(t, enumspb.PENDING_ACTIVITY_STATE_PAUSE_REQUESTED,
 			newSAADriver(t, env, cfg).driveTrace(t, trace).activityInfo(t).RunState)
 	})
+}
+
+// Reset rewinds the attempt counter but preserves the last heartbeat checkpoint so the activity can
+// resume from its progress; clearing the checkpoint is opt-in via ResetHeartbeat. When a worker still
+// owns the attempt, the checkpoint stays visible until the worker yields, and only then is the same
+// keep-vs-clear policy applied.
+func (s *activityParityTestSuite) TestResetHeartbeatDetails() {
+	env := newActivityParityEnv(s.T())
+	cfg := activityConfig{MaxAttempts: 3, RetryInterval: activityLongDuration}
+	checkpoint := activityMarshalPayloads(payloads.EncodeString("heartbeat details"))
+	resetKeepPausedClearingHeartbeat := model.Event{Type: model.ResetType, KeepPaused: true, ResetHeartbeat: true}
+
+	type resetState struct {
+		RunState             enumspb.PendingActivityState
+		Attempt              int32
+		LastHeartbeatDetails []byte
+	}
+	testCases := []struct {
+		name     string
+		trace    []model.Event
+		expected resetState
+		wfaSkip  string
+	}{
+		{
+			name:     "Scheduled",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.FailRetryably, model.Reset},
+			expected: resetState{enumspb.PENDING_ACTIVITY_STATE_SCHEDULED, 1, checkpoint},
+		},
+		{
+			name:     "ScheduledClearingHeartbeat",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.FailRetryably, model.ResetClearingHeartbeat},
+			expected: resetState{enumspb.PENDING_ACTIVITY_STATE_SCHEDULED, 1, nil},
+		},
+		{
+			name:     "PausedKeepPaused",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.FailRetryably, model.Pause, model.ResetKeepPaused},
+			expected: resetState{enumspb.PENDING_ACTIVITY_STATE_PAUSED, 1, checkpoint},
+		},
+		{
+			name:     "PausedKeepPausedClearingHeartbeat",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.FailRetryably, model.Pause, resetKeepPausedClearingHeartbeat},
+			expected: resetState{enumspb.PENDING_ACTIVITY_STATE_PAUSED, 1, nil},
+			wfaSkip:  "WFA should clear heartbeat details immediately on a keep-paused reset of a paused activity",
+		},
+		{
+			name:     "StartedBeforeYield",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.Reset},
+			expected: resetState{enumspb.PENDING_ACTIVITY_STATE_STARTED, 1, checkpoint},
+		},
+		{
+			name:     "StartedClearingHeartbeatBeforeYield",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.ResetClearingHeartbeat},
+			expected: resetState{enumspb.PENDING_ACTIVITY_STATE_STARTED, 1, checkpoint},
+		},
+		{
+			name:     "StartedAfterYield",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.Reset, model.FailRetryably},
+			expected: resetState{enumspb.PENDING_ACTIVITY_STATE_SCHEDULED, 1, checkpoint},
+			wfaSkip:  "WFA should not count the yielded attempt after a deferred reset",
+		},
+		{
+			name:     "StartedClearingHeartbeatAfterYield",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.ResetClearingHeartbeat, model.FailRetryably},
+			expected: resetState{enumspb.PENDING_ACTIVITY_STATE_SCHEDULED, 1, nil},
+			wfaSkip:  "WFA should not count the yielded attempt after a deferred reset",
+		},
+	}
+
+	project := func(info activityInfo) resetState {
+		return resetState{RunState: info.RunState, Attempt: info.Attempt, LastHeartbeatDetails: info.LastHeartbeatDetails}
+	}
+	for _, tc := range testCases {
+		s.Run(tc.name, func(s *activityParityTestSuite) {
+			s.Run("WorkflowActivity", func(s *activityParityTestSuite) {
+				t := s.T()
+				if tc.wfaSkip != "" {
+					t.Skip(tc.wfaSkip)
+				}
+				require.Equal(t, tc.expected, project(newWFADriver(t, env, cfg).driveTrace(t, tc.trace).activityInfo(t)))
+			})
+			s.Run("StandaloneActivity", func(s *activityParityTestSuite) {
+				t := s.T()
+				require.Equal(t, tc.expected, project(newSAADriver(t, env, cfg).driveTrace(t, tc.trace).activityInfo(t)))
+			})
+		})
+	}
 }
 
 // TestCancel drives a running activity through cancellation in both implementations. RequestCancel uses the
