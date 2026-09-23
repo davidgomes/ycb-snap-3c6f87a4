@@ -137,3 +137,20 @@ other value.
  │ ..., (08:20,NULL)│  │(08:20,1001), ... │  ──▶  │ merged + correctly sorted│
  └──────────────────┘  └──────────────────┘       └──────────────────────────┘
 ```
+
+## Bounding the work per call
+
+`compact_chunk(chunk, max_batches)` stops once it has decompressed at least
+`max_batches` batches; 0 (the default) means unlimited. The limit is only
+checked after a merge group has been recompressed, so a group is never left
+partially rewritten and a single group can exceed the limit. The verify phase
+still finds the remaining overlaps, so the chunk stays UNORDERED and the next
+call continues from the first remaining overlap. The compaction policy passes
+its `max_batches` option to every chunk it compacts.
+
+```
+ max_batches = 2         call 1      call 2      call 3
+ d1: ┌────┐┌────┐  ──▶  merged
+ d2: ┌────┐┌────┐  ──▶              merged
+ d3: ┌────┐┌────┐  ──▶                          merged, UNORDERED cleared
+```
