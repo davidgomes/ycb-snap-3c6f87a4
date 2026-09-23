@@ -1052,3 +1052,125 @@ FROM :NO_FL_CHUNK ORDER BY _ts_meta_min_1;
 SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_no_firstlast') chunk;
 
 DROP TABLE metrics_no_firstlast;
+
+-- compact_chunk with max_batches
+-- max_batches bounds how many batches a single call decompresses; 0 means
+-- unlimited. The limit is only checked after a merge group has been fully
+-- recompressed, so a group is never split and may exceed the limit. Overlaps
+-- that are left over keep the chunk UNORDERED for a later call.
+CREATE TABLE metrics_limit (time TIMESTAMPTZ NOT NULL, device TEXT, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.segmentby='device');
+
+SET timescaledb.enable_direct_compress_insert = true;
+SET timescaledb.enable_direct_compress_insert_sort_batches = true;
+SET timescaledb.enable_direct_compress_insert_client_sorted = false;
+
+-- Two inserts over the same time range give each of the three devices two
+-- overlapping batches: three independent merge groups of two batches each.
+INSERT INTO metrics_limit
+SELECT '2025-01-03'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM unnest(ARRAY['d1', 'd2', 'd3']) d, generate_series(1,500) i;
+
+INSERT INTO metrics_limit
+SELECT '2025-01-03'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM unnest(ARRAY['d1', 'd2', 'd3']) d, generate_series(1,500) i;
+
+SELECT cs.compress_relid::regclass::text AS "LIMIT_CHUNK"
+FROM _timescaledb_catalog.chunk ch
+    JOIN _timescaledb_catalog.compression_settings cs
+        ON cs.relid = ch.relid
+    JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+WHERE ht.table_name = 'metrics_limit'
+ORDER BY ch.id LIMIT 1 \gset
+
+SELECT ctid, device, _ts_meta_count, _ts_meta_v2_first_time, _ts_meta_v2_last_time
+FROM :LIMIT_CHUNK
+ORDER BY device, _ts_meta_v2_first_time, _ts_meta_v2_last_time;
+
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+-- A negative max_batches is rejected
+\set ON_ERROR_STOP 0
+SELECT _timescaledb_functions.compact_chunk(chunk, -1) FROM show_chunks('metrics_limit') chunk;
+\set ON_ERROR_STOP 1
+
+-- max_batches => 1: the d1 group has two batches, more than the limit, but it
+-- is merged completely before the call stops. d2 and d3 are untouched.
+SELECT _timescaledb_functions.compact_chunk(chunk, max_batches => 1) FROM show_chunks('metrics_limit') chunk;
+
+SELECT ctid, device, _ts_meta_count, _ts_meta_v2_first_time, _ts_meta_v2_last_time
+FROM :LIMIT_CHUNK
+ORDER BY device, _ts_meta_v2_first_time, _ts_meta_v2_last_time;
+
+-- Overlaps remain, so the chunk is still UNORDERED
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+-- The next call picks up where the previous one stopped: max_batches => 2
+-- merges the d2 group and stops before d3.
+SELECT _timescaledb_functions.compact_chunk(chunk, 2) FROM show_chunks('metrics_limit') chunk;
+
+SELECT ctid, device, _ts_meta_count, _ts_meta_v2_first_time, _ts_meta_v2_last_time
+FROM :LIMIT_CHUNK
+ORDER BY device, _ts_meta_v2_first_time, _ts_meta_v2_last_time;
+
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+-- The third call merges the last group and clears UNORDERED
+SELECT _timescaledb_functions.compact_chunk(chunk, 2) FROM show_chunks('metrics_limit') chunk;
+
+SELECT ctid, device, _ts_meta_count, _ts_meta_v2_first_time, _ts_meta_v2_last_time
+FROM :LIMIT_CHUNK
+ORDER BY device, _ts_meta_v2_first_time, _ts_meta_v2_last_time;
+
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+-- Without max_batches (unlimited) a single call merges every group
+INSERT INTO metrics_limit
+SELECT '2025-01-03'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM unnest(ARRAY['d1', 'd2', 'd3']) d, generate_series(1,500) i;
+
+SELECT ctid, device, _ts_meta_count, _ts_meta_v2_first_time, _ts_meta_v2_last_time
+FROM :LIMIT_CHUNK
+ORDER BY device, _ts_meta_v2_first_time, _ts_meta_v2_last_time;
+
+SELECT _timescaledb_functions.compact_chunk(chunk) FROM show_chunks('metrics_limit') chunk;
+
+SELECT ctid, device, _ts_meta_count, _ts_meta_v2_first_time, _ts_meta_v2_last_time
+FROM :LIMIT_CHUNK
+ORDER BY device, _ts_meta_v2_first_time, _ts_meta_v2_last_time;
+
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+-- The limit counts batches across groups. Each device now has a group of three
+-- overlapping batches. With max_batches => 4 the d1 group (3 batches) stays
+-- under the limit, so the d2 group is merged too, reaching 6 batches, and the
+-- call stops before d3.
+INSERT INTO metrics_limit
+SELECT '2025-01-03'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM unnest(ARRAY['d1', 'd2', 'd3']) d, generate_series(1,500) i;
+
+SELECT ctid, device, _ts_meta_count, _ts_meta_v2_first_time, _ts_meta_v2_last_time
+FROM :LIMIT_CHUNK
+ORDER BY device, _ts_meta_v2_first_time, _ts_meta_v2_last_time;
+
+SELECT _timescaledb_functions.compact_chunk(chunk, 4) FROM show_chunks('metrics_limit') chunk;
+
+SELECT ctid, device, _ts_meta_count, _ts_meta_v2_first_time, _ts_meta_v2_last_time
+FROM :LIMIT_CHUNK
+ORDER BY device, _ts_meta_v2_first_time, _ts_meta_v2_last_time;
+
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+-- max_batches => 0 is unlimited: the remaining group is merged
+SELECT _timescaledb_functions.compact_chunk(chunk, 0) FROM show_chunks('metrics_limit') chunk;
+
+SELECT ctid, device, _ts_meta_count, _ts_meta_v2_first_time, _ts_meta_v2_last_time
+FROM :LIMIT_CHUNK
+ORDER BY device, _ts_meta_v2_first_time, _ts_meta_v2_last_time;
+
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+-- Data integrity: every inserted row survived the incremental compaction
+SELECT device, count(*), count(DISTINCT time) FROM metrics_limit GROUP BY device ORDER BY device;
+
+DROP TABLE metrics_limit;
