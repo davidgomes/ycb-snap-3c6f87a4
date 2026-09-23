@@ -39,6 +39,8 @@ class StringWritableFile : public FSWritableFile {
  public:
   explicit StringWritableFile(std::string* contents) : contents_(contents) {}
 
+  using FSWritableFile::Append;
+
   IOStatus Append(const Slice& data, const IOOptions& /*options*/,
                   IODebugContext* /*dbg*/) override {
     contents_->append(data.data(), data.size());

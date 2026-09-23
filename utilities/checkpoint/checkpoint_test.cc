@@ -403,9 +403,8 @@ TEST_F(CheckpointTest, CheckpointSubsetOfColumnFamilies) {
 
   std::string other_name = dbname_ + "_other";
   ASSERT_OK(DestroyDB(other_name, options));
-  DB* other_db = nullptr;
+  std::unique_ptr<DB> other_db;
   ASSERT_OK(DB::Open(options, other_name, &other_db));
-  std::unique_ptr<DB> other_guard(other_db);
   ColumnFamilyHandle* other_cf = nullptr;
   ASSERT_OK(other_db->CreateColumnFamily(ColumnFamilyOptions(options), "other",
                                          &other_cf));
@@ -414,7 +413,7 @@ TEST_F(CheckpointTest, CheckpointSubsetOfColumnFamilies) {
   ASSERT_TRUE(checkpoint->CreateCheckpoint(snapshot_name_, {cf1, other_cf})
                   .IsInvalidArgument());
   ASSERT_OK(other_db->DestroyColumnFamilyHandle(other_cf));
-  other_guard.reset();
+  other_db.reset();
   ASSERT_OK(DestroyDB(other_name, options));
 
   ColumnFamilyHandle* dropped = nullptr;
@@ -533,10 +532,9 @@ TEST_F(CheckpointTest, CheckpointSubsetOfColumnFamilies) {
       {"cf1", ColumnFamilyOptions(options)},
   };
   std::vector<ColumnFamilyHandle*> subset_handles;
-  DB* subset_raw = nullptr;
+  std::unique_ptr<DB> subset_db;
   ASSERT_OK(DB::Open(DBOptions(options), snapshot_name_, subset_descs,
-                     &subset_handles, &subset_raw));
-  std::unique_ptr<DB> subset_db(subset_raw);
+                     &subset_handles, &subset_db));
   ReadOptions read_opts;
   read_opts.verify_checksums = true;
   std::string value;
@@ -563,11 +561,11 @@ TEST_F(CheckpointTest, CheckpointSubsetOfColumnFamilies) {
       {"cf2", ColumnFamilyOptions(options)},
   };
   std::vector<ColumnFamilyHandle*> full_handles;
-  DB* full_raw = nullptr;
+  std::unique_ptr<DB> full_db;
   Status open_full = DB::Open(DBOptions(options), snapshot_name_, full_descs,
-                              &full_handles, &full_raw);
+                              &full_handles, &full_db);
   ASSERT_TRUE(open_full.IsInvalidArgument());
-  ASSERT_EQ(full_raw, nullptr);
+  ASSERT_EQ(full_db, nullptr);
 
   // An empty selection still checkpoints every column family.
   const std::string all_snapshot = snapshot_name_ + "_allcf";
@@ -583,10 +581,9 @@ TEST_F(CheckpointTest, CheckpointSubsetOfColumnFamilies) {
   ASSERT_EQ(all_family_set, families_after_set);
 
   std::vector<ColumnFamilyHandle*> all_handles;
-  DB* all_raw = nullptr;
+  std::unique_ptr<DB> all_db;
   ASSERT_OK(DB::Open(DBOptions(options), all_snapshot, full_descs, &all_handles,
-                     &all_raw));
-  std::unique_ptr<DB> all_db(all_raw);
+                     &all_db));
   value.clear();
   ASSERT_OK(all_db->Get(read_opts, all_handles[2], "k2", &value));
   ASSERT_EQ("v2", value);
