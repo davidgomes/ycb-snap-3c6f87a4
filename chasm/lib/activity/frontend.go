@@ -34,7 +34,10 @@ type FrontendHandler interface {
 	IsStandaloneActivityEnabled(namespaceName string) bool
 }
 
-var ErrStandaloneActivityDisabled = serviceerror.NewUnimplemented("Standalone activity is disabled")
+var (
+	ErrStandaloneActivityDisabled = serviceerror.NewUnimplemented("Standalone activity is disabled")
+	errStartDelayDisabled         = serviceerror.NewInvalidArgument("StartDelay is disabled for standalone activities on this namespace")
+)
 
 type frontendHandler struct {
 	FrontendHandler
@@ -88,6 +91,10 @@ func (h *frontendHandler) IsStandaloneActivityEnabled(namespaceName string) bool
 func (h *frontendHandler) StartActivityExecution(ctx context.Context, req *workflowservice.StartActivityExecutionRequest) (*workflowservice.StartActivityExecutionResponse, error) {
 	if !h.config.Enabled(req.GetNamespace()) {
 		return nil, ErrStandaloneActivityDisabled
+	}
+
+	if req.GetStartDelay().AsDuration() > 0 && !h.config.StartDelayEnabled(req.GetNamespace()) {
+		return nil, errStartDelayDisabled
 	}
 
 	namespaceID, err := h.namespaceRegistry.GetNamespaceID(namespace.Name(req.GetNamespace()))

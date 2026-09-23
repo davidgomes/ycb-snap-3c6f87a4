@@ -207,6 +207,13 @@ func validateAndNormalizeTimeouts(
 	return nil
 }
 
+func validateStartDelay(startDelay *durationpb.Duration) error {
+	if err := timestamp.ValidateAndCapProtoDuration(startDelay); err != nil {
+		return serviceerror.NewInvalidArgumentf("invalid StartDelay: %v", err)
+	}
+	return nil
+}
+
 func validateAndNormalizeIDPolicy(req *workflowservice.StartActivityExecutionRequest) error {
 	if req.GetIdReusePolicy() == enumspb.ACTIVITY_ID_REUSE_POLICY_UNSPECIFIED {
 		req.IdReusePolicy = enumspb.ACTIVITY_ID_REUSE_POLICY_ALLOW_DUPLICATE
@@ -338,6 +345,10 @@ func validateAndNormalizeStartRequest(
 	}
 
 	if err := validateAndNormalizeIDPolicy(req); err != nil {
+		return err
+	}
+
+	if err := validateStartDelay(req.GetStartDelay()); err != nil {
 		return err
 	}
 
