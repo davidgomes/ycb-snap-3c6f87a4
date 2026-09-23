@@ -12,16 +12,27 @@
 #include <algorithm>
 #include <cinttypes>
 #include <future>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "db/column_family.h"
+#include "db/db_impl/db_impl.h"
+#include "db/log_reader.h"
+#include "db/log_writer.h"
+#include "db/version_edit.h"
 #include "db/wal_manager.h"
 #include "file/file_util.h"
 #include "file/filename.h"
+#include "file/sequence_file_reader.h"
+#include "file/writable_file_writer.h"
 #include "logging/logging.h"
+#include "options/options_parser.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -84,7 +95,8 @@ class CheckpointEngineImpl : public CheckpointEngine {
     const bool use_link = options_.use_link_file_when_available;
     CheckpointImpl impl(source_db);
     return status_to_io_status(impl.CreateCheckpointImpl(
-        destination_dir, create_options.log_size_for_flush, sequence_number_ptr,
+        destination_dir, /*column_families=*/{},
+        create_options.log_size_for_flush, sequence_number_ptr,
         copy_engine_.get(), use_link, options_.backup_rate_limiter.get()));
   }
 
@@ -254,6 +266,16 @@ class ParallelFileMover : public CheckpointFileMover {
   std::vector<std::future<WorkItemResult>> copy_futures_;
   std::vector<PendingLink> link_pendings_;
 };
+
+struct ManifestReadReporter : public log::Reader::Reporter {
+  Status* status;
+  void Corruption(size_t /*bytes*/, const Status& s,
+                  uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+    if (status->ok()) {
+      *status = s;
+    }
+  }
+};
 }  // namespace
 
 Status CheckpointEngine::Open(
@@ -271,6 +293,13 @@ Status CheckpointEngine::Open(
 Status Checkpoint::CreateCheckpoint(const std::string& /*checkpoint_dir*/,
                                     uint64_t /*log_size_for_flush*/,
                                     uint64_t* /*sequence_number_ptr*/) {
+  return Status::NotSupported("");
+}
+
+Status Checkpoint::CreateCheckpoint(
+    const std::string& /*checkpoint_dir*/,
+    const std::vector<ColumnFamilyHandle*>& /*column_families*/,
+    uint64_t /*log_size_for_flush*/, uint64_t* /*sequence_number_ptr*/) {
   return Status::NotSupported("");
 }
 
@@ -321,16 +350,36 @@ Status Checkpoint::ExportColumnFamily(
 Status CheckpointImpl::CreateCheckpoint(const std::string& checkpoint_dir,
                                         uint64_t log_size_for_flush,
                                         uint64_t* sequence_number_ptr) {
-  return CreateCheckpointImpl(checkpoint_dir, log_size_for_flush,
-                              sequence_number_ptr, /*engine=*/nullptr,
+  return CreateCheckpointImpl(checkpoint_dir, /*column_families=*/{},
+                              log_size_for_flush, sequence_number_ptr,
+                              /*engine=*/nullptr,
                               /*use_link=*/true, /*copy_rate_limiter=*/nullptr);
 }
 
-Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
-                                            uint64_t log_size_for_flush,
-                                            uint64_t* sequence_number_ptr,
-                                            CopyEngine* engine, bool use_link,
-                                            RateLimiter* copy_rate_limiter) {
+Status CheckpointImpl::CreateCheckpoint(
+    const std::string& checkpoint_dir,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    uint64_t log_size_for_flush, uint64_t* sequence_number_ptr) {
+  return CreateCheckpointImpl(checkpoint_dir, column_families,
+                              log_size_for_flush, sequence_number_ptr,
+                              /*engine=*/nullptr,
+                              /*use_link=*/true, /*copy_rate_limiter=*/nullptr);
+}
+
+Status CheckpointImpl::CreateCheckpointImpl(
+    const std::string& checkpoint_dir,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    uint64_t log_size_for_flush, uint64_t* sequence_number_ptr,
+    CopyEngine* engine, bool use_link, RateLimiter* copy_rate_limiter) {
+  std::vector<ColumnFamilyHandle*> included_cfs;
+  if (!column_families.empty()) {
+    Status resolve_s =
+        ResolveColumnFamilySubset(column_families, &included_cfs);
+    if (!resolve_s.ok()) {
+      return resolve_s;
+    }
+  }
+
   DBOptions db_options = db_->GetDBOptions();
   Env* env = db_->GetEnv();
   const auto& fs = db_->GetFileSystem();
@@ -384,6 +433,14 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
         db_options.statistics.get(), db_options.info_log.get());
   }
 
+  std::function<Status(std::vector<LiveFileStorageInfo>*)> preprocess_files_cb;
+  if (!included_cfs.empty()) {
+    preprocess_files_cb = [&](std::vector<LiveFileStorageInfo>* files) {
+      return PrepareColumnFamilySubset(included_cfs, full_private_path,
+                                       db_options, files);
+    };
+  }
+
   // create snapshot directory
   s = env->CreateDir(full_private_path);
   uint64_t sequence_number = 0;
@@ -413,7 +470,9 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
             return CreateFile(fs, full_private_path + "/" + fname, contents,
                               db_options.use_fsync);
           } /* create_file_cb */,
-          &sequence_number, log_size_for_flush);
+          &sequence_number, log_size_for_flush,
+          /*get_live_table_checksum=*/false, /*atomic_flush=*/false,
+          preprocess_files_cb);
 
       // Await any deferred work and fold in the first error before committing.
       Status finish_s = mover->Finish();
@@ -492,7 +551,9 @@ Status CheckpointImpl::CreateCustomCheckpoint(
                          FileType type)>
         create_file_cb,
     uint64_t* sequence_number, uint64_t log_size_for_flush,
-    bool get_live_table_checksum, bool atomic_flush) {
+    bool get_live_table_checksum, bool atomic_flush,
+    const std::function<Status(std::vector<LiveFileStorageInfo>* files)>&
+        preprocess_files_cb) {
   *sequence_number = db_->GetLatestSequenceNumber();
 
   LiveFilesStorageInfoOptions opts;
@@ -519,6 +580,13 @@ Status CheckpointImpl::CreateCustomCheckpoint(
   if (dirs.size() > 1) {
     return Status::NotSupported(
         "db_paths / cf_paths not supported for Checkpoint nor BackupEngine");
+  }
+
+  if (preprocess_files_cb) {
+    Status s = preprocess_files_cb(&infos);
+    if (!s.ok()) {
+      return s;
+    }
   }
 
   bool same_fs = true;
@@ -568,6 +636,243 @@ Status CheckpointImpl::CreateCustomCheckpoint(
   }
 
   return Status::OK();
+}
+
+Status CheckpointImpl::ResolveColumnFamilySubset(
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    std::vector<ColumnFamilyHandle*>* included) {
+  assert(included != nullptr);
+  DB* const root_db = db_->GetRootDB();
+  ColumnFamilyHandle* const default_cf = db_->DefaultColumnFamily();
+  std::map<uint32_t, ColumnFamilyHandle*> by_id{
+      {default_cf->GetID(), default_cf}};
+  for (ColumnFamilyHandle* handle : column_families) {
+    if (handle == nullptr) {
+      return Status::InvalidArgument("Column family handle is null");
+    }
+    auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(handle);
+    if (cfh->db() != root_db) {
+      return Status::InvalidArgument("Column family " + cfh->GetName() +
+                                     " does not belong to this DB");
+    }
+    if (cfh->cfd()->IsDropped()) {
+      return Status::InvalidArgument("Column family " + cfh->GetName() +
+                                     " has been dropped");
+    }
+    by_id.emplace(cfh->GetID(), handle);
+  }
+  included->clear();
+  included->reserve(by_id.size());
+  for (const auto& id_and_handle : by_id) {
+    included->push_back(id_and_handle.second);
+  }
+  return Status::OK();
+}
+
+Status CheckpointImpl::PrepareColumnFamilySubset(
+    const std::vector<ColumnFamilyHandle*>& included,
+    const std::string& staging_dir, const DBOptions& db_options,
+    std::vector<LiveFileStorageInfo>* files) {
+  std::unordered_set<uint32_t> included_cf_ids;
+  for (ColumnFamilyHandle* handle : included) {
+    included_cf_ids.insert(handle->GetID());
+  }
+
+  const LiveFileStorageInfo* manifest = nullptr;
+  for (const auto& info : *files) {
+    if (info.file_type == kDescriptorFile) {
+      if (manifest != nullptr) {
+        return Status::Corruption("Multiple live MANIFEST files");
+      }
+      manifest = &info;
+    }
+  }
+  if (manifest == nullptr) {
+    return Status::Corruption("No live MANIFEST file");
+  }
+
+  std::unordered_map<uint64_t, uint32_t> file_to_cf;
+  Status s = WriteSubsetManifest(
+      *manifest, included_cf_ids,
+      staging_dir + "/" + manifest->relative_filename, db_options, &file_to_cf);
+  if (!s.ok()) {
+    return s;
+  }
+
+  std::vector<LiveFileStorageInfo> kept;
+  kept.reserve(files->size());
+  for (auto& info : *files) {
+    if (info.file_type == kDescriptorFile) {
+      continue;
+    }
+    if (info.file_type == kOptionsFile) {
+      std::vector<std::string> cf_names;
+      std::vector<ColumnFamilyOptions> cf_opts;
+      for (ColumnFamilyHandle* handle : included) {
+        ColumnFamilyDescriptor desc;
+        s = handle->GetDescriptor(&desc);
+        if (!s.ok()) {
+          return s;
+        }
+        cf_names.push_back(std::move(desc.name));
+        cf_opts.push_back(std::move(desc.options));
+      }
+      const std::string dst_path = staging_dir + "/" + info.relative_filename;
+      ROCKS_LOG_INFO(db_options.info_log, "Creating %s", dst_path.c_str());
+      s = PersistRocksDBOptions(WriteOptions(), db_options, cf_names, cf_opts,
+                                dst_path, db_->GetFileSystem());
+      if (!s.ok()) {
+        return s;
+      }
+      continue;
+    }
+    if (info.file_type == kTableFile || info.file_type == kBlobFile) {
+      auto it = file_to_cf.find(info.file_number);
+      if (it == file_to_cf.end()) {
+        return Status::Corruption("Live file " + info.relative_filename +
+                                  " not found in MANIFEST");
+      }
+      if (included_cf_ids.count(it->second) == 0) {
+        continue;
+      }
+    }
+    kept.push_back(std::move(info));
+  }
+  *files = std::move(kept);
+  return Status::OK();
+}
+
+Status CheckpointImpl::WriteSubsetManifest(
+    const LiveFileStorageInfo& manifest,
+    const std::unordered_set<uint32_t>& included_cf_ids,
+    const std::string& dst_path, const DBOptions& db_options,
+    std::unordered_map<uint64_t, uint32_t>* file_to_cf) {
+  assert(file_to_cf != nullptr);
+  FileSystem* const fs = db_->GetFileSystem();
+  const std::string src_path =
+      manifest.directory + "/" + manifest.relative_filename;
+  ROCKS_LOG_INFO(db_options.info_log, "Rewriting %s for column family subset",
+                 dst_path.c_str());
+
+  std::unique_ptr<SequentialFileReader> file_reader;
+  {
+    std::unique_ptr<FSSequentialFile> src_file;
+    IOStatus io_s =
+        fs->NewSequentialFile(src_path, FileOptions(), &src_file, nullptr);
+    if (!io_s.ok()) {
+      return io_s;
+    }
+    file_reader =
+        std::make_unique<SequentialFileReader>(std::move(src_file), src_path);
+  }
+
+  FileOptions dst_opts;
+  dst_opts.temperature = manifest.temperature;
+  std::unique_ptr<log::Writer> writer;
+  {
+    std::unique_ptr<FSWritableFile> dst_file;
+    IOStatus io_s = fs->NewWritableFile(dst_path, dst_opts, &dst_file, nullptr);
+    if (!io_s.ok()) {
+      return io_s;
+    }
+    writer = std::make_unique<log::Writer>(
+        std::make_unique<WritableFileWriter>(std::move(dst_file), dst_path,
+                                             dst_opts),
+        /*log_number=*/0, /*recycle_log_files=*/false);
+  }
+
+  Status read_s;
+  ManifestReadReporter reporter;
+  reporter.status = &read_s;
+  log::Reader reader(nullptr, std::move(file_reader), &reporter,
+                     /*checksum=*/true, /*log_num=*/0);
+
+  // The default column family exists without an explicit add record.
+  std::set<uint32_t> live_cf_ids{0};
+  Status s;
+  Slice record;
+  std::string scratch;
+  // Only the first manifest.size bytes belong to this checkpoint; the live
+  // MANIFEST may have grown (or been preallocated) past that.
+  while (reader.LastRecordEnd() < manifest.size &&
+         reader.ReadRecord(&record, &scratch,
+                           WALRecoveryMode::kAbsoluteConsistency)) {
+    if (reader.LastRecordEnd() > manifest.size) {
+      break;
+    }
+    VersionEdit edit;
+    s = edit.DecodeFrom(record);
+    if (!s.ok()) {
+      break;
+    }
+    const uint32_t cf_id = edit.GetColumnFamily();
+    if (edit.IsColumnFamilyAdd()) {
+      live_cf_ids.insert(cf_id);
+    } else if (edit.IsColumnFamilyDrop()) {
+      live_cf_ids.erase(cf_id);
+    }
+    for (const auto& level_and_file : edit.GetNewFiles()) {
+      (*file_to_cf)[level_and_file.second.fd.GetNumber()] = cf_id;
+    }
+    for (const auto& blob_file : edit.GetBlobFileAdditions()) {
+      (*file_to_cf)[blob_file.GetBlobFileNumber()] = cf_id;
+    }
+    s = writer->AddRecord(WriteOptions(), record);
+    if (!s.ok()) {
+      break;
+    }
+  }
+  if (s.ok()) {
+    s = read_s;
+  } else {
+    read_s.PermitUncheckedError();
+  }
+  if (s.ok() && reader.LastRecordEnd() != manifest.size) {
+    s = Status::Corruption("MANIFEST " + src_path +
+                           " does not end at the expected offset");
+  }
+
+  if (s.ok()) {
+    for (uint32_t cf_id : included_cf_ids) {
+      if (live_cf_ids.count(cf_id) == 0) {
+        s = Status::InvalidArgument(
+            "Column family dropped while creating checkpoint");
+        break;
+      }
+    }
+  }
+  if (s.ok()) {
+    for (uint32_t cf_id : live_cf_ids) {
+      if (included_cf_ids.count(cf_id) != 0) {
+        continue;
+      }
+      ROCKS_LOG_INFO(db_options.info_log,
+                     "Excluding column family %" PRIu32 " from checkpoint",
+                     cf_id);
+      VersionEdit drop_edit;
+      drop_edit.DropColumnFamily();
+      drop_edit.SetColumnFamily(cf_id);
+      std::string encoded;
+      if (!drop_edit.EncodeTo(&encoded)) {
+        s = Status::Corruption("Unable to encode column family drop");
+        break;
+      }
+      s = writer->AddRecord(WriteOptions(), encoded);
+      if (!s.ok()) {
+        break;
+      }
+    }
+  }
+  if (s.ok()) {
+    s = writer->file()->Sync(IOOptions(), db_options.use_fsync);
+  }
+  Status close_s = writer->Close(WriteOptions());
+  if (s.ok()) {
+    s = close_s;
+  } else {
+    close_s.PermitUncheckedError();
+  }
+  return s;
 }
 
 // Exports all live SST files of a specified Column Family onto export_dir,
