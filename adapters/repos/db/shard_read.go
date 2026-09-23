@@ -222,7 +222,7 @@ func (s *Shard) ObjectDigestsInRange(ctx context.Context,
 		return nil, fmt.Errorf("invalid final UUID %q: %w", finalUUID, err)
 	}
 
-	cursor := s.store.Bucket(helpers.ObjectsBucketLSM).CursorReplaceReusable()
+	cursor := s.store.Bucket(helpers.ObjectsBucketLSM).CursorReplaceDigestReusable(storobj.MarshallerV1HeaderLen)
 	defer cursor.Close()
 
 	return collectObjectDigests(ctx, cursor, initialUUID16[:], finalUUID16[:], limit)
@@ -230,7 +230,9 @@ func (s *Shard) ObjectDigestsInRange(ctx context.Context,
 
 // collectObjectDigests seeks cursor to initialKey and returns up to limit
 // digests with key <= finalKey. The cursor is reused across calls by the
-// async-replication scan, so it must not be opened/closed here.
+// async-replication scan, so it must not be opened/closed here. Only the
+// object header of each value is read, so cursor may be a digest cursor
+// bounded by storobj.MarshallerV1HeaderLen.
 func collectObjectDigests(ctx context.Context, cursor *lsmkv.CursorReplace,
 	initialKey, finalKey []byte, limit int) (objs []types.RepairResponse, err error,
 ) {
@@ -278,7 +280,7 @@ func (s *Shard) CompareDigests(ctx context.Context, sourceDigests []types.Repair
 
 	bucket := s.store.Bucket(helpers.ObjectsBucketLSM)
 
-	cursor := bucket.Cursor()
+	cursor := bucket.CursorReplaceDigestReusable(storobj.MarshallerV1HeaderLen)
 	defer cursor.Close()
 
 	firstUUID, err := uuid.Parse(sourceDigests[0].ID)
