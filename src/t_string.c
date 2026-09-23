@@ -555,6 +555,113 @@ void msetnxCommand(client *c) {
     msetGenericCommand(c, 1);
 }
 
+/* MSETEX numkeys key value [key value ...] [NX | XX]
+ *     [EX seconds | PX milliseconds |
+ *      EXAT seconds-timestamp | PXAT milliseconds-timestamp | KEEPTTL]
+ *
+ * Replies 1 if all the keys were set, or 0 if nothing was set because of
+ * the NX / XX condition. */
+void msetexCommand(client *c) {
+    long long numkeys;
+    robj *expire = NULL;
+    int unit = UNIT_SECONDS;
+    int flags = ARGS_NO_FLAGS;
+    mstime_t milliseconds = 0;
+    int j;
+
+    if (getLongLongFromObjectOrReply(c, c->argv[1], &numkeys, "invalid numkeys value") != C_OK) return;
+    if (numkeys <= 0) {
+        addReplyError(c, "invalid numkeys value");
+        return;
+    }
+    if (numkeys > (c->argc - 2) / 2) {
+        addReplyErrorArity(c);
+        return;
+    }
+
+    int opts_index = 2 + (int)numkeys * 2;
+    if (parseExtendedCommandArgumentsFromOrReply(c, &flags, &unit, &expire, NULL, COMMAND_MSET, opts_index, c->argc) != C_OK) {
+        return;
+    }
+
+    if (expire && getExpireMillisecondsOrReply(c, expire, flags, unit, &milliseconds) != C_OK) {
+        return;
+    }
+
+    if (flags & (ARGS_SET_NX | ARGS_SET_XX)) {
+        for (j = 2; j < opts_index; j += 2) {
+            int found = lookupKeyWrite(c->db, c->argv[j]) != NULL;
+            if ((flags & ARGS_SET_NX && found) || (flags & ARGS_SET_XX && !found)) {
+                addReply(c, shared.czero);
+                return;
+            }
+        }
+    }
+
+    /* Setting keys with an already elapsed expire is the same as deleting them. */
+    if (expire && checkAlreadyExpired(milliseconds)) {
+        robj **del_argv = zmalloc(sizeof(robj *) * (numkeys + 1));
+        int del_argc = 0;
+        del_argv[del_argc++] = server.lazyfree_lazy_expire ? shared.unlink : shared.del;
+        incrRefCount(del_argv[0]);
+        for (j = 2; j < opts_index; j += 2) {
+            robj *key = c->argv[j];
+            if (lookupKeyWrite(c->db, key) == NULL) continue;
+            int deleted = dbGenericDelete(c->db, key, server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED);
+            serverAssertWithInfo(c, key, deleted);
+            signalModifiedKey(c, c->db, key);
+            notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", key, c->db->id);
+            server.stat_expiredkeys++;
+            server.dirty++;
+            incrRefCount(key);
+            del_argv[del_argc++] = key;
+        }
+        if (del_argc > 1) {
+            /* Replicate/AOF this as an explicit DEL or UNLINK. */
+            replaceClientCommandVector(c, del_argc, del_argv);
+        } else {
+            decrRefCount(del_argv[0]);
+            zfree(del_argv);
+        }
+        addReply(c, shared.cone);
+        return;
+    }
+
+    int setkey_flags = ((flags & ARGS_KEEPTTL) || expire) ? SETKEY_KEEPTTL : 0;
+    if (flags & ARGS_SET_XX) setkey_flags |= SETKEY_ALREADY_EXIST;
+    for (j = 2; j < opts_index; j += 2) {
+        robj *key = c->argv[j];
+        robj *val = tryObjectEncoding(c->argv[j + 1]);
+        /* With NX the keys are known not to exist, unless the same key is repeated. */
+        int key_flags = setkey_flags;
+        if (flags & ARGS_SET_NX) key_flags |= (j == 2) ? SETKEY_DOESNT_EXIST : SETKEY_ADD_OR_UPDATE;
+        setKey(c, c->db, key, &val, key_flags);
+        if (expire) val = setExpire(c, c->db, key, milliseconds);
+        incrRefCount(val);
+        c->argv[j + 1] = val;
+        notifyKeyspaceEvent(NOTIFY_STRING, "set", key, c->db->id);
+        if (expire) notifyKeyspaceEvent(NOTIFY_GENERIC, "expire", key, c->db->id);
+    }
+    server.dirty += numkeys;
+
+    /* Propagate relative expires (EX/PX/EXAT) as an absolute PXAT, so replicas
+     * and the AOF apply the same expire time. */
+    if (expire && !(flags & ARGS_PXAT)) {
+        int new_argc = opts_index + 2;
+        robj **new_argv = zmalloc(sizeof(robj *) * new_argc);
+        for (j = 0; j < opts_index; j++) {
+            new_argv[j] = c->argv[j];
+            incrRefCount(new_argv[j]);
+        }
+        new_argv[opts_index] = shared.pxat;
+        incrRefCount(shared.pxat);
+        new_argv[opts_index + 1] = createStringObjectFromLongLong(milliseconds);
+        replaceClientCommandVector(c, new_argc, new_argv);
+    }
+
+    addReply(c, shared.cone);
+}
+
 void incrDecrCommand(client *c, long long incr) {
     long long value, oldvalue;
     robj *o, *new;

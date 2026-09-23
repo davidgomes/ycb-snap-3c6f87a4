@@ -7710,7 +7710,13 @@ __attribute__((weak)) int main(int argc, char **argv) {
  * max_args provides a way to limit the scan to a specific range of arguments.
  */
 int parseExtendedCommandArgumentsOrReply(client *c, int *flags, int *unit, robj **expire, robj **compare_val, int command_type, int max_args) {
-    int j = command_type == COMMAND_SET ? 3 : 2;
+    int start = command_type == COMMAND_SET ? 3 : 2;
+    return parseExtendedCommandArgumentsFromOrReply(c, flags, unit, expire, compare_val, command_type, start, max_args);
+}
+
+/* Same as parseExtendedCommandArgumentsOrReply(), but scans the arguments in the range [start, max_args). */
+int parseExtendedCommandArgumentsFromOrReply(client *c, int *flags, int *unit, robj **expire, robj **compare_val, int command_type, int start, int max_args) {
+    int j = start;
     for (; j < max_args; j++) {
         char *opt = objectGetVal(c->argv[j]);
         robj *next = (j == max_args - 1) ? NULL : c->argv[j + 1];
@@ -7718,12 +7724,14 @@ int parseExtendedCommandArgumentsOrReply(client *c, int *flags, int *unit, robj 
         /* clang-format off */
         if ((opt[0] == 'n' || opt[0] == 'N') &&
             (opt[1] == 'x' || opt[1] == 'X') && opt[2] == '\0' &&
-            !(*flags & ARGS_SET_XX || *flags & ARGS_SET_IFEQ) && (command_type == COMMAND_SET || command_type == COMMAND_HSET))
+            !(*flags & ARGS_SET_XX || *flags & ARGS_SET_IFEQ) &&
+            (command_type == COMMAND_SET || command_type == COMMAND_HSET || command_type == COMMAND_MSET))
         {
             *flags |= ARGS_SET_NX;
         } else if ((opt[0] == 'x' || opt[0] == 'X') &&
                    (opt[1] == 'x' || opt[1] == 'X') && opt[2] == '\0' &&
-                   !(*flags & ARGS_SET_NX || *flags & ARGS_SET_IFEQ) && (command_type == COMMAND_SET || command_type == COMMAND_HSET))
+                   !(*flags & ARGS_SET_NX || *flags & ARGS_SET_IFEQ) &&
+                   (command_type == COMMAND_SET || command_type == COMMAND_HSET || command_type == COMMAND_MSET))
         {
             *flags |= ARGS_SET_XX;
         } else if ((opt[0] == 'f' || opt[0] == 'F') &&
@@ -7756,7 +7764,8 @@ int parseExtendedCommandArgumentsOrReply(client *c, int *flags, int *unit, robj 
             *flags |= ARGS_SET_GET;
         } else if (!strcasecmp(opt, "KEEPTTL") && !(*flags & ARGS_PERSIST) &&
                    !(*flags & ARGS_EX) && !(*flags & ARGS_EXAT) &&
-                   !(*flags & ARGS_PX) && !(*flags & ARGS_PXAT) && (command_type == COMMAND_SET || command_type == COMMAND_HSET))
+                   !(*flags & ARGS_PX) && !(*flags & ARGS_PXAT) &&
+                   (command_type == COMMAND_SET || command_type == COMMAND_HSET || command_type == COMMAND_MSET))
         {
             *flags |= ARGS_KEEPTTL;
         } else if (!strcasecmp(opt,"PERSIST") && (command_type == COMMAND_GET || command_type == COMMAND_HGET) &&
