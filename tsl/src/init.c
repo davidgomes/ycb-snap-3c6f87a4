@@ -147,6 +147,7 @@ CrossModuleFunctions tsl_cm_functions = {
 	.compressed_data_in = tsl_compressed_data_in,
 	.compressed_data_out = tsl_compressed_data_out,
 	.compressed_data_info = tsl_compressed_data_info,
+	.decompress_batch = tsl_decompress_batch,
 	.compressed_data_has_nulls = tsl_compressed_data_has_nulls,
 	.deltadelta_compressor_append = tsl_deltadelta_compressor_append,
 	.deltadelta_compressor_finish = tsl_deltadelta_compressor_finish,

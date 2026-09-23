@@ -279,3 +279,8 @@ ANALYZE _timescaledb_catalog.continuous_agg;
 ALTER EXTENSION timescaledb DROP TABLE _timescaledb_catalog.telemetry_event;
 DROP TABLE _timescaledb_catalog.telemetry_event;
 
+
+CREATE FUNCTION _timescaledb_functions.decompress_batch(record)
+    RETURNS SETOF record
+    LANGUAGE C STRICT
+    AS '@MODULE_PATHNAME@', 'ts_decompress_batch';

@@ -65,6 +65,7 @@ CROSSMODULE_WRAPPER(compressed_data_recv);
 CROSSMODULE_WRAPPER(compressed_data_in);
 CROSSMODULE_WRAPPER(compressed_data_out);
 CROSSMODULE_WRAPPER(compressed_data_info);
+CROSSMODULE_WRAPPER(decompress_batch);
 CROSSMODULE_WRAPPER(compressed_data_has_nulls);
 CROSSMODULE_WRAPPER(deltadelta_compressor_append);
 CROSSMODULE_WRAPPER(deltadelta_compressor_finish);
@@ -361,6 +362,7 @@ TSDLLEXPORT CrossModuleFunctions ts_cm_functions_default = {
 	.create_compressed_chunk = error_no_default_fn_pg_community,
 	.compress_chunk = error_no_default_fn_pg_community,
 	.decompress_chunk = error_no_default_fn_pg_community,
+	.decompress_batch = error_no_default_fn_pg_community,
 	.rebuild_columnstore = error_no_default_fn_pg_community,
 	.rebuild_sparse_index = error_no_default_fn_pg_community,
 	.compressed_data_decompress_forward = error_no_default_fn_pg_community,

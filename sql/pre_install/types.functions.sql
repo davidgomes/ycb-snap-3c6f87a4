@@ -59,3 +59,8 @@ CREATE OR REPLACE FUNCTION _timescaledb_functions.dimension_info_out(_timescaled
 CREATE OR REPLACE FUNCTION _timescaledb_functions.bloom1in(cstring) RETURNS _timescaledb_internal.bloom1 AS 'byteain' LANGUAGE INTERNAL STRICT IMMUTABLE PARALLEL SAFE;
 CREATE OR REPLACE FUNCTION _timescaledb_functions.bloom1out(_timescaledb_internal.bloom1) RETURNS cstring AS 'byteaout' LANGUAGE INTERNAL STRICT IMMUTABLE PARALLEL SAFE;
 
+
+CREATE OR REPLACE FUNCTION _timescaledb_functions.decompress_batch(record)
+    RETURNS SETOF record
+    LANGUAGE C STRICT
+    AS '@MODULE_PATHNAME@', 'ts_decompress_batch';

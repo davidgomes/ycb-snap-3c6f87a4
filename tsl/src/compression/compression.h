@@ -348,6 +348,7 @@ extern Datum tsl_compressed_data_recv(PG_FUNCTION_ARGS);
 extern Datum tsl_compressed_data_in(PG_FUNCTION_ARGS);
 extern Datum tsl_compressed_data_out(PG_FUNCTION_ARGS);
 extern Datum tsl_compressed_data_info(PG_FUNCTION_ARGS);
+extern Datum tsl_decompress_batch(PG_FUNCTION_ARGS);
 extern Datum tsl_compressed_data_has_nulls(PG_FUNCTION_ARGS);
 extern Datum tsl_compressed_data_column_size(PG_FUNCTION_ARGS);
 extern Datum tsl_compressed_data_to_array(PG_FUNCTION_ARGS);

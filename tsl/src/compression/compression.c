@@ -3417,3 +3417,117 @@ analyze_and_get_segmentby(CompressionSettings *settings, RowCompressor *compress
 	pfree(candidates);
 	return result;
 }
+
+static void
+decompress_batch_error_not_batch(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("record is not a compressed batch")));
+}
+
+/*
+ * Decompress a single compressed batch row, passed as a record, into the rows
+ * it represents. The output row shape is taken from the column definition
+ * list at the call site.
+ */
+Datum
+tsl_decompress_batch(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	HeapTupleHeader rec = PG_GETARG_HEAPTUPLEHEADER(0);
+	TupleDesc out_desc;
+
+	if (get_call_result_type(fcinfo, NULL, &out_desc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context that cannot accept type "
+						"record"),
+				 errhint("Use a column definition list, e.g. AS x(col type, ...).")));
+
+	TupleDesc in_desc_ref =
+		lookup_rowtype_tupdesc(HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
+	TupleDesc in_desc = CreateTupleDescCopy(in_desc_ref);
+	ReleaseTupleDesc(in_desc_ref);
+
+	Oid compressed_data_type_oid = ts_custom_type_cache_get(CUSTOM_TYPE_COMPRESSED_DATA)->type_oid;
+	bool has_count = false;
+
+	for (int i = 0; i < in_desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(in_desc, i);
+		if (attr->attisdropped)
+			continue;
+		if (strcmp(NameStr(attr->attname), COMPRESSION_COLUMN_METADATA_COUNT_NAME) == 0)
+		{
+			if (attr->atttypid != INT4OID)
+				decompress_batch_error_not_batch();
+			has_count = true;
+		}
+	}
+	if (!has_count)
+		decompress_batch_error_not_batch();
+
+	/* Validate the requested output shape against the batch columns. */
+	for (int i = 0; i < out_desc->natts; i++)
+	{
+		Form_pg_attribute out_attr = TupleDescAttr(out_desc, i);
+		int j;
+
+		for (j = 0; j < in_desc->natts; j++)
+		{
+			Form_pg_attribute in_attr = TupleDescAttr(in_desc, j);
+			if (!in_attr->attisdropped &&
+				strcmp(NameStr(in_attr->attname), NameStr(out_attr->attname)) == 0)
+				break;
+		}
+		if (j == in_desc->natts)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("column \"%s\" not found in compressed batch",
+							NameStr(out_attr->attname))));
+
+		Form_pg_attribute in_attr = TupleDescAttr(in_desc, j);
+		if (in_attr->atttypid != compressed_data_type_oid && in_attr->atttypid != out_attr->atttypid)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("type mismatch for segment-by column \"%s\"",
+							NameStr(out_attr->attname)),
+					 errdetail("Compressed batch has type %s but %s was requested.",
+							   format_type_be(in_attr->atttypid),
+							   format_type_be(out_attr->atttypid))));
+	}
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+
+	MemoryContext per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	MemoryContext old_ctx = MemoryContextSwitchTo(per_query_ctx);
+	RowDecompressor decompressor = build_decompressor(in_desc, out_desc, InvalidOid, InvalidOid);
+	MemoryContextSwitchTo(old_ctx);
+
+	HeapTupleData tuple = {
+		.t_len = HeapTupleHeaderGetDatumLength(rec),
+		.t_tableOid = InvalidOid,
+		.t_data = rec,
+	};
+	ItemPointerSetInvalid(&tuple.t_self);
+	heap_deform_tuple(&tuple,
+					  decompressor.in_desc,
+					  decompressor.compressed_datums,
+					  decompressor.compressed_is_nulls);
+
+	if (decompressor.compressed_is_nulls[decompressor.count_compressed_attindex])
+		decompress_batch_error_not_batch();
+
+	int n_rows = decompress_batch(&decompressor);
+	for (int i = 0; i < n_rows; i++)
+		tuplestore_puttupleslot(rsinfo->setResult, decompressor.decompressed_slots[i]);
+
+	for (int i = 0; i < decompressor.decompressed_slots_capacity; i++)
+		if (decompressor.decompressed_slots[i])
+			ExecDropSingleTupleTableSlot(decompressor.decompressed_slots[i]);
+	MemoryContextDelete(decompressor.per_compressed_row_ctx);
+	detoaster_close(&decompressor.detoaster);
+
+	return (Datum) 0;
+}
