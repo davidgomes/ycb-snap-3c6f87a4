@@ -35,6 +35,7 @@
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
+#include "yb/dockv/doc_key.h"
 #include "yb/dockv/pg_key_decoder.h"
 #include "yb/dockv/pg_row.h"
 #include "yb/dockv/reader_projection.h"
@@ -3157,6 +3158,13 @@ YbcStatus YBCTabletsMetadata(YbcPgGlobalTabletsDescriptor** tablets, size_t* cou
         }
       }
 
+      const auto decode_range_bound = [&](const std::string& key) -> const char* {
+        if (tablet_metadata.is_hash_partitioned() || key.empty()) {
+          return nullptr;
+        }
+        return YBCPAllocStdString(dockv::DocKey::DebugSliceToString(key));
+      };
+
       new (dest) YbcPgGlobalTabletsDescriptor {
         .tablet_descriptor = MakeYbcPgTabletsDescriptor(tablet_metadata),
         .replicas = replicas_array,
@@ -3166,7 +3174,9 @@ YbcStatus YBCTabletsMetadata(YbcPgGlobalTabletsDescriptor** tablets, size_t* cou
             ? YBCPAllocStdString(tablet_metadata.tablet_state())
             : nullptr,
         .pg_table_oid = tablet_metadata.has_pg_table_oid() ? tablet_metadata.pg_table_oid()
-                                                           : kPgInvalidOid
+                                                           : kPgInvalidOid,
+        .start_range = decode_range_bound(tablet_metadata.partition().partition_key_start()),
+        .end_range = decode_range_bound(tablet_metadata.partition().partition_key_end()),
       };
       ++dest;
     }

@@ -151,21 +151,153 @@ ORDER BY db_name, relname;
  same_name | yb_tmeta_b
 (4 rows)
 
--- Test that non-superusers can see cluster-wide tablet metadata
-CREATE ROLE yb_tmeta_user LOGIN;
-\c yb_tmeta_a yb_tmeta_user
-SELECT
-    relname,
-    db_name
+-- Test start_range/end_range for range-sharded and hash-sharded tables
+\c yb_tmeta_a yugabyte
+CREATE TABLE range_granted (k INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((10), (20));
+CREATE TABLE range_ungranted (k INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((10));
+CREATE TABLE hash_ungranted (k INT PRIMARY KEY) SPLIT INTO 2 TABLETS;
+CREATE TABLE hash_asc (h INT, r INT, PRIMARY KEY (h HASH, r ASC)) SPLIT INTO 2 TABLETS;
+CREATE TABLE ts_range (t TIMESTAMP, PRIMARY KEY (t ASC))
+    SPLIT AT VALUES (('2000-01-01 00:00:00'));
+CREATE TABLE rewrite_granted (k INT, v INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((5));
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
 FROM yb_tablet_metadata
-WHERE
-    relname IN ('only_in_b', 'same_name')
+WHERE db_name = current_database()
+    AND relname IN ('range_granted', 'hash_ungranted', 'hash_asc', 'ts_range')
+ORDER BY relname, start_hash_code NULLS FIRST, start_range NULLS FIRST;
+    relname     | start_hash_code | end_hash_code |          start_range          |           end_range           
+----------------+-----------------+---------------+-------------------------------+-------------------------------
+ hash_asc       |               0 |         32768 |                               | 
+ hash_asc       |           32768 |         65536 |                               | 
+ hash_ungranted |               0 |         32768 |                               | 
+ hash_ungranted |           32768 |         65536 |                               | 
+ range_granted  |                 |               |                               | DocKey([], [10])
+ range_granted  |                 |               | DocKey([], [10])              | DocKey([], [20])
+ range_granted  |                 |               | DocKey([], [20])              | 
+ ts_range       |                 |               |                               | DocKey([], [946684800000000])
+ ts_range       |                 |               | DocKey([], [946684800000000]) | 
+(9 rows)
+
+-- Test masking of relname/start_range/end_range for unprivileged roles
+CREATE ROLE yb_tmeta_user LOGIN;
+CREATE ROLE yb_tmeta_admin LOGIN;
+GRANT yb_db_admin TO yb_tmeta_admin;
+GRANT SELECT ON range_granted, rewrite_granted TO yb_tmeta_user;
+-- Rewrite keeps the pg_class oid, so the grant must keep applying.
+ALTER TABLE rewrite_granted ALTER COLUMN v TYPE BIGINT;
+\c colocated_db yugabyte
+GRANT SELECT ON colocated_hash TO yb_tmeta_user;
+\c yb_tmeta_a yb_tmeta_user
+-- Granted range table: real values.
+SELECT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE oid = 'range_granted'::regclass AND db_name = current_database()
+ORDER BY start_range NULLS FIRST;
+    relname    |   start_range    |    end_range     
+---------------+------------------+------------------
+ range_granted |                  | DocKey([], [10])
+ range_granted | DocKey([], [10]) | DocKey([], [20])
+ range_granted | DocKey([], [20]) | 
+(3 rows)
+
+-- Rewritten table with a grant: still real values.
+SELECT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE oid = 'rewrite_granted'::regclass AND db_name = current_database()
+ORDER BY start_range NULLS FIRST;
+     relname     |   start_range   |    end_range    
+-----------------+-----------------+-----------------
+ rewrite_granted |                 | DocKey([], [5])
+ rewrite_granted | DocKey([], [5]) | 
+(2 rows)
+
+-- Ungranted range table: every range cell is masked, including open edges.
+SELECT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE oid = 'range_ungranted'::regclass AND db_name = current_database();
+         relname          |       start_range        |        end_range         
+--------------------------+--------------------------+--------------------------
+ <insufficient privilege> | <insufficient privilege> | <insufficient privilege>
+ <insufficient privilege> | <insufficient privilege> | <insufficient privilege>
+(2 rows)
+
+-- Ungranted hash table: relname masked, hash codes kept, ranges stay NULL.
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
+FROM yb_tablet_metadata
+WHERE oid = 'hash_ungranted'::regclass AND db_name = current_database()
+ORDER BY start_hash_code;
+         relname          | start_hash_code | end_hash_code | start_range | end_range 
+--------------------------+-----------------+---------------+-------------+-----------
+ <insufficient privilege> |               0 |         32768 |             | 
+ <insufficient privilege> |           32768 |         65536 |             | 
+(2 rows)
+
+-- Tables in other databases are masked even if names collide.
+SELECT DISTINCT relname
+FROM yb_tablet_metadata
+WHERE db_name = 'yb_tmeta_b';
+         relname          
+--------------------------
+ <insufficient privilege>
+(1 row)
+
+-- Colocation parent and colocated tables in another database are masked.
+SELECT DISTINCT relname
+FROM yb_tablet_metadata
+WHERE db_name = 'colocated_db';
+         relname          
+--------------------------
+ <insufficient privilege>
+(1 row)
+
+-- The system transactions tablet is always unmasked.
+SELECT count(*) > 0 AS has_transactions
+FROM yb_tablet_metadata
+WHERE db_name = 'system' AND relname = 'transactions';
+ has_transactions 
+------------------
+ t
+(1 row)
+
+-- No rows are dropped by masking.
+SELECT count(*) = :yb_tmeta_a_row_count::bigint + 13 AS same_row_count
+FROM yb_tablet_metadata;
+ same_row_count 
+----------------
+ t
+(1 row)
+
+\c colocated_db yb_tmeta_user
+-- Colocation parent stays masked even with SELECT on a colocated table.
+SELECT relname
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid IS NULL;
+         relname          
+--------------------------
+ <insufficient privilege>
+(1 row)
+
+\c yb_tmeta_a yb_tmeta_admin
+-- yb_db_admin members see real values.
+SELECT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE oid = 'range_ungranted'::regclass AND db_name = current_database()
+ORDER BY start_range NULLS FIRST;
+     relname     |   start_range    |    end_range     
+-----------------+------------------+------------------
+ range_ungranted |                  | DocKey([], [10])
+ range_ungranted | DocKey([], [10]) | 
+(2 rows)
+
+SELECT relname
+FROM yb_tablet_metadata
+WHERE relname IN ('only_in_b', 'same_name')
     AND db_name = 'yb_tmeta_b'
 ORDER BY relname;
-  relname  |  db_name   
------------+------------
- only_in_b | yb_tmeta_b
- same_name | yb_tmeta_b
+  relname  
+-----------
+ only_in_b
+ same_name
 (2 rows)
 
 -- Cleanup
@@ -174,3 +306,4 @@ DROP DATABASE colocated_db;
 DROP DATABASE yb_tmeta_a;
 DROP DATABASE yb_tmeta_b;
 DROP ROLE yb_tmeta_user;
+DROP ROLE yb_tmeta_admin;

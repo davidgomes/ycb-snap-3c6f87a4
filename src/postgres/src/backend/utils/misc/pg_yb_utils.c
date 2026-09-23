@@ -9136,6 +9136,34 @@ string_list_compare(const ListCell *a, const ListCell *b)
 	return strcmp((char *) lfirst(a), (char *) lfirst(b));
 }
 
+#define YB_INSUFFICIENT_PRIVILEGE_STR "<insufficient privilege>"
+
+/*
+ * Whether an unprivileged caller may see the sensitive columns (relname,
+ * start_range, end_range) of a yb_tablet_metadata row: the system
+ * transactions tablet, or a table in the current database on which the caller
+ * has SELECT. Missing/orphaned OIDs are treated as not visible.
+ */
+static bool
+YbTabletMetadataRowVisible(YbcPgGlobalTabletsDescriptor *tablet,
+						   const char *current_db_name)
+{
+	YbcPgTabletsDescriptor *desc = &tablet->tablet_descriptor;
+	bool		is_missing = false;
+
+	if (strcmp(desc->namespace_name, "system") == 0 &&
+		strcmp(desc->table_name, "transactions") == 0 &&
+		strcmp(desc->table_type, "YSQL") != 0)
+		return true;
+
+	if (!OidIsValid(tablet->pg_table_oid) || current_db_name == NULL ||
+		strcmp(desc->namespace_name, current_db_name) != 0)
+		return false;
+
+	return pg_class_aclcheck_ext(tablet->pg_table_oid, GetUserId(), ACL_SELECT,
+								 &is_missing) == ACLCHECK_OK && !is_missing;
+}
+
 /*
  * Returns the metadata for all tablets in the cluster.
  * The returned data structure is a row type with the following columns:
@@ -9202,6 +9230,9 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 	size_t		num_tablets = 0;
 
 	HandleYBStatus(YBCTabletsMetadata(&tablets, &num_tablets));
+
+	bool		privileged = superuser() || IsYbDbAdminUser(GetUserId());
+	const char *current_db_name = get_database_name(MyDatabaseId);
 
 	for (int i = 0; i < num_tablets; ++i)
 	{
@@ -9274,9 +9305,34 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[9] = true;
 		}
 
-		/* TODO (#28172): start_range, end_range, tablet_attrs are populated in a follow-up change. */
-		nulls[10] = true;
-		nulls[11] = true;
+		if (tablet->start_range)
+			values[10] = CStringGetTextDatum(tablet->start_range);
+		else
+			nulls[10] = true;
+		if (tablet->end_range)
+			values[11] = CStringGetTextDatum(tablet->end_range);
+		else
+			nulls[11] = true;
+
+		if (!privileged &&
+			!YbTabletMetadataRowVisible(tablet, current_db_name))
+		{
+			values[4] = CStringGetTextDatum(YB_INSUFFICIENT_PRIVILEGE_STR);
+			/*
+			 * Hash-sharded ranges are always NULL, so there is nothing to hide.
+			 * For range-sharded tablets, mask every range cell (including open
+			 * edges) so the tablet edges don't leak.
+			 */
+			if (!tablet->is_hash_partitioned)
+			{
+				values[10] = CStringGetTextDatum(YB_INSUFFICIENT_PRIVILEGE_STR);
+				values[11] = CStringGetTextDatum(YB_INSUFFICIENT_PRIVILEGE_STR);
+				nulls[10] = false;
+				nulls[11] = false;
+			}
+		}
+
+		/* TODO (#28172): tablet_attrs is populated in a follow-up change. */
 		nulls[12] = true;
 
 		if (tablet->tablet_state)
