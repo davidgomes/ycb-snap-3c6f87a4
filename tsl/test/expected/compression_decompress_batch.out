@@ -1,0 +1,211 @@
+-- This file and its contents are licensed under the Timescale License.
+-- Please see the included NOTICE for copyright information and
+-- LICENSE-TIMESCALE for a copy of the license.
+\set VERBOSITY default
+CREATE TABLE metrics(time timestamptz NOT NULL, device_id int, value float, note text);
+SELECT table_name FROM create_hypertable('metrics', 'time', chunk_time_interval => interval '10 days');
+ table_name 
+------------
+ metrics
+
+ALTER TABLE metrics SET (timescaledb.compress,
+    timescaledb.compress_segmentby = 'device_id',
+    timescaledb.compress_orderby = 'time');
+-- Three segments per chunk (including a NULL segment), spanning more than one
+-- batch each. The value and note columns contain NULLs.
+INSERT INTO metrics
+SELECT t,
+    CASE WHEN d = 0 THEN NULL ELSE d END,
+    CASE WHEN extract(minute FROM t)::int % 7 = 0 THEN NULL ELSE d * 100 + extract(epoch FROM t) / 3600 END,
+    CASE WHEN (extract(epoch FROM t)::int / 600) % 5 = 0 THEN NULL ELSE 'note ' || d END
+FROM generate_series('2024-01-01'::timestamptz, '2024-01-15'::timestamptz, interval '10 minutes') t,
+    generate_series(0, 2) d;
+SELECT count(compress_chunk(c)) FROM show_chunks('metrics') c;
+ count 
+-------
+     2
+
+SELECT format('%I.%I', cc.schema_name, cc.table_name) AS "COMPRESSED_CHUNK",
+    format('%I.%I', ch.schema_name, ch.table_name) AS "CHUNK"
+FROM _timescaledb_catalog.chunk ch
+JOIN _timescaledb_catalog.chunk cc ON cc.id = ch.compressed_chunk_id
+JOIN _timescaledb_catalog.hypertable ht ON ht.id = ch.hypertable_id
+WHERE ht.table_name = 'metrics'
+ORDER BY ch.id DESC LIMIT 1 \gset
+-- Decompressing all batches is set-equal to the hypertable data
+CREATE TEMP TABLE decompressed(time timestamptz, device_id int, value float, note text);
+DO $$
+DECLARE
+    rel regclass;
+BEGIN
+    FOR rel IN
+        SELECT format('%I.%I', cc.schema_name, cc.table_name)::regclass
+        FROM _timescaledb_catalog.chunk ch
+        JOIN _timescaledb_catalog.chunk cc ON cc.id = ch.compressed_chunk_id
+        JOIN _timescaledb_catalog.hypertable ht ON ht.id = ch.hypertable_id
+        WHERE ht.table_name = 'metrics'
+    LOOP
+        EXECUTE format($sql$
+            INSERT INTO decompressed
+            SELECT x.*
+            FROM %s t
+            CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t)
+                AS x(time timestamptz, device_id int, value float, note text)
+        $sql$, rel);
+    END LOOP;
+END;
+$$;
+SELECT (SELECT count(*) FROM metrics) AS hypertable_rows,
+    (SELECT count(*) FROM decompressed) AS decompressed_rows,
+    (SELECT count(*) FROM metrics WHERE value IS NULL) AS hypertable_null_values,
+    (SELECT count(*) FROM decompressed WHERE value IS NULL) AS decompressed_null_values,
+    (SELECT count(*) FROM decompressed WHERE device_id IS NULL) AS decompressed_null_devices;
+ hypertable_rows | decompressed_rows | hypertable_null_values | decompressed_null_values | decompressed_null_devices 
+-----------------+-------------------+------------------------+--------------------------+---------------------------
+            6051 |              6051 |                   1011 |                     1011 |                      2017
+
+SELECT count(*) AS missing FROM (SELECT * FROM metrics EXCEPT ALL SELECT * FROM decompressed) s;
+ missing 
+---------
+       0
+
+SELECT count(*) AS extra FROM (SELECT * FROM decompressed EXCEPT ALL SELECT * FROM metrics) s;
+ extra 
+-------
+     0
+
+-- Decompressing a single batch yields exactly the rows of that batch
+SELECT count(*) AS batches, sum(_ts_meta_count) AS rows FROM :COMPRESSED_CHUNK;
+ batches | rows 
+---------+------
+       6 | 3171
+
+SELECT t.device_id, t._ts_meta_count,
+    (SELECT count(*) FROM _timescaledb_functions.decompress_batch(t)
+        AS x(time timestamptz, device_id int, value float, note text)) AS decompressed_rows,
+    (SELECT count(*) FROM (
+        SELECT * FROM :CHUNK c
+        WHERE c.device_id IS NOT DISTINCT FROM t.device_id
+            AND c.time BETWEEN t._ts_meta_min_1 AND t._ts_meta_max_1
+        EXCEPT ALL
+        SELECT * FROM _timescaledb_functions.decompress_batch(t)
+            AS x(time timestamptz, device_id int, value float, note text)) s) AS missing,
+    (SELECT count(*) FROM (
+        SELECT * FROM _timescaledb_functions.decompress_batch(t)
+            AS x(time timestamptz, device_id int, value float, note text)
+        EXCEPT ALL
+        SELECT * FROM :CHUNK c
+        WHERE c.device_id IS NOT DISTINCT FROM t.device_id
+            AND c.time BETWEEN t._ts_meta_min_1 AND t._ts_meta_max_1) s) AS extra
+FROM :COMPRESSED_CHUNK t
+ORDER BY t.device_id NULLS FIRST, t._ts_meta_min_1;
+ device_id | _ts_meta_count | decompressed_rows | missing | extra 
+-----------+----------------+-------------------+---------+-------
+           |           1000 |              1000 |       0 |     0
+           |             57 |                57 |       0 |     0
+         1 |           1000 |              1000 |       0 |     0
+         1 |             57 |                57 |       0 |     0
+         2 |           1000 |              1000 |       0 |     0
+         2 |             57 |                57 |       0 |     0
+
+-- Rows come out in batch order
+SELECT x.*
+FROM (SELECT * FROM :COMPRESSED_CHUNK WHERE device_id = 2 ORDER BY _ts_meta_min_1 LIMIT 1) t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t)
+    AS x(time timestamptz, device_id int, value float, note text)
+LIMIT 5;
+             time             | device_id |      value       |  note  
+------------------------------+-----------+------------------+--------
+ Sun Jan 07 16:00:00 2024 PST |         2 |                  | 
+ Sun Jan 07 16:10:00 2024 PST |         2 | 473720.166666667 | note 2
+ Sun Jan 07 16:20:00 2024 PST |         2 | 473720.333333333 | note 2
+ Sun Jan 07 16:30:00 2024 PST |         2 |         473720.5 | note 2
+ Sun Jan 07 16:40:00 2024 PST |         2 | 473720.666666667 | note 2
+
+-- A subset of the columns, in any order
+SELECT x.*
+FROM (SELECT * FROM :COMPRESSED_CHUNK WHERE device_id = 2 ORDER BY _ts_meta_min_1 LIMIT 1) t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t) AS x(note text, time timestamptz)
+LIMIT 3;
+  note  |             time             
+--------+------------------------------
+        | Sun Jan 07 16:00:00 2024 PST
+ note 2 | Sun Jan 07 16:10:00 2024 PST
+ note 2 | Sun Jan 07 16:20:00 2024 PST
+
+-- NULL input yields no rows since the function is strict
+SELECT count(*) FROM _timescaledb_functions.decompress_batch(NULL::record) AS x(time timestamptz);
+ count 
+-------
+     0
+
+\set ON_ERROR_STOP 0
+-- Not a compressed batch
+SELECT * FROM (SELECT * FROM metrics LIMIT 1) t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t) AS x(time timestamptz);
+ERROR:  record is not a compressed batch
+DETAIL:  A compressed batch must have a column "_ts_meta_count" of type integer.
+SELECT * FROM _timescaledb_functions.decompress_batch(ROW(1, 'foo')) AS x(f1 int);
+ERROR:  record is not a compressed batch
+DETAIL:  A compressed batch must have a column "_ts_meta_count" of type integer.
+CREATE TABLE fake_batch(device_id int, _ts_meta_count text);
+INSERT INTO fake_batch VALUES (1, '10');
+SELECT * FROM fake_batch t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t) AS x(device_id int);
+ERROR:  record is not a compressed batch
+DETAIL:  A compressed batch must have a column "_ts_meta_count" of type integer.
+DROP TABLE fake_batch;
+CREATE TABLE fake_batch(device_id int, _ts_meta_count int);
+INSERT INTO fake_batch VALUES (1, NULL);
+SELECT * FROM fake_batch t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t) AS x(device_id int);
+ERROR:  record is not a compressed batch
+DETAIL:  Column "_ts_meta_count" is NULL.
+DROP TABLE fake_batch;
+-- Output shape does not match the batch
+SELECT x.* FROM (SELECT * FROM :COMPRESSED_CHUNK ORDER BY device_id, _ts_meta_min_1 LIMIT 1) t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t)
+    AS x(time timestamptz, device_id text, value float, note text);
+ERROR:  type mismatch for column "device_id" of compressed batch
+DETAIL:  Column has type integer in the compressed batch, but text in the column definition list.
+SELECT x.* FROM :COMPRESSED_CHUNK t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t)
+    AS x(time timestamptz, device_id int, value int, note text);
+ERROR:  type mismatch for column "value" of compressed batch
+DETAIL:  Column has type double precision in the compressed batch, but integer in the column definition list.
+SELECT x.* FROM :COMPRESSED_CHUNK t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t)
+    AS x(time timestamp, device_id int);
+ERROR:  type mismatch for column "time" of compressed batch
+DETAIL:  Column has type timestamp with time zone in the compressed batch, but timestamp without time zone in the column definition list.
+-- Without the uncompressed relation, types are checked against the
+-- compressed data itself
+SELECT x.* FROM (SELECT * FROM :COMPRESSED_CHUNK ORDER BY device_id, _ts_meta_min_1 LIMIT 1) t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t)
+    AS x(time timestamptz, device_id int, value text);
+ERROR:  type mismatch for column "value" of compressed batch
+DETAIL:  Column compressed with algorithm "GORILLA" cannot be decompressed as text.
+SELECT x.* FROM (SELECT * FROM :COMPRESSED_CHUNK ORDER BY device_id, _ts_meta_min_1 LIMIT 1) t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t)
+    AS x(time timestamptz, device_id int, note int);
+ERROR:  type mismatch for column "note" of compressed batch
+DETAIL:  Column compressed with algorithm "DICTIONARY" cannot be decompressed as integer.
+SELECT x.* FROM (SELECT * FROM :COMPRESSED_CHUNK ORDER BY device_id, _ts_meta_min_1 LIMIT 1) t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t)
+    AS x(time float, device_id int);
+ERROR:  type mismatch for column "time" of compressed batch
+DETAIL:  Column compressed with algorithm "DELTADELTA" cannot be decompressed as double precision.
+SELECT x.* FROM (SELECT * FROM :COMPRESSED_CHUNK ORDER BY device_id, _ts_meta_min_1 LIMIT 1) t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t)
+    AS x(time timestamptz, device_id int, missing float);
+ERROR:  column "missing" does not exist in compressed batch
+SELECT x.* FROM (SELECT * FROM :COMPRESSED_CHUNK ORDER BY device_id, _ts_meta_min_1 LIMIT 1) t
+CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t)
+    AS x(time timestamptz, _ts_meta_count int);
+ERROR:  column "_ts_meta_count" does not exist in compressed batch
+-- A column definition list is required
+SELECT _timescaledb_functions.decompress_batch(t) FROM (SELECT * FROM :COMPRESSED_CHUNK ORDER BY device_id, _ts_meta_min_1 LIMIT 1) t;
+ERROR:  function returning record called in context that cannot accept type record
+HINT:  Specify the output columns with a column definition list, for example "AS x(time timestamptz, value float)".
+\set ON_ERROR_STOP 1
+DROP TABLE metrics;

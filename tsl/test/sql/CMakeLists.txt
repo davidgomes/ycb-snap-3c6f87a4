@@ -51,6 +51,7 @@ set(TEST_FILES
     compression_conflicts.sql
     compression_constraints.sql
     compression_create_compressed_table.sql
+    compression_decompress_batch.sql
     compression_defaults.sql
     compression_fks.sql
     compression_indexcreate.sql
