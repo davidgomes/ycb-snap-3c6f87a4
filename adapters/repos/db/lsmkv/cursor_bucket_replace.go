@@ -124,6 +124,40 @@ func (b *Bucket) CursorReplaceReusable() *CursorReplace {
 	}
 }
 
+// CursorReplaceDigestReusable behaves like CursorReplaceReusable, but values
+// served from disk segments are truncated to their first valuePrefixLen bytes;
+// the remainder is skipped without being allocated. Memtable values are served
+// in full. Key order, seek and merge semantics are unchanged. Intended for
+// scans that only inspect a fixed-size value header (e.g. object digests).
+// valuePrefixLen <= 0 is equivalent to CursorReplaceReusable.
+func (b *Bucket) CursorReplaceDigestReusable(valuePrefixLen int) *CursorReplace {
+	MustBeExpectedStrategy(b.strategy, StrategyReplace)
+
+	cursorOpenedAt := time.Now()
+	b.metrics.IncBucketOpenedCursorsByStrategy(b.strategy)
+	b.metrics.IncBucketOpenCursorsByStrategy(b.strategy)
+
+	b.flushLock.RLock()
+	defer b.flushLock.RUnlock()
+
+	innerCursors, unlockSegmentGroup := b.disk.newDigestReusableCursors(valuePrefixLen)
+
+	if b.flushing != nil {
+		innerCursors = append(innerCursors, b.flushing.newCursor())
+	}
+	innerCursors = append(innerCursors, b.active.newCursor())
+
+	return &CursorReplace{
+		innerCursors: innerCursors,
+		unlock: func() {
+			unlockSegmentGroup()
+
+			b.metrics.DecBucketOpenCursorsByStrategy(b.strategy)
+			b.metrics.ObserveBucketCursorDurationByStrategy(b.strategy, time.Since(cursorOpenedAt))
+		},
+	}
+}
+
 // CursorInMemWith returns a cursor which scan over the primary key of entries
 // not yet persisted on disk.
 // Segment creation and compaction will be blocked until the cursor is closed
@@ -169,6 +203,20 @@ func (b *Bucket) CursorOnDisk() *CursorReplace {
 	MustBeExpectedStrategy(b.strategy, StrategyReplace)
 
 	innerCursors, unlockSegmentGroup := b.disk.newCursors()
+
+	return &CursorReplace{
+		innerCursors: innerCursors,
+		unlock:       unlockSegmentGroup,
+	}
+}
+
+// CursorOnDiskDigest is CursorOnDisk with every segment cursor in digest mode:
+// values are truncated to their first valuePrefixLen bytes and the remainder
+// is skipped without being allocated. valuePrefixLen <= 0 serves full values.
+func (b *Bucket) CursorOnDiskDigest(valuePrefixLen int) *CursorReplace {
+	MustBeExpectedStrategy(b.strategy, StrategyReplace)
+
+	innerCursors, unlockSegmentGroup := b.disk.newDigestReusableCursors(valuePrefixLen)
 
 	return &CursorReplace{
 		innerCursors: innerCursors,

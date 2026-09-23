@@ -37,6 +37,28 @@ func (r *offsetReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// preadSkipReader reads through br but implements Discard by repositioning the
+// underlying offsetReader, so skipped value bytes are never read from disk.
+type preadSkipReader struct {
+	or *offsetReader
+	br *bufio.Reader
+}
+
+func (p *preadSkipReader) Read(b []byte) (int, error) {
+	return p.br.Read(b)
+}
+
+func (p *preadSkipReader) Discard(n int) (int, error) {
+	buffered := p.br.Buffered()
+	if n <= buffered {
+		return p.br.Discard(n)
+	}
+	// or.off is ahead of the logical position by whatever br has buffered.
+	p.or.off = p.or.off - int64(buffered) + int64(n)
+	p.br.Reset(p.or)
+	return n, nil
+}
+
 type segmentCursorReplace struct {
 	segment       *segment
 	index         diskIndex
@@ -297,6 +319,10 @@ type segmentCursorReplaceReusable struct {
 	// avoid allocating a MeteredReader+SectionReader+nodeReader per iteration.
 	preadOffset *offsetReader
 	preadReader *bufio.Reader
+	// digest mode (valuePrefixLen > 0): only the first valuePrefixLen value
+	// bytes of each node are retained; node offsets still cover the full node.
+	valuePrefixLen int
+	preadSkip      *preadSkipReader
 }
 
 func (s *segment) newReplaceCursorReusable() *segmentCursorReplaceReusable {
@@ -313,6 +339,22 @@ func (s *segment) newReplaceCursorReusable() *segmentCursorReplaceReusable {
 		or := &offsetReader{ra: s.contentFile}
 		c.preadOffset = or
 		c.preadReader = bufio.NewReader(or)
+	}
+	return c
+}
+
+// newReplaceCursorDigestReusable is newReplaceCursorReusable in digest mode:
+// returned nodes carry at most the first valuePrefixLen bytes of their value,
+// the rest is skipped without being allocated. valuePrefixLen <= 0 yields a
+// cursor identical to newReplaceCursorReusable.
+func (s *segment) newReplaceCursorDigestReusable(valuePrefixLen int) *segmentCursorReplaceReusable {
+	c := s.newReplaceCursorReusable()
+	if valuePrefixLen <= 0 {
+		return c
+	}
+	c.valuePrefixLen = valuePrefixLen
+	if c.preadReader != nil {
+		c.preadSkip = &preadSkipReader{or: c.preadOffset, br: c.preadReader}
 	}
 	return c
 }
@@ -356,13 +398,25 @@ func (s *segmentCursorReplaceReusable) parseInto() (*segmentReplaceNode, error) 
 			return nil, lsmkv.NotFound
 		}
 		s.reusableBORW.ResetBuffer(buf)
-		if err := ParseReplaceNodeIntoMMAP(&s.reusableBORW, s.segment.secondaryIndexCount, &s.reusableNode); err != nil {
+		var err error
+		if s.valuePrefixLen > 0 {
+			err = ParseReplaceNodeDigestIntoMMAP(&s.reusableBORW, s.segment.secondaryIndexCount, s.valuePrefixLen, &s.reusableNode)
+		} else {
+			err = ParseReplaceNodeIntoMMAP(&s.reusableBORW, s.segment.secondaryIndexCount, &s.reusableNode)
+		}
+		if err != nil {
 			return &s.reusableNode, err
 		}
 	} else {
 		s.preadOffset.off = int64(s.currOffset)
 		s.preadReader.Reset(s.preadOffset)
-		if err := ParseReplaceNodeIntoPread(s.preadReader, s.segment.secondaryIndexCount, &s.reusableNode); err != nil {
+		var err error
+		if s.valuePrefixLen > 0 {
+			err = ParseReplaceNodeDigestIntoPread(s.preadSkip, s.segment.secondaryIndexCount, s.valuePrefixLen, &s.reusableNode)
+		} else {
+			err = ParseReplaceNodeIntoPread(s.preadReader, s.segment.secondaryIndexCount, &s.reusableNode)
+		}
+		if err != nil {
 			return &s.reusableNode, err
 		}
 	}
@@ -411,6 +465,19 @@ func (sg *SegmentGroup) newReusableCursors() ([]innerCursorReplace, func()) {
 	out := make([]innerCursorReplace, len(segments))
 	for i, segment := range segments {
 		out[i] = &reusableInnerCursorReplace{c: segment.newReplaceCursorReusable()}
+	}
+
+	return out, release
+}
+
+// newDigestReusableCursors mirrors newReusableCursors but puts every segment
+// cursor in digest mode, retaining only the first valuePrefixLen value bytes.
+func (sg *SegmentGroup) newDigestReusableCursors(valuePrefixLen int) ([]innerCursorReplace, func()) {
+	segments, release := sg.getConsistentViewOfSegments()
+
+	out := make([]innerCursorReplace, len(segments))
+	for i, segment := range segments {
+		out[i] = &reusableInnerCursorReplace{c: segment.newReplaceCursorDigestReusable(valuePrefixLen)}
 	}
 
 	return out, release
