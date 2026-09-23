@@ -281,6 +281,51 @@ start_server {tags {"string"}} {
         list [r msetnx x1{t} xxx x1{t} zzz] [r get x1{t}]
     } {0 yyy}
 
+    test {MSETEX sets multiple keys and a shared TTL} {
+        r del mx1{t} mx2{t}
+        assert_equal 1 [r msetex 2 mx1{t} a mx2{t} b EX 100]
+        assert_equal {a b} [r mget mx1{t} mx2{t}]
+        assert_range [r ttl mx1{t}] 90 100
+        assert_range [r ttl mx2{t}] 90 100
+    }
+
+    test {MSETEX NX and XX apply to every key} {
+        r del mx1{t} mx2{t} mx3{t}
+        assert_equal 1 [r msetex 2 mx1{t} a mx2{t} b NX]
+        assert_equal 0 [r msetex 2 mx1{t} c mx3{t} d NX]
+        assert_equal a [r get mx1{t}]
+        assert_equal 0 [r exists mx3{t}]
+        assert_equal 0 [r msetex 2 mx1{t} c mx3{t} d XX]
+        assert_equal a [r get mx1{t}]
+        assert_equal 1 [r msetex 2 mx1{t} c mx2{t} d XX]
+        assert_equal {c d} [r mget mx1{t} mx2{t}]
+    }
+
+    test {MSETEX KEEPTTL preserves existing expirations} {
+        r set mx1{t} old EX 50
+        r set mx2{t} old PX 50000
+        assert_equal 1 [r msetex 2 mx1{t} neu mx2{t} neu KEEPTTL]
+        assert_equal neu [r get mx1{t}]
+        assert_range [r ttl mx1{t}] 40 50
+        assert_range [r pttl mx2{t}] 40000 50000
+    }
+
+    test {MSETEX rejects bad numkeys, arity, and conflicting options} {
+        assert_error {*wrong number of arguments for 'msetex' command} {r msetex 1 onlykey}
+        assert_error {*numkeys should be greater than 0*} {r msetex 0 k v}
+        assert_error {*numkeys should be greater than 0*} {r msetex 2 k v}
+        assert_error {ERR syntax error} {r msetex 1 k v NX XX}
+        assert_error {ERR syntax error} {r msetex 1 k v EX 10 KEEPTTL}
+        assert_error {ERR*invalid expire time*} {r msetex 1 k v EX 0}
+        assert_error {ERR*not an integer*} {r msetex zz k v}
+    }
+
+    test {MSETEX COMMAND GETKEYS returns each key} {
+        assert_equal {mx1{t} mx2{t}} [r command getkeys msetex 2 mx1{t} a mx2{t} b EX 10]
+        assert_equal {{mx1{t} {OW update insert}} {mx2{t} {OW update insert}}} \
+            [r command getkeysandflags msetex 2 mx1{t} a mx2{t} b NX]
+    }
+
     test "STRLEN against non-existing key" {
         assert_equal 0 [r strlen notakey]
     }
