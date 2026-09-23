@@ -3,6 +3,7 @@ package activity
 import (
 	"cmp"
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/searchattribute/sadefs"
 	serviceerrors "go.temporal.io/server/common/serviceerror"
+	"go.temporal.io/server/common/testing/protorequire"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
@@ -1339,6 +1341,97 @@ func TestHandleResetRequestID(t *testing.T) {
 		require.Error(t, err)
 		require.Equal(t, "previous-reset-request-id", activity.GetLastResetRequestId())
 	})
+}
+
+// Reset rewinds the attempt counter but preserves heartbeat details unless ResetHeartbeat is set.
+// When a worker still owns the attempt, the heartbeat details are left in place and the clear
+// intent is recorded for when the worker yields.
+func TestHandleResetHeartbeat(t *testing.T) {
+	testCases := []struct {
+		name           string
+		status         activitypb.ActivityExecutionStatus
+		keepPaused     bool
+		expectedStatus activitypb.ActivityExecutionStatus
+		deferred       bool
+	}{
+		{
+			name:           "scheduled",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+		},
+		{
+			name:           "paused",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+		},
+		{
+			name:           "paused keepPaused",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED,
+			keepPaused:     true,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED,
+		},
+		{
+			name:           "started",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED,
+			deferred:       true,
+		},
+		{
+			name:           "pause requested keepPaused",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_PAUSE_REQUESTED,
+			keepPaused:     true,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED,
+			deferred:       true,
+		},
+	}
+
+	for _, tc := range testCases {
+		for _, resetHeartbeat := range []bool{false, true} {
+			t.Run(tc.name+"/resetHeartbeat="+strconv.FormatBool(resetHeartbeat), func(t *testing.T) {
+				ctx := newOperatorCommandTestContext(t)
+				heartbeatDetails := &commonpb.Payloads{Payloads: []*commonpb.Payload{{Data: []byte("checkpoint")}}}
+				activity := &Activity{
+					ActivityState: &activitypb.ActivityState{
+						ActivityType: &commonpb.ActivityType{Name: "test-activity-type"},
+						Status:       tc.status,
+						TaskQueue:    &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+						ScheduleTime: timestamppb.New(time.Unix(0, 0)),
+					},
+					LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{Count: 3}),
+					LastHeartbeat: chasm.NewDataField(ctx, &activitypb.ActivityHeartbeatState{
+						Details:      heartbeatDetails,
+						RecordedTime: timestamppb.New(time.Unix(0, 0)),
+					}),
+				}
+
+				_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+					FrontendRequest: &workflowservice.ResetActivityExecutionRequest{
+						KeepPaused:     tc.keepPaused,
+						ResetHeartbeat: resetHeartbeat,
+					},
+				})
+				require.NoError(t, err)
+				require.Equal(t, tc.expectedStatus, activity.GetStatus())
+
+				heartbeat := activity.LastHeartbeat.Get(ctx)
+				if tc.deferred {
+					require.Equal(t, int32(3), activity.LastAttempt.Get(ctx).GetCount(), "in-flight attempt must be undisturbed")
+					require.Equal(t, resetHeartbeat, activity.GetResetShouldClearHeartbeat())
+					protorequire.ProtoEqual(t, heartbeatDetails, heartbeat.GetDetails())
+					return
+				}
+				require.Equal(t, int32(1), activity.LastAttempt.Get(ctx).GetCount())
+				require.False(t, activity.GetResetShouldClearHeartbeat())
+				if resetHeartbeat {
+					require.Nil(t, heartbeat.GetDetails())
+					require.Nil(t, heartbeat.GetRecordedTime())
+				} else {
+					protorequire.ProtoEqual(t, heartbeatDetails, heartbeat.GetDetails())
+					require.NotNil(t, heartbeat.GetRecordedTime())
+				}
+			})
+		}
+	}
 }
 
 func TestUpdateActivityExecutionOptionsRequestID(t *testing.T) {
