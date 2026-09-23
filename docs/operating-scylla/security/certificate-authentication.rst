@@ -44,6 +44,32 @@ Procedure
 
    Restart the cluster.
 
+Certificate or password on the same port
+-----------------------------------------
+
+``CertificateAuthenticator`` accepts only certificate logins. To let legacy password clients and certificate clients share one CQL endpoint during a migration, select ``CertificateOrPasswordAuthenticator``.
+
+* A connection that presents a trusted client certificate is authenticated from that certificate, using the same ``auth_certificate_role_queries`` subject and SAN rules. No SASL username/password exchange is performed.
+* A connection with no client certificate — a plain (non-TLS) CQL connection, or TLS with client authentication not required — uses normal username/password SASL authentication, including ``CREATE ROLE`` / ``ALTER ROLE`` password options.
+* If a certificate is presented but does not match a role query, authentication fails. The server does not fall back to a password. A certificate the trust store does not accept fails during the TLS handshake, before password authentication can run.
+
+Set ``require_client_auth`` to ``optional`` (request a certificate, do not require one). ``true`` rejects password-only clients at the handshake, so they never reach SASL. ``false`` never asks for a certificate, so every TLS client uses the password path.
+
+.. code-block:: yaml
+
+   authenticator: com.scylladb.auth.CertificateOrPasswordAuthenticator
+   auth_certificate_role_queries:
+            - source: SUBJECT
+            query: CN=([^,\s]+)
+   client_encryption_options:
+      enabled: True
+      certificate: <server cert>
+      keyfile: <server key>
+      truststore: <shared trust>
+      require_client_auth: optional
+
+The short name ``CertificateOrPasswordAuthenticator`` is accepted as well.
+
 
 Additional Resources
 --------------------
