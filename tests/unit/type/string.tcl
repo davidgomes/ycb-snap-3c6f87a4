@@ -272,6 +272,49 @@ start_server {tags {"string"}} {
         list [r msetnx x1{t} xxx y2{t} yyy] [r get x1{t}] [r get y2{t}]
     } {1 xxx yyy}
 
+    test {MSETEX basic with EX and PX} {
+        r del m1{t} m2{t}
+        assert_equal 1 [r msetex 2 m1{t} a m2{t} b ex 100]
+        assert_equal {a b} [r mget m1{t} m2{t}]
+        assert_range [r ttl m2{t}] 90 100
+        assert_equal 1 [r msetex 1 m1{t} c px 100000]
+        assert_range [r pttl m1{t}] 90000 100000
+    }
+
+    test {MSETEX NX / XX} {
+        r del m1{t} m2{t} m3{t}
+        r set m1{t} x
+        assert_equal 0 [r msetex 2 m1{t} a m2{t} b nx]
+        assert_equal 0 [r exists m2{t}]
+        assert_equal 0 [r msetex 2 m1{t} a m3{t} b xx]
+        assert_equal x [r get m1{t}]
+        assert_equal 1 [r msetex 2 m2{t} a m3{t} b nx]
+        assert_equal 1 [r msetex 2 m1{t} y m2{t} z xx]
+        assert_equal {y z} [r mget m1{t} m2{t}]
+    }
+
+    test {MSETEX KEEPTTL and past EXAT} {
+        r del m1{t}
+        r set m1{t} a ex 100
+        assert_equal 1 [r msetex 1 m1{t} b keepttl]
+        assert_range [r ttl m1{t}] 90 100
+        assert_equal 1 [r msetex 1 m1{t} c exat 1]
+        assert_equal 0 [r exists m1{t}]
+    }
+
+    test {MSETEX errors} {
+        assert_error {*numkeys*} {r msetex 0 a 1}
+        assert_error {*wrong number of arguments*} {r msetex 2 a 1}
+        assert_error {*syntax*} {r msetex 1 a 1 nx xx}
+        assert_error {*syntax*} {r msetex 1 a 1 ex 10 px 10}
+        assert_error {*syntax*} {r msetex 1 a 1 ex}
+        assert_error {*invalid expire*} {r msetex 1 a 1 ex 0}
+    }
+
+    test {MSETEX GETKEYS} {
+        r command getkeys msetex 2 a 1 b 2 nx ex 10
+    } {a b}
+
     test {MSETNX with not existing keys - same key twice} {
         r del x1{t}
         list [r msetnx x1{t} xxx x1{t} yyy] [r get x1{t}]

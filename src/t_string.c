@@ -555,6 +555,95 @@ void msetnxCommand(client *c) {
     msetGenericCommand(c, 1);
 }
 
+/* MSETEX numkeys key value [key value ...] [NX | XX]
+ *     [EX seconds | PX milliseconds |
+ *      EXAT seconds-timestamp | PXAT milliseconds-timestamp | KEEPTTL] */
+void msetexCommand(client *c) {
+    long numkeys;
+    int flags = ARGS_NO_FLAGS;
+    int unit = UNIT_SECONDS;
+    robj *expire = NULL;
+    mstime_t milliseconds = 0;
+    int j;
+
+    if (getRangeLongFromObjectOrReply(c, c->argv[1], 1, INT_MAX, &numkeys, "numkeys should be greater than 0") != C_OK)
+        return;
+    if (numkeys > (c->argc - 2) / 2) {
+        addReplyErrorArity(c);
+        return;
+    }
+    int first_opt = 2 + (int)numkeys * 2;
+
+    for (j = first_opt; j < c->argc; j++) {
+        char *opt = objectGetVal(c->argv[j]);
+        robj *next = (j == c->argc - 1) ? NULL : c->argv[j + 1];
+        int exp_flag = 0;
+        if (!strcasecmp(opt, "nx") && !(flags & (ARGS_SET_NX | ARGS_SET_XX))) {
+            flags |= ARGS_SET_NX;
+        } else if (!strcasecmp(opt, "xx") && !(flags & (ARGS_SET_NX | ARGS_SET_XX))) {
+            flags |= ARGS_SET_XX;
+        } else if (!strcasecmp(opt, "keepttl") && !(flags & (ARGS_KEEPTTL | ARGS_EX | ARGS_PX | ARGS_EXAT | ARGS_PXAT))) {
+            flags |= ARGS_KEEPTTL;
+        } else if (!(flags & (ARGS_KEEPTTL | ARGS_EX | ARGS_PX | ARGS_EXAT | ARGS_PXAT)) && next &&
+                   ((!strcasecmp(opt, "ex") && (exp_flag = ARGS_EX)) ||
+                    (!strcasecmp(opt, "px") && (exp_flag = ARGS_PX)) ||
+                    (!strcasecmp(opt, "exat") && (exp_flag = ARGS_EXAT)) ||
+                    (!strcasecmp(opt, "pxat") && (exp_flag = ARGS_PXAT)))) {
+            flags |= exp_flag;
+            unit = (exp_flag & (ARGS_PX | ARGS_PXAT)) ? UNIT_MILLISECONDS : UNIT_SECONDS;
+            expire = next;
+            j++;
+        } else {
+            addReplyErrorObject(c, shared.syntaxerr);
+            return;
+        }
+    }
+
+    if (expire && getExpireMillisecondsOrReply(c, expire, flags, unit, &milliseconds) != C_OK) return;
+
+    if (flags & (ARGS_SET_NX | ARGS_SET_XX)) {
+        for (j = 2; j < first_opt; j += 2) {
+            int found = lookupKeyWrite(c->db, c->argv[j]) != NULL;
+            if ((flags & ARGS_SET_NX && found) || (flags & ARGS_SET_XX && !found)) {
+                addReply(c, shared.czero);
+                return;
+            }
+        }
+    }
+
+    int expired = expire && checkAlreadyExpired(milliseconds);
+    int setkey_flags = (expire || (flags & ARGS_KEEPTTL)) ? SETKEY_KEEPTTL : 0;
+    robj *ms_obj = expire ? createStringObjectFromLongLong(milliseconds) : NULL;
+
+    for (j = 2; j < first_opt; j += 2) {
+        robj *key = c->argv[j];
+        if (expired) {
+            if (lookupKeyWrite(c->db, key) != NULL) deleteExpiredKeyFromOverwriteAndPropagate(c, key);
+            continue;
+        }
+        robj *val = tryObjectEncoding(c->argv[j + 1]);
+        setKey(c, c->db, key, &val, setkey_flags);
+        if (expire) val = setExpire(c, c->db, key, milliseconds);
+        incrRefCount(val);
+        c->argv[j + 1] = val;
+        server.dirty++;
+        notifyKeyspaceEvent(NOTIFY_STRING, "set", key, c->db->id);
+        if (expire) {
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "expire", key, c->db->id);
+            robj *argv[5] = {shared.set, key, val, shared.pxat, ms_obj};
+            alsoPropagate(c->db->id, argv, 5, PROPAGATE_AOF | PROPAGATE_REPL,
+                          c->slot);
+        } else {
+            robj *argv[4] = {shared.set, key, val, shared.keepttl};
+            alsoPropagate(c->db->id, argv, (flags & ARGS_KEEPTTL) ? 4 : 3, PROPAGATE_AOF | PROPAGATE_REPL,
+                          c->slot);
+        }
+    }
+    if (ms_obj) decrRefCount(ms_obj);
+    preventCommandPropagation(c);
+    addReply(c, shared.cone);
+}
+
 void incrDecrCommand(client *c, long long incr) {
     long long value, oldvalue;
     robj *o, *new;
