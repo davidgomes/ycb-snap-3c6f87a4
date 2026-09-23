@@ -373,7 +373,7 @@ func (s *stateRebuilderSuite) TestRebuild() {
 }
 
 func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
-	requestID := uuid.NewString()
+	startRequestID := uuid.NewString()
 	version := int64(12)
 	lastEventID := int64(2)
 	branchToken := []byte("other random branch token")
@@ -460,6 +460,12 @@ func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
 
 	s.mockTaskRefresher.EXPECT().Refresh(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 	currentMutableState := &persistencespb.WorkflowMutableState{
+		ExecutionState: &persistencespb.WorkflowExecutionState{
+			CreateRequestId: uuid.NewString(),
+			RequestIds: map[string]*persistencespb.RequestIDInfo{
+				startRequestID: {EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, EventId: common.FirstEventID},
+			},
+		},
 		ExecutionInfo: &persistencespb.WorkflowExecutionInfo{
 			TransitionHistory: []*persistencespb.VersionedTransition{
 				{
@@ -479,7 +485,6 @@ func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
 		util.Ptr(version),
 		definition.NewWorkflowKey(targetNamespaceID.String(), targetWorkflowID, targetRunID),
 		targetBranchToken,
-		requestID,
 		currentMutableState,
 	)
 	s.NoError(err)
@@ -498,4 +503,29 @@ func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
 	s.Equal(timestamp.TimeValue(rebuildMutableState.GetExecutionState().StartTime), s.now)
 	s.Equal(expectedLastFirstTransactionID, rebuildExecutionInfo.LastFirstEventTxnId)
 	s.Equal(int64(11), rebuildExecutionInfo.TransitionHistory[0].TransitionCount)
+	s.Equal(startRequestID, rebuildMutableState.GetExecutionState().CreateRequestId)
+	s.Equal(enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, rebuildMutableState.GetExecutionState().GetRequestIds()[startRequestID].GetEventType())
+}
+
+func (s *stateRebuilderSuite) TestFindStartRequestID() {
+	startRequestID := uuid.NewString()
+	attachedRequestID := uuid.NewString()
+
+	s.Equal(startRequestID, findStartRequestID(&persistencespb.WorkflowExecutionState{
+		CreateRequestId: uuid.NewString(),
+		RequestIds: map[string]*persistencespb.RequestIDInfo{
+			attachedRequestID: {EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED, EventId: 5},
+			startRequestID:    {EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, EventId: common.FirstEventID},
+		},
+	}))
+
+	createRequestID := uuid.NewString()
+	s.Equal(createRequestID, findStartRequestID(&persistencespb.WorkflowExecutionState{
+		CreateRequestId: createRequestID,
+		RequestIds: map[string]*persistencespb.RequestIDInfo{
+			attachedRequestID: {EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED, EventId: 5},
+		},
+	}))
+
+	s.Empty(findStartRequestID(nil))
 }

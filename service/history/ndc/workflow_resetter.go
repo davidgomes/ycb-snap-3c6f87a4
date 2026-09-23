@@ -59,7 +59,6 @@ type (
 			baseRebuildLastEventVersion int64,
 			baseNextEventID int64,
 			resetRunID string,
-			resetRequestID string,
 			baseWorkflow Workflow,
 			currentWorkflow Workflow,
 			resetReason string,
@@ -115,7 +114,6 @@ func (r *workflowResetterImpl) ResetWorkflow(
 	baseRebuildLastEventVersion int64,
 	baseNextEventID int64,
 	resetRunID string,
-	resetRequestID string,
 	baseWorkflow Workflow,
 	currentWorkflow Workflow,
 	resetReason string,
@@ -203,6 +201,11 @@ func (r *workflowResetterImpl) ResetWorkflow(
 		}
 	}
 
+	// The reset run replays the base run's WorkflowExecutionStarted event, so it keeps the original start
+	// request ID (the base run may itself be a reset run that already inherited it). Start-event completion
+	// callbacks are keyed by that request ID and must keep matching the originating caller.
+	startRequestID := findStartRequestID(baseWorkflow.GetMutableState().GetExecutionState())
+
 	resetWorkflow, err := r.prepareResetWorkflow(
 		ctx,
 		namespaceID,
@@ -212,7 +215,7 @@ func (r *workflowResetterImpl) ResetWorkflow(
 		baseRebuildLastEventID,
 		baseRebuildLastEventVersion,
 		resetRunID,
-		resetRequestID,
+		startRequestID,
 		resetWorkflowVersion,
 		resetReason,
 		allowResetWithPendingChildren,
@@ -263,7 +266,7 @@ func (r *workflowResetterImpl) prepareResetWorkflow(
 	baseRebuildLastEventID int64,
 	baseRebuildLastEventVersion int64,
 	resetRunID string,
-	resetRequestID string,
+	startRequestID string,
 	resetWorkflowVersion int64,
 	resetReason string,
 	allowResetWithPendingChildren bool,
@@ -278,7 +281,7 @@ func (r *workflowResetterImpl) prepareResetWorkflow(
 		baseRebuildLastEventID,
 		baseRebuildLastEventVersion,
 		resetRunID,
-		resetRequestID,
+		startRequestID,
 	)
 	if err != nil {
 		return nil, err
@@ -434,7 +437,7 @@ func (r *workflowResetterImpl) replayResetWorkflow(
 	baseRebuildLastEventID int64,
 	baseRebuildLastEventVersion int64,
 	resetRunID string,
-	resetRequestID string,
+	startRequestID string,
 ) (Workflow, error) {
 
 	resetBranchToken, err := r.forkAndGenerateBranchToken(
@@ -479,7 +482,7 @@ func (r *workflowResetterImpl) replayResetWorkflow(
 			resetRunID,
 		),
 		resetBranchToken,
-		resetRequestID,
+		startRequestID,
 	)
 	if err != nil {
 		return nil, err

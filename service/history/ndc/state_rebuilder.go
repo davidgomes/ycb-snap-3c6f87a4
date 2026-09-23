@@ -7,6 +7,7 @@ import (
 	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
+	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/serviceerror"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
@@ -48,7 +49,6 @@ type (
 			baseLastEventVersion *int64,
 			targetWorkflowIdentifier definition.WorkflowKey,
 			targetBranchToken []byte,
-			requestID string,
 			currentMutableState *persistencespb.WorkflowMutableState,
 		) (historyi.MutableState, RebuildStats, error)
 	}
@@ -158,7 +158,6 @@ func (r *StateRebuilderImpl) RebuildWithCurrentMutableState(
 	baseLastEventVersion *int64,
 	targetWorkflowIdentifier definition.WorkflowKey,
 	targetBranchToken []byte,
-	requestID string,
 	currentMutableState *persistencespb.WorkflowMutableState,
 ) (historyi.MutableState, RebuildStats, error) {
 	rebuiltMutableState, lastTxnId, err := r.buildMutableStateFromEvent(
@@ -170,7 +169,7 @@ func (r *StateRebuilderImpl) RebuildWithCurrentMutableState(
 		baseLastEventVersion,
 		targetWorkflowIdentifier,
 		targetBranchToken,
-		requestID,
+		findStartRequestID(currentMutableState.GetExecutionState()),
 	)
 	if err != nil {
 		return nil, RebuildStats{}, err
@@ -397,4 +396,17 @@ func (r *StateRebuilderImpl) getPaginationFn(
 		}
 		return paginateItems, resp.NextPageToken, nil
 	}
+}
+
+// findStartRequestID returns the request ID that started the workflow execution. Completion callbacks
+// attached via the start event are keyed by this request ID (e.g. the scheduler matches completions to
+// its BufferedStart entries with it), so it must be preserved when mutable state is rebuilt or reset.
+// Falls back to CreateRequestId if no request ID is recorded for the WorkflowExecutionStarted event.
+func findStartRequestID(executionState *persistencespb.WorkflowExecutionState) string {
+	for requestID, info := range executionState.GetRequestIds() {
+		if info.GetEventType() == enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED {
+			return requestID
+		}
+	}
+	return executionState.GetCreateRequestId()
 }
