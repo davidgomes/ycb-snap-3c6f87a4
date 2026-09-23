@@ -394,7 +394,7 @@ create_materialization_table(MaterializationHypertableColumnInfo *matcolinfo, in
 	int32 mat_htid;
 	Oid mat_relid;
 	Cache *hcache;
-	Hypertable *mat_ht = NULL, *orig_ht = NULL;
+	Hypertable *mat_ht = NULL;
 	Oid owner = GetUserId();
 
 	create = makeNode(CreateStmt);
@@ -440,8 +440,7 @@ create_materialization_table(MaterializationHypertableColumnInfo *matcolinfo, in
 	 * aggregate. This is the initial state of the aggregate before any
 	 * refreshes.
 	 */
-	orig_ht = ts_hypertable_cache_get_entry(hcache, bucket_info->htoid, CACHE_FLAG_NONE);
-	continuous_agg_invalidate_mat_ht(orig_ht, mat_ht, TS_TIME_NOBEGIN, TS_TIME_NOEND);
+	invalidation_cagg_log_add_entry(mat_ht->fd.id, TS_TIME_NOBEGIN, TS_TIME_NOEND);
 	ts_cache_release(&hcache);
 	return mat_htid;
 }

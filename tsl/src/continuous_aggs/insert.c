@@ -190,6 +190,9 @@ get_cache_inval_entry(int32 hypertable_id, Oid chunk_relid)
 void
 continuous_agg_invalidate_range(int32 hypertable_id, Oid chunk_relid, int64 start, int64 end)
 {
+	if (ts_guc_skip_cagg_invalidation)
+		return;
+
 	ContinuousAggsCacheInvalEntry *cache_entry = get_cache_inval_entry(hypertable_id, chunk_relid);
 
 	cache_entry->value_is_set = true;
@@ -208,6 +211,9 @@ void
 continuous_agg_dml_invalidate(int32 hypertable_id, Relation chunk_rel, HeapTuple chunk_tuple,
 							  HeapTuple chunk_newtuple, bool update)
 {
+	if (ts_guc_skip_cagg_invalidation)
+		return;
+
 	ContinuousAggsCacheInvalEntry *cache_entry =
 		get_cache_inval_entry(hypertable_id, chunk_rel->rd_id);
 
