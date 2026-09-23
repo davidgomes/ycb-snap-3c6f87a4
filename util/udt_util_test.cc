@@ -226,11 +226,11 @@ TEST_F(HandleTimestampSizeDifferenceTest, AllColumnFamiliesConsistent) {
   // All `check_mode` pass with OK status and `batch` not checked or updated.
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kVerifyConsistency));
+      TimestampSizeConsistencyMode::kVerifyConsistency, false, true));
   std::unique_ptr<WriteBatch> new_batch(nullptr);
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency, false, true, &new_batch));
   ASSERT_TRUE(new_batch.get() == nullptr);
 }
 
@@ -245,11 +245,11 @@ TEST_F(HandleTimestampSizeDifferenceTest,
   // All `check_mode` pass with OK status and `batch` not checked or updated.
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kVerifyConsistency));
+      TimestampSizeConsistencyMode::kVerifyConsistency, false, true));
   std::unique_ptr<WriteBatch> new_batch(nullptr);
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency, false, true, &new_batch));
   ASSERT_TRUE(new_batch.get() == nullptr);
 }
 
@@ -263,11 +263,11 @@ TEST_F(HandleTimestampSizeDifferenceTest, InvolvedColumnFamiliesConsistent) {
   // All `check_mode` pass with OK status and `batch` not updated.
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kVerifyConsistency));
+      TimestampSizeConsistencyMode::kVerifyConsistency, false, true));
   std::unique_ptr<WriteBatch> new_batch(nullptr);
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency, false, true, &new_batch));
   ASSERT_TRUE(new_batch.get() == nullptr);
 }
 
@@ -282,13 +282,13 @@ TEST_F(HandleTimestampSizeDifferenceTest,
   // families.
   ASSERT_TRUE(HandleWriteBatchTimestampSizeDifference(
                   &batch, running_ts_sz, record_ts_sz,
-                  TimestampSizeConsistencyMode::kVerifyConsistency)
+                  TimestampSizeConsistencyMode::kVerifyConsistency, false, true)
                   .IsInvalidArgument());
 
   std::unique_ptr<WriteBatch> new_batch(nullptr);
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency, false, true, &new_batch));
   ASSERT_TRUE(new_batch.get() != nullptr);
   CheckContentsWithTimestampStripping(batch, *new_batch, sizeof(uint64_t),
                                       std::nullopt /* dropped_cf */);
@@ -307,13 +307,13 @@ TEST_F(HandleTimestampSizeDifferenceTest,
   // families.
   ASSERT_TRUE(HandleWriteBatchTimestampSizeDifference(
                   &batch, running_ts_sz, record_ts_sz,
-                  TimestampSizeConsistencyMode::kVerifyConsistency)
+                  TimestampSizeConsistencyMode::kVerifyConsistency, false, true)
                   .IsInvalidArgument());
 
   std::unique_ptr<WriteBatch> new_batch(nullptr);
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency, false, true, &new_batch));
   ASSERT_TRUE(new_batch.get() != nullptr);
   CheckContentsWithTimestampPadding(batch, *new_batch, sizeof(uint64_t));
 }
@@ -331,7 +331,7 @@ TEST_F(HandleTimestampSizeDifferenceTest,
   // and all related entries copied over to the new WriteBatch.
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency, false, true, &new_batch));
 
   ASSERT_TRUE(new_batch.get() != nullptr);
   CheckContentsWithTimestampStripping(batch, *new_batch, sizeof(uint64_t),
@@ -346,12 +346,12 @@ TEST_F(HandleTimestampSizeDifferenceTest, UnrecoverableInconsistency) {
 
   ASSERT_TRUE(HandleWriteBatchTimestampSizeDifference(
                   &batch, running_ts_sz, record_ts_sz,
-                  TimestampSizeConsistencyMode::kVerifyConsistency)
+                  TimestampSizeConsistencyMode::kVerifyConsistency, false, true)
                   .IsInvalidArgument());
 
   ASSERT_TRUE(HandleWriteBatchTimestampSizeDifference(
                   &batch, running_ts_sz, record_ts_sz,
-                  TimestampSizeConsistencyMode::kReconcileInconsistency)
+                  TimestampSizeConsistencyMode::kReconcileInconsistency, false, true)
                   .IsInvalidArgument());
 }
 
