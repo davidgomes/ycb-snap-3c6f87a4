@@ -680,6 +680,68 @@ TEST(DefaultCertValidatorTest, WithVerifyDepth) {
   EXPECT_EQ(X509_STORE_CTX_get_error(store_ctx.get()), X509_V_OK);
 }
 
+TEST(DefaultCertValidatorTest, SuppressClientCaList) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  Stats::TestUtil::TestStore test_store;
+  SslStats stats = generateSslStats(*test_store.rootScope());
+  envoy::config::core::v3::TypedExtensionConfig typed_conf;
+  const std::string ca_certs = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
+      "{{ test_rundir }}/test/common/tls/test_data/ca_certificates.pem"));
+
+  {
+    TestCertificateValidationContextConfig config(typed_conf, false, {}, ca_certs);
+    DefaultCertValidator validator(&config, stats, context);
+    SSLContextPtr ssl_ctx = SSL_CTX_new(TLS_method());
+    ASSERT_TRUE(validator.addClientValidationContext(ssl_ctx.get(), true).ok());
+    EXPECT_EQ(2U, sk_X509_NAME_num(SSL_CTX_get_client_CA_list(ssl_ctx.get())));
+    EXPECT_EQ(SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+              SSL_CTX_get_verify_mode(ssl_ctx.get()));
+  }
+
+  {
+    TestCertificateValidationContextConfig config(typed_conf, false, {}, ca_certs, absl::nullopt,
+                                                  true);
+    DefaultCertValidator validator(&config, stats, context);
+    SSLContextPtr ssl_ctx = SSL_CTX_new(TLS_method());
+    ASSERT_TRUE(validator.addClientValidationContext(ssl_ctx.get(), true).ok());
+    EXPECT_EQ(0U, sk_X509_NAME_num(SSL_CTX_get_client_CA_list(ssl_ctx.get())));
+    EXPECT_EQ(SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+              SSL_CTX_get_verify_mode(ssl_ctx.get()));
+  }
+}
+
+TEST(DefaultCertValidatorTest, SuppressClientCaListChangesSessionIdDigest) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  Stats::TestUtil::TestStore test_store;
+  SslStats stats = generateSslStats(*test_store.rootScope());
+  envoy::config::core::v3::TypedExtensionConfig typed_conf;
+  const std::string ca_certs = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
+      "{{ test_rundir }}/test/common/tls/test_data/ca_certificates.pem"));
+
+  auto session_id_digest = [&](bool suppress_client_ca_list) {
+    TestCertificateValidationContextConfig config(typed_conf, false, {}, ca_certs, absl::nullopt,
+                                                  suppress_client_ca_list);
+    DefaultCertValidator validator(&config, stats, context);
+    SSLContextPtr ssl_ctx = SSL_CTX_new(TLS_method());
+    EXPECT_TRUE(
+        validator.initializeSslContexts({ssl_ctx.get()}, false, *test_store.rootScope()).ok());
+
+    uint8_t hash_buffer[EVP_MAX_MD_SIZE];
+    bssl::ScopedEVP_MD_CTX md;
+    EXPECT_EQ(1, EVP_DigestInit(md.get(), EVP_sha256()));
+    validator.updateDigestForSessionId(md, hash_buffer, SHA256_DIGEST_LENGTH);
+    std::vector<uint8_t> digest(EVP_MAX_MD_SIZE);
+    unsigned digest_length = 0;
+    EXPECT_EQ(1, EVP_DigestFinal(md.get(), digest.data(), &digest_length));
+    digest.resize(digest_length);
+    return digest;
+  };
+
+  EXPECT_EQ(session_id_digest(false), session_id_digest(false));
+  EXPECT_EQ(session_id_digest(true), session_id_digest(true));
+  EXPECT_NE(session_id_digest(false), session_id_digest(true));
+}
+
 class MockCertificateValidationContextConfig : public Ssl::CertificateValidationContextConfig {
 public:
   MockCertificateValidationContextConfig() : MockCertificateValidationContextConfig("") {}
@@ -712,6 +774,7 @@ public:
   bool onlyVerifyLeafCertificateCrl() const override { return false; }
   absl::optional<uint32_t> maxVerifyDepth() const override { return absl::nullopt; }
   bool autoSniSanMatch() const override { return false; }
+  bool suppressClientCaList() const override { return false; }
 
 private:
   std::string s_;
@@ -788,6 +851,7 @@ public:
   bool onlyVerifyLeafCertificateCrl() const override { return false; }
   absl::optional<uint32_t> maxVerifyDepth() const override { return absl::nullopt; }
   bool autoSniSanMatch() const override { return false; }
+  bool suppressClientCaList() const override { return false; }
 
 private:
   std::string ca_name_;

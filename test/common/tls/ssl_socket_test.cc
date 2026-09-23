@@ -4328,6 +4328,114 @@ TEST_P(SslSocketTest, ClientAuthMultipleCAs) {
   EXPECT_EQ(1UL, server_stats_store.counter("ssl.handshake").value());
 }
 
+// Verify that with `suppress_client_ca_list` the server advertises no acceptable client
+// certificate CA names, while still requiring and verifying the client certificate against the
+// trusted CAs.
+TEST_P(SslSocketTest, ClientAuthSuppressClientCaList) {
+  const std::string server_ctx_yaml = R"EOF(
+  require_client_certificate: true
+  common_tls_context:
+    tls_certificates:
+      certificate_chain:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_cert.pem"
+      private_key:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_key.pem"
+    validation_context:
+      trusted_ca:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/ca_certificates.pem"
+      suppress_client_ca_list: true
+)EOF";
+
+  const std::string client_ctx_yaml = R"EOF(
+  common_tls_context:
+    tls_certificates:
+      certificate_chain:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/no_san_cert.pem"
+      private_key:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/no_san_key.pem"
+)EOF";
+
+  for (const auto& [tls_version, tls_version_name] : std::vector<std::pair<
+           envoy::extensions::transport_sockets::tls::v3::TlsParameters::TlsProtocol, std::string>>{
+           {envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_2, "TLSv1.2"},
+           {envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_3, "TLSv1.3"}}) {
+    SCOPED_TRACE(tls_version_name);
+
+    envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext server_tls_context;
+    TestUtility::loadFromYaml(TestEnvironment::substitute(server_ctx_yaml), server_tls_context);
+    auto server_cfg =
+        *ServerContextConfigImpl::create(server_tls_context, factory_context_, {}, false);
+    NiceMock<Server::Configuration::MockServerFactoryContext> server_factory_context;
+    ContextManagerImpl manager(server_factory_context);
+    Stats::TestUtil::TestStore server_stats_store;
+    auto server_ssl_socket_factory = *ServerSslSocketFactory::create(
+        std::move(server_cfg), manager, *server_stats_store.rootScope());
+
+    auto socket = std::make_shared<Network::Test::TcpListenSocketImmediateListen>(
+        Network::Test::getCanonicalLoopbackAddress(version_));
+    Network::MockTcpListenerCallbacks callbacks;
+    NiceMock<Network::MockListenerConfig> listener_config;
+    Server::ThreadLocalOverloadStateOptRef overload_state;
+    Network::ListenerPtr listener =
+        createListener(socket, callbacks, runtime_, listener_config, overload_state, *dispatcher_);
+
+    envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls_context;
+    TestUtility::loadFromYaml(TestEnvironment::substitute(client_ctx_yaml), tls_context);
+    auto* client_params = tls_context.mutable_common_tls_context()->mutable_tls_params();
+    client_params->set_tls_minimum_protocol_version(tls_version);
+    client_params->set_tls_maximum_protocol_version(tls_version);
+    auto client_cfg = *ClientContextConfigImpl::create(tls_context, factory_context_);
+    Stats::TestUtil::TestStore client_stats_store;
+    auto ssl_socket_factory = *ClientSslSocketFactory::create(std::move(client_cfg), manager,
+                                                              *client_stats_store.rootScope());
+    Network::ClientConnectionPtr client_connection = dispatcher_->createClientConnection(
+        socket->connectionInfoProvider().localAddress(), Network::Address::InstanceConstSharedPtr(),
+        ssl_socket_factory->createTransportSocket(nullptr, nullptr), nullptr, nullptr);
+
+    // Verify that the server sent no acceptable client certificate CA names.
+    bool cert_cb_called = false;
+    const SslHandshakerImpl* ssl_socket =
+        dynamic_cast<const SslHandshakerImpl*>(client_connection->ssl().get());
+    SSL_set_cert_cb(
+        ssl_socket->ssl(),
+        [](SSL* ssl, void* arg) -> int {
+          *static_cast<bool*>(arg) = true;
+          EXPECT_EQ(0U, sk_X509_NAME_num(SSL_get_client_CA_list(ssl)));
+          return 1;
+        },
+        &cert_cb_called);
+
+    client_connection->connect();
+
+    Network::ConnectionPtr server_connection;
+    Network::MockConnectionCallbacks server_connection_callbacks;
+    EXPECT_CALL(callbacks, onAccept_(_))
+        .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+          server_connection = dispatcher_->createServerConnection(
+              std::move(socket), server_ssl_socket_factory->createDownstreamTransportSocket(),
+              stream_info_);
+          server_connection->addConnectionCallbacks(server_connection_callbacks);
+        }));
+    EXPECT_CALL(callbacks, recordConnectionsAcceptedOnSocketEvent(_));
+
+    EXPECT_CALL(server_connection_callbacks, onEvent(Network::ConnectionEvent::Connected))
+        .WillOnce(Invoke([&](Network::ConnectionEvent) -> void {
+          EXPECT_EQ(tls_version_name, server_connection->ssl()->tlsVersion());
+          EXPECT_TRUE(server_connection->ssl()->peerCertificatePresented());
+          EXPECT_TRUE(server_connection->ssl()->peerCertificateValidated());
+          server_connection->close(Network::ConnectionCloseType::NoFlush);
+          client_connection->close(Network::ConnectionCloseType::NoFlush);
+          dispatcher_->exit();
+        }));
+    EXPECT_CALL(server_connection_callbacks, onEvent(Network::ConnectionEvent::LocalClose));
+
+    dispatcher_->run(Event::Dispatcher::RunType::Block);
+
+    EXPECT_TRUE(cert_cb_called);
+    EXPECT_EQ(1UL, server_stats_store.counter("ssl.handshake").value());
+  }
+}
+
 namespace {
 
 // Test connecting with a client to server1, then trying to reuse the session on server2
@@ -4923,6 +5031,59 @@ TEST_P(SslSocketTest, TicketSessionResumptionDifferentMatchSAN) {
   testTicketSessionResumption(server_ctx_yaml1, {}, server_ctx_yaml1, {}, client_ctx_yaml, true,
                               version_);
   testTicketSessionResumption(server_ctx_yaml1, {}, server_ctx_yaml2, {}, client_ctx_yaml, false,
+                              version_);
+}
+
+// Sessions cannot be resumed even though the server certificates are the same,
+// because of the different `suppress_client_ca_list` settings.
+TEST_P(SslSocketTest, TicketSessionResumptionDifferentSuppressClientCaList) {
+  const std::string server_ctx_yaml1 = R"EOF(
+  session_ticket_keys:
+    keys:
+      filename: "{{ test_rundir }}/test/common/tls/test_data/ticket_key_a"
+  common_tls_context:
+    tls_certificates:
+      certificate_chain:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_cert.pem"
+      private_key:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_key.pem"
+    validation_context:
+      trusted_ca:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/ca_cert.pem"
+)EOF";
+
+  const std::string server_ctx_yaml2 = R"EOF(
+  session_ticket_keys:
+    keys:
+      filename: "{{ test_rundir }}/test/common/tls/test_data/ticket_key_a"
+  common_tls_context:
+    tls_certificates:
+      certificate_chain:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_cert.pem"
+      private_key:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_key.pem"
+    validation_context:
+      trusted_ca:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/ca_cert.pem"
+      suppress_client_ca_list: true
+)EOF";
+
+  const std::string client_ctx_yaml = R"EOF(
+  common_tls_context:
+    tls_certificates:
+      certificate_chain:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/no_san_cert.pem"
+      private_key:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/no_san_key.pem"
+)EOF";
+
+  testTicketSessionResumption(server_ctx_yaml1, {}, server_ctx_yaml1, {}, client_ctx_yaml, true,
+                              version_);
+  testTicketSessionResumption(server_ctx_yaml2, {}, server_ctx_yaml2, {}, client_ctx_yaml, true,
+                              version_);
+  testTicketSessionResumption(server_ctx_yaml1, {}, server_ctx_yaml2, {}, client_ctx_yaml, false,
+                              version_);
+  testTicketSessionResumption(server_ctx_yaml2, {}, server_ctx_yaml1, {}, client_ctx_yaml, false,
                               version_);
 }
 
