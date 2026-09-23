@@ -80,6 +80,7 @@ TSDLLEXPORT int ts_guc_direct_compress_segmentby_batch_size_limit = 500;
 bool ts_guc_enable_deprecation_warnings = true;
 bool ts_guc_enable_optimizations = true;
 bool ts_guc_restoring = false;
+TSDLLEXPORT bool ts_guc_skip_cagg_invalidation = false;
 bool ts_guc_enable_constraint_aware_append = true;
 bool ts_guc_enable_ordered_append = true;
 bool ts_guc_enable_chunk_append = true;
@@ -676,6 +677,21 @@ _guc_init(void)
 							 &ts_guc_restoring,
 							 false,
 							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable(MAKE_EXTOPTION("skip_cagg_invalidation"),
+							 "Skip continuous aggregate invalidation tracking",
+							 "When on, DML and DDL that would record continuous aggregate "
+							 "invalidations do not append invalidation log entries. Callers that "
+							 "enable this own the refresh lifecycle; continuous aggregates may be "
+							 "left stale until an explicit refresh. Intended for SET LOCAL during "
+							 "bulk loads.",
+							 &ts_guc_skip_cagg_invalidation,
+							 false,
+							 PGC_USERSET,
 							 0,
 							 NULL,
 							 NULL,

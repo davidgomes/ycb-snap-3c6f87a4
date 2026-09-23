@@ -215,6 +215,17 @@ invalidation_cagg_log_add_entry(int32 cagg_hyper_id, int64 start, int64 end)
 	HeapTuple tuple;
 
 	Assert(start <= end);
+
+	/*
+	 * Session/transaction opt-out for bulk loads that own the refresh
+	 * lifecycle. SET LOCAL resets at COMMIT, so later statements record
+	 * invalidations again.
+	 */
+	if (ts_guc_skip_cagg_invalidation)
+	{
+		return;
+	}
+
 	tuple = create_invalidation_tup(RelationGetDescr(rel), cagg_hyper_id, start, end);
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
 	ts_catalog_insert_only(rel, tuple);
@@ -232,6 +243,13 @@ invalidation_hyper_log_add_entry(int32 hyper_id, int64 start, int64 end)
 	bool nulls[Natts_continuous_aggs_hypertable_invalidation_log] = { false };
 
 	Assert(start <= end);
+
+	/* See invalidation_cagg_log_add_entry. Covers DML flushes and raw-ht DDL. */
+	if (ts_guc_skip_cagg_invalidation)
+	{
+		return;
+	}
+
 	values[AttrNumberGetAttrOffset(
 		Anum_continuous_aggs_hypertable_invalidation_log_hypertable_id)] = Int32GetDatum(hyper_id);
 	values[AttrNumberGetAttrOffset(
