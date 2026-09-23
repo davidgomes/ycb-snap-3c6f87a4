@@ -3604,13 +3604,25 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
   if (db_fault_injection_fs_) {
     db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
   }
+  // Sometimes checkpoint only the column families verified below (plus the
+  // default one).
+  const bool cf_subset = thread->rand.OneIn(2);
   Checkpoint* checkpoint = nullptr;
   Status s = Checkpoint::Create(db_, &checkpoint);
   if (s.ok()) {
-    s = checkpoint->CreateCheckpoint(checkpoint_dir);
+    if (cf_subset) {
+      std::vector<ColumnFamilyHandle*> subset_cfs;
+      for (int rand_column_family : rand_column_families) {
+        subset_cfs.push_back(column_families_[rand_column_family]);
+      }
+      s = checkpoint->CreateCheckpoint(checkpoint_dir, subset_cfs);
+    } else {
+      s = checkpoint->CreateCheckpoint(checkpoint_dir);
+    }
     if (!s.ok() && !IsErrorInjectedAndRetryable(s)) {
-      fprintf(stderr, "Fail to create checkpoint to %s\n",
-              checkpoint_dir.c_str());
+      fprintf(stderr, "Fail to create checkpoint to %s%s\n",
+              checkpoint_dir.c_str(),
+              cf_subset ? " (column family subset)" : "");
       std::vector<std::string> files;
 
       // Temporarily disable error injection to print debugging information
@@ -3640,6 +3652,8 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
   delete checkpoint;
   checkpoint = nullptr;
   std::vector<ColumnFamilyHandle*> cf_handles;
+  // cf_handles[i] is for column_families_[checkpoint_cfs[i]].
+  std::vector<int> checkpoint_cfs;
   std::unique_ptr<DB> checkpoint_db;
   if (s.ok()) {
     Options options(options_);
@@ -3654,8 +3668,16 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
     // the same order as `column_family_names_`.
     assert(FLAGS_clear_column_family_one_in == 0);
     if (FLAGS_clear_column_family_one_in == 0) {
-      for (const auto& name : column_family_names_) {
-        cf_descs.emplace_back(name, ColumnFamilyOptions(options));
+      const int num_cfs = static_cast<int>(column_family_names_.size());
+      for (int cf = 0; cf < num_cfs; ++cf) {
+        if (!cf_subset ||
+            column_family_names_[cf] == kDefaultColumnFamilyName ||
+            std::find(rand_column_families.begin(), rand_column_families.end(),
+                      cf) != rand_column_families.end()) {
+          checkpoint_cfs.push_back(cf);
+          cf_descs.emplace_back(column_family_names_[cf],
+                                ColumnFamilyOptions(options));
+        }
       }
       s = DB::OpenForReadOnly(DBOptions(options), checkpoint_dir, cf_descs,
                               &cf_handles, &checkpoint_db);
@@ -3677,9 +3699,12 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
         read_opts.timestamp = &ts;
       }
       std::string value;
+      const auto cf_it = std::find(checkpoint_cfs.begin(), checkpoint_cfs.end(),
+                                   rand_column_families[i]);
+      assert(cf_it != checkpoint_cfs.end());
       Status get_status =
           DbStressGet(checkpoint_db.get(), read_opts,
-                      cf_handles[rand_column_families[i]], key, &value);
+                      cf_handles[cf_it - checkpoint_cfs.begin()], key, &value);
       bool exists =
           thread->shared->Exists(rand_column_families[i], rand_keys[0]);
       if (get_status.ok()) {
