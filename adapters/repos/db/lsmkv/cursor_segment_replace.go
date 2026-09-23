@@ -456,15 +456,10 @@ func (r *reusableInnerCursorReplace) seek(key []byte) ([]byte, []byte, error) {
 	return nodeToKV(r.c.seek(key))
 }
 
-// newReusableCursors mirrors newCursors but uses reusable per-segment cursors,
-// avoiding the per-node reader allocations of the default pread path.
-func (sg *SegmentGroup) newReusableCursors() ([]innerCursorReplace, func()) {
-	return sg.newDigestReusableCursors(0)
-}
-
-// newDigestReusableCursors is newReusableCursors with every segment cursor in
-// digest mode (see newReplaceCursorDigestReusable). valuePrefixLen <= 0 yields
-// full values.
+// newDigestReusableCursors mirrors newCursors but uses reusable per-segment
+// cursors, avoiding the per-node reader allocations of the default pread path.
+// valuePrefixLen > 0 puts every segment cursor in digest mode (see
+// newReplaceCursorDigestReusable); valuePrefixLen <= 0 yields full values.
 func (sg *SegmentGroup) newDigestReusableCursors(valuePrefixLen int) ([]innerCursorReplace, func()) {
 	segments, release := sg.getConsistentViewOfSegments()
 
