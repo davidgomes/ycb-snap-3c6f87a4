@@ -1052,3 +1052,64 @@ FROM :NO_FL_CHUNK ORDER BY _ts_meta_min_1;
 SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_no_firstlast') chunk;
 
 DROP TABLE metrics_no_firstlast;
+
+-- compact_chunk with max_batches
+CREATE TABLE metrics_mb (time TIMESTAMPTZ NOT NULL, device TEXT, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.segmentby='device');
+
+-- Negative max_batches is rejected.
+\set ON_ERROR_STOP 0
+SELECT count(_timescaledb_functions.compact_chunk(chunk, -1)) FROM show_chunks('metrics_mb') chunk;
+\set ON_ERROR_STOP 1
+
+-- Two overlapping merge groups, one per device, two batches each.
+INSERT INTO metrics_mb SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, 'd1', i FROM generate_series(1,1000) i;
+INSERT INTO metrics_mb SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, 'd1', i FROM generate_series(1,1000) i;
+INSERT INTO metrics_mb SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, 'd2', i FROM generate_series(1,1000) i;
+INSERT INTO metrics_mb SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, 'd2', i FROM generate_series(1,1000) i;
+
+SELECT cs.compress_relid::regclass::text AS "MB_CHUNK"
+FROM _timescaledb_catalog.chunk ch
+    JOIN _timescaledb_catalog.compression_settings cs
+        ON cs.relid = ch.relid
+    JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+WHERE ht.table_name = 'metrics_mb'
+ORDER BY ch.id LIMIT 1 \gset
+
+SELECT device, count(*) AS overlapping_batches FROM :MB_CHUNK a
+WHERE EXISTS (SELECT 1 FROM :MB_CHUNK b WHERE b.device = a.device AND b.ctid <> a.ctid
+  AND b._ts_meta_min_1 <= a._ts_meta_max_1 AND a._ts_meta_min_1 <= b._ts_meta_max_1)
+GROUP BY device ORDER BY device;
+
+-- The limit is only checked after a merge group is flushed, so the first
+-- group is merged completely even though it decompresses more than one
+-- batch. The second group is left for a later call and the chunk stays
+-- UNORDERED.
+SELECT count(_timescaledb_functions.compact_chunk(chunk, 1)) FROM show_chunks('metrics_mb') chunk;
+SELECT device, count(*) AS overlapping_batches FROM :MB_CHUNK a
+WHERE EXISTS (SELECT 1 FROM :MB_CHUNK b WHERE b.device = a.device AND b.ctid <> a.ctid
+  AND b._ts_meta_min_1 <= a._ts_meta_max_1 AND a._ts_meta_min_1 <= b._ts_meta_max_1)
+GROUP BY device ORDER BY device;
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_mb') chunk;
+
+-- The next call makes progress on the remaining group and clears UNORDERED.
+SELECT count(_timescaledb_functions.compact_chunk(chunk, 1)) FROM show_chunks('metrics_mb') chunk;
+SELECT device, count(*) AS overlapping_batches FROM :MB_CHUNK a
+WHERE EXISTS (SELECT 1 FROM :MB_CHUNK b WHERE b.device = a.device AND b.ctid <> a.ctid
+  AND b._ts_meta_min_1 <= a._ts_meta_max_1 AND a._ts_meta_min_1 <= b._ts_meta_max_1)
+GROUP BY device ORDER BY device;
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_mb') chunk;
+
+-- Zero means unlimited: all groups are merged in a single call.
+INSERT INTO metrics_mb SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, 'd1', i FROM generate_series(1,1000) i;
+INSERT INTO metrics_mb SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, 'd2', i FROM generate_series(1,1000) i;
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_mb') chunk;
+SELECT count(_timescaledb_functions.compact_chunk(chunk, 0)) FROM show_chunks('metrics_mb') chunk;
+SELECT device, count(*) AS overlapping_batches FROM :MB_CHUNK a
+WHERE EXISTS (SELECT 1 FROM :MB_CHUNK b WHERE b.device = a.device AND b.ctid <> a.ctid
+  AND b._ts_meta_min_1 <= a._ts_meta_max_1 AND a._ts_meta_min_1 <= b._ts_meta_max_1)
+GROUP BY device ORDER BY device;
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_mb') chunk;
+SELECT count(*) FROM metrics_mb;
+
+DROP TABLE metrics_mb;

@@ -163,7 +163,8 @@ static bool compact_chunk_find_overlapping_batches(Relation compressed_chunk_rel
 static bool compact_chunk_recompress_overlapping_batches(
 	Relation compressed_chunk_rel, IndexScanDesc index_scan, Snapshot snapshot,
 	RecompressContext *recompress_ctx, CompactChunkScanState *state, RowCompressor *compressor,
-	RowDecompressor *decompressor, Tuplesortstate *recompress_tuplesortstate, BulkWriter *writer);
+	RowDecompressor *decompressor, Tuplesortstate *recompress_tuplesortstate, BulkWriter *writer,
+	int32 max_batches, bool *limit_reached);
 static void try_updating_chunk_status(Chunk *uncompressed_chunk, Relation uncompressed_chunk_rel);
 
 /*
@@ -242,11 +243,20 @@ tsl_recompress_chunk_segmentwise(PG_FUNCTION_ARGS)
  * Compact a chunk by recombining overlapping batches
  *
  * 0 uncompressed_chunk_id REGCLASS
+ * 1 max_batches INTEGER = 0 (0 means unlimited)
  */
 Datum
 tsl_compact_chunk(PG_FUNCTION_ARGS)
 {
 	Oid uncompressed_relid = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
+	int32 max_batches = (PG_NARGS() < 2 || PG_ARGISNULL(1)) ? 0 : PG_GETARG_INT32(1);
+
+	if (max_batches < 0)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("max_batches must be greater than or equal to 0")));
+	}
 
 	ts_feature_flag_check(FEATURE_HYPERTABLE_COMPRESSION);
 	TS_PREVENT_FUNC_IF_READ_ONLY();
@@ -272,7 +282,7 @@ tsl_compact_chunk(PG_FUNCTION_ARGS)
 						ts_chunk_get_table_name(chunk))));
 	}
 
-	uncompressed_relid = compact_chunk_impl(chunk);
+	uncompressed_relid = compact_chunk_impl(chunk, max_batches);
 
 	PG_RETURN_OID(uncompressed_relid);
 }
@@ -1163,14 +1173,23 @@ compact_chunk_find_overlapping_batches(Relation compressed_chunk_rel, IndexScanD
  * including their NULLS FIRST/LAST setting, so NULL orderby values sort to the
  * correct end on their own.
  *
+ * If max_batches > 0, stop once at least that many batches have been
+ * decompressed. The limit is only checked after a merge group has been fully
+ * flushed, so a single group may exceed it. *limit_reached is set when the
+ * scan stopped early.
+ *
  * Returns true if any overlapping batches were found and recompressed.
  */
 static bool
 compact_chunk_recompress_overlapping_batches(
 	Relation compressed_chunk_rel, IndexScanDesc index_scan, Snapshot snapshot,
 	RecompressContext *recompress_ctx, CompactChunkScanState *state, RowCompressor *compressor,
-	RowDecompressor *decompressor, Tuplesortstate *recompress_tuplesortstate, BulkWriter *writer)
+	RowDecompressor *decompressor, Tuplesortstate *recompress_tuplesortstate, BulkWriter *writer,
+	int32 max_batches, bool *limit_reached)
 {
+	int64 batches_decompressed = 0;
+	*limit_reached = false;
+
 	TupleTableSlot *previous_compressed_slot = table_slot_create(compressed_chunk_rel, NULL);
 	TupleTableSlot *compressed_slot = table_slot_create(compressed_chunk_rel, NULL);
 
@@ -1201,6 +1220,7 @@ compact_chunk_recompress_overlapping_batches(
 									  recompress_tuplesortstate,
 									  compressed_chunk_rel,
 									  snapshot);
+		batches_decompressed++;
 
 		found = table_index_fetch_tuple(index_scan->xs_heapfetch,
 										&state->previous_tid,
@@ -1215,6 +1235,7 @@ compact_chunk_recompress_overlapping_batches(
 									  recompress_tuplesortstate,
 									  compressed_chunk_rel,
 									  snapshot);
+		batches_decompressed++;
 
 		overlapping = true;
 		found_overlaps = true;
@@ -1248,6 +1269,11 @@ compact_chunk_recompress_overlapping_batches(
 								   compressor,
 								   writer);
 				overlapping = false;
+				if (max_batches > 0 && batches_decompressed >= max_batches)
+				{
+					*limit_reached = true;
+					break;
+				}
 			}
 
 			ItemPointerCopy(&index_scan->xs_heaptid, &state->previous_tid);
@@ -1286,6 +1312,7 @@ compact_chunk_recompress_overlapping_batches(
 											  recompress_tuplesortstate,
 											  compressed_chunk_rel,
 											  snapshot);
+				batches_decompressed++;
 
 				overlapping = true;
 				found_overlaps = true;
@@ -1297,6 +1324,7 @@ compact_chunk_recompress_overlapping_batches(
 										  recompress_tuplesortstate,
 										  compressed_chunk_rel,
 										  snapshot);
+			batches_decompressed++;
 
 			CommandCounterIncrement();
 		}
@@ -1307,6 +1335,11 @@ compact_chunk_recompress_overlapping_batches(
 			recompress_segment(recompress_tuplesortstate, compressed_chunk_rel, compressor, writer);
 			overlapping = false;
 			CommandCounterIncrement();
+			if (max_batches > 0 && batches_decompressed >= max_batches)
+			{
+				*limit_reached = true;
+				break;
+			}
 		}
 
 		ItemPointerCopy(&index_scan->xs_heaptid, &state->previous_tid);
@@ -1325,7 +1358,7 @@ compact_chunk_recompress_overlapping_batches(
 }
 
 Oid
-compact_chunk_impl(Chunk *uncompressed_chunk)
+compact_chunk_impl(Chunk *uncompressed_chunk, int32 max_batches)
 {
 	Oid uncompressed_chunk_id = uncompressed_chunk->fd.relid;
 
@@ -1458,6 +1491,8 @@ compact_chunk_impl(Chunk *uncompressed_chunk)
 																 recompress_ctx,
 																 state);
 
+	bool limit_reached = false;
+
 	if (found_overlaps)
 	{
 		/* Recompress the overlaps */
@@ -1496,16 +1531,19 @@ compact_chunk_impl(Chunk *uncompressed_chunk)
 													 &compressor,
 													 &decompressor,
 													 recompress_tuplesortstate,
-													 &writer);
+													 &writer,
+													 max_batches,
+													 &limit_reached);
 		row_compressor_close(&compressor);
 		row_decompressor_close(&decompressor);
 		tuplesort_end(recompress_tuplesortstate);
 	}
 
-	/* At this point, we have resolved all the overlaps.
-	 * Try to switch the chunk status if we can get the exclusive lock
+	/* At this point, we have resolved all the overlaps unless the batch limit
+	 * stopped us early. Try to switch the chunk status if we can get the
+	 * exclusive lock.
 	 */
-	if (ConditionalLockRelation(compressed_chunk_rel, ExclusiveLock))
+	if (!limit_reached && ConditionalLockRelation(compressed_chunk_rel, ExclusiveLock))
 	{
 		/*
 		 * Use a fresh snapshot for the verification scan. If recompression

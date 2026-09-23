@@ -193,4 +193,41 @@ SELECT remove_compaction_policy('m2');
 SELECT remove_compaction_policy('m2', if_exists => true);
 DROP TABLE m2;
 
+----------------------------------------------------------------------
+-- max_batches bounds the work done per chunk
+----------------------------------------------------------------------
+
+CREATE TABLE mb (time TIMESTAMPTZ NOT NULL, device TEXT, value float) WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.segmentby='device');
+
+-- Negative max_batches is rejected by both the API and the config check.
+\set ON_ERROR_STOP 0
+SELECT add_compaction_policy('mb', max_batches => -1);
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": -1}');
+\set ON_ERROR_STOP 1
+
+-- Zero means unlimited and is not stored in the config.
+SELECT add_compaction_policy('mb', max_batches => 0) AS job_id \gset
+SELECT config - 'hypertable_id' AS config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+SELECT remove_compaction_policy('mb');
+
+SELECT add_compaction_policy('mb', max_batches => 2) AS job_id \gset
+SELECT config - 'hypertable_id' AS config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+
+-- Two overlapping merge groups (one per device) in a single chunk.
+INSERT INTO mb SELECT '2025-07-01'::timestamptz + (i || ' minute')::interval, 'd1', i FROM generate_series(1,1000) i;
+INSERT INTO mb SELECT '2025-07-01'::timestamptz + (i || ' minute')::interval, 'd1', i FROM generate_series(1,1000) i;
+INSERT INTO mb SELECT '2025-07-01'::timestamptz + (i || ' minute')::interval, 'd2', i FROM generate_series(1,1000) i;
+INSERT INTO mb SELECT '2025-07-01'::timestamptz + (i || ' minute')::interval, 'd2', i FROM generate_series(1,1000) i;
+SELECT unordered_count('mb');
+
+-- The first run merges only the first group, so the chunk stays unordered.
+CALL run_job(:job_id);
+SELECT unordered_count('mb');
+
+-- The second run merges the remaining group and clears the status.
+CALL run_job(:job_id);
+SELECT unordered_count('mb');
+SELECT count(*) FROM mb;
+DROP TABLE mb;
+
 DROP FUNCTION unordered_count(regclass);
