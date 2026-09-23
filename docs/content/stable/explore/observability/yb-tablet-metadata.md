@@ -37,6 +37,20 @@ The following table describes the columns of the `yb_tablet_metadata` view.
 | end_hash_code | int | Ending hash code (exclusive) for the tablet. (NULL for range-sharded tables.) |
 | leader | text | IP address, port of the leader node for the tablet. |
 | replicas | text[] | A list of replica IP addresses and port (includes leader) associated with the tablet. |
+| start_range | text | Starting range key (inclusive) for the tablet, in DocDB key form. NULL for the first tablet of a table and for hash-sharded tables. |
+| end_range | text | Ending range key (exclusive) for the tablet, in DocDB key form. NULL for the last tablet of a table and for hash-sharded tables. |
+
+Range keys are rendered the same way as in the tablet listing of the YB-Master UI. For example, a `TIMESTAMP` value is shown as an int64 number of microseconds since the PostgreSQL epoch (2000-01-01).
+
+### Privileges
+
+The view returns every tablet of the cluster to all users, but the `relname`, `start_range`, and `end_range` columns are masked (shown as `<insufficient privilege>`) for rows that the current user is not allowed to see:
+
+- Superusers and members of the `yb_db_admin` role see all values.
+- Other users see the values only for tables of the database they are connected to and on which they have the `SELECT` privilege. The system `transactions` tablets are always shown.
+- For a masked range-sharded tablet, both `start_range` and `end_range` are masked, including when the tablet is the first or last tablet of its table. For hash-sharded tablets, `start_range` and `end_range` remain NULL, and `start_hash_code` and `end_hash_code` are never masked.
+
+Because table names can be masked, and the same table name can exist in multiple databases, filter on `db_name` (for example, `db_name = current_database()`) in addition to `relname` when looking up the tablets of a table.
 
 ## Examples
 
@@ -152,7 +166,8 @@ Use the [yb_hash_code()](../../../api/ysql/exprs/func_yb_hash_code/) function to
         t.end_hash_code,
         t.leader
     FROM yb_tablet_metadata t
-    WHERE t.relname = 'test_table'
+    WHERE t.db_name = current_database()
+      AND t.relname = 'test_table'
       AND yb_hash_code('k1'::text) >= t.start_hash_code
       AND yb_hash_code('k1'::text) < t.end_hash_code;
     ```
@@ -199,6 +214,36 @@ Use the [yb_hash_code()](../../../api/ysql/exprs/func_yb_hash_code/) function to
 {{<tip title="Get hash codes in YCQL">}}
 To obtain hash codes in YCQL, you can use the `partition_hash()` function, which, similar to `yb_hash_code()`, also dumps hash codes. You can use the `partition_hash()` function in YCQL to link rows with their tablets.
 {{</tip>}}
+
+### View range boundaries for range-sharded tables
+
+For range-sharded tables, `start_range` and `end_range` show the boundaries of each tablet. The first tablet has no start bound and the last tablet has no end bound, so those values are NULL.
+
+```sql
+CREATE TABLE range_sharded_table (k INT, v TEXT, PRIMARY KEY (k ASC))
+    SPLIT AT VALUES ((100), (200));
+
+SELECT
+    tablet_id,
+    relname,
+    start_range,
+    end_range,
+    leader
+FROM yb_tablet_metadata
+WHERE db_name = current_database()
+  AND relname = 'range_sharded_table'
+ORDER BY start_range NULLS FIRST;
+```
+
+```output
++----------------------------------+---------------------+-------------------+-------------------+----------------+
+| tablet_id                        | relname             | start_range       | end_range         | leader         |
+|----------------------------------+---------------------+-------------------+-------------------+----------------|
+| 4fcb5627f95c4317a2dbe4cb589d77d5 | range_sharded_table | NULL              | DocKey([], [100]) | 127.0.0.3:5433 |
+| 287286d4f5e240999577f70a37e81266 | range_sharded_table | DocKey([], [100]) | DocKey([], [200]) | 127.0.0.1:5433 |
+| 15f205a450a947a5a414b31e24ede059 | range_sharded_table | DocKey([], [200]) | NULL              | 127.0.0.2:5433 |
++----------------------------------+---------------------+-------------------+-------------------+----------------+
+```
 
 ### Join with Active Session History
 
