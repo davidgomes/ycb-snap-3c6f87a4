@@ -339,6 +339,12 @@ public:
 
   /*** Basic data type feautures ***/
 
+  /*
+    SYS_REFCURSOR is not a numeric type. Length, scale, character set,
+    collation, and REF_SYSTEM_ID are meaningless on it.
+  */
+  uint get_column_attributes() const override { return ATTR_NONE; }
+
   const Type_collection *type_collection() const override
   {
     return &type_collection_cursor;

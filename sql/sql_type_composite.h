@@ -46,6 +46,11 @@ public:
   {
     return this;
   }
+  /*
+    RECORD and associative-array values do not take length, scale,
+    character set/collation, or REF_SYSTEM_ID.
+  */
+  uint get_column_attributes() const override { return ATTR_NONE; }
   bool is_scalar_type() const override { return false; }
   bool can_return_int() const override { return false; }
   bool can_return_decimal() const override { return false; }
