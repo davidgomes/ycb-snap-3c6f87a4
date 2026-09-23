@@ -2,6 +2,11 @@
 
 **Please note: When updating your database, you should connect using `psql` with the `-X` flag to prevent any `.psqlrc` commands from accidentally triggering the load of a previous TimescaleDB version.**
 
+## 2.28.0 (unreleased)
+
+**Features**
+* Add `timescaledb.skip_cagg_invalidation`, a session-scoped opt-out so bulk loads can skip continuous aggregate invalidation tracking and refresh explicitly
+
 ## 2.27.1 (2026-05-19)
 
 This release contains performance improvements and bug fixes since the 2.27.0 release. We recommend that you upgrade at the next available opportunity.

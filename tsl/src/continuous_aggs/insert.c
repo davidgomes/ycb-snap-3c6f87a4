@@ -190,7 +190,15 @@ get_cache_inval_entry(int32 hypertable_id, Oid chunk_relid)
 void
 continuous_agg_invalidate_range(int32 hypertable_id, Oid chunk_relid, int64 start, int64 end)
 {
-	ContinuousAggsCacheInvalEntry *cache_entry = get_cache_inval_entry(hypertable_id, chunk_relid);
+	ContinuousAggsCacheInvalEntry *cache_entry;
+
+	/* Direct-compress INSERT/COPY records ranges through this cache. */
+	if (ts_guc_skip_cagg_invalidation)
+	{
+		return;
+	}
+
+	cache_entry = get_cache_inval_entry(hypertable_id, chunk_relid);
 
 	cache_entry->value_is_set = true;
 	Assert(start <= end);
@@ -208,8 +216,19 @@ void
 continuous_agg_dml_invalidate(int32 hypertable_id, Relation chunk_rel, HeapTuple chunk_tuple,
 							  HeapTuple chunk_newtuple, bool update)
 {
-	ContinuousAggsCacheInvalEntry *cache_entry =
-		get_cache_inval_entry(hypertable_id, chunk_rel->rd_id);
+	ContinuousAggsCacheInvalEntry *cache_entry;
+
+	/*
+	 * Covers INSERT/UPDATE/DELETE/COPY on the hypertable and direct writes to
+	 * its chunks. Ranges are flushed at pre-commit, so skipping here means no
+	 * invalidation log row is appended for this modification.
+	 */
+	if (ts_guc_skip_cagg_invalidation)
+	{
+		return;
+	}
+
+	cache_entry = get_cache_inval_entry(hypertable_id, chunk_rel->rd_id);
 
 	update_cache_from_tuple(cache_entry, chunk_tuple, RelationGetDescr(chunk_rel));
 

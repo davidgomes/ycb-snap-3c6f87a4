@@ -80,6 +80,7 @@ TSDLLEXPORT int ts_guc_direct_compress_segmentby_batch_size_limit = 500;
 bool ts_guc_enable_deprecation_warnings = true;
 bool ts_guc_enable_optimizations = true;
 bool ts_guc_restoring = false;
+TSDLLEXPORT bool ts_guc_skip_cagg_invalidation = false;
 bool ts_guc_enable_constraint_aware_append = true;
 bool ts_guc_enable_ordered_append = true;
 bool ts_guc_enable_chunk_append = true;
@@ -676,6 +677,26 @@ _guc_init(void)
 							 &ts_guc_restoring,
 							 false,
 							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	/*
+	 * Session-scoped opt-out for tools that copy hypertable data and continuous
+	 * aggregate materializations and then refresh themselves. SET LOCAL keeps
+	 * the opt-out inside one transaction so later DML records invalidations
+	 * again. Callers that leave this on must refresh continuous aggregates
+	 * themselves; skipped ranges can otherwise stay stale.
+	 */
+	DefineCustomBoolVariable(MAKE_EXTOPTION("skip_cagg_invalidation"),
+							 "Skip continuous aggregate invalidation tracking",
+							 "When on, modifications and invalidating DDL do not append continuous "
+							 "aggregate invalidation log entries. Callers must refresh continuous "
+							 "aggregates themselves.",
+							 &ts_guc_skip_cagg_invalidation,
+							 false,
+							 PGC_USERSET,
 							 0,
 							 NULL,
 							 NULL,
