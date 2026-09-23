@@ -153,6 +153,7 @@ func NewStandaloneActivity(
 			HeartbeatTimeout:       request.GetHeartbeatTimeout(),
 			RetryPolicy:            request.GetRetryPolicy(),
 			Priority:               request.Priority,
+			StartDelay:             request.GetStartDelay(),
 		},
 		LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{}),
 		RequestData: chasm.NewDataField(ctx, &activitypb.ActivityRequestData{
@@ -237,7 +238,8 @@ func (a *Activity) GenerateRecordActivityTaskStartedResponse(
 		CurrentAttemptScheduledTime: a.attemptScheduleTime(attempt),
 		ScheduledEvent: &historypb.HistoryEvent{
 			EventType: enumspb.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED,
-			EventTime: a.GetScheduleTime(),
+			// Workers derive the schedule-to-close deadline from this time, so it must include the start delay.
+			EventTime: a.firstAttemptScheduleTime(),
 			Attributes: &historypb.HistoryEvent_ActivityTaskScheduledEventAttributes{
 				ActivityTaskScheduledEventAttributes: &historypb.ActivityTaskScheduledEventAttributes{
 					ActivityId:             key.BusinessID,
@@ -256,13 +258,23 @@ func (a *Activity) GenerateRecordActivityTaskStartedResponse(
 }
 
 // attemptScheduleTime returns when the given attempt was scheduled to run:
-// the activity's original schedule time for the first attempt, or
+// firstAttemptScheduleTime for the first attempt, or
 // calculated from attemptScheduleTimeForRetry on retries.
 func (a *Activity) attemptScheduleTime(attempt *activitypb.ActivityAttemptState) *timestamppb.Timestamp {
 	if attempt.GetCount() == 1 {
-		return a.GetScheduleTime()
+		return a.firstAttemptScheduleTime()
 	}
 	return attemptScheduleTimeForRetry(attempt)
+}
+
+// firstAttemptScheduleTime returns when the first attempt becomes eligible for dispatch: the activity's original
+// schedule time pushed out by the start delay, if any. Schedule-to-close deadlines are measured from this time.
+func (a *Activity) firstAttemptScheduleTime() *timestamppb.Timestamp {
+	startDelay := a.GetStartDelay().AsDuration()
+	if startDelay <= 0 {
+		return a.GetScheduleTime()
+	}
+	return timestamppb.New(a.GetScheduleTime().AsTime().Add(startDelay))
 }
 
 // attemptScheduleTimeForRetry computes the time a retried attempt is scheduled to start,
@@ -663,7 +675,7 @@ func (a *Activity) hasEnoughTimeForRetry(ctx chasm.Context, overridingRetryInter
 		return true, retryInterval
 	}
 
-	deadline := a.ScheduleTime.AsTime().Add(scheduleToClose)
+	deadline := a.firstAttemptScheduleTime().AsTime().Add(scheduleToClose)
 	return ctx.Now(a).Add(retryInterval).Before(deadline), retryInterval
 }
 
@@ -783,7 +795,7 @@ func (a *Activity) buildActivityExecutionInfo(ctx chasm.Context) *apiactivitypb.
 
 	var expirationTime *timestamppb.Timestamp
 	if timeout := a.GetScheduleToCloseTimeout().AsDuration(); timeout > 0 {
-		expirationTime = timestamppb.New(a.GetScheduleTime().AsTime().Add(timeout))
+		expirationTime = timestamppb.New(a.firstAttemptScheduleTime().AsTime().Add(timeout))
 	}
 
 	sa := &commonpb.SearchAttributes{

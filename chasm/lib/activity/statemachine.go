@@ -41,7 +41,8 @@ var TransitionScheduled = chasm.NewTransition(
 	activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
 	func(a *Activity, ctx chasm.MutableContext, _ any) error {
 		attempt := a.LastAttempt.Get(ctx)
-		currentTime := ctx.Now(a)
+		startDelay := a.GetStartDelay().AsDuration()
+		dispatchTime := ctx.Now(a).Add(startDelay)
 		attempt.Count++
 		attempt.Stamp++
 
@@ -49,7 +50,7 @@ var TransitionScheduled = chasm.NewTransition(
 			ctx.AddTask(
 				a,
 				chasm.TaskAttributes{
-					ScheduledTime: currentTime.Add(timeout),
+					ScheduledTime: dispatchTime.Add(timeout),
 				},
 				&activitypb.ScheduleToStartTimeoutTask{
 					Stamp: attempt.GetStamp(),
@@ -60,14 +61,18 @@ var TransitionScheduled = chasm.NewTransition(
 			ctx.AddTask(
 				a,
 				chasm.TaskAttributes{
-					ScheduledTime: currentTime.Add(timeout),
+					ScheduledTime: dispatchTime.Add(timeout),
 				},
 				&activitypb.ScheduleToCloseTimeoutTask{})
 		}
 
+		var dispatchTaskAttributes chasm.TaskAttributes
+		if startDelay > 0 {
+			dispatchTaskAttributes.ScheduledTime = dispatchTime
+		}
 		ctx.AddTask(
 			a,
-			chasm.TaskAttributes{},
+			dispatchTaskAttributes,
 			&activitypb.ActivityDispatchTask{
 				Stamp: attempt.GetStamp(),
 			})
