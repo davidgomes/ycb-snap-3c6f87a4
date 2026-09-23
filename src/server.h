@@ -235,6 +235,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 #define COMMAND_SET 1
 #define COMMAND_HGET 2
 #define COMMAND_HSET 3
+#define COMMAND_MSET 4
 
 /* Command flags. Please check the definition of struct serverCommand in this file
  * for more information about the meaning of every flag. */
@@ -3024,6 +3025,7 @@ void releaseReplyReferences(client *c);
 void resetLastWrittenBuf(client *c);
 
 int parseExtendedCommandArgumentsOrReply(client *c, int *flags, int *unit, robj **expire, robj **compare_val, int command_type, int max_args);
+int parseExtendedCommandArgumentsFromOrReply(client *c, int *flags, int *unit, robj **expire, robj **compare_val, int command_type, int start_idx, int max_args);
 
 /* logreqres.c - logging of requests and responses */
 void reqresReset(client *c, int free_buf);
@@ -3994,6 +3996,7 @@ void replicaofCommand(client *c);
 void roleCommand(client *c);
 void debugCommand(client *c);
 void msetCommand(client *c);
+void msetexCommand(client *c);
 void msetnxCommand(client *c);
 void zaddCommand(client *c);
 void zincrbyCommand(client *c);

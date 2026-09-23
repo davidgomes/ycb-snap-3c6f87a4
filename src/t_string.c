@@ -555,6 +555,80 @@ void msetnxCommand(client *c) {
     msetGenericCommand(c, 1);
 }
 
+/* MSETEX numkeys key value [key value ...] [NX | XX]
+ *     [EX seconds | PX milliseconds |
+ *      EXAT seconds-timestamp | PXAT milliseconds-timestamp | KEEPTTL]
+ *
+ * Replies with 1 if all the keys were set, or 0 if no key was set because
+ * of the NX / XX condition. */
+void msetexCommand(client *c) {
+    long numkeys;
+    robj *expire = NULL;
+    int unit = UNIT_SECONDS;
+    int flags = ARGS_NO_FLAGS;
+    mstime_t milliseconds = 0;
+    int j;
+
+    if (getRangeLongFromObjectOrReply(c, c->argv[1], 1, INT_MAX, &numkeys, "invalid numkeys value or out of range") !=
+        C_OK)
+        return;
+
+    /* The options start right after the numkeys key-value pairs. */
+    long long opts_idx = 2 + (long long)numkeys * 2;
+    if (opts_idx > c->argc) {
+        addReplyErrorObject(c, shared.syntaxerr);
+        return;
+    }
+
+    if (parseExtendedCommandArgumentsFromOrReply(c, &flags, &unit, &expire, NULL, COMMAND_MSET, (int)opts_idx,
+                                                 c->argc) != C_OK)
+        return;
+
+    if (expire && getExpireMillisecondsOrReply(c, expire, flags, unit, &milliseconds) != C_OK) return;
+
+    /* NX: none of the keys may exist. XX: all the keys must exist. */
+    if (flags & (ARGS_SET_NX | ARGS_SET_XX)) {
+        for (j = 2; j < opts_idx; j += 2) {
+            int found = lookupKeyWrite(c->db, c->argv[j]) != NULL;
+            if (((flags & ARGS_SET_NX) && found) || ((flags & ARGS_SET_XX) && !found)) {
+                addReply(c, shared.czero);
+                return;
+            }
+        }
+    }
+
+    /* When an expire is given, keep the existing TTL so setExpire() can update it
+     * instead of deleting it and creating it again. An expire that is already in the
+     * past is still applied, the keys are then removed by lazy or active expiration. */
+    int setkey_flags = ((flags & ARGS_KEEPTTL) || expire) ? SETKEY_KEEPTTL : 0;
+    for (j = 2; j < opts_idx; j += 2) {
+        robj *key = c->argv[j];
+        robj *val = tryObjectEncoding(c->argv[j + 1]);
+        setKey(c, c->db, key, &val, setkey_flags);
+        if (expire) val = setExpire(c, c->db, key, milliseconds);
+        incrRefCount(val);
+        c->argv[j + 1] = val;
+        notifyKeyspaceEvent(NOTIFY_STRING, "set", key, c->db->id);
+        if (expire) notifyKeyspaceEvent(NOTIFY_GENERIC, "expire", key, c->db->id);
+    }
+    server.dirty += numkeys;
+
+    /* Propagate EX/PX/EXAT as PXAT millisecond-timestamp, so replicas and the AOF
+     * get the same absolute expire time. */
+    if (expire && !(flags & ARGS_PXAT)) {
+        for (j = opts_idx + 1; j < c->argc; j++) {
+            if (c->argv[j] != expire) continue;
+            robj *milliseconds_obj = createStringObjectFromLongLong(milliseconds);
+            rewriteClientCommandArgument(c, j - 1, shared.pxat);
+            rewriteClientCommandArgument(c, j, milliseconds_obj);
+            decrRefCount(milliseconds_obj);
+            break;
+        }
+    }
+
+    addReply(c, shared.cone);
+}
+
 void incrDecrCommand(client *c, long long incr) {
     long long value, oldvalue;
     robj *o, *new;
