@@ -174,6 +174,11 @@ void YBCUpdateInitPostgresMetrics();
 uint16_t YBCDecodeMultiColumnHashLeftBound(const char* partition_key, size_t key_len);
 uint16_t YBCDecodeMultiColumnHashRightBound(const char* partition_key, size_t key_len);
 
+// DocDB debug form of one range-partition bound (DocKey::DebugSliceToString), matching the
+// master UI tablet listing. Empty bounds return NULL. Timestamps render as the int64 stored
+// in the key (microseconds).
+const char* YBCRangePartitionBoundDebugString(const char* partition_key, size_t key_len);
+
 bool YBCIsObjectLockingEnabled();
 void YBCPgSetClampUncertaintyWindow(bool clamp);
 

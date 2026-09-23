@@ -131,6 +131,7 @@
 #include "storage/procarray.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -9137,6 +9138,62 @@ string_list_compare(const ListCell *a, const ListCell *b)
 }
 
 /*
+ * Placeholder substituted for relname / range bounds when the caller may not
+ * see them. Rows are still returned.
+ */
+#define YB_TABLET_METADATA_REDACTED "<insufficient privilege>"
+
+/*
+ * Superusers and yb_db_admin see every row. The system transactions tablet is
+ * always visible. Everyone else sees sensitive columns only for a relation in
+ * the current database on which they hold SELECT. A missing or orphaned OID
+ * (dropped relation, colocation parent) masks the row instead of failing.
+ */
+static bool
+yb_tablet_metadata_show_sensitive(const char *namespace_name, const char *table_name,
+								  Oid pg_table_oid, bool privileged,
+								  const char *current_db_name)
+{
+	bool		is_missing = false;
+
+	if (privileged)
+		return true;
+
+	if (namespace_name != NULL && table_name != NULL &&
+		strcmp(namespace_name, "system") == 0 &&
+		strcmp(table_name, "transactions") == 0)
+		return true;
+
+	if (current_db_name == NULL || namespace_name == NULL ||
+		strcmp(namespace_name, current_db_name) != 0)
+		return false;
+
+	/* Colocation parents and non-YSQL rows have no pg_class oid to check. */
+	if (!OidIsValid(pg_table_oid))
+		return false;
+
+	if (pg_class_aclcheck_ext(pg_table_oid, GetUserId(), ACL_SELECT,
+							  &is_missing) != ACLCHECK_OK ||
+		is_missing)
+		return false;
+
+	return true;
+}
+
+/* DocDB debug string for one range bound. Empty keys stay NULL. */
+static void
+yb_tablet_metadata_set_range_bound(Datum *value, bool *isnull,
+								   const char *partition_key, size_t key_len)
+{
+	const char *debug_str = YBCRangePartitionBoundDebugString(partition_key, key_len);
+
+	if (debug_str == NULL)
+		*isnull = true;
+	else
+		*value = CStringGetTextDatum(debug_str);
+}
+
+/*
  * Returns the metadata for all tablets in the cluster.
  * The returned data structure is a row type with the following columns:
  * - tablet_id: text
@@ -9157,6 +9214,16 @@ string_list_compare(const ListCell *a, const ListCell *b)
  * The start_hash_code and end_hash_code are the hash codes of the start and end
  * keys of the tablet for hash sharded tables. Leader is provided as a separate
  * column for simpler querying and self-explanatory access.
+ *
+ * start_range and end_range are the DocDB debug form of the partition bounds for
+ * range-sharded tablets (the same rendering as the master UI tablet listing).
+ * Hash-sharded tablets, including composite HASH+ASC, leave those columns NULL.
+ *
+ * relname, start_range, and end_range are masked for callers who are not
+ * superuser or yb_db_admin, unless the row is the system transactions tablet
+ * or a current-database relation the caller can SELECT. Masked range tablets
+ * use the redaction placeholder for every range cell, including unbounded
+ * edges. Masked hash tablets keep NULL ranges. Hash codes are not masked.
  */
 Datum
 yb_get_tablet_metadata(PG_FUNCTION_ARGS)
@@ -9200,8 +9267,13 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 
 	YbcPgGlobalTabletsDescriptor *tablets = NULL;
 	size_t		num_tablets = 0;
+	bool		privileged;
+	char	   *current_db_name;
 
 	HandleYBStatus(YBCTabletsMetadata(&tablets, &num_tablets));
+
+	privileged = superuser() || IsYbDbAdminUser(GetUserId());
+	current_db_name = get_database_name(MyDatabaseId);
 
 	for (int i = 0; i < num_tablets; ++i)
 	{
@@ -9274,15 +9346,54 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[9] = true;
 		}
 
-		/* TODO (#28172): start_range, end_range, tablet_attrs are populated in a follow-up change. */
-		nulls[10] = true;
-		nulls[11] = true;
+		/*
+		 * Hash tablets (including HASH+ASC) report bounds only via hash codes.
+		 * Range tablets use the DocDB key debug string; an empty edge is NULL.
+		 */
+		if (tablet->is_hash_partitioned)
+		{
+			nulls[10] = true;
+			nulls[11] = true;
+		}
+		else
+		{
+			yb_tablet_metadata_set_range_bound(&values[10], &nulls[10],
+											   tablet_descriptor->partition_key_start,
+											   tablet_descriptor->partition_key_start_len);
+			yb_tablet_metadata_set_range_bound(&values[11], &nulls[11],
+											   tablet_descriptor->partition_key_end,
+											   tablet_descriptor->partition_key_end_len);
+		}
+
+		/* TODO (#28172): tablet_attrs is populated in a follow-up change. */
 		nulls[12] = true;
 
 		if (tablet->tablet_state)
 			values[13] = CStringGetTextDatum(tablet->tablet_state);
 		else
 			nulls[13] = true;
+
+		if (!yb_tablet_metadata_show_sensitive(tablet_descriptor->namespace_name,
+											   tablet_descriptor->table_name,
+											   tablet->pg_table_oid,
+											   privileged, current_db_name))
+		{
+			values[4] = CStringGetTextDatum(YB_TABLET_METADATA_REDACTED);
+			nulls[4] = false;
+
+			/*
+			 * Range rows: redact every bound, including edges that were NULL,
+			 * so split points and unbounded edges are not distinguishable.
+			 * Hash rows keep their natural NULL ranges; hash codes stay visible.
+			 */
+			if (!tablet->is_hash_partitioned)
+			{
+				values[10] = CStringGetTextDatum(YB_TABLET_METADATA_REDACTED);
+				values[11] = CStringGetTextDatum(YB_TABLET_METADATA_REDACTED);
+				nulls[10] = false;
+				nulls[11] = false;
+			}
+		}
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}

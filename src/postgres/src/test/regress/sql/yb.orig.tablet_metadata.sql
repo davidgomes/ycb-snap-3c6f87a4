@@ -7,7 +7,9 @@ SELECT
     db_name,
     start_hash_code,
     end_hash_code
-FROM yb_tablet_metadata WHERE relname IN ('test_table_1', 'test_table_2')
+FROM yb_tablet_metadata
+WHERE relname IN ('test_table_1', 'test_table_2')
+  AND db_name = current_database()
 ORDER BY start_hash_code NULLS FIRST;
 
 -- Test that we are able to join with yb_servers()
@@ -24,6 +26,7 @@ JOIN yb_servers() ys
     ON split_part(ytm.leader, ':', 1) = ys.host
     AND split_part(ytm.leader, ':', 2)::int = ys.port
 WHERE ytm.relname IN ('test_table_1', 'test_table_2')
+  AND ytm.db_name = current_database()
 ORDER BY ytm.start_hash_code NULLS FIRST;
 
 -- Test that data from multiple databases is returned
@@ -75,6 +78,53 @@ WHERE
     db_name = 'colocated_db'
     AND relname LIKE '%.colocation.parent.tablename';
 
+-- Colocated user tables share the parent tablet, so they have no row of their own.
+-- SELECT on a colocated table does not unmask the parent. A non-colocated table
+-- in the same database is gated by SELECT on that table. The parent is range
+-- sharded with unbounded edges.
+SELECT count(*) = 0 AS colocated_user_has_no_tablet_row
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND relname = 'colocated_hash';
+
+SELECT count(*) = 1 AS one_null_oid_row,
+       bool_and(start_hash_code IS NULL) AS parent_not_hash,
+       bool_and(start_range IS NULL AND end_range IS NULL) AS parent_ranges_null
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid IS NULL;
+
+CREATE ROLE coloc_reader LOGIN;
+GRANT SELECT ON colocated_hash TO coloc_reader;
+GRANT SELECT ON non_colocated_split TO coloc_reader;
+
+\c colocated_db coloc_reader
+
+-- Parent name is hidden even though colocated_hash was granted.
+SELECT count(*) = 0 AS parent_name_hidden
+FROM yb_tablet_metadata
+WHERE db_name = current_database()
+  AND relname LIKE '%.colocation.parent.tablename';
+
+SELECT
+    bool_and(relname = '<insufficient privilege>') AS parent_rel_masked,
+    bool_and(start_range = '<insufficient privilege>') AS parent_start_masked,
+    bool_and(end_range = '<insufficient privilege>') AS parent_end_masked,
+    bool_and(oid IS NULL) AS parent_oid_null,
+    count(*) = 1 AS one_parent
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid IS NULL;
+
+SELECT
+    relname,
+    start_hash_code,
+    end_hash_code,
+    start_range IS NULL AS start_null,
+    end_range IS NULL AS end_null
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND relname = 'non_colocated_split'
+ORDER BY start_hash_code;
+
+\c yugabyte yugabyte
+
 -- Test that yb_tablet_metadata is independent of the connected database
 CREATE DATABASE yb_tmeta_a;
 CREATE DATABASE yb_tmeta_b;
@@ -116,23 +166,196 @@ WHERE
     AND db_name IN ('yb_tmeta_a', 'yb_tmeta_b')
 ORDER BY db_name, relname;
 
--- Test that non-superusers can see cluster-wide tablet metadata
+-- Range bounds are DocDB keys. Hash-sharded tablets, including HASH+ASC, leave
+-- them NULL. Callers should scope relname filters by db_name.
+\c yugabyte yugabyte
+CREATE TABLE tmeta_range (k INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((10), (20));
+CREATE TABLE tmeta_hash (k INT PRIMARY KEY) SPLIT INTO 2 TABLETS;
+CREATE TABLE tmeta_hash_range (h INT, r INT, PRIMARY KEY (h HASH, r ASC)) SPLIT INTO 2 TABLETS;
+CREATE TABLE tmeta_text (k TEXT, PRIMARY KEY (k ASC)) SPLIT AT VALUES (('m'));
+CREATE TABLE tmeta_ts (k TIMESTAMP, PRIMARY KEY (k ASC))
+    SPLIT AT VALUES (('2024-06-01'), ('2024-09-01'));
+CREATE TABLE tmeta_hash_secret (k INT PRIMARY KEY) SPLIT INTO 2 TABLETS;
+
+SELECT relname, start_range, end_range, start_hash_code, end_hash_code
+FROM yb_tablet_metadata
+WHERE db_name = current_database()
+  AND relname IN ('tmeta_range', 'tmeta_hash', 'tmeta_hash_range', 'tmeta_text')
+ORDER BY relname, start_hash_code NULLS FIRST, start_range NULLS FIRST, end_range NULLS LAST;
+
+-- Timestamp bounds are the int64 microseconds stored in the DocDB key (PostgreSQL
+-- epoch), not a formatted timestamp string.
+SELECT
+    (start_range IS NULL) AS start_unbounded,
+    end_range = format(
+        'DocKey([], [%s])',
+        (EXTRACT(EPOCH FROM timestamp '2024-06-01' - timestamp '2000-01-01') * 1000000)::bigint
+    ) AS first_end_is_docdb_ts
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND relname = 'tmeta_ts'
+ORDER BY start_range NULLS FIRST
+LIMIT 1;
+
+-- Unprivileged roles still see every tablet row. relname and range bounds are
+-- masked unless the table is in the current database and the role has SELECT.
+-- The system transactions tablet stays visible. Hash codes are not masked.
+-- Superusers and yb_db_admin see real values.
 CREATE ROLE yb_tmeta_user LOGIN;
+CREATE ROLE yb_tmeta_admin LOGIN;
+GRANT yb_db_admin TO yb_tmeta_admin;
+CREATE ROLE tmeta_reader LOGIN;
+GRANT SELECT ON tmeta_range TO tmeta_reader;
+GRANT SELECT ON tmeta_hash TO tmeta_reader;
+
+SELECT 'tmeta_text'::regclass::oid AS tmeta_text_oid \gset
+SELECT 'tmeta_range'::regclass::oid AS tmeta_range_oid \gset
+SELECT 'tmeta_hash_secret'::regclass::oid AS tmeta_hash_secret_oid \gset
+
+\c yb_tmeta_a yugabyte
+SELECT 'only_in_a'::regclass::oid AS only_in_a_oid \gset
+SELECT 'same_name'::regclass::oid AS same_name_a_oid \gset
+SELECT count(*) AS yb_tmeta_live_count FROM yb_tablet_metadata \gset
 
 \c yb_tmeta_a yb_tmeta_user
+
+-- No SELECT: current-db range tablets are masked, including unbounded edges.
+SELECT
+    relname,
+    start_range,
+    end_range,
+    start_hash_code IS NULL AS hash_null
+FROM yb_tablet_metadata
+WHERE db_name = 'yb_tmeta_a' AND oid IN (:only_in_a_oid, :same_name_a_oid)
+ORDER BY oid;
+
+-- Filtering another database by the real relname misses masked rows.
+SELECT count(*) AS other_db_name_hits
+FROM yb_tablet_metadata
+WHERE
+    relname IN ('only_in_b', 'same_name')
+    AND db_name = 'yb_tmeta_b';
+
+-- Rows are not dropped.
+SELECT count(*) = :yb_tmeta_live_count::bigint AS same_row_count
+FROM yb_tablet_metadata;
+
+-- transactions is always unmasked.
+SELECT count(*) > 0 AS sees_transactions
+FROM yb_tablet_metadata
+WHERE db_name = 'system' AND relname = 'transactions';
+
+\c yb_tmeta_a yugabyte
+GRANT SELECT ON only_in_a TO yb_tmeta_user;
+\c yb_tmeta_a yb_tmeta_user
+
+SELECT relname,
+       start_range IS NULL AS start_null,
+       end_range IS NULL AS end_null
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = :only_in_a_oid;
+
+SELECT relname
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = :same_name_a_oid;
+
+\c yugabyte yb_tmeta_admin
 
 SELECT
     relname,
     db_name
 FROM yb_tablet_metadata
 WHERE
-    relname IN ('only_in_b', 'same_name')
-    AND db_name = 'yb_tmeta_b'
-ORDER BY relname;
+    relname IN ('only_in_a', 'only_in_b', 'same_name')
+    AND db_name IN ('yb_tmeta_a', 'yb_tmeta_b')
+ORDER BY db_name, relname;
+
+\c yugabyte tmeta_reader
+
+SELECT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND relname = 'tmeta_range'
+ORDER BY start_range NULLS FIRST, end_range NULLS LAST;
+
+SELECT relname, start_hash_code, end_hash_code,
+       start_range IS NULL AS start_null,
+       end_range IS NULL AS end_null
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND relname = 'tmeta_hash'
+ORDER BY start_hash_code;
+
+-- No SELECT on the text table: the real name does not match.
+SELECT count(*) AS text_name_hits
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND relname = 'tmeta_text';
+
+-- Masked range tablet: both bounds are the placeholder, including the NULL edge.
+SELECT relname, start_range, end_range,
+       start_hash_code IS NULL AS hash_null
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = :tmeta_text_oid;
+
+-- Masked hash tablet: hash codes stay, ranges stay NULL.
+SELECT relname, start_hash_code, end_hash_code,
+       start_range IS NULL AS start_null,
+       end_range IS NULL AS end_null
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = :tmeta_hash_secret_oid
+ORDER BY start_hash_code;
+
+-- SELECT granted in yugabyte does not reveal that table from another database.
+\c yb_tmeta_a tmeta_reader
+
+SELECT count(*) AS cross_db_name_hits
+FROM yb_tablet_metadata
+WHERE db_name = 'yugabyte' AND relname = 'tmeta_range';
+
+SELECT count(*) = 3 AS cross_db_ranges_masked
+FROM yb_tablet_metadata
+WHERE db_name = 'yugabyte'
+  AND oid = :tmeta_range_oid
+  AND relname = '<insufficient privilege>'
+  AND start_range = '<insufficient privilege>'
+  AND end_range = '<insufficient privilege>';
+
+-- Rewrite keeps pg_class.oid. A grant on that oid still unmasks the row, and a
+-- role with no privilege does not error on the rewritten relation.
+\c yugabyte yugabyte
+CREATE TABLE tmeta_rewrite (k INT, v INT);
+SELECT oid AS rewrite_oid, relfilenode AS rewrite_relfilenode
+FROM pg_class WHERE relname = 'tmeta_rewrite' \gset
+GRANT SELECT ON tmeta_rewrite TO tmeta_reader;
+ALTER TABLE tmeta_rewrite ADD PRIMARY KEY (k ASC);
+SELECT
+    oid = :rewrite_oid AS oid_stable,
+    relfilenode <> :rewrite_relfilenode AS storage_rewritten
+FROM pg_class WHERE relname = 'tmeta_rewrite';
+
+\c yugabyte tmeta_reader
+SELECT relname = 'tmeta_rewrite' AS grant_follows_oid,
+       start_range IS NULL AS start_null,
+       end_range IS NULL AS end_null
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = :rewrite_oid;
+
+\c yugabyte yugabyte
+CREATE ROLE tmeta_nobody LOGIN;
+\c yugabyte tmeta_nobody
+SELECT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = :rewrite_oid;
+
+-- Full scan must not fail on masked, rewritten, or orphaned OIDs.
+SELECT count(*) > 0 AS metadata_query_ok FROM yb_tablet_metadata;
 
 -- Cleanup
 \c yugabyte yugabyte
+DROP TABLE tmeta_range, tmeta_hash, tmeta_hash_range, tmeta_text, tmeta_ts,
+          tmeta_hash_secret, tmeta_rewrite;
 DROP DATABASE colocated_db;
 DROP DATABASE yb_tmeta_a;
 DROP DATABASE yb_tmeta_b;
+DROP ROLE coloc_reader;
+DROP ROLE tmeta_reader;
+DROP ROLE tmeta_nobody;
 DROP ROLE yb_tmeta_user;
+DROP ROLE yb_tmeta_admin;
