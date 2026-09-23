@@ -297,9 +297,22 @@ type segmentCursorReplaceReusable struct {
 	// avoid allocating a MeteredReader+SectionReader+nodeReader per iteration.
 	preadOffset *offsetReader
 	preadReader *bufio.Reader
+	// valuePrefixLen controls on-disk value retention. <= 0 keeps the full
+	// value (default cursors and compaction). > 0 retains only the first N
+	// value bytes and discards the rest without allocating it. Node offset
+	// still spans the entire on-disk record, so seek and sequential iteration
+	// match the full-value path.
+	valuePrefixLen int
 }
 
 func (s *segment) newReplaceCursorReusable() *segmentCursorReplaceReusable {
+	return s.newReplaceCursorDigestReusable(0)
+}
+
+func (s *segment) newReplaceCursorDigestReusable(valuePrefixLen int) *segmentCursorReplaceReusable {
+	if valuePrefixLen < 0 {
+		valuePrefixLen = 0
+	}
 	c := &segmentCursorReplaceReusable{
 		segment:    s,
 		currOffset: s.dataStartPos,
@@ -307,7 +320,8 @@ func (s *segment) newReplaceCursorReusable() *segmentCursorReplaceReusable {
 			secondaryIndexCount: s.secondaryIndexCount,
 			secondaryKeys:       make([][]byte, s.secondaryIndexCount),
 		},
-		reusableBORW: byteops.NewReadWriter(nil),
+		reusableBORW:   byteops.NewReadWriter(nil),
+		valuePrefixLen: valuePrefixLen,
 	}
 	if !s.readFromMemory && s.contentFile != nil {
 		or := &offsetReader{ra: s.contentFile}
@@ -356,13 +370,25 @@ func (s *segmentCursorReplaceReusable) parseInto() (*segmentReplaceNode, error) 
 			return nil, lsmkv.NotFound
 		}
 		s.reusableBORW.ResetBuffer(buf)
-		if err := ParseReplaceNodeIntoMMAP(&s.reusableBORW, s.segment.secondaryIndexCount, &s.reusableNode); err != nil {
+		var err error
+		if s.valuePrefixLen > 0 {
+			err = ParseReplaceNodeDigestIntoMMAP(&s.reusableBORW, s.segment.secondaryIndexCount, &s.reusableNode, s.valuePrefixLen)
+		} else {
+			err = ParseReplaceNodeIntoMMAP(&s.reusableBORW, s.segment.secondaryIndexCount, &s.reusableNode)
+		}
+		if err != nil {
 			return &s.reusableNode, err
 		}
 	} else {
 		s.preadOffset.off = int64(s.currOffset)
 		s.preadReader.Reset(s.preadOffset)
-		if err := ParseReplaceNodeIntoPread(s.preadReader, s.segment.secondaryIndexCount, &s.reusableNode); err != nil {
+		var err error
+		if s.valuePrefixLen > 0 {
+			err = ParseReplaceNodeDigestIntoPread(s.preadReader, s.segment.secondaryIndexCount, &s.reusableNode, s.valuePrefixLen)
+		} else {
+			err = ParseReplaceNodeIntoPread(s.preadReader, s.segment.secondaryIndexCount, &s.reusableNode)
+		}
+		if err != nil {
 			return &s.reusableNode, err
 		}
 	}
@@ -411,6 +437,20 @@ func (sg *SegmentGroup) newReusableCursors() ([]innerCursorReplace, func()) {
 	out := make([]innerCursorReplace, len(segments))
 	for i, segment := range segments {
 		out[i] = &reusableInnerCursorReplace{c: segment.newReplaceCursorReusable()}
+	}
+
+	return out, release
+}
+
+// newDigestReusableCursors mirrors newReusableCursors but retains only the
+// first valuePrefixLen bytes of each on-disk value. valuePrefixLen <= 0 keeps
+// full values. Memtable cursors are not created here.
+func (sg *SegmentGroup) newDigestReusableCursors(valuePrefixLen int) ([]innerCursorReplace, func()) {
+	segments, release := sg.getConsistentViewOfSegments()
+
+	out := make([]innerCursorReplace, len(segments))
+	for i, segment := range segments {
+		out[i] = &reusableInnerCursorReplace{c: segment.newReplaceCursorDigestReusable(valuePrefixLen)}
 	}
 
 	return out, release

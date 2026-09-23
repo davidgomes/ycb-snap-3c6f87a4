@@ -124,6 +124,39 @@ func (b *Bucket) CursorReplaceReusable() *CursorReplace {
 	}
 }
 
+// CursorReplaceDigestReusable behaves like CursorReplaceReusable, but on-disk
+// segments retain only the first valuePrefixLen bytes of each value.
+// valuePrefixLen <= 0 keeps full on-disk values. Memtable entries stay full
+// because they are already resident. Same locking and Close contract as
+// CursorReplaceReusable.
+func (b *Bucket) CursorReplaceDigestReusable(valuePrefixLen int) *CursorReplace {
+	MustBeExpectedStrategy(b.strategy, StrategyReplace)
+
+	cursorOpenedAt := time.Now()
+	b.metrics.IncBucketOpenedCursorsByStrategy(b.strategy)
+	b.metrics.IncBucketOpenCursorsByStrategy(b.strategy)
+
+	b.flushLock.RLock()
+	defer b.flushLock.RUnlock()
+
+	innerCursors, unlockSegmentGroup := b.disk.newDigestReusableCursors(valuePrefixLen)
+
+	if b.flushing != nil {
+		innerCursors = append(innerCursors, b.flushing.newCursor())
+	}
+	innerCursors = append(innerCursors, b.active.newCursor())
+
+	return &CursorReplace{
+		innerCursors: innerCursors,
+		unlock: func() {
+			unlockSegmentGroup()
+
+			b.metrics.DecBucketOpenCursorsByStrategy(b.strategy)
+			b.metrics.ObserveBucketCursorDurationByStrategy(b.strategy, time.Since(cursorOpenedAt))
+		},
+	}
+}
+
 // CursorInMemWith returns a cursor which scan over the primary key of entries
 // not yet persisted on disk.
 // Segment creation and compaction will be blocked until the cursor is closed
@@ -169,6 +202,21 @@ func (b *Bucket) CursorOnDisk() *CursorReplace {
 	MustBeExpectedStrategy(b.strategy, StrategyReplace)
 
 	innerCursors, unlockSegmentGroup := b.disk.newCursors()
+
+	return &CursorReplace{
+		innerCursors: innerCursors,
+		unlock:       unlockSegmentGroup,
+	}
+}
+
+// CursorOnDiskDigest scans on-disk replace entries, retaining only the first
+// valuePrefixLen bytes of each value. valuePrefixLen <= 0 keeps full values.
+// Node iteration still spans each full on-disk record. Same Close contract as
+// CursorOnDisk; compaction is pinned by the segment view, not the flush lock.
+func (b *Bucket) CursorOnDiskDigest(valuePrefixLen int) *CursorReplace {
+	MustBeExpectedStrategy(b.strategy, StrategyReplace)
+
+	innerCursors, unlockSegmentGroup := b.disk.newDigestReusableCursors(valuePrefixLen)
 
 	return &CursorReplace{
 		innerCursors: innerCursors,

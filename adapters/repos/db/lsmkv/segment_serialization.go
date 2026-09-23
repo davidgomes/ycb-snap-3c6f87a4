@@ -12,6 +12,7 @@
 package lsmkv
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -290,6 +291,172 @@ func ParseReplaceNodeIntoMMAP(r *byteops.ReadWriter, secondaryIndexCount uint16,
 		// .next() is called, this should be safe. Nevertheless, we are leaving this
 		// note in case a future bug appears, as this should make this spot easier to
 		// find.
+		out.secondaryKeys[j] = r.ReadBytesFromBufferWithUint32LengthIndicator()
+	}
+
+	out.offset = int(r.Position)
+	return nil
+}
+
+// retainedReplaceValueLen is the number of value bytes to copy into out.value.
+// A non-positive valuePrefixLen retains the whole value, so N=0 matches the
+// full parsers. A positive limit retains at most that many bytes.
+func retainedReplaceValueLen(valueLength uint64, valuePrefixLen int) int {
+	if valuePrefixLen <= 0 || uint64(valuePrefixLen) >= valueLength {
+		return int(valueLength)
+	}
+	return valuePrefixLen
+}
+
+// setReusableBuffer returns buf with length n, allocating only when cap is short.
+// n is the retained size, never the discarded tail of a longer on-disk value.
+func setReusableBuffer(buf []byte, n int) []byte {
+	if n > cap(buf) {
+		return make([]byte, n)
+	}
+	return buf[:n]
+}
+
+// discardReader consumes n bytes from r without retaining them.
+// bufio.Reader.Discard reuses its existing buffer; other readers go through
+// io.Discard, which does not allocate the discarded payload.
+func discardReader(r io.Reader, n uint64) error {
+	if n == 0 {
+		return nil
+	}
+	if br, ok := r.(*bufio.Reader); ok {
+		for n > 0 {
+			step := n
+			const maxDiscard = 1 << 30
+			if step > maxDiscard {
+				step = maxDiscard
+			}
+			got, err := br.Discard(int(step))
+			n -= uint64(got)
+			if err != nil {
+				return err
+			}
+			if got == 0 {
+				return io.ErrUnexpectedEOF
+			}
+		}
+		return nil
+	}
+	_, err := io.CopyN(io.Discard, r, int64(n))
+	return err
+}
+
+// ParseReplaceNodeDigestIntoPread parses one replace node from a pread reader,
+// retaining only the first valuePrefixLen value bytes. The remainder of the
+// value is discarded without being allocated. out.offset still covers the
+// whole on-disk node, matching ParseReplaceNodeIntoPread. valuePrefixLen <= 0
+// retains the full value.
+func ParseReplaceNodeDigestIntoPread(r io.Reader, secondaryIndexCount uint16, out *segmentReplaceNode, valuePrefixLen int) error {
+	out.offset = 0
+
+	// 9 bytes covers the largest uninterrupted read (tombstone + value length).
+	var tmpBuf [9]byte
+
+	if _, err := io.ReadFull(r, tmpBuf[:9]); err != nil {
+		return errors.Wrap(err, "read tombstone and value length")
+	}
+	out.tombstone = tmpBuf[0] != 0
+	out.offset += 1
+	valueLength := binary.LittleEndian.Uint64(tmpBuf[1:9])
+	out.offset += 8
+
+	keep := retainedReplaceValueLen(valueLength, valuePrefixLen)
+	out.value = setReusableBuffer(out.value, keep)
+	if keep > 0 {
+		if _, err := io.ReadFull(r, out.value); err != nil {
+			return errors.Wrap(err, "read value")
+		}
+	}
+	if tail := valueLength - uint64(keep); tail > 0 {
+		if err := discardReader(r, tail); err != nil {
+			return errors.Wrap(err, "discard value tail")
+		}
+	}
+	// Count the whole value, including the discarded tail, so the cursor's
+	// next-node offset matches the full parser.
+	out.offset += int(valueLength)
+
+	if _, err := io.ReadFull(r, tmpBuf[:4]); err != nil {
+		return errors.Wrap(err, "read key length encoding")
+	}
+	keyLength := binary.LittleEndian.Uint32(tmpBuf[:4])
+	out.offset += 4
+
+	if int(keyLength) > cap(out.primaryKey) {
+		out.primaryKey = make([]byte, keyLength)
+	} else {
+		out.primaryKey = out.primaryKey[:keyLength]
+	}
+	if n, err := io.ReadFull(r, out.primaryKey); err != nil {
+		return errors.Wrap(err, "read key")
+	} else {
+		out.offset += n
+	}
+
+	if secondaryIndexCount > 0 && len(out.secondaryKeys) < int(secondaryIndexCount) {
+		out.secondaryKeys = make([][]byte, secondaryIndexCount)
+	}
+
+	for j := 0; j < int(secondaryIndexCount); j++ {
+		if _, err := io.ReadFull(r, tmpBuf[:4]); err != nil {
+			return errors.Wrap(err, "read secondary key length encoding")
+		}
+		secKeyLen := binary.LittleEndian.Uint32(tmpBuf[:4])
+		out.offset += 4
+
+		if secKeyLen == 0 {
+			out.secondaryKeys[j] = out.secondaryKeys[j][:0]
+			continue
+		}
+
+		if int(secKeyLen) > cap(out.secondaryKeys[j]) {
+			out.secondaryKeys[j] = make([]byte, secKeyLen)
+		} else {
+			out.secondaryKeys[j] = out.secondaryKeys[j][:secKeyLen]
+		}
+		if n, err := io.ReadFull(r, out.secondaryKeys[j]); err != nil {
+			return errors.Wrap(err, "read secondary key")
+		} else {
+			out.offset += n
+		}
+	}
+
+	return nil
+}
+
+// ParseReplaceNodeDigestIntoMMAP parses one replace node from an mmap buffer,
+// retaining only the first valuePrefixLen value bytes. The remainder is skipped
+// in place (no copy, no allocation). out.offset still covers the whole on-disk
+// node, matching ParseReplaceNodeIntoMMAP. valuePrefixLen <= 0 retains the full value.
+func ParseReplaceNodeDigestIntoMMAP(r *byteops.ReadWriter, secondaryIndexCount uint16, out *segmentReplaceNode, valuePrefixLen int) error {
+	out.tombstone = r.ReadUint8() == 0x01
+	valueLength := r.ReadUint64()
+
+	keep := retainedReplaceValueLen(valueLength, valuePrefixLen)
+	out.value = setReusableBuffer(out.value, keep)
+	if keep > 0 {
+		if _, err := r.CopyBytesFromBuffer(uint64(keep), out.value); err != nil {
+			return err
+		}
+	}
+	if tail := valueLength - uint64(keep); tail > 0 {
+		r.MoveBufferPositionForward(tail)
+	}
+
+	// Note: primary and secondary keys alias the mmap buffer, matching
+	// ParseReplaceNodeIntoMMAP. They are valid only until the next parse.
+	out.primaryKey = r.ReadBytesFromBufferWithUint32LengthIndicator()
+
+	if secondaryIndexCount > 0 {
+		out.secondaryKeys = make([][]byte, secondaryIndexCount)
+	}
+
+	for j := 0; j < int(secondaryIndexCount); j++ {
 		out.secondaryKeys[j] = r.ReadBytesFromBufferWithUint32LengthIndicator()
 	}
 

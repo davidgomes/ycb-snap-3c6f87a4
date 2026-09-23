@@ -2089,6 +2089,26 @@ func TestPatchDocID(t *testing.T) {
 	assert.Equal(t, obj.ID(), decoded.ID())
 }
 
+func TestMarshallerV1HeaderLen_BoundsDocIDAndTime(t *testing.T) {
+	require.Equal(t, 42, MarshallerV1HeaderLen)
+
+	buf := make([]byte, MarshallerV1HeaderLen+128)
+	buf[0] = 1
+	binary.LittleEndian.PutUint64(buf[1:9], 7)
+	binary.LittleEndian.PutUint64(buf[marshallerV1UpdateTimeOffset:MarshallerV1HeaderLen], 99)
+	for i := MarshallerV1HeaderLen; i < len(buf); i++ {
+		buf[i] = 0xab
+	}
+
+	docID, updateTime, err := DocIDAndTimeFromBinary(buf[:MarshallerV1HeaderLen])
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), docID)
+	require.Equal(t, int64(99), updateTime)
+
+	_, _, err = DocIDAndTimeFromBinary(buf[:MarshallerV1HeaderLen-1])
+	require.Error(t, err)
+}
+
 func TestPatchDocID_Errors(t *testing.T) {
 	t.Run("too short", func(t *testing.T) {
 		require.Error(t, PatchDocID(make([]byte, 8), 1))
