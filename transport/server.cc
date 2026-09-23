@@ -1478,6 +1478,9 @@ future<std::unique_ptr<cql_server::response>> cql_server::connection::process_st
     if (auto& a = client_state.get_auth_service()->underlying_authenticator(); a.require_authentication()) {
         _authenticating = true;
         auto opt_user = co_await a.authenticate([this]() -> future<std::optional<auth::certificate_info>> {
+            if (!_ssl_enabled) {
+                co_return std::nullopt;
+            }
             auto dn_info = co_await tls::get_dn_information(this->_fd);
             if (dn_info) {
                 co_return auth::certificate_info{ dn_info->subject, [this]() -> future<std::string> {
