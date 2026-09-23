@@ -210,11 +210,22 @@ create_invalidation_tup(const TupleDesc tupdesc, int32 cagg_hyper_id, int64 star
 void
 invalidation_cagg_log_add_entry(int32 cagg_hyper_id, int64 start, int64 end)
 {
-	Relation rel = open_cagg_table(CAGG_INVALIDATION_LOG, RowExclusiveLock);
+	Relation rel;
 	CatalogSecurityContext sec_ctx;
 	HeapTuple tuple;
 
+	/*
+	 * timescaledb.skip_cagg_invalidation is the single gate for new log
+	 * entries. Refresh still rewrites existing entries through
+	 * write_invalidation_entry(), which is intentionally not skipped.
+	 */
+	if (ts_guc_skip_cagg_invalidation)
+	{
+		return;
+	}
+
 	Assert(start <= end);
+	rel = open_cagg_table(CAGG_INVALIDATION_LOG, RowExclusiveLock);
 	tuple = create_invalidation_tup(RelationGetDescr(rel), cagg_hyper_id, start, end);
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
 	ts_catalog_insert_only(rel, tuple);
@@ -226,12 +237,19 @@ invalidation_cagg_log_add_entry(int32 cagg_hyper_id, int64 start, int64 end)
 void
 invalidation_hyper_log_add_entry(int32 hyper_id, int64 start, int64 end)
 {
-	Relation rel = open_cagg_table(HYPER_INVALIDATION_LOG, RowExclusiveLock);
+	Relation rel;
 	CatalogSecurityContext sec_ctx;
 	Datum values[Natts_continuous_aggs_hypertable_invalidation_log];
 	bool nulls[Natts_continuous_aggs_hypertable_invalidation_log] = { false };
 
+	/* See invalidation_cagg_log_add_entry(). */
+	if (ts_guc_skip_cagg_invalidation)
+	{
+		return;
+	}
+
 	Assert(start <= end);
+	rel = open_cagg_table(HYPER_INVALIDATION_LOG, RowExclusiveLock);
 	values[AttrNumberGetAttrOffset(
 		Anum_continuous_aggs_hypertable_invalidation_log_hypertable_id)] = Int32GetDatum(hyper_id);
 	values[AttrNumberGetAttrOffset(

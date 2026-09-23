@@ -1,0 +1,322 @@
+-- This file and its contents are licensed under the Timescale License.
+-- Please see the included NOTICE for copyright information and
+-- LICENSE-TIMESCALE for a copy of the license.
+
+-- timescaledb.skip_cagg_invalidation lets a bulk load skip continuous
+-- aggregate invalidation logging. The default stays off.
+
+\c :TEST_DBNAME :ROLE_SUPERUSER
+SELECT _timescaledb_functions.stop_background_workers();
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+SET datestyle TO 'ISO, YMD';
+SET timezone TO 'UTC';
+
+SELECT name, setting, context
+  FROM pg_settings
+ WHERE name = 'timescaledb.skip_cagg_invalidation';
+
+CREATE VIEW cagg_invalidation_counts AS
+SELECT (SELECT count(*)
+          FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log) AS hyper_invals,
+       (SELECT count(*)
+          FROM _timescaledb_catalog.continuous_aggs_materialization_invalidation_log) AS mat_invals;
+
+CREATE TABLE metrics (time int NOT NULL, device int, val double precision);
+SELECT create_hypertable('metrics', 'time', chunk_time_interval => 100);
+
+CREATE FUNCTION metrics_now() RETURNS int LANGUAGE SQL STABLE AS
+$$ SELECT coalesce(max(time), 0) FROM metrics $$;
+SELECT set_integer_now_func('metrics', 'metrics_now');
+
+INSERT INTO metrics
+SELECT i, 1, i::float8 FROM generate_series(0, 249) i;
+
+CREATE MATERIALIZED VIEW metrics_10
+WITH (timescaledb.continuous, timescaledb.materialized_only = true) AS
+SELECT time_bucket(10, time) AS bucket, avg(val) AS avg_val
+FROM metrics
+GROUP BY 1
+WITH NO DATA;
+
+CREATE MATERIALIZED VIEW metrics_20
+WITH (timescaledb.continuous, timescaledb.materialized_only = true) AS
+SELECT time_bucket(20, bucket) AS bucket, avg(avg_val) AS avg_val
+FROM metrics_10
+GROUP BY 1
+WITH NO DATA;
+
+CALL refresh_continuous_aggregate('metrics_10', 0, 300);
+
+-- Drop invalidations produced by creation and the initial refresh.
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+SELECT * FROM cagg_invalidation_counts;
+
+-- Default off: normal DML records hypertable invalidations.
+INSERT INTO metrics VALUES (10, 1, 1);
+SELECT * FROM cagg_invalidation_counts;
+
+UPDATE metrics SET val = 2 WHERE time = 10;
+SELECT * FROM cagg_invalidation_counts;
+
+DELETE FROM metrics WHERE time = 10;
+SELECT * FROM cagg_invalidation_counts;
+
+COPY metrics (time, device, val) FROM STDIN;
+11	1	1
+\.
+SELECT * FROM cagg_invalidation_counts;
+
+-- Direct writes to a chunk use the same invalidation path.
+INSERT INTO _timescaledb_internal._hyper_1_1_chunk VALUES (12, 1, 1);
+SELECT * FROM cagg_invalidation_counts;
+
+UPDATE _timescaledb_internal._hyper_1_1_chunk SET val = 2 WHERE time = 12;
+SELECT * FROM cagg_invalidation_counts;
+
+DELETE FROM _timescaledb_internal._hyper_1_1_chunk WHERE time = 12;
+SELECT * FROM cagg_invalidation_counts;
+
+COPY _timescaledb_internal._hyper_1_1_chunk (time, device, val) FROM STDIN;
+13	1	1
+\.
+SELECT * FROM cagg_invalidation_counts;
+
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+-- SET LOCAL suppresses invalidation logging until COMMIT, including direct
+-- chunk writes. Bucket 0 is updated here so a later refresh can show staleness.
+SELECT avg_val FROM metrics_10 WHERE bucket = 0;
+
+BEGIN;
+SET LOCAL timescaledb.skip_cagg_invalidation = on;
+INSERT INTO metrics VALUES (14, 1, 1);
+UPDATE metrics SET val = 1000 WHERE time = 0;
+DELETE FROM metrics WHERE time = 1;
+COPY metrics (time, device, val) FROM STDIN;
+15	1	1
+\.
+INSERT INTO _timescaledb_internal._hyper_1_1_chunk VALUES (16, 1, 1);
+UPDATE _timescaledb_internal._hyper_1_1_chunk SET val = 3 WHERE time = 16;
+DELETE FROM _timescaledb_internal._hyper_1_1_chunk WHERE time = 16;
+COPY _timescaledb_internal._hyper_1_1_chunk (time, device, val) FROM STDIN;
+17	1	1
+\.
+COMMIT;
+
+SELECT current_setting('timescaledb.skip_cagg_invalidation') AS skip_after_commit;
+SELECT * FROM cagg_invalidation_counts;
+-- Materialized data is stale: callers own the refresh.
+SELECT avg_val FROM metrics_10 WHERE bucket = 0;
+
+-- A refresh without force does not see the skipped write.
+CALL refresh_continuous_aggregate('metrics_10', 0, 50);
+SELECT avg_val FROM metrics_10 WHERE bucket = 0;
+
+-- force still materializes the window.
+CALL refresh_continuous_aggregate('metrics_10', 0, 50, force => true);
+SELECT avg_val FROM metrics_10 WHERE bucket = 0;
+
+-- The opt-out does not leak: later DML records invalidations again.
+INSERT INTO metrics VALUES (18, 1, 1);
+SELECT * FROM cagg_invalidation_counts;
+
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+-- DDL that invalidates is covered by the same opt-out.
+BEGIN;
+SET LOCAL timescaledb.skip_cagg_invalidation = on;
+SELECT count(*) AS dropped FROM drop_chunks('metrics', 100);
+COMMIT;
+SELECT * FROM cagg_invalidation_counts;
+
+SELECT count(*) AS dropped FROM drop_chunks('metrics', 200);
+SELECT * FROM cagg_invalidation_counts;
+
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+BEGIN;
+SET LOCAL timescaledb.skip_cagg_invalidation = on;
+TRUNCATE _timescaledb_internal._hyper_1_3_chunk;
+COMMIT;
+SELECT * FROM cagg_invalidation_counts;
+
+INSERT INTO metrics VALUES (200, 1, 1);
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+TRUNCATE _timescaledb_internal._hyper_1_3_chunk;
+SELECT * FROM cagg_invalidation_counts;
+
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+INSERT INTO metrics VALUES (300, 1, 1);
+INSERT INTO metrics VALUES (400, 1, 1);
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+SELECT format('%I.%I', chunk_schema, chunk_name) AS drop_skip
+  FROM timescaledb_information.chunks
+ WHERE hypertable_name = 'metrics'
+   AND range_start_integer = 300 \gset
+SELECT format('%I.%I', chunk_schema, chunk_name) AS drop_record
+  FROM timescaledb_information.chunks
+ WHERE hypertable_name = 'metrics'
+   AND range_start_integer = 400 \gset
+
+BEGIN;
+SET LOCAL timescaledb.skip_cagg_invalidation = on;
+DROP TABLE :drop_skip;
+COMMIT;
+SELECT * FROM cagg_invalidation_counts;
+
+DROP TABLE :drop_record;
+SELECT * FROM cagg_invalidation_counts;
+
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+BEGIN;
+SET LOCAL timescaledb.skip_cagg_invalidation = on;
+TRUNCATE metrics;
+COMMIT;
+SELECT * FROM cagg_invalidation_counts;
+
+INSERT INTO metrics
+SELECT i, 1, i::float8 FROM generate_series(0, 20) i;
+CALL refresh_continuous_aggregate('metrics_10', 0, 100);
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+TRUNCATE metrics;
+SELECT * FROM cagg_invalidation_counts;
+
+-- TRUNCATE of a continuous aggregate, including the hierarchical cascade.
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+BEGIN;
+SET LOCAL timescaledb.skip_cagg_invalidation = on;
+TRUNCATE metrics_10;
+COMMIT;
+SELECT * FROM cagg_invalidation_counts;
+
+TRUNCATE metrics_10;
+SELECT * FROM cagg_invalidation_counts;
+
+-- Direct-compress INSERT and COPY also honor the opt-out.
+CREATE TABLE dc_metrics (time int NOT NULL, device int, val double precision);
+SELECT create_hypertable('dc_metrics', 'time', chunk_time_interval => 1000);
+CREATE FUNCTION dc_metrics_now() RETURNS int LANGUAGE SQL STABLE AS
+$$ SELECT coalesce(max(time), 0) FROM dc_metrics $$;
+SELECT set_integer_now_func('dc_metrics', 'dc_metrics_now');
+ALTER TABLE dc_metrics SET (timescaledb.compress, timescaledb.compress_orderby = 'time');
+
+CREATE MATERIALIZED VIEW dc_metrics_10
+WITH (timescaledb.continuous, timescaledb.materialized_only = true) AS
+SELECT time_bucket(10, time) AS bucket, avg(val) AS avg_val
+FROM dc_metrics
+GROUP BY 1
+WITH NO DATA;
+
+INSERT INTO dc_metrics VALUES (1, 1, 1);
+CALL refresh_continuous_aggregate('dc_metrics_10', 0, 1000);
+
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+SET timescaledb.enable_direct_compress_insert = on;
+SET timescaledb.enable_direct_compress_insert_client_sorted = on;
+INSERT INTO dc_metrics
+SELECT i, 1, 1 FROM generate_series(2, 40) i;
+SELECT * FROM cagg_invalidation_counts;
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(c) AS status
+  FROM show_chunks('dc_metrics') c
+ ORDER BY 1;
+
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+BEGIN;
+SET LOCAL timescaledb.skip_cagg_invalidation = on;
+INSERT INTO dc_metrics
+SELECT i, 1, 2 FROM generate_series(41, 80) i;
+COMMIT;
+SELECT * FROM cagg_invalidation_counts;
+
+RESET timescaledb.enable_direct_compress_insert;
+RESET timescaledb.enable_direct_compress_insert_client_sorted;
+
+SET timescaledb.enable_direct_compress_copy = on;
+SET timescaledb.enable_direct_compress_copy_client_sorted = on;
+COPY dc_metrics (time, device, val) FROM STDIN;
+81	1	1
+82	1	1
+83	1	1
+84	1	1
+85	1	1
+86	1	1
+87	1	1
+88	1	1
+89	1	1
+90	1	1
+91	1	1
+\.
+SELECT * FROM cagg_invalidation_counts;
+
+RESET ROLE;
+TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+TRUNCATE _timescaledb_catalog.continuous_aggs_materialization_invalidation_log;
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+
+BEGIN;
+SET LOCAL timescaledb.skip_cagg_invalidation = on;
+COPY dc_metrics (time, device, val) FROM STDIN;
+92	1	1
+93	1	1
+94	1	1
+95	1	1
+96	1	1
+97	1	1
+98	1	1
+99	1	1
+100	1	1
+101	1	1
+102	1	1
+\.
+COMMIT;
+SELECT * FROM cagg_invalidation_counts;
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(c) AS status
+  FROM show_chunks('dc_metrics') c
+ ORDER BY 1;
+
+RESET timescaledb.enable_direct_compress_copy;
+RESET timescaledb.enable_direct_compress_copy_client_sorted;

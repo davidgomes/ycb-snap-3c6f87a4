@@ -97,6 +97,7 @@ bool ts_guc_enable_foreign_key_propagation = true;
 TSDLLEXPORT bool ts_guc_enable_cagg_sort_pushdown = true;
 #endif
 TSDLLEXPORT bool ts_guc_enable_cagg_watermark_constify = true;
+TSDLLEXPORT bool ts_guc_skip_cagg_invalidation = false;
 TSDLLEXPORT int ts_guc_cagg_max_individual_materializations = 10;
 bool ts_guc_enable_osm_reads = true;
 TSDLLEXPORT bool ts_guc_enable_compressed_direct_batch_delete = true;
@@ -1040,6 +1041,25 @@ _guc_init(void)
 							 "Enable constifying cagg watermark for real-time caggs",
 							 &ts_guc_enable_cagg_watermark_constify,
 							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	/*
+	 * Bulk migration tools copy both hypertable data and continuous-aggregate
+	 * materializations, then refresh on their own schedule. While this is on,
+	 * DML and invalidating DDL do not append continuous aggregate invalidation
+	 * log entries. Misuse can leave continuous aggregates stale; callers own
+	 * the refresh. SET LOCAL limits the opt-out to the current transaction.
+	 */
+	DefineCustomBoolVariable(MAKE_EXTOPTION("skip_cagg_invalidation"),
+							 "Skip continuous aggregate invalidation logging",
+							 "Do not append continuous aggregate invalidation log entries for "
+							 "DML or invalidating DDL in this session",
+							 &ts_guc_skip_cagg_invalidation,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL,
