@@ -48,8 +48,10 @@ func digestTestNodes(secondaryIndexCount uint16) []segmentReplaceNode {
 
 	// Sizes deliberately alternate large/small so buffer reuse across
 	// iterations is exercised in both directions.
-	sizes := []int{10_000, 0, 5, storobj.MarshallerV1HeaderLen - 1, 20_000,
-		storobj.MarshallerV1HeaderLen, storobj.MarshallerV1HeaderLen + 1, 1, 6_000}
+	sizes := []int{
+		10_000, 0, 5, storobj.MarshallerV1HeaderLen - 1, 20_000,
+		storobj.MarshallerV1HeaderLen, storobj.MarshallerV1HeaderLen + 1, 1, 6_000,
+	}
 	nodes := make([]segmentReplaceNode, 0, len(sizes)+1)
 	for i, size := range sizes {
 		nodes = append(nodes, segmentReplaceNode{
