@@ -159,6 +159,111 @@ func TestHandleStarted(t *testing.T) {
 	}
 }
 
+func TestHasEnoughTimeForRetryWithStartDelay(t *testing.T) {
+	scheduleTime := defaultTime
+	scheduleToClose := 10 * time.Minute
+	startDelay := 5 * time.Minute
+	retryInterval := time.Second
+
+	testCases := []struct {
+		name       string
+		startDelay *durationpb.Duration
+		now        time.Time
+		expected   bool
+	}{
+		{
+			name:     "no start delay - past schedule-to-close deadline",
+			now:      scheduleTime.Add(scheduleToClose),
+			expected: false,
+		},
+		{
+			name:       "start delay extends schedule-to-close deadline",
+			startDelay: durationpb.New(startDelay),
+			now:        scheduleTime.Add(scheduleToClose),
+			expected:   true,
+		},
+		{
+			name:       "start delay - retry would land past extended deadline",
+			startDelay: durationpb.New(startDelay),
+			now:        scheduleTime.Add(startDelay + scheduleToClose - retryInterval),
+			expected:   false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := &chasm.MockMutableContext{
+				MockContext: chasm.MockContext{
+					HandleNow: func(chasm.Component) time.Time { return tc.now },
+				},
+			}
+			activity := &Activity{
+				ActivityState: &activitypb.ActivityState{
+					RetryPolicy:            defaultRetryPolicy,
+					ScheduleToCloseTimeout: durationpb.New(scheduleToClose),
+					ScheduleTime:           timestamppb.New(scheduleTime),
+					StartDelay:             tc.startDelay,
+				},
+				LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{Count: 1}),
+			}
+
+			enoughTime, interval := activity.hasEnoughTimeForRetry(ctx, retryInterval)
+			require.Equal(t, tc.expected, enoughTime)
+			require.Equal(t, retryInterval, interval)
+		})
+	}
+}
+
+func TestRecordActivityTaskStartedResponseScheduledTimeIncludesStartDelay(t *testing.T) {
+	scheduleTime := defaultTime
+	startDelay := 5 * time.Minute
+
+	testCases := []struct {
+		name                  string
+		startDelay            *durationpb.Duration
+		expectedScheduledTime time.Time
+	}{
+		{
+			name:                  "no start delay",
+			expectedScheduledTime: scheduleTime,
+		},
+		{
+			name:                  "with start delay",
+			startDelay:            durationpb.New(startDelay),
+			expectedScheduledTime: scheduleTime.Add(startDelay),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := &chasm.MockMutableContext{
+				MockContext: chasm.MockContext{
+					HandleExecutionKey: func() chasm.ExecutionKey {
+						return chasm.ExecutionKey{BusinessID: "test-activity-id", RunID: "test-run-id"}
+					},
+				},
+			}
+			activity := &Activity{
+				ActivityState: &activitypb.ActivityState{
+					ActivityType:           &commonpb.ActivityType{Name: "test-activity-type"},
+					Status:                 activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+					TaskQueue:              &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+					ScheduleToCloseTimeout: durationpb.New(10 * time.Minute),
+					ScheduleTime:           timestamppb.New(scheduleTime),
+					StartDelay:             tc.startDelay,
+				},
+				LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{Count: 1}),
+				RequestData: chasm.NewDataField(ctx, &activitypb.ActivityRequestData{}),
+			}
+
+			response, err := activity.GenerateRecordActivityTaskStartedResponse(ctx, "test-namespace")
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedScheduledTime, response.GetScheduledEvent().GetEventTime().AsTime())
+			require.Equal(t, tc.expectedScheduledTime, response.GetCurrentAttemptScheduledTime().AsTime())
+		})
+	}
+}
+
 func TestActivityTerminate(t *testing.T) {
 	testCases := []struct {
 		name           string

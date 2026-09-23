@@ -641,6 +641,56 @@ func TestModifiedActivityTimeouts(t *testing.T) {
 	}
 }
 
+func TestValidateStartDelay(t *testing.T) {
+	validCases := []struct {
+		name       string
+		startDelay *durationpb.Duration
+	}{
+		{name: "nil", startDelay: nil},
+		{name: "zero", startDelay: durationpb.New(0)},
+		{name: "positive", startDelay: durationpb.New(10 * time.Second)},
+	}
+	for _, tc := range validCases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, validateStartDelay(tc.startDelay))
+		})
+	}
+
+	invalidCases := []struct {
+		name       string
+		startDelay *durationpb.Duration
+	}{
+		{name: "negative", startDelay: durationpb.New(-1 * time.Second)},
+		{name: "mismatched signs", startDelay: &durationpb.Duration{Seconds: 1, Nanos: -1}},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateStartDelay(tc.startDelay)
+			var invalidArgErr *serviceerror.InvalidArgument
+			require.ErrorAs(t, err, &invalidArgErr)
+			require.Contains(t, invalidArgErr.Error(), "invalid StartDelay")
+		})
+	}
+}
+
+func TestValidateStandAloneNegativeStartDelay(t *testing.T) {
+	req := &workflowservice.StartActivityExecutionRequest{
+		ActivityId:             defaultActivityID,
+		ActivityType:           &commonpb.ActivityType{Name: defaultActivityType},
+		ScheduleToCloseTimeout: durationpb.New(10 * time.Second),
+		TaskQueue:              &taskqueuepb.TaskQueue{Name: defaultTaskQueue},
+		Namespace:              "default",
+		RequestId:              "test-request-id",
+		StartDelay:             durationpb.New(-1 * time.Second),
+	}
+
+	h := newTestFrontendHandler(defaultBlobSizeLimitError, defaultBlobSizeLimitWarn, defaultMaxIDLengthLimit)
+	err := validateAndNormalizeStartRequest(req, h.config.MaxIDLengthLimit(), h.config.BlobSizeLimitError, h.config.BlobSizeLimitWarn, h.logger, h.saMapperProvider, h.saValidator)
+	var invalidArgErr *serviceerror.InvalidArgument
+	require.ErrorAs(t, err, &invalidArgErr)
+	require.Contains(t, invalidArgErr.Error(), "invalid StartDelay")
+}
+
 func TestValidateDeleteActivityExecutionRequest(t *testing.T) {
 	t.Run("Success", func(t *testing.T) {
 		req := &workflowservice.DeleteActivityExecutionRequest{
