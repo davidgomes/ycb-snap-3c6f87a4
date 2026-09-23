@@ -52,7 +52,8 @@ CREATE OR REPLACE FUNCTION @extschema@.add_compaction_policy(
     initial_start TIMESTAMPTZ = NULL,
     timezone TEXT = NULL,
     max_chunks INTEGER = NULL,
-    inactive_for INTERVAL = NULL
+    inactive_for INTERVAL = NULL,
+    max_batches INTEGER = NULL
 ) RETURNS INTEGER
 AS '@MODULE_PATHNAME@', 'ts_policy_compaction_add'
 LANGUAGE C VOLATILE; -- not strict because we need to set a default schedule_interval

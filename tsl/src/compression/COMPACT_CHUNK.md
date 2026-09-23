@@ -9,6 +9,16 @@ when the current batch's first row sorts before the previous batch's last row.
 Because the metadata holds the real boundary rows for every orderby column, no
 decompression is needed, even for multi-column orderby.
 
+## Limiting work per call
+
+`compact_chunk(chunk, max_batches)` returns after a merge group has been fully
+rewritten once the number of decompressed batches reaches `max_batches`.
+`0` (the default) means unlimited. The limit is not applied in the middle of
+an overlapping set, so one group may decompress more batches than the limit.
+A later call continues with the overlaps that remain. A negative value is
+rejected. The compaction policy stores the same limit as config key
+`max_batches` when it is greater than zero and passes it to each chunk.
+
 ## How It Works
 
 ```

@@ -28,6 +28,8 @@ SELECT create_hypertable('plain', 'time');
 SELECT add_compaction_policy('plain');
 -- Negative max_chunks is rejected.
 SELECT add_compaction_policy('metrics', max_chunks => -1);
+-- Negative max_batches is rejected.
+SELECT add_compaction_policy('metrics', max_batches => -1);
 \set ON_ERROR_STOP 1
 DROP TABLE plain;
 
@@ -37,7 +39,11 @@ SELECT _timescaledb_functions.policy_compaction_check('{"max_chunks": 1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_chunks": -1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "-1 hour"}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "not an interval"}');
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": -1}');
 \set ON_ERROR_STOP 1
+-- Zero and a positive limit are valid. Zero means unlimited.
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": 0}');
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": 2}');
 
 -- Add the policy and inspect the resulting job. Default schedule is 5 minutes.
 SELECT add_compaction_policy('metrics') AS job_id \gset
@@ -192,5 +198,77 @@ SELECT remove_compaction_policy('m2');
 \set ON_ERROR_STOP 1
 SELECT remove_compaction_policy('m2', if_exists => true);
 DROP TABLE m2;
+
+----------------------------------------------------------------------
+-- max_batches config and pass-through
+----------------------------------------------------------------------
+
+CREATE TABLE cfg (time TIMESTAMPTZ NOT NULL, device TEXT, value float) WITH (tsdb.hypertable, tsdb.orderby='time');
+
+-- Zero is unlimited and is not stored. Omitting the argument is the same.
+SELECT add_compaction_policy('cfg', max_batches => 0) AS job_id \gset
+SELECT config - 'hypertable_id' AS config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+SELECT remove_compaction_policy('cfg');
+SELECT add_compaction_policy('cfg') AS job_id \gset
+SELECT config - 'hypertable_id' AS config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+SELECT remove_compaction_policy('cfg');
+
+-- A positive limit is stored under the max_batches key, alongside max_chunks.
+SELECT add_compaction_policy('cfg', max_chunks => 3, max_batches => 2) AS job_id \gset
+SELECT config - 'hypertable_id' AS config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+SELECT remove_compaction_policy('cfg');
+DROP TABLE cfg;
+
+-- The policy passes max_batches into compact_chunk. One run merges the first
+-- overlap group and leaves the second; the next run finishes the chunk.
+CREATE TABLE paced (time TIMESTAMPTZ NOT NULL, device TEXT, value float) WITH (tsdb.hypertable, tsdb.orderby='time');
+
+INSERT INTO paced
+SELECT '2025-03-03'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(0,999) i;
+INSERT INTO paced
+SELECT '2025-03-03'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(500,1499) i;
+INSERT INTO paced
+SELECT '2025-03-03'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(1200,2199) i;
+INSERT INTO paced
+SELECT '2025-03-03'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(2500,3499) i;
+INSERT INTO paced
+SELECT '2025-03-03'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(2800,3799) i;
+
+SELECT cs.compress_relid::regclass::text AS "PACED_CHUNK"
+FROM _timescaledb_catalog.chunk ch
+    JOIN _timescaledb_catalog.compression_settings cs
+        ON cs.relid = ch.relid
+    JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+WHERE ht.table_name = 'paced'
+ORDER BY ch.id LIMIT 1 \gset
+
+SELECT unordered_count('paced');
+
+SELECT add_compaction_policy('paced', max_batches => 2) AS job_id \gset
+CALL run_job(:job_id);
+
+-- First group merged (one overlap edge left) and the chunk is still unordered.
+SELECT count(*) AS batches,
+       count(*) FILTER (WHERE prev_max > min_t) AS overlap_edges,
+       sum(cnt) AS nrows
+FROM (
+  SELECT _ts_meta_count AS cnt,
+         _ts_meta_min_1 AS min_t,
+         lag(_ts_meta_max_1) OVER (ORDER BY _ts_meta_min_1, ctid) AS prev_max
+  FROM :PACED_CHUNK
+) s;
+SELECT unordered_count('paced');
+
+CALL run_job(:job_id);
+SELECT unordered_count('paced');
+SELECT count(*) FROM paced;
+
+SELECT remove_compaction_policy('paced');
+DROP TABLE paced;
 
 DROP FUNCTION unordered_count(regclass);

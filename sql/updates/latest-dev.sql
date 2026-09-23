@@ -1,6 +1,11 @@
 
 DROP FUNCTION IF EXISTS _timescaledb_functions.estimate_uncompressed_size(regclass);
 
+-- Signature gained max_batches. Drop the previous overload so CREATE OR REPLACE
+-- below installs a single function.
+DROP FUNCTION IF EXISTS _timescaledb_functions.compact_chunk(REGCLASS);
+DROP FUNCTION IF EXISTS @extschema@.add_compaction_policy(REGCLASS, BOOL, INTERVAL, TIMESTAMPTZ, TEXT, INTEGER, INTERVAL);
+
 DROP PROCEDURE IF EXISTS _timescaledb_functions.policy_compression_execute(INTEGER, INTEGER, ANYELEMENT, INTEGER, BOOLEAN, BOOLEAN, BOOLEAN, BOOLEAN);
 
 --
