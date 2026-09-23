@@ -20,6 +20,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -588,6 +589,17 @@ class DBImpl : public DB {
   Status GetLiveFilesStorageInfo(
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override;
+
+  // column_family_ids == nullptr is the whole-DB capture above.
+  // A non-null set limits table and blob files to those column families and
+  // replaces the MANIFEST entry with an in-memory snapshot of just those
+  // families. The on-disk MANIFEST of this DB is not modified. The set must
+  // include the default column family (id 0); ids that are missing or dropped
+  // return InvalidArgument.
+  Status GetLiveFilesStorageInfo(
+      const LiveFilesStorageInfoOptions& opts,
+      std::vector<LiveFileStorageInfo>* files,
+      const std::unordered_set<uint32_t>* column_family_ids);
 
   Status GetPreparedFileInfoForExternalSstIngestion(
       const std::string& file_path,

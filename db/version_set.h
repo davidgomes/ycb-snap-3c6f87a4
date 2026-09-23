@@ -1727,11 +1727,16 @@ class VersionSet {
         : log_number(_log_number), full_history_ts_low(std::move(ts_low)) {}
   };
 
-  // Save current contents to *log
+  // Save current contents to *log.
+  // column_family_ids == nullptr writes every non-dropped column family.
+  // Otherwise only those ids are written, and the default column family's
+  // record also stores next_file_number and max_column_family so the result
+  // can be opened on its own. The default column family id must be in the set.
   Status WriteCurrentStateToManifest(
       const WriteOptions& write_options,
       const std::unordered_map<uint32_t, MutableCFState>& curr_state,
-      const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s);
+      const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s,
+      const std::unordered_set<uint32_t>* column_family_ids = nullptr);
 
   // Reopen the existing MANIFEST file for append at the end of Recover()
   // when reuse_manifest_on_open is set, so the next LogAndApply appends

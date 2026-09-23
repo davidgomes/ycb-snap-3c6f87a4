@@ -1,0 +1,1 @@
+Added `Checkpoint::CreateCheckpoint` overload that writes a checkpoint containing only a selected set of column families. The default column family is always included. An empty selection checkpoints every column family, matching the existing whole-DB API.

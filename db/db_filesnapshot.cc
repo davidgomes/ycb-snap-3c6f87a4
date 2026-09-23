@@ -8,13 +8,17 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
 #include "db/job_context.h"
+#include "db/log_writer.h"
 #include "db/version_set.h"
 #include "file/file_util.h"
 #include "file/filename.h"
+#include "file/writable_file_writer.h"
 #include "logging/logging.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
@@ -27,6 +31,46 @@
 #include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+// WritableFile that appends into a caller-owned string. Used to encode a
+// column-family subset MANIFEST without touching the live DB directory.
+class StringWritableFile : public FSWritableFile {
+ public:
+  explicit StringWritableFile(std::string* contents) : contents_(contents) {}
+
+  IOStatus Append(const Slice& data, const IOOptions& /*options*/,
+                  IODebugContext* /*dbg*/) override {
+    contents_->append(data.data(), data.size());
+    return IOStatus::OK();
+  }
+
+  IOStatus Close(const IOOptions& /*options*/,
+                 IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+
+  IOStatus Flush(const IOOptions& /*options*/,
+                 IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+
+  IOStatus Sync(const IOOptions& /*options*/,
+                IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+
+  uint64_t GetFileSize(const IOOptions& /*options*/,
+                       IODebugContext* /*dbg*/) override {
+    return contents_->size();
+  }
+
+  bool use_direct_io() const override { return false; }
+
+ private:
+  std::string* contents_;
+};
+}  // namespace
 
 Status DBImpl::FlushForGetLiveFiles(bool force_atomic_flush) {
   FlushOptions flush_opts;
@@ -198,6 +242,13 @@ Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
+  return GetLiveFilesStorageInfo(opts, files, /*column_family_ids=*/nullptr);
+}
+
+Status DBImpl::GetLiveFilesStorageInfo(
+    const LiveFilesStorageInfoOptions& opts,
+    std::vector<LiveFileStorageInfo>* files,
+    const std::unordered_set<uint32_t>* column_family_ids) {
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
@@ -277,9 +328,30 @@ Status DBImpl::GetLiveFilesStorageInfo(
     }
   }
 
+  if (column_family_ids != nullptr) {
+    if (column_family_ids->find(0) == column_family_ids->end()) {
+      mutex_.Unlock();
+      return Status::InvalidArgument(
+          "Default column family must be included in a checkpoint");
+    }
+    for (uint32_t id : *column_family_ids) {
+      ColumnFamilyData* cfd =
+          versions_->GetColumnFamilySet()->GetColumnFamily(id);
+      if (cfd == nullptr || cfd->IsDropped()) {
+        mutex_.Unlock();
+        return Status::InvalidArgument(
+            "Column family is dropped or does not belong to this DB");
+      }
+    }
+  }
+
   // Make a set of all of the live table and blob files
   for (auto cfd : *versions_->GetColumnFamilySet()) {
     if (cfd->IsDropped()) {
+      continue;
+    }
+    if (column_family_ids != nullptr &&
+        column_family_ids->find(cfd->GetID()) == column_family_ids->end()) {
       continue;
     }
     VersionStorageInfo& vsi = *cfd->current()->storage_info();
@@ -352,6 +424,50 @@ Status DBImpl::GetLiveFilesStorageInfo(
   // Ensure consistency with manifest for track_and_verify_wals_in_manifest
   const uint64_t max_log_num = cur_wal_number_;
 
+  // Subset checkpoints need a MANIFEST that does not mention excluded column
+  // families. Encode it while the mutex is held so it matches the file list
+  // captured above. The live MANIFEST is not modified.
+  std::string subset_manifest;
+  if (column_family_ids != nullptr) {
+    std::unordered_map<uint32_t, VersionSet::MutableCFState> curr_state;
+    for (const auto* cfd : *versions_->GetColumnFamilySet()) {
+      if (cfd->IsDropped()) {
+        continue;
+      }
+      curr_state.emplace(
+          cfd->GetID(), VersionSet::MutableCFState(cfd->GetLogNumber(),
+                                                   cfd->GetFullHistoryTsLow()));
+    }
+    VersionEdit wal_additions;
+    for (const auto& wal : versions_->GetWalSet().GetWals()) {
+      wal_additions.AddWal(wal.first, wal.second);
+    }
+
+    const std::string snapshot_manifest_fname =
+        DescriptorFileName(manifest_number);
+    FileOptions file_opts;
+    auto file_writer = std::make_unique<WritableFileWriter>(
+        std::make_unique<StringWritableFile>(&subset_manifest),
+        snapshot_manifest_fname, file_opts);
+    log::Writer log_writer(std::move(file_writer), /*log_number=*/0,
+                           /*recycle_log_files=*/false);
+    WriteOptions write_options;
+    IOStatus io_s;
+    Status manifest_s = versions_->WriteCurrentStateToManifest(
+        write_options, curr_state, wal_additions, &log_writer, io_s,
+        column_family_ids);
+    if (manifest_s.ok()) {
+      io_s = log_writer.WriteBuffer(write_options);
+      if (!io_s.ok()) {
+        manifest_s = io_s;
+      }
+    }
+    if (!manifest_s.ok()) {
+      mutex_.Unlock();
+      return manifest_s;
+    }
+  }
+
   mutex_.Unlock();
 
   std::string manifest_fname = DescriptorFileName(manifest_number);
@@ -363,8 +479,14 @@ Status DBImpl::GetLiveFilesStorageInfo(
     info.directory = GetName();
     info.file_number = manifest_number;
     info.file_type = kDescriptorFile;
-    info.size = manifest_size;
-    info.trim_to_size = true;
+    if (column_family_ids != nullptr) {
+      info.replacement_contents = std::move(subset_manifest);
+      info.size = info.replacement_contents.size();
+      info.trim_to_size = false;
+    } else {
+      info.size = manifest_size;
+      info.trim_to_size = true;
+    }
     if (opts.include_checksum_info) {
       info.file_checksum_func_name = kUnknownFileChecksumFuncName;
       info.file_checksum = kUnknownFileChecksum;

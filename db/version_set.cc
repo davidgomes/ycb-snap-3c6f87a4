@@ -5973,7 +5973,8 @@ Status VersionSet::ProcessManifestWrites(
                                  opt_file_opts, manifest_preallocation_size);
         raw_desc_log_ptr = new_desc_log_ptr.get();
         s = WriteCurrentStateToManifest(write_options, curr_state,
-                                        wal_additions, raw_desc_log_ptr, io_s);
+                                        wal_additions, raw_desc_log_ptr, io_s,
+                                        /*column_family_ids=*/nullptr);
         assert(s == io_s);
       }
       if (!io_s.ok()) {
@@ -7098,7 +7099,9 @@ void VersionSet::MarkMinLogNumberToKeep(uint64_t number) {
 Status VersionSet::WriteCurrentStateToManifest(
     const WriteOptions& write_options,
     const std::unordered_map<uint32_t, MutableCFState>& curr_state,
-    const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s) {
+    const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s,
+    const std::unordered_set<uint32_t>* column_family_ids) {
+  assert(column_family_ids == nullptr || column_family_ids->count(0) == 1);
   // TODO: Break up into multiple records to reduce memory usage on recovery?
 
   // WARNING: This method doesn't hold a mutex!!
@@ -7158,6 +7161,10 @@ Status VersionSet::WriteCurrentStateToManifest(
     assert(cfd);
 
     if (cfd->IsDropped()) {
+      continue;
+    }
+    if (column_family_ids != nullptr &&
+        column_family_ids->find(cfd->GetID()) == column_family_ids->end()) {
       continue;
     }
     assert(cfd->initialized());
@@ -7249,6 +7256,13 @@ Status VersionSet::WriteCurrentStateToManifest(
         uint64_t min_log = min_log_number_to_keep();
         if (min_log != 0) {
           edit.SetMinLogNumberToKeep(min_log);
+        }
+        // A subset snapshot is opened by itself, so it needs the file-number
+        // high water mark and the max column-family id. Whole-DB manifest
+        // rotation records those on the edit that follows this snapshot.
+        if (column_family_ids != nullptr) {
+          edit.SetNextFile(next_file_number_.load());
+          edit.SetMaxColumnFamily(column_family_set_->GetMaxColumnFamily());
         }
       }
 
