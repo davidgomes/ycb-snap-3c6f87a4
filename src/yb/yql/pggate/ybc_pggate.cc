@@ -35,6 +35,7 @@
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
+#include "yb/dockv/doc_key.h"
 #include "yb/dockv/pg_key_decoder.h"
 #include "yb/dockv/pg_row.h"
 #include "yb/dockv/reader_projection.h"
@@ -492,6 +493,14 @@ YbcPgTabletsDescriptor MakeYbcPgTabletsDescriptor(const tablet::TabletStatusPB& 
     .partition_key_end = YBCPAllocStdString(tablet_status.partition().partition_key_end()),
     .partition_key_end_len = tablet_status.partition().partition_key_end().size()
   };
+}
+
+// Renders a range partition bound the same way as the master UI tablet listing.
+const char* RangePartitionBoundToString(const std::string& partition_key) {
+  if (partition_key.empty()) {
+    return nullptr;
+  }
+  return YBCPAllocStdString(dockv::DocKey::DebugSliceToString(partition_key));
 }
 
 } // namespace
@@ -3147,6 +3156,8 @@ YbcStatus YBCTabletsMetadata(YbcPgGlobalTabletsDescriptor** tablets, size_t* cou
 
     for (const auto& tablet_metadata : tablet_metadatas) {
       const char** replicas_array = nullptr;
+      const bool is_hash_partitioned = tablet_metadata.is_hash_partitioned();
+      const auto& partition = tablet_metadata.partition();
 
       if (!tablet_metadata.replicas().empty()) {
         replicas_array = static_cast<const char**>(
@@ -3161,12 +3172,16 @@ YbcStatus YBCTabletsMetadata(YbcPgGlobalTabletsDescriptor** tablets, size_t* cou
         .tablet_descriptor = MakeYbcPgTabletsDescriptor(tablet_metadata),
         .replicas = replicas_array,
         .replicas_count = static_cast<size_t>(tablet_metadata.replicas().size()),
-        .is_hash_partitioned = tablet_metadata.is_hash_partitioned(),
+        .is_hash_partitioned = is_hash_partitioned,
         .tablet_state = tablet_metadata.has_tablet_state()
             ? YBCPAllocStdString(tablet_metadata.tablet_state())
             : nullptr,
         .pg_table_oid = tablet_metadata.has_pg_table_oid() ? tablet_metadata.pg_table_oid()
-                                                           : kPgInvalidOid
+                                                           : kPgInvalidOid,
+        .start_range = is_hash_partitioned
+            ? nullptr : RangePartitionBoundToString(partition.partition_key_start()),
+        .end_range = is_hash_partitioned
+            ? nullptr : RangePartitionBoundToString(partition.partition_key_end()),
       };
       ++dest;
     }

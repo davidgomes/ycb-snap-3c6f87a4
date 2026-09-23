@@ -26,6 +26,26 @@ JOIN yb_servers() ys
 WHERE ytm.relname IN ('test_table_1', 'test_table_2')
 ORDER BY ytm.start_hash_code NULLS FIRST;
 
+-- Test start_range/end_range. Range-sharded tablets report their decoded DocDB
+-- partition bounds (timestamps as int64 microseconds), NULL for unbounded
+-- edges. Hash-sharded tablets, including HASH+ASC composite keys, only report
+-- hash bounds.
+CREATE TABLE range_int (k INT, v INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((100), (200));
+CREATE TABLE range_ts (ts TIMESTAMP, PRIMARY KEY (ts ASC)) SPLIT AT VALUES (('2024-06-01'));
+CREATE TABLE hash_range (h INT, r INT, PRIMARY KEY (h HASH, r ASC)) SPLIT INTO 2 TABLETS;
+
+SELECT
+    relname,
+    start_hash_code,
+    end_hash_code,
+    start_range,
+    end_range
+FROM yb_tablet_metadata
+WHERE
+    db_name = current_database()
+    AND relname IN ('range_int', 'range_ts', 'hash_range', 'test_table_2')
+ORDER BY relname, start_hash_code NULLS FIRST, start_range NULLS FIRST;
+
 -- Test that data from multiple databases is returned
 CREATE DATABASE test_db;
 \c test_db
@@ -116,18 +136,139 @@ WHERE
     AND db_name IN ('yb_tmeta_a', 'yb_tmeta_b')
 ORDER BY db_name, relname;
 
--- Test that non-superusers can see cluster-wide tablet metadata
+-- Test masking of relname, start_range and end_range. Superusers and
+-- yb_db_admin members always see real values. Other roles see them only for
+-- tables in the current database on which they have SELECT; otherwise those
+-- columns read '<insufficient privilege>'. Rows are never dropped and hash
+-- bounds are never masked.
 CREATE ROLE yb_tmeta_user LOGIN;
+CREATE ROLE yb_tmeta_admin LOGIN;
+GRANT yb_db_admin TO yb_tmeta_admin;
+
+\c yb_tmeta_a
+
+CREATE TABLE granted_range (k INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((10));
+CREATE TABLE granted_hash (k INT PRIMARY KEY) SPLIT INTO 2 TABLETS;
+CREATE TABLE ungranted_range (k INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((10));
+CREATE TABLE ungranted_hash (k INT PRIMARY KEY) SPLIT INTO 2 TABLETS;
+CREATE TABLE rewritten (k INT, v INT);
+CREATE TABLE dropped (k INT PRIMARY KEY);
+GRANT SELECT ON granted_range, granted_hash, rewritten, dropped TO yb_tmeta_user;
+-- The rewrite assigns a new relfilenode; the grant stays on the stable oid.
+ALTER TABLE rewritten ADD PRIMARY KEY (k ASC);
+DROP TABLE dropped;
+
+\c yb_tmeta_b
+
+GRANT SELECT ON same_name TO yb_tmeta_user;
+SELECT count(*) AS yb_tmeta_b_row_count
+FROM yb_tablet_metadata
+WHERE db_name = 'yb_tmeta_b' \gset
 
 \c yb_tmeta_a yb_tmeta_user
 
+-- Masked hash-sharded rows keep NULL ranges; masked range-sharded rows mask
+-- every range cell, including unbounded edges.
 SELECT
+    oid::regclass AS rel,
+    relname,
+    start_hash_code,
+    end_hash_code,
+    start_range,
+    end_range
+FROM yb_tablet_metadata
+WHERE
+    db_name = current_database()
+    AND oid::regclass::text IN ('granted_range', 'granted_hash',
+                                'ungranted_range', 'ungranted_hash',
+                                'only_in_a', 'same_name')
+ORDER BY oid::regclass::text COLLATE "C", start_hash_code NULLS FIRST,
+    start_range COLLATE "C" NULLS FIRST;
+
+-- The grant survives the table rewrite.
+SELECT
+    (SELECT relfilenode <> oid FROM pg_class WHERE relname = 'rewritten') AS is_rewritten;
+SELECT DISTINCT
+    relname,
+    start_range,
+    end_range
+FROM yb_tablet_metadata
+WHERE
+    db_name = current_database()
+    AND oid = 'rewritten'::regclass
+    AND tablet_state = 'RUNNING';
+
+-- Rows whose oid no longer resolves are masked rather than raising an error.
+SELECT count(*) AS visible_dropped_rows
+FROM yb_tablet_metadata
+WHERE relname = 'dropped';
+
+-- Tables in other databases are masked even with SELECT on them, but no rows
+-- are dropped.
+SELECT
+    relname,
+    start_range,
+    end_range,
+    count(*) AS num_tablets
+FROM yb_tablet_metadata
+WHERE db_name = 'yb_tmeta_b'
+GROUP BY relname, start_range, end_range;
+
+SELECT count(*) = :yb_tmeta_b_row_count::bigint AS same_row_count
+FROM yb_tablet_metadata
+WHERE db_name = 'yb_tmeta_b';
+
+-- The system transactions tablets are always shown unmasked.
+SELECT DISTINCT
     relname,
     db_name
 FROM yb_tablet_metadata
+WHERE db_name = 'system';
+
+\c yb_tmeta_b yb_tmeta_user
+
+SELECT
+    oid::regclass AS rel,
+    relname,
+    start_range,
+    end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database()
+ORDER BY oid::regclass::text COLLATE "C";
+
+-- The colocation parent stays masked; per-table SELECT gates the rest.
+\c colocated_db yugabyte
+
+GRANT SELECT ON colocated_hash, colocated_asc, non_colocated_split TO yb_tmeta_user;
+
+\c colocated_db yb_tmeta_user
+
+SELECT relname
+FROM yb_tablet_metadata
 WHERE
-    relname IN ('only_in_b', 'same_name')
-    AND db_name = 'yb_tmeta_b'
+    db_name = current_database()
+    AND oid IS NULL;
+
+SELECT
+    relname,
+    start_hash_code,
+    end_hash_code
+FROM yb_tablet_metadata
+WHERE
+    db_name = current_database()
+    AND oid IS NOT NULL
+ORDER BY start_hash_code;
+
+-- yb_db_admin members see real values across databases.
+\c yb_tmeta_a yb_tmeta_admin
+
+SELECT
+    relname,
+    db_name,
+    start_range,
+    end_range
+FROM yb_tablet_metadata
+WHERE db_name = 'yb_tmeta_b'
 ORDER BY relname;
 
 -- Cleanup
@@ -136,3 +277,4 @@ DROP DATABASE colocated_db;
 DROP DATABASE yb_tmeta_a;
 DROP DATABASE yb_tmeta_b;
 DROP ROLE yb_tmeta_user;
+DROP ROLE yb_tmeta_admin;

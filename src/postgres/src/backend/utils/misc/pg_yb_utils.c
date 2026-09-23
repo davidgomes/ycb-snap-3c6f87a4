@@ -131,6 +131,7 @@
 #include "storage/procarray.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -9136,6 +9137,51 @@ string_list_compare(const ListCell *a, const ListCell *b)
 	return strcmp((char *) lfirst(a), (char *) lfirst(b));
 }
 
+#define YB_TABLET_METADATA_MASKED_VALUE "<insufficient privilege>"
+
+/*
+ * Returns whether an unprivileged caller may see the sensitive columns
+ * (object_name, start_range, end_range) of a yb_get_tablet_metadata() row.
+ *
+ * The system 'transactions' tablet is always visible. Otherwise the row must
+ * belong to a YSQL table in the current database on which the caller has
+ * SELECT; index tablets are gated by their base table. The oid comes from the
+ * master and may not (or no longer) exist locally, e.g. for colocation parents
+ * or concurrently dropped tables, in which case the row is masked instead of
+ * raising an error.
+ */
+static bool
+YbTabletMetadataRowIsVisible(const YbcPgGlobalTabletsDescriptor *tablet,
+							 const char *current_db_name)
+{
+	const YbcPgTabletsDescriptor *desc = &tablet->tablet_descriptor;
+	Oid			relid = tablet->pg_table_oid;
+	char		relkind;
+	bool		is_missing = false;
+
+	if (strcmp(desc->table_type, "System") == 0 &&
+		strcmp(desc->namespace_name, "system") == 0 &&
+		strcmp(desc->table_name, "transactions") == 0)
+		return true;
+
+	if (strcmp(desc->table_type, "YSQL") != 0 ||
+		strcmp(desc->namespace_name, current_db_name) != 0 ||
+		!OidIsValid(relid))
+		return false;
+
+	relkind = get_rel_relkind(relid);
+	if (relkind == RELKIND_INDEX || relkind == RELKIND_PARTITIONED_INDEX)
+		relid = IndexGetRelation(relid, true /* missing_ok */ );
+	else if (relkind == '\0')
+		return false;
+
+	if (!OidIsValid(relid))
+		return false;
+
+	return pg_class_aclcheck_ext(relid, GetUserId(), ACL_SELECT,
+								 &is_missing) == ACLCHECK_OK && !is_missing;
+}
+
 /*
  * Returns the metadata for all tablets in the cluster.
  * The returned data structure is a row type with the following columns:
@@ -9155,8 +9201,16 @@ string_list_compare(const ListCell *a, const ListCell *b)
  * - tablet_state: text
  *
  * The start_hash_code and end_hash_code are the hash codes of the start and end
- * keys of the tablet for hash sharded tables. Leader is provided as a separate
- * column for simpler querying and self-explanatory access.
+ * keys of the tablet for hash sharded tables. start_range and end_range are the
+ * decoded DocDB partition bounds of range sharded tables (NULL for unbounded
+ * edges and for hash sharded tables). Leader is provided as a separate column
+ * for simpler querying and self-explanatory access.
+ *
+ * Unless the caller is a superuser or a yb_db_admin member, object_name,
+ * start_range and end_range are replaced with "<insufficient privilege>" for
+ * rows the caller may not see (see YbTabletMetadataRowIsVisible). For masked
+ * range sharded rows both range columns are masked, even unbounded edges, so
+ * that the tablet layout is not revealed.
  */
 Datum
 yb_get_tablet_metadata(PG_FUNCTION_ARGS)
@@ -9200,6 +9254,8 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 
 	YbcPgGlobalTabletsDescriptor *tablets = NULL;
 	size_t		num_tablets = 0;
+	bool		is_privileged = superuser() || IsYbDbAdminUser(GetUserId());
+	char	   *current_db_name = get_database_name(MyDatabaseId);
 
 	HandleYBStatus(YBCTabletsMetadata(&tablets, &num_tablets));
 
@@ -9209,9 +9265,13 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 		YbcPgTabletsDescriptor *tablet_descriptor = &tablet->tablet_descriptor;
 		Datum		values[ncols];
 		bool		nulls[ncols];
+		bool		is_masked;
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
+
+		is_masked = !is_privileged &&
+			!YbTabletMetadataRowIsVisible(tablet, current_db_name);
 
 		values[0] = CStringGetTextDatum(tablet_descriptor->tablet_id);
 		values[1] = CStringGetTextDatum(tablet_descriptor->table_id);
@@ -9228,7 +9288,9 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 
 		values[3] = CStringGetTextDatum(tablet_descriptor->namespace_name);
-		values[4] = CStringGetTextDatum(tablet_descriptor->table_name);
+		values[4] = CStringGetTextDatum(is_masked ?
+										YB_TABLET_METADATA_MASKED_VALUE :
+										tablet_descriptor->table_name);
 		values[5] = CStringGetTextDatum(tablet_descriptor->table_type);
 
 		if (tablet->is_hash_partitioned)
@@ -9274,9 +9336,30 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[9] = true;
 		}
 
-		/* TODO (#28172): start_range, end_range, tablet_attrs are populated in a follow-up change. */
-		nulls[10] = true;
-		nulls[11] = true;
+		if (tablet->is_hash_partitioned)
+		{
+			nulls[10] = true;
+			nulls[11] = true;
+		}
+		else if (is_masked)
+		{
+			values[10] = CStringGetTextDatum(YB_TABLET_METADATA_MASKED_VALUE);
+			values[11] = CStringGetTextDatum(YB_TABLET_METADATA_MASKED_VALUE);
+		}
+		else
+		{
+			if (tablet->start_range)
+				values[10] = CStringGetTextDatum(tablet->start_range);
+			else
+				nulls[10] = true;
+
+			if (tablet->end_range)
+				values[11] = CStringGetTextDatum(tablet->end_range);
+			else
+				nulls[11] = true;
+		}
+
+		/* TODO (#28172): tablet_attrs is populated in a follow-up change. */
 		nulls[12] = true;
 
 		if (tablet->tablet_state)
