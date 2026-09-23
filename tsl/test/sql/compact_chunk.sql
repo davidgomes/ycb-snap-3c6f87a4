@@ -1052,3 +1052,113 @@ FROM :NO_FL_CHUNK ORDER BY _ts_meta_min_1;
 SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_no_firstlast') chunk;
 
 DROP TABLE metrics_no_firstlast;
+
+-- compact_chunk with max_batches bounds the batch decompression work done per
+-- call. The limit is only checked after a merge group has been fully
+-- recompressed, so a group is never left half rewritten and may decompress
+-- more batches than the limit. Remaining overlaps are left for a later call.
+CREATE TABLE metrics_limit (time TIMESTAMPTZ NOT NULL, device TEXT, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.segmentby='device');
+
+SET timescaledb.enable_direct_compress_insert = true;
+SET timescaledb.enable_direct_compress_insert_sort_batches = true;
+SET timescaledb.enable_direct_compress_insert_client_sorted = false;
+
+-- Per segment, count batches and the batches that overlap their predecessor.
+CREATE FUNCTION limit_batches(compressed regclass)
+RETURNS TABLE(device text, batches bigint, overlapping bigint, rows bigint) LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE format($q$
+    SELECT device, count(*), count(*) FILTER (WHERE first_time < prev_last), sum(cnt)::bigint
+    FROM (SELECT device, _ts_meta_count AS cnt, _ts_meta_v2_first_time AS first_time,
+                 lag(_ts_meta_v2_last_time) OVER (PARTITION BY device ORDER BY _ts_meta_v2_first_time, _ts_meta_v2_last_time) AS prev_last
+          FROM %s) b
+    GROUP BY device ORDER BY device $q$, compressed);
+END $$;
+
+-- Three independent merge groups: d1 has 3 overlapping batches, d2 and d3 have 2.
+INSERT INTO metrics_limit
+SELECT '2025-01-03'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM generate_series(0,999) i, unnest(ARRAY['d1','d2','d3']) d;
+INSERT INTO metrics_limit
+SELECT '2025-01-03'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM generate_series(0,999) i, unnest(ARRAY['d1','d2','d3']) d;
+INSERT INTO metrics_limit
+SELECT '2025-01-03'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(0,999) i;
+
+SELECT cs.compress_relid::regclass::text AS "LIMIT_CHUNK"
+FROM _timescaledb_catalog.chunk ch
+    JOIN _timescaledb_catalog.compression_settings cs
+        ON cs.relid = ch.relid
+    JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+WHERE ht.table_name = 'metrics_limit'
+ORDER BY ch.id LIMIT 1 \gset
+
+SELECT show_chunks('metrics_limit') AS "LIMIT_UNCOMPRESSED" \gset
+
+SELECT * FROM limit_batches(:'LIMIT_CHUNK');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+
+-- Negative max_batches is rejected; NULL returns NULL since the function is STRICT.
+\set ON_ERROR_STOP 0
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', -1);
+\set ON_ERROR_STOP 1
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', NULL);
+
+-- max_batches = 1: the whole d1 group (3 batches) is merged even though it
+-- exceeds the limit, then the call stops. d2 and d3 are untouched.
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', 1) IS NOT NULL AS compacted;
+SELECT * FROM limit_batches(:'LIMIT_CHUNK');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+
+-- max_batches = 2: the next call picks up where the previous one left off and
+-- merges only the d2 group.
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', 2) IS NOT NULL AS compacted;
+SELECT * FROM limit_batches(:'LIMIT_CHUNK');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+
+-- The last group is merged. The limit is reached on the final group, the
+-- verification pass finds no overlaps left and UNORDERED is cleared.
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', 2) IS NOT NULL AS compacted;
+SELECT * FROM limit_batches(:'LIMIT_CHUNK');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+
+SELECT count(*), min(time), max(time) FROM metrics_limit;
+
+-- max_batches = 0 means unlimited: all groups are merged in a single call, the
+-- same as omitting the argument.
+TRUNCATE metrics_limit;
+INSERT INTO metrics_limit
+SELECT '2025-01-03'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM generate_series(0,999) i, unnest(ARRAY['d1','d2','d3']) d;
+INSERT INTO metrics_limit
+SELECT '2025-01-03'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM generate_series(0,999) i, unnest(ARRAY['d1','d2','d3']) d;
+
+SELECT cs.compress_relid::regclass::text AS "LIMIT_CHUNK"
+FROM _timescaledb_catalog.chunk ch
+    JOIN _timescaledb_catalog.compression_settings cs
+        ON cs.relid = ch.relid
+    JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+WHERE ht.table_name = 'metrics_limit'
+ORDER BY ch.id LIMIT 1 \gset
+
+SELECT show_chunks('metrics_limit') AS "LIMIT_UNCOMPRESSED" \gset
+
+SELECT * FROM limit_batches(:'LIMIT_CHUNK');
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', 0) IS NOT NULL AS compacted;
+SELECT * FROM limit_batches(:'LIMIT_CHUNK');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+
+-- A limit larger than the total work also compacts everything in one call.
+INSERT INTO metrics_limit
+SELECT '2025-01-03'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM generate_series(0,999) i, unnest(ARRAY['d1','d2','d3']) d;
+SELECT * FROM limit_batches(:'LIMIT_CHUNK');
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', 100) IS NOT NULL AS compacted;
+SELECT * FROM limit_batches(:'LIMIT_CHUNK');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+
+DROP TABLE metrics_limit;
+DROP FUNCTION limit_batches(regclass);

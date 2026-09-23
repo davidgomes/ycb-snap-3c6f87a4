@@ -28,6 +28,8 @@ SELECT create_hypertable('plain', 'time');
 SELECT add_compaction_policy('plain');
 -- Negative max_chunks is rejected.
 SELECT add_compaction_policy('metrics', max_chunks => -1);
+-- Negative max_batches is rejected.
+SELECT add_compaction_policy('metrics', max_batches => -1);
 \set ON_ERROR_STOP 1
 DROP TABLE plain;
 
@@ -35,6 +37,7 @@ DROP TABLE plain;
 \set ON_ERROR_STOP 0
 SELECT _timescaledb_functions.policy_compaction_check('{"max_chunks": 1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_chunks": -1}');
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": -1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "-1 hour"}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "not an interval"}');
 \set ON_ERROR_STOP 1
@@ -54,6 +57,23 @@ SELECT add_compaction_policy('metrics', if_not_exists => true);
 SELECT remove_compaction_policy('metrics');
 SELECT add_compaction_policy('metrics', max_chunks => 2) AS job_id \gset
 SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+
+-- max_batches is stored in the config only when greater than 0.
+SELECT remove_compaction_policy('metrics');
+SELECT add_compaction_policy('metrics', max_batches => 0) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+SELECT remove_compaction_policy('metrics');
+SELECT add_compaction_policy('metrics', max_batches => 5) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+-- A valid max_batches passes the config check.
+SELECT _timescaledb_functions.policy_compaction_check(config) FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+-- alter_job runs the check and rejects a negative max_batches.
+\set ON_ERROR_STOP 0
+SELECT config FROM alter_job(:job_id, config => jsonb_set((SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id), '{max_batches}', '-1'));
+\set ON_ERROR_STOP 1
+
+SELECT remove_compaction_policy('metrics');
+SELECT add_compaction_policy('metrics', max_chunks => 2) AS job_id \gset
 
 ----------------------------------------------------------------------
 -- multi-chunk loop and max_chunks cap
@@ -179,6 +199,63 @@ SELECT _timescaledb_functions.chunk_statistics_reset();
 CALL run_job(:job_id);
 SELECT unordered_count('gate');
 DROP TABLE gate;
+
+----------------------------------------------------------------------
+-- max_batches bounds the work compact_chunk does per chunk
+----------------------------------------------------------------------
+
+CREATE TABLE lim (time TIMESTAMPTZ NOT NULL, device TEXT, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.segmentby='device');
+
+-- One chunk with three overlapping merge groups, one per device, two
+-- batches each.
+INSERT INTO lim SELECT '2025-07-07'::timestamptz + (i || ' minute')::interval, d, i FROM generate_series(1,1000) i, unnest(ARRAY['d1','d2','d3']) d;
+INSERT INTO lim SELECT '2025-07-07'::timestamptz + (i || ' minute')::interval, d, i FROM generate_series(1,1000) i, unnest(ARRAY['d1','d2','d3']) d;
+SELECT unordered_count('lim');
+
+SELECT cs.compress_relid::regclass::text AS lim_compressed
+FROM _timescaledb_catalog.chunk ch
+JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+JOIN _timescaledb_catalog.compression_settings cs ON cs.relid = ch.relid
+WHERE ht.table_name = 'lim' \gset
+SELECT count(*) AS batches FROM :lim_compressed;
+
+-- Per device, the number of batches that overlap their predecessor.
+CREATE FUNCTION lim_overlaps(compressed regclass) RETURNS TABLE(device text, overlapping bigint) LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE format($q$
+    SELECT device, count(*) FILTER (WHERE first_time < prev_last)
+    FROM (SELECT device, _ts_meta_v2_first_time AS first_time,
+                 lag(_ts_meta_v2_last_time) OVER (PARTITION BY device ORDER BY _ts_meta_v2_first_time, _ts_meta_v2_last_time) AS prev_last
+          FROM %s) b
+    GROUP BY device ORDER BY device $q$, compressed);
+END $$;
+SELECT * FROM lim_overlaps(:'lim_compressed');
+
+-- With max_batches = 2 each run merges one group, so the chunk stays
+-- unordered until the third run.
+SELECT add_compaction_policy('lim', max_batches => 2) AS job_id \gset
+SELECT config->'max_batches' AS max_batches FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+CALL run_job(:job_id);
+SELECT unordered_count('lim');
+SELECT * FROM lim_overlaps(:'lim_compressed');
+CALL run_job(:job_id);
+SELECT unordered_count('lim');
+SELECT * FROM lim_overlaps(:'lim_compressed');
+CALL run_job(:job_id);
+SELECT unordered_count('lim');
+SELECT * FROM lim_overlaps(:'lim_compressed');
+SELECT count(*), min(time), max(time) FROM lim;
+SELECT remove_compaction_policy('lim');
+
+-- Without max_batches a single run compacts the whole chunk.
+INSERT INTO lim SELECT '2025-07-07'::timestamptz + (i || ' minute')::interval, d, i FROM generate_series(1,1000) i, unnest(ARRAY['d1','d2','d3']) d;
+SELECT unordered_count('lim');
+SELECT add_compaction_policy('lim') AS job_id \gset
+CALL run_job(:job_id);
+SELECT unordered_count('lim');
+DROP TABLE lim;
+DROP FUNCTION lim_overlaps(regclass);
 
 ----------------------------------------------------------------------
 -- remove behavior
