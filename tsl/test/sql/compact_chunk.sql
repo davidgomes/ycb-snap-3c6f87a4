@@ -1098,31 +1098,31 @@ ORDER BY ch.id LIMIT 1 \gset
 SELECT show_chunks('metrics_limit') AS "LIMIT_UNCOMPRESSED" \gset
 
 SELECT * FROM limit_batches(:'LIMIT_CHUNK');
-SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED'::regclass);
 
 -- Negative max_batches is rejected; NULL returns NULL since the function is STRICT.
 \set ON_ERROR_STOP 0
-SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', -1);
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED'::regclass, -1);
 \set ON_ERROR_STOP 1
-SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', NULL);
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED'::regclass, NULL);
 
 -- max_batches = 1: the whole d1 group (3 batches) is merged even though it
 -- exceeds the limit, then the call stops. d2 and d3 are untouched.
-SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', 1) IS NOT NULL AS compacted;
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED'::regclass, 1) IS NOT NULL AS compacted;
 SELECT * FROM limit_batches(:'LIMIT_CHUNK');
-SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED'::regclass);
 
 -- max_batches = 2: the next call picks up where the previous one left off and
 -- merges only the d2 group.
-SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', 2) IS NOT NULL AS compacted;
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED'::regclass, 2) IS NOT NULL AS compacted;
 SELECT * FROM limit_batches(:'LIMIT_CHUNK');
-SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED'::regclass);
 
 -- The last group is merged. The limit is reached on the final group, the
 -- verification pass finds no overlaps left and UNORDERED is cleared.
-SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', 2) IS NOT NULL AS compacted;
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED'::regclass, 2) IS NOT NULL AS compacted;
 SELECT * FROM limit_batches(:'LIMIT_CHUNK');
-SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED'::regclass);
 
 SELECT count(*), min(time), max(time) FROM metrics_limit;
 
@@ -1147,18 +1147,18 @@ ORDER BY ch.id LIMIT 1 \gset
 SELECT show_chunks('metrics_limit') AS "LIMIT_UNCOMPRESSED" \gset
 
 SELECT * FROM limit_batches(:'LIMIT_CHUNK');
-SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', 0) IS NOT NULL AS compacted;
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED'::regclass, 0) IS NOT NULL AS compacted;
 SELECT * FROM limit_batches(:'LIMIT_CHUNK');
-SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED'::regclass);
 
 -- A limit larger than the total work also compacts everything in one call.
 INSERT INTO metrics_limit
 SELECT '2025-01-03'::timestamptz + (i || ' minute')::interval, d, i::float
 FROM generate_series(0,999) i, unnest(ARRAY['d1','d2','d3']) d;
 SELECT * FROM limit_batches(:'LIMIT_CHUNK');
-SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED', 100) IS NOT NULL AS compacted;
+SELECT _timescaledb_functions.compact_chunk(:'LIMIT_UNCOMPRESSED'::regclass, 100) IS NOT NULL AS compacted;
 SELECT * FROM limit_batches(:'LIMIT_CHUNK');
-SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED');
+SELECT _timescaledb_functions.chunk_status_text(:'LIMIT_UNCOMPRESSED'::regclass);
 
 DROP TABLE metrics_limit;
 DROP FUNCTION limit_batches(regclass);
