@@ -297,6 +297,18 @@ type segmentCursorReplaceReusable struct {
 	// avoid allocating a MeteredReader+SectionReader+nodeReader per iteration.
 	preadOffset *offsetReader
 	preadReader *bufio.Reader
+	// valuePrefixLen > 0 retains only that many leading value bytes per node
+	// (digest mode); 0 retains the full value.
+	valuePrefixLen int
+}
+
+// newReplaceCursorDigestReusable is newReplaceCursorReusable in digest mode:
+// each node's value is truncated to its first valuePrefixLen bytes, while node
+// spans and iteration order stay identical to the full-value cursor.
+func (s *segment) newReplaceCursorDigestReusable(valuePrefixLen int) *segmentCursorReplaceReusable {
+	c := s.newReplaceCursorReusable()
+	c.valuePrefixLen = valuePrefixLen
+	return c
 }
 
 func (s *segment) newReplaceCursorReusable() *segmentCursorReplaceReusable {
@@ -356,13 +368,15 @@ func (s *segmentCursorReplaceReusable) parseInto() (*segmentReplaceNode, error) 
 			return nil, lsmkv.NotFound
 		}
 		s.reusableBORW.ResetBuffer(buf)
-		if err := ParseReplaceNodeIntoMMAP(&s.reusableBORW, s.segment.secondaryIndexCount, &s.reusableNode); err != nil {
+		if err := ParseReplaceNodeDigestIntoMMAP(&s.reusableBORW, s.segment.secondaryIndexCount,
+			&s.reusableNode, s.valuePrefixLen); err != nil {
 			return &s.reusableNode, err
 		}
 	} else {
 		s.preadOffset.off = int64(s.currOffset)
 		s.preadReader.Reset(s.preadOffset)
-		if err := ParseReplaceNodeIntoPread(s.preadReader, s.segment.secondaryIndexCount, &s.reusableNode); err != nil {
+		if err := ParseReplaceNodeDigestIntoPread(s.preadReader, s.segment.secondaryIndexCount,
+			&s.reusableNode, s.valuePrefixLen); err != nil {
 			return &s.reusableNode, err
 		}
 	}
@@ -411,6 +425,19 @@ func (sg *SegmentGroup) newReusableCursors() ([]innerCursorReplace, func()) {
 	out := make([]innerCursorReplace, len(segments))
 	for i, segment := range segments {
 		out[i] = &reusableInnerCursorReplace{c: segment.newReplaceCursorReusable()}
+	}
+
+	return out, release
+}
+
+// newDigestReusableCursors mirrors newReusableCursors but each segment cursor
+// retains only the first valuePrefixLen value bytes of every node.
+func (sg *SegmentGroup) newDigestReusableCursors(valuePrefixLen int) ([]innerCursorReplace, func()) {
+	segments, release := sg.getConsistentViewOfSegments()
+
+	out := make([]innerCursorReplace, len(segments))
+	for i, segment := range segments {
+		out[i] = &reusableInnerCursorReplace{c: segment.newReplaceCursorDigestReusable(valuePrefixLen)}
 	}
 
 	return out, release
