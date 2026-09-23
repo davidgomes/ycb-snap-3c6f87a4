@@ -281,6 +281,273 @@ start_server {tags {"string"}} {
         list [r msetnx x1{t} xxx x1{t} zzz] [r get x1{t}]
     } {0 yyy}
 
+    test {MSETEX with illegal arguments} {
+        assert_error "ERR wrong number of arguments for 'msetex' command" {r msetex}
+        assert_error "ERR wrong number of arguments for 'msetex' command" {r msetex key value}
+
+        assert_error "ERR invalid numkeys value or out of range" {r msetex 0 key1{t} value}
+        assert_error "ERR invalid numkeys value or out of range" {r msetex -1 key1{t} value}
+        assert_error "ERR invalid numkeys value or out of range" {r msetex 1.5 key1{t} value}
+        assert_error "ERR invalid numkeys value or out of range" {r msetex numkeys key1{t} value}
+
+        assert_error "ERR syntax error" {r msetex 2 key1{t} value}
+        assert_error "ERR syntax error" {r msetex 2 key1{t} value key{2}}
+
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value key{2}}
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value key{2} value}
+
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value nx xx}
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value xx nx}
+
+        foreach ex_flag {ex px exat pxat} {
+            assert_error "ERR syntax error" {r msetex 1 key1{t} value $ex_flag}
+            assert_error "ERR invalid expire time in 'msetex' command" {r msetex 1 key1{t} value $ex_flag 0}
+            assert_error "ERR invalid expire time in 'msetex' command" {r msetex 1 key1{t} value $ex_flag -1}
+            assert_error "ERR value is not an integer or out of range" {r msetex 1 key1{t} value $ex_flag 1.5}
+            assert_error "ERR value is not an integer or out of range" {r msetex 1 key1{t} value $ex_flag foo}
+        }
+
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value ex 1 px 1}
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value ex 1 exat 1}
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value px 1 ex 1}
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value px 1 exat 1}
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value ex 1 keepttl}
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value keepttl pxat 1}
+
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value ex 1 wrong_option}
+        assert_error "ERR syntax error" {r msetex 1 key1{t} value ex 1 wrong_option 1}
+
+        # (2 + numkeys * 2) must not wrap; a huge numkeys is a syntax error
+        # once it no longer fits the supplied arguments.
+        assert_error "ERR syntax error" {r msetex 2147483646 key1{t} value}
+        assert_error "ERR syntax error" {r msetex 2147483647 key1{t} value}
+        assert_error "ERR invalid numkeys value or out of range" {r msetex 2147483648 key1{t} value}
+        assert_error "ERR syntax error" {r msetex 1073741822 key1{t} value}
+        assert_error "ERR syntax error" {r msetex 1073741823 key1{t} value}
+    }
+
+    test {MSETEX with EX option - set the specified expire time, in seconds} {
+        r del key1{t} key2{t}
+        r msetex 2 key1{t} val1 key2{t} val2 ex 10
+        assert_equal {val1 val2} [r mget key1{t} key2{t}]
+        assert_range [r ttl key1{t}] 5 10
+        assert_range [r ttl key2{t}] 5 10
+    }
+
+    test {MSETEX with PX option - set the specified expire time, in milliseconds} {
+        r del key1{t} key2{t}
+        r msetex 2 key1{t} val1 key2{t} val2 px 10000
+        assert_equal {val1 val2} [r mget key1{t} key2{t}]
+        assert_range [r pttl key1{t}] 5000 10000
+        assert_range [r pttl key2{t}] 5000 10000
+    }
+
+    test {MSETEX with EXAT option - set the specified Unix time at which the keys will expire, in seconds} {
+        r del key1{t} key2{t}
+        r msetex 2 key1{t} val1 key2{t} val2 exat [expr [clock seconds] + 10]
+        assert_equal {val1 val2} [r mget key1{t} key2{t}]
+        assert_range [r ttl key1{t}] 5 10
+        assert_range [r ttl key2{t}] 5 10
+    }
+
+    test {MSETEX with PXAT option - set the specified Unix time at which the keys will expire, in milliseconds} {
+        r del key1{t} key2{t}
+        r msetex 2 key1{t} val1 key2{t} val2 pxat [expr [clock milliseconds] + 10000]
+        assert_equal {val1 val2} [r mget key1{t} key2{t}]
+        assert_range [r pttl key1{t}] 5000 10000
+        assert_range [r pttl key2{t}] 5000 10000
+    }
+
+    test {MSETEX with past EXAT/PXAT - key stored but logically expired} {
+        r debug set-active-expire 0
+        r flushall
+
+        assert_equal 1 [r msetex 1 key1{t} val1 exat [expr [clock seconds] - 100]]
+        assert_equal 1 [r msetex 1 key2{t} val2 pxat [expr [clock milliseconds] - 100000]]
+
+        set repl [attach_to_replication_stream]
+
+        assert_equal 2 [r dbsize]
+        assert_equal 0 [r exists key1{t} key2{t}]
+        assert_equal 0 [r dbsize]
+
+        assert_replication_stream $repl {
+            {multi}
+            {select *}
+            {unlink *}
+            {unlink *}
+            {exec}
+        }
+        close_replication_stream $repl
+
+        assert_equal {OK} [r debug set-active-expire 1]
+    } {} {needs:debug needs:repl}
+
+    test {MSETEX with KEEPTTL option - retain the time to live associated with the keys} {
+        r del key1{t} key2{t}
+        r msetex 2 key1{t} val1 key2{t} val2 ex 100
+        set key1_ttl [r ttl key1{t}]
+        set key2_ttl [r ttl key2{t}]
+        r msetex 2 key1{t} newval1 key2{t} newval2 keepttl
+        assert_equal {newval1 newval2} [r mget key1{t} key2{t}]
+        assert_range [r ttl key1{t}] [expr $key1_ttl - 10] $key1_ttl
+        assert_range [r ttl key2{t}] [expr $key2_ttl - 10] $key2_ttl
+
+        r del key1{t} key2{t}
+        r msetex 2 key1{t} val1 key2{t} val2 keepttl
+        assert_equal {val1 val2} [r mget key1{t} key2{t}]
+        assert_equal -1 [r ttl key1{t}]
+        assert_equal -1 [r ttl key2{t}]
+    }
+
+    test {MSETEX with NX option - only set the keys if all keys do not already exist} {
+        r del key1{t} key2{t}
+        assert_equal 1 [r msetex 2 key1{t} val1 key2{t} val2 nx]
+        assert_equal "val1" [r get key1{t}]
+        assert_equal "val2" [r get key2{t}]
+
+        r del key1{t} key2{t}
+        r set key1{t} existing
+        assert_equal 0 [r msetex 2 key1{t} val1 key2{t} val2 nx]
+        assert_equal "existing" [r get key1{t}]
+        assert_equal {} [r get key2{t}]
+
+        r mset key1{t} existing key2{t} existing
+        assert_equal 0 [r msetex 2 key1{t} val1 key2{t} val2 nx]
+        assert_equal "existing" [r get key1{t}]
+        assert_equal "existing" [r get key2{t}]
+    }
+
+    test {MSETEX with XX option - only set the keys if all keys already exist} {
+        r mset key1{t} existing key2{t} existing
+        assert_equal 1 [r msetex 2 key1{t} val1 key2{t} val2 xx]
+        assert_equal "val1" [r get key1{t}]
+        assert_equal "val2" [r get key2{t}]
+
+        r set key1{t} existing
+        r del key2{t}
+        assert_equal 0 [r msetex 2 key1{t} val1 key2{t} val2 xx]
+        assert_equal "existing" [r get key1{t}]
+        assert_equal 0 [r exists key2{t}]
+
+        r del key1{t} key2{t}
+        assert_equal 0 [r msetex 2 key1{t} val1 key2{t} val2 xx]
+        assert_equal 0 [r exists key1{t} key2{t}]
+    }
+
+    test {MSETEX with NX and EX options combined} {
+        r del key1{t} key2{t}
+        assert_equal 1 [r msetex 2 key1{t} val1 key2{t} val2 nx ex 10]
+        assert_equal {val1 val2} [r mget key1{t} key2{t}]
+        assert_range [r ttl key1{t}] 5 10
+        assert_range [r ttl key2{t}] 5 10
+    }
+
+    test {MSETEX with XX and PX options combined} {
+        r mset key1{t} old1 key2{t} old2
+        assert_equal 1 [r msetex 2 key1{t} val1 key2{t} val2 xx px 10000]
+        assert_equal {val1 val2} [r mget key1{t} key2{t}]
+        assert_range [r pttl key1{t}] 5000 10000
+        assert_range [r pttl key2{t}] 5000 10000
+    }
+
+    test {MSETEX with expired keys using NX} {
+        r debug set-active-expire 0
+        r del key1{t}
+        r set key1{t} oldval px 1
+        after 10
+        assert_equal 1 [r msetex 1 key1{t} newval nx]
+        assert_equal "newval" [r get key1{t}]
+        assert_equal {OK} [r debug set-active-expire 1]
+    } {} {needs:debug}
+
+    test {MSETEX with expired keys using XX} {
+        r debug set-active-expire 0
+        r del key1{t}
+        r set key1{t} oldval px 1
+        after 10
+        assert_equal 0 [r msetex 1 key1{t} newval xx]
+        assert_error {ERR no such key} {r debug object key1{t}}
+        assert_equal {OK} [r debug set-active-expire 1]
+    } {} {needs:debug}
+
+    test {MSETEX with same key twice - last value wins} {
+        r del key1{t}
+        assert_equal 1 [r msetex 2 key1{t} val1 key1{t} val2]
+        assert_equal "val2" [r get key1{t}]
+    }
+
+    test {MSETEX overwrites existing keys without options} {
+        r mset key1{t} old1 key2{t} old2
+        assert_equal 1 [r msetex 2 key1{t} new1 key2{t} new2]
+        assert_equal {new1 new2} [r mget key1{t} key2{t}]
+    }
+
+    test {MSETEX removes TTL when setting without expiration options} {
+        r del key1{t} key2{t}
+        r set key1{t} old1 ex 100
+        r set key2{t} old2 ex 100
+        r msetex 2 key1{t} new1 key2{t} new2
+        assert_equal {new1 new2} [r mget key1{t} key2{t}]
+        assert_equal -1 [r ttl key1{t}]
+        assert_equal -1 [r ttl key2{t}]
+    }
+
+    test {MSETEX overwrites a non-string key} {
+        r del key1{t}
+        r lpush key1{t} a
+        assert_equal 1 [r msetex 1 key1{t} str]
+        assert_equal "str" [r get key1{t}]
+    }
+
+    test {MSETEX propagate as MSETEX with PXAT to replica} {
+        r del key1{t} key2{t} key3{t} key4{t} key5{t} key6{t} key7{t} key8{t}
+        set repl [attach_to_replication_stream]
+        r msetex 2 key1{t} val1 key2{t} val2
+        assert_equal 0 [r msetex 2 key1{t} val1 key2{t} val2 nx]
+        r msetex 2 key1{t} val1 key2{t} val2 ex 100
+        r msetex 2 key3{t} val3 key4{t} val4 exat [expr [clock seconds] + 100]
+        r msetex 2 key5{t} val5 key6{t} val6 px 100000
+        r msetex 2 key7{t} val7 key8{t} val8 pxat [expr [clock milliseconds] + 100000]
+        assert_replication_stream $repl {
+            {select *}
+            {msetex 2 key1{t} val1 key2{t} val2}
+            {msetex 2 key1{t} val1 key2{t} val2 PXAT *}
+            {msetex 2 key3{t} val3 key4{t} val4 PXAT *}
+            {msetex 2 key5{t} val5 key6{t} val6 PXAT *}
+            {msetex 2 key7{t} val7 key8{t} val8 pxat *}
+        }
+        close_replication_stream $repl
+    } {} {needs:repl}
+
+    test {MSETEX keyspace notifications} {
+        r config set notify-keyspace-events KEA
+        r del key1{t} key2{t}
+
+        set rd [valkey_deferring_client]
+        assert_equal {1 2} [psubscribe $rd {__keyspace@* __keyevent@*}]
+
+        r msetex 2 key1{t} val1 key2{t} val2 ex 100
+
+        assert_match "pmessage __keyspace@* __keyspace@*__:key1{t} set" [$rd read]
+        assert_match "pmessage __keyevent@* __keyevent@*__:set key1{t}" [$rd read]
+        assert_match "pmessage __keyspace@* __keyspace@*__:key1{t} expire" [$rd read]
+        assert_match "pmessage __keyevent@* __keyevent@*__:expire key1{t}" [$rd read]
+
+        assert_match "pmessage __keyspace@* __keyspace@*__:key2{t} set" [$rd read]
+        assert_match "pmessage __keyevent@* __keyevent@*__:set key2{t}" [$rd read]
+        assert_match "pmessage __keyspace@* __keyspace@*__:key2{t} expire" [$rd read]
+        assert_match "pmessage __keyevent@* __keyevent@*__:expire key2{t}" [$rd read]
+
+        $rd close
+        r config set notify-keyspace-events ""
+    }
+
+    test {COMMAND GETKEYS MSETEX} {
+        assert_equal {k1 k2} [r command getkeys msetex 2 k1 v1 k2 v2]
+        assert_equal {{k1 {OW update}} {k2 {OW update}}} [r command getkeysandflags msetex 2 k1 v1 k2 v2 nx ex 10]
+    }
+
     test "STRLEN against non-existing key" {
         assert_equal 0 [r strlen notakey]
     }
