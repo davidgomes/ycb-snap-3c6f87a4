@@ -589,6 +589,13 @@ class DBImpl : public DB {
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override;
 
+  // Like above, but when cf_id_filter is non-null, table and blob files are
+  // only reported for column families whose IDs are in the set.
+  Status GetLiveFilesStorageInfo(
+      const LiveFilesStorageInfoOptions& opts,
+      std::vector<LiveFileStorageInfo>* files,
+      const std::unordered_set<uint32_t>* cf_id_filter);
+
   Status GetPreparedFileInfoForExternalSstIngestion(
       const std::string& file_path,
       std::shared_ptr<const PreparedFileInfo>* file_info) override;

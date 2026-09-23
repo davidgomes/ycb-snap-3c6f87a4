@@ -13,12 +13,21 @@
 #include <cinttypes>
 #include <future>
 #include <memory>
+#include <set>
 #include <string>
 #include <tuple>
 #include <unordered_set>
 #include <vector>
 
+#include "db/column_family.h"
+#include "db/db_impl/db_impl.h"
+#include "db/log_reader.h"
+#include "db/log_writer.h"
+#include "db/version_edit.h"
+#include "db/version_set.h"
 #include "db/wal_manager.h"
+#include "file/sequence_file_reader.h"
+#include "file/writable_file_writer.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "logging/logging.h"
@@ -274,6 +283,131 @@ Status Checkpoint::CreateCheckpoint(const std::string& /*checkpoint_dir*/,
   return Status::NotSupported("");
 }
 
+Status Checkpoint::CreateCheckpoint(
+    const std::string& /*checkpoint_dir*/,
+    const std::vector<ColumnFamilyHandle*>& /*column_families*/,
+    uint64_t /*log_size_for_flush*/, uint64_t* /*sequence_number_ptr*/) {
+  return Status::NotSupported("");
+}
+
+namespace {
+constexpr uint32_t kDefaultColumnFamilyId = 0;
+
+struct ManifestReadReporter : public log::Reader::Reporter {
+  Status* status;
+  void Corruption(size_t /*bytes*/, const Status& s,
+                  uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+    if (status->ok()) {
+      *status = s;
+    }
+  }
+};
+
+// Appends a drop edit to the (privately copied) MANIFEST in `dir` for every
+// column family live in that MANIFEST whose ID is not in `keep_cf_ids`.
+Status DropExcludedColumnFamiliesFromManifest(
+    FileSystem* fs, const std::string& dir,
+    const std::unordered_set<uint32_t>& keep_cf_ids, bool use_fsync) {
+  std::string current;
+  Status s = ReadFileToString(fs, dir + "/" + kCurrentFileName, &current);
+  if (!s.ok()) {
+    return s;
+  }
+  if (current.empty() || current.back() != '\n') {
+    return Status::Corruption("CURRENT file does not end with newline");
+  }
+  current.pop_back();
+  const std::string manifest_path = dir + "/" + current;
+
+  std::set<uint32_t> live_cf_ids;
+  uint64_t manifest_size = 0;
+  {
+    std::unique_ptr<FSSequentialFile> file;
+    s = fs->NewSequentialFile(manifest_path, FileOptions(), &file, nullptr);
+    if (!s.ok()) {
+      return s;
+    }
+    ManifestReadReporter reporter;
+    Status read_s;
+    reporter.status = &read_s;
+    log::Reader reader(
+        nullptr,
+        std::make_unique<SequentialFileReader>(std::move(file), manifest_path),
+        &reporter, /*checksum=*/true, /*log_num=*/0);
+    Slice record;
+    std::string scratch;
+    while (read_s.ok() && reader.ReadRecord(&record, &scratch)) {
+      VersionEdit edit;
+      s = edit.DecodeFrom(record);
+      if (!s.ok()) {
+        return s;
+      }
+      if (edit.IsColumnFamilyAdd()) {
+        live_cf_ids.insert(edit.GetColumnFamily());
+      } else if (edit.IsColumnFamilyDrop()) {
+        live_cf_ids.erase(edit.GetColumnFamily());
+      }
+    }
+    if (!read_s.ok()) {
+      return read_s;
+    }
+    manifest_size = reader.GetReadOffset();
+  }
+  // The default column family is implicit in the MANIFEST.
+  live_cf_ids.insert(kDefaultColumnFamilyId);
+
+  uint64_t file_size = 0;
+  s = fs->GetFileSize(manifest_path, IOOptions(), &file_size, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  if (file_size != manifest_size) {
+    return Status::Corruption("Unexpected trailing data in MANIFEST " +
+                              manifest_path);
+  }
+
+  std::unique_ptr<FSWritableFile> file;
+  FileOptions file_opts;
+  s = fs->ReopenWritableFile(manifest_path, file_opts, &file, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  log::Writer writer(
+      std::make_unique<WritableFileWriter>(std::move(file), manifest_path,
+                                           file_opts, nullptr, nullptr, nullptr,
+                                           Histograms::HISTOGRAM_ENUM_MAX,
+                                           std::vector<std::shared_ptr<
+                                               EventListener>>{},
+                                           nullptr, false, false, file_size),
+      /*log_number=*/0, /*recycle_log_files=*/false, /*manual_flush=*/false,
+      kNoCompression, /*track_and_verify_wals=*/false,
+      file_size % log::kBlockSize);
+  const WriteOptions write_options;
+  for (uint32_t cf_id : live_cf_ids) {
+    if (keep_cf_ids.count(cf_id) > 0) {
+      continue;
+    }
+    VersionEdit edit;
+    edit.SetColumnFamily(cf_id);
+    edit.DropColumnFamily();
+    std::string record;
+    if (!edit.EncodeTo(&record)) {
+      return Status::Corruption("Unable to encode VersionEdit");
+    }
+    s = writer.AddRecord(write_options, record);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  IOOptions io_opts;
+  s = writer.file()->Sync(io_opts, use_fsync);
+  if (s.ok()) {
+    s = writer.Close(write_options);
+  }
+  return s;
+}
+}  // namespace
+
 Status CheckpointImpl::CleanStagingDirectory(
     const std::string& full_private_path, Logger* info_log) {
   std::vector<std::string> subchildren;
@@ -326,11 +460,42 @@ Status CheckpointImpl::CreateCheckpoint(const std::string& checkpoint_dir,
                               /*use_link=*/true, /*copy_rate_limiter=*/nullptr);
 }
 
-Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
-                                            uint64_t log_size_for_flush,
-                                            uint64_t* sequence_number_ptr,
-                                            CopyEngine* engine, bool use_link,
-                                            RateLimiter* copy_rate_limiter) {
+Status CheckpointImpl::CreateCheckpoint(
+    const std::string& checkpoint_dir,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    uint64_t log_size_for_flush, uint64_t* sequence_number_ptr) {
+  if (column_families.empty()) {
+    return CreateCheckpoint(checkpoint_dir, log_size_for_flush,
+                            sequence_number_ptr);
+  }
+  DBImpl* root_db = static_cast_with_check<DBImpl>(db_->GetRootDB());
+  std::unordered_set<uint32_t> cf_ids{kDefaultColumnFamilyId};
+  for (ColumnFamilyHandle* handle : column_families) {
+    if (handle == nullptr) {
+      return Status::InvalidArgument("Null column family handle");
+    }
+    auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(handle);
+    if (cfh->db() != root_db) {
+      return Status::InvalidArgument(
+          "Column family handle does not belong to this DB");
+    }
+    if (cfh->cfd() == nullptr || cfh->cfd()->IsDropped()) {
+      return Status::InvalidArgument("Column family has been dropped: " +
+                                     cfh->GetName());
+    }
+    cf_ids.insert(cfh->GetID());
+  }
+  return CreateCheckpointImpl(checkpoint_dir, log_size_for_flush,
+                              sequence_number_ptr, /*engine=*/nullptr,
+                              /*use_link=*/true, /*copy_rate_limiter=*/nullptr,
+                              &cf_ids);
+}
+
+Status CheckpointImpl::CreateCheckpointImpl(
+    const std::string& checkpoint_dir, uint64_t log_size_for_flush,
+    uint64_t* sequence_number_ptr, CopyEngine* engine, bool use_link,
+    RateLimiter* copy_rate_limiter,
+    const std::unordered_set<uint32_t>* cf_id_filter) {
   DBOptions db_options = db_->GetDBOptions();
   Env* env = db_->GetEnv();
   const auto& fs = db_->GetFileSystem();
@@ -413,7 +578,9 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
             return CreateFile(fs, full_private_path + "/" + fname, contents,
                               db_options.use_fsync);
           } /* create_file_cb */,
-          &sequence_number, log_size_for_flush);
+          &sequence_number, log_size_for_flush,
+          /*get_live_table_checksum=*/false, /*atomic_flush=*/false,
+          cf_id_filter);
 
       // Await any deferred work and fold in the first error before committing.
       Status finish_s = mover->Finish();
@@ -421,6 +588,10 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
         s = finish_s;
       } else {
         finish_s.PermitUncheckedError();
+      }
+      if (s.ok() && cf_id_filter != nullptr) {
+        s = DropExcludedColumnFamiliesFromManifest(
+            fs, full_private_path, *cf_id_filter, db_options.use_fsync);
       }
 
       // we copied all the files, enable file deletions
@@ -492,7 +663,8 @@ Status CheckpointImpl::CreateCustomCheckpoint(
                          FileType type)>
         create_file_cb,
     uint64_t* sequence_number, uint64_t log_size_for_flush,
-    bool get_live_table_checksum, bool atomic_flush) {
+    bool get_live_table_checksum, bool atomic_flush,
+    const std::unordered_set<uint32_t>* cf_id_filter) {
   *sequence_number = db_->GetLatestSequenceNumber();
 
   LiveFilesStorageInfoOptions opts;
@@ -502,7 +674,10 @@ Status CheckpointImpl::CreateCustomCheckpoint(
 
   std::vector<LiveFileStorageInfo> infos;
   {
-    Status s = db_->GetLiveFilesStorageInfo(opts, &infos);
+    Status s = cf_id_filter == nullptr
+                   ? db_->GetLiveFilesStorageInfo(opts, &infos)
+                   : static_cast_with_check<DBImpl>(db_->GetRootDB())
+                         ->GetLiveFilesStorageInfo(opts, &infos, cf_id_filter);
     if (!s.ok()) {
       return s;
     }

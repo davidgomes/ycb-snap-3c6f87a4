@@ -198,6 +198,13 @@ Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
+  return GetLiveFilesStorageInfo(opts, files, /*cf_id_filter=*/nullptr);
+}
+
+Status DBImpl::GetLiveFilesStorageInfo(
+    const LiveFilesStorageInfoOptions& opts,
+    std::vector<LiveFileStorageInfo>* files,
+    const std::unordered_set<uint32_t>* cf_id_filter) {
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
@@ -280,6 +287,9 @@ Status DBImpl::GetLiveFilesStorageInfo(
   // Make a set of all of the live table and blob files
   for (auto cfd : *versions_->GetColumnFamilySet()) {
     if (cfd->IsDropped()) {
+      continue;
+    }
+    if (cf_id_filter != nullptr && cf_id_filter->count(cfd->GetID()) == 0) {
       continue;
     }
     VersionStorageInfo& vsi = *cfd->current()->storage_info();
