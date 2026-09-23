@@ -309,6 +309,8 @@ public:
     return Sys_refcursor_traits::flags();
   }
 
+  uint get_column_attributes() const override { return ATTR_NONE; }
+
   protocol_send_type_t protocol_send_type() const override
   {
     return Sys_refcursor_traits::protocol_send_type();

@@ -1,0 +1,158 @@
+#
+# RECORD, associative-array, and SYS_REFCURSOR variables reject
+# length, decimals, REF_SYSTEM_ID, CHARACTER SET, and COLLATE.
+#
+SET sql_mode=ORACLE;
+CREATE PROCEDURE p_rec_len()
+AS
+  TYPE rt IS RECORD(a INT);
+  v rt(10);
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'rt' doesn't support LENGTH attribute.
+CREATE PROCEDURE p_rec_dec()
+AS
+  TYPE rt IS RECORD(a INT);
+  v rt(10,2);
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'rt' doesn't support DECIMALS attribute.
+CREATE PROCEDURE p_rec_srid()
+AS
+  TYPE rt IS RECORD(a INT);
+  v rt REF_SYSTEM_ID=4326;
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'rt' doesn't support REF_SYSTEM_ID attribute.
+CREATE PROCEDURE p_rec_cs()
+AS
+  TYPE rt IS RECORD(a INT);
+  v rt CHARACTER SET latin1;
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'rt' doesn't support CHARACTER SET attribute.
+CREATE PROCEDURE p_rec_coll()
+AS
+  TYPE rt IS RECORD(a INT);
+  v rt COLLATE latin1_bin;
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'rt' doesn't support CHARACTER SET attribute.
+CREATE PROCEDURE p_aa_len()
+AS
+  TYPE aa IS TABLE OF INT INDEX BY INT;
+  v aa(10);
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'aa' doesn't support LENGTH attribute.
+CREATE PROCEDURE p_aa_dec()
+AS
+  TYPE aa IS TABLE OF INT INDEX BY INT;
+  v aa(10,2);
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'aa' doesn't support DECIMALS attribute.
+CREATE PROCEDURE p_aa_srid()
+AS
+  TYPE aa IS TABLE OF INT INDEX BY INT;
+  v aa REF_SYSTEM_ID=4326;
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'aa' doesn't support REF_SYSTEM_ID attribute.
+CREATE PROCEDURE p_aa_cs()
+AS
+  TYPE aa IS TABLE OF INT INDEX BY INT;
+  v aa CHARACTER SET latin1;
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'aa' doesn't support CHARACTER SET attribute.
+CREATE PROCEDURE p_aa_coll()
+AS
+  TYPE aa IS TABLE OF INT INDEX BY INT;
+  v aa COLLATE latin1_bin;
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'aa' doesn't support CHARACTER SET attribute.
+CREATE PROCEDURE p_rc_len()
+AS
+  v SYS_REFCURSOR(10);
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'SYS_REFCURSOR' doesn't support LENGTH attribute.
+CREATE PROCEDURE p_rc_dec()
+AS
+  v SYS_REFCURSOR(10,2);
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'SYS_REFCURSOR' doesn't support DECIMALS attribute.
+CREATE PROCEDURE p_rc_srid()
+AS
+  v SYS_REFCURSOR REF_SYSTEM_ID=4326;
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'SYS_REFCURSOR' doesn't support REF_SYSTEM_ID attribute.
+CREATE PROCEDURE p_rc_cs()
+AS
+  v SYS_REFCURSOR CHARACTER SET latin1;
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'SYS_REFCURSOR' doesn't support CHARACTER SET attribute.
+CREATE PROCEDURE p_rc_coll()
+AS
+  v SYS_REFCURSOR COLLATE latin1_bin;
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'SYS_REFCURSOR' doesn't support CHARACTER SET attribute.
+#
+# Plugin type name uses the same declaration syntax.
+#
+CREATE PROCEDURE p_plugin_aa()
+AS
+  v associative_array(10);
+BEGIN
+  NULL;
+END;
+$$
+ERROR HY000: Data type 'associative_array' doesn't support LENGTH attribute.
+CREATE PROCEDURE p_ok()
+AS
+  TYPE rt IS RECORD(a INT);
+  TYPE aa IS TABLE OF INT INDEX BY INT;
+  r rt;
+  m aa;
+  c SYS_REFCURSOR;
+BEGIN
+  NULL;
+END;
+$$
+DROP PROCEDURE p_ok;

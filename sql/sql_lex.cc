@@ -13179,38 +13179,20 @@ bool LEX::declare_type_assoc_array(THD *thd,
 }
 
 
-bool LEX::set_field_type_udt_or_typedef(Lex_field_type_st *type,
-                                        const LEX_CSTRING &name,
-                                        const Lex_length_and_dec_st &attr)
+static bool
+reject_unsupported_data_type_attributes(const LEX_CSTRING &name,
+                                        const Type_handler *h,
+                                        const Lex_length_and_dec_st &attr,
+                                        const Lex_column_charset_collation_attrs_st
+                                          &coll,
+                                        bool has_srid)
 {
-  bool is_typedef= false;
-  if (unlikely(set_field_type_typedef(type, name, &is_typedef)))
-    return true;
-
-  if (is_typedef)
-    return false;
-
-  return set_field_type_udt(type, name, attr,
-                            Lex_column_charset_collation_attrs());
-}
-
-
-bool LEX::set_field_type_udt(Lex_field_type_st *type,
-                             const LEX_CSTRING &name,
-                             const Lex_length_and_dec_st &attr,
-                             const Lex_column_charset_collation_attrs_st &coll)
-{
-  const Type_handler *h;
   uint column_attributes;
-
-  if (!(h= Type_handler::handler_by_name_or_error(thd, name)))
-    return true;
 
   column_attributes= attr.has_explicit_length() ? Type_handler::ATTR_LENGTH :0;
   column_attributes|= attr.has_explicit_dec() ? Type_handler::ATTR_DEC :0;
   column_attributes|= coll.is_empty() ? 0 : Type_handler::ATTR_CHARSET;
-  column_attributes|= last_field->get_attr_uint32(0) ?
-                        Type_handler::ATTR_SRID : 0;
+  column_attributes|= has_srid ? Type_handler::ATTR_SRID : 0;
 
   if ((column_attributes&= ~h->get_column_attributes()))
   {
@@ -13229,6 +13211,47 @@ bool LEX::set_field_type_udt(Lex_field_type_st *type,
         attr_name);
     return true;
   }
+  return false;
+}
+
+
+bool LEX::set_field_type_udt_or_typedef(Lex_field_type_st *type,
+                                        const LEX_CSTRING &name,
+                                        const Lex_length_and_dec_st &attr,
+                                        const Lex_column_charset_collation_attrs_st
+                                          &coll)
+{
+  bool is_typedef= false;
+  if (unlikely(set_field_type_typedef(type, name, &is_typedef)))
+    return true;
+
+  /*
+    User TYPE aliases and named/plugin types share this declaration syntax.
+    Both must reject length, decimals, charset/collation, and REF_SYSTEM_ID
+    when the resolved handler does not support them.
+  */
+  if (is_typedef)
+    return reject_unsupported_data_type_attributes(name, type->type_handler(),
+                                                   attr, coll,
+                                                   last_field->get_attr_uint32(0));
+
+  return set_field_type_udt(type, name, attr, coll);
+}
+
+
+bool LEX::set_field_type_udt(Lex_field_type_st *type,
+                             const LEX_CSTRING &name,
+                             const Lex_length_and_dec_st &attr,
+                             const Lex_column_charset_collation_attrs_st &coll)
+{
+  const Type_handler *h;
+
+  if (!(h= Type_handler::handler_by_name_or_error(thd, name)))
+    return true;
+
+  if (reject_unsupported_data_type_attributes(name, h, attr, coll,
+                                              last_field->get_attr_uint32(0)))
+    return true;
 
   type->set(h, attr, coll);
   return false;
