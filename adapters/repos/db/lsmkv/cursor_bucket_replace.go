@@ -161,6 +161,37 @@ func (b *Bucket) CursorInMem() *CursorReplace {
 	}
 }
 
+// CursorReplaceDigestReusable is CursorReplaceReusable with on-disk segment
+// values truncated to valuePrefixLen bytes. Memtable entries stay full.
+// valuePrefixLen <= 0 keeps full on-disk values.
+func (b *Bucket) CursorReplaceDigestReusable(valuePrefixLen int) *CursorReplace {
+	MustBeExpectedStrategy(b.strategy, StrategyReplace)
+
+	cursorOpenedAt := time.Now()
+	b.metrics.IncBucketOpenedCursorsByStrategy(b.strategy)
+	b.metrics.IncBucketOpenCursorsByStrategy(b.strategy)
+
+	b.flushLock.RLock()
+	defer b.flushLock.RUnlock()
+
+	innerCursors, unlockSegmentGroup := b.disk.newReusableCursorsDigest(valuePrefixLen)
+
+	if b.flushing != nil {
+		innerCursors = append(innerCursors, b.flushing.newCursor())
+	}
+	innerCursors = append(innerCursors, b.active.newCursor())
+
+	return &CursorReplace{
+		innerCursors: innerCursors,
+		unlock: func() {
+			unlockSegmentGroup()
+
+			b.metrics.DecBucketOpenCursorsByStrategy(b.strategy)
+			b.metrics.ObserveBucketCursorDurationByStrategy(b.strategy, time.Since(cursorOpenedAt))
+		},
+	}
+}
+
 // CursorOnDiskWith returns a cursor which scan over the primary key of entries
 // already persisted on disk.
 // New segments can still be created but compaction will be prevented
@@ -169,6 +200,20 @@ func (b *Bucket) CursorOnDisk() *CursorReplace {
 	MustBeExpectedStrategy(b.strategy, StrategyReplace)
 
 	innerCursors, unlockSegmentGroup := b.disk.newCursors()
+
+	return &CursorReplace{
+		innerCursors: innerCursors,
+		unlock:       unlockSegmentGroup,
+	}
+}
+
+// CursorOnDiskDigest scans on-disk segments in digest mode: each node's value
+// keeps only the first valuePrefixLen bytes, while seek and merge still walk
+// the full on-disk node. valuePrefixLen <= 0 keeps full values.
+func (b *Bucket) CursorOnDiskDigest(valuePrefixLen int) *CursorReplace {
+	MustBeExpectedStrategy(b.strategy, StrategyReplace)
+
+	innerCursors, unlockSegmentGroup := b.disk.newReusableCursorsDigest(valuePrefixLen)
 
 	return &CursorReplace{
 		innerCursors: innerCursors,

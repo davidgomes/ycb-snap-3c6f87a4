@@ -297,6 +297,160 @@ func ParseReplaceNodeIntoMMAP(r *byteops.ReadWriter, secondaryIndexCount uint16,
 	return nil
 }
 
+// ParseReplaceNodeDigestIntoPread is ParseReplaceNodeIntoPread but retains only
+// the first valuePrefixLen bytes of the value. The remainder is read and
+// discarded so out.offset still spans the whole on-disk node. valuePrefixLen <= 0
+// keeps the full value (same as ParseReplaceNodeIntoPread).
+func ParseReplaceNodeDigestIntoPread(r io.Reader, secondaryIndexCount uint16, valuePrefixLen int, out *segmentReplaceNode) error {
+	if valuePrefixLen <= 0 {
+		return ParseReplaceNodeIntoPread(r, secondaryIndexCount, out)
+	}
+
+	out.offset = 0
+
+	var tmpBuf [9]byte
+
+	if _, err := io.ReadFull(r, tmpBuf[:9]); err != nil {
+		return errors.Wrap(err, "read tombstone and value length")
+	}
+	out.tombstone = tmpBuf[0] != 0
+	out.offset += 1
+	valueLength := binary.LittleEndian.Uint64(tmpBuf[1:9])
+	out.offset += 8
+
+	keep := valueLength
+	if uint64(valuePrefixLen) < valueLength {
+		keep = uint64(valuePrefixLen)
+	}
+
+	if int(keep) > cap(out.value) {
+		out.value = make([]byte, keep)
+	} else {
+		out.value = out.value[:keep]
+	}
+
+	if keep > 0 {
+		if _, err := io.ReadFull(r, out.value); err != nil {
+			return errors.Wrap(err, "read value")
+		}
+	}
+	if rem := valueLength - keep; rem > 0 {
+		if err := discardReader(r, rem); err != nil {
+			return errors.Wrap(err, "discard value tail")
+		}
+	}
+	out.offset += int(valueLength)
+
+	if _, err := io.ReadFull(r, tmpBuf[:4]); err != nil {
+		return errors.Wrap(err, "read key length encoding")
+	}
+	keyLength := binary.LittleEndian.Uint32(tmpBuf[:4])
+	out.offset += 4
+
+	if int(keyLength) > cap(out.primaryKey) {
+		out.primaryKey = make([]byte, keyLength)
+	} else {
+		out.primaryKey = out.primaryKey[:keyLength]
+	}
+	if n, err := io.ReadFull(r, out.primaryKey); err != nil {
+		return errors.Wrap(err, "read key")
+	} else {
+		out.offset += n
+	}
+
+	if secondaryIndexCount > 0 && len(out.secondaryKeys) < int(secondaryIndexCount) {
+		out.secondaryKeys = make([][]byte, secondaryIndexCount)
+	}
+
+	for j := 0; j < int(secondaryIndexCount); j++ {
+		if _, err := io.ReadFull(r, tmpBuf[:4]); err != nil {
+			return errors.Wrap(err, "read secondary key length encoding")
+		}
+		secKeyLen := binary.LittleEndian.Uint32(tmpBuf[:4])
+		out.offset += 4
+
+		if secKeyLen == 0 {
+			out.secondaryKeys[j] = out.secondaryKeys[j][:0]
+			continue
+		}
+
+		if int(secKeyLen) > cap(out.secondaryKeys[j]) {
+			out.secondaryKeys[j] = make([]byte, secKeyLen)
+		} else {
+			out.secondaryKeys[j] = out.secondaryKeys[j][:secKeyLen]
+		}
+		if n, err := io.ReadFull(r, out.secondaryKeys[j]); err != nil {
+			return errors.Wrap(err, "read secondary key")
+		} else {
+			out.offset += n
+		}
+	}
+
+	return nil
+}
+
+// ParseReplaceNodeDigestIntoMMAP is ParseReplaceNodeIntoMMAP but retains only
+// the first valuePrefixLen bytes of the value. The reader position (and thus
+// out.offset) still advances across the unread tail. valuePrefixLen <= 0 keeps
+// the full value.
+func ParseReplaceNodeDigestIntoMMAP(r *byteops.ReadWriter, secondaryIndexCount uint16, valuePrefixLen int, out *segmentReplaceNode) error {
+	if valuePrefixLen <= 0 {
+		return ParseReplaceNodeIntoMMAP(r, secondaryIndexCount, out)
+	}
+
+	out.tombstone = r.ReadUint8() == 0x01
+	valueLength := r.ReadUint64()
+
+	keep := valueLength
+	if uint64(valuePrefixLen) < valueLength {
+		keep = uint64(valuePrefixLen)
+	}
+
+	if int(keep) > cap(out.value) {
+		out.value = make([]byte, keep)
+	} else {
+		out.value = out.value[:keep]
+	}
+
+	if keep > 0 {
+		if _, err := r.CopyBytesFromBuffer(keep, out.value); err != nil {
+			return err
+		}
+	}
+	if rem := valueLength - keep; rem > 0 {
+		r.MoveBufferPositionForward(rem)
+	}
+
+	out.primaryKey = r.ReadBytesFromBufferWithUint32LengthIndicator()
+
+	if secondaryIndexCount > 0 {
+		out.secondaryKeys = make([][]byte, secondaryIndexCount)
+	}
+
+	for j := 0; j < int(secondaryIndexCount); j++ {
+		out.secondaryKeys[j] = r.ReadBytesFromBufferWithUint32LengthIndicator()
+	}
+
+	out.offset = int(r.Position)
+	return nil
+}
+
+// discardReader consumes n bytes from r without retaining them.
+func discardReader(r io.Reader, n uint64) error {
+	var buf [4096]byte
+	for n > 0 {
+		chunk := uint64(len(buf))
+		if chunk > n {
+			chunk = n
+		}
+		if _, err := io.ReadFull(r, buf[:chunk]); err != nil {
+			return err
+		}
+		n -= chunk
+	}
+	return nil
+}
+
 // collection strategy does not support secondary keys at this time
 type segmentCollectionNode struct {
 	values     []value
