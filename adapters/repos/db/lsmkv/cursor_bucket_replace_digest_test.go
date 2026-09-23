@@ -86,7 +86,7 @@ func TestCursorDigest_MatchesTruncatedFullCursor(t *testing.T) {
 				if string(k) >= "key-080" {
 					require.Equal(t, full[i], got[i])
 				} else {
-					require.Equal(t, truncate(full[i:i+1])[0], got[i])
+					require.Equal(t, truncate(full[i : i+1])[0], got[i])
 				}
 			}
 

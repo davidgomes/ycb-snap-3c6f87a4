@@ -312,8 +312,8 @@ func (s *segment) newReplaceCursorDigestReusable(valuePrefixLen int) *segmentCur
 	}
 	c := &segmentCursorReplaceReusable{
 		valuePrefixLen: valuePrefixLen,
-		segment:    s,
-		currOffset: s.dataStartPos,
+		segment:        s,
+		currOffset:     s.dataStartPos,
 		reusableNode: segmentReplaceNode{
 			secondaryIndexCount: s.secondaryIndexCount,
 			secondaryKeys:       make([][]byte, s.secondaryIndexCount),
