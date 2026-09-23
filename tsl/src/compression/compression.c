@@ -3270,7 +3270,9 @@ decompress_batch_check_compressed_type(const CompressedDataHeader *header, Oid t
  * list at the call site. Columns are matched by name.
  *
  * No TimescaleDB catalog tables are read, so the function can also be used
- * where only system catalogs are accessible, e.g. from logical decoding.
+ * where only system catalogs are accessible, e.g. from logical decoding. As a
+ * consequence, columns added after the batch was compressed get the missing
+ * value of the output row type, which is NULL for a column definition list.
  */
 Datum
 tsl_decompress_batch(PG_FUNCTION_ARGS)
