@@ -2708,6 +2708,13 @@ int lmpopGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult
     return genericGetKeys(0, 1, 2, 1, argv, argc, result);
 }
 
+/* MSETEX <numkeys> <key> <value> [<key> <value> ...] [options]
+ * Keys are every other argument starting at argv[2], for <numkeys> pairs. */
+int msetexGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+    UNUSED(cmd);
+    return genericGetKeys(0, 1, 2, 2, argv, argc, result);
+}
+
 int blmpopGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
     UNUSED(cmd);
     return genericGetKeys(0, 2, 3, 1, argv, argc, result);

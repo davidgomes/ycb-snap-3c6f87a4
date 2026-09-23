@@ -235,6 +235,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 #define COMMAND_SET 1
 #define COMMAND_HGET 2
 #define COMMAND_HSET 3
+#define COMMAND_MSET 4
 
 /* Command flags. Please check the definition of struct serverCommand in this file
  * for more information about the meaning of every flag. */
@@ -3023,7 +3024,7 @@ int processIOThreadsWriteDone(void);
 void releaseReplyReferences(client *c);
 void resetLastWrittenBuf(client *c);
 
-int parseExtendedCommandArgumentsOrReply(client *c, int *flags, int *unit, robj **expire, robj **compare_val, int command_type, int max_args);
+int parseExtendedCommandArgumentsOrReply(client *c, int *flags, int *unit, robj **expire, robj **compare_val, int command_type, int start_idx, int max_args);
 
 /* logreqres.c - logging of requests and responses */
 void reqresReset(client *c, int free_buf);
@@ -3782,6 +3783,7 @@ int migrateGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResu
 int georadiusGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result);
 int xreadGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result);
 int lmpopGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result);
+int msetexGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result);
 int blmpopGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result);
 int zmpopGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result);
 int bzmpopGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result);
@@ -3995,6 +3997,7 @@ void roleCommand(client *c);
 void debugCommand(client *c);
 void msetCommand(client *c);
 void msetnxCommand(client *c);
+void msetexCommand(client *c);
 void zaddCommand(client *c);
 void zincrbyCommand(client *c);
 void zrangeCommand(client *c);
