@@ -13047,11 +13047,12 @@ func (s *standaloneActivityTestSuite) TestResetActivityExecution() {
 			require.Equal(c, enumspb.PENDING_ACTIVITY_STATE_SCHEDULED, d.GetInfo().GetRunState())
 		}, 5*time.Second, 200*time.Millisecond)
 
-		// Reset clears recorded heartbeat state.
+		// Reset with ResetHeartbeat clears recorded heartbeat state.
 		_, err = env.FrontendClient().ResetActivityExecution(ctx, &workflowservice.ResetActivityExecutionRequest{
-			Namespace:  env.Namespace().String(),
-			ActivityId: activityID,
-			RunId:      startResp.GetRunId(),
+			Namespace:      env.Namespace().String(),
+			ActivityId:     activityID,
+			RunId:          startResp.GetRunId(),
+			ResetHeartbeat: true,
 		})
 		require.NoError(t, err)
 
@@ -13109,7 +13110,13 @@ func (s *standaloneActivityTestSuite) TestResetActivityExecution() {
 		require.NotNil(t, desc.GetInfo().GetHeartbeatDetails())
 
 		// Reset while STARTED — heartbeat clearing is deferred.
-		resetActivity(ctx, t, activityID, startResp.GetRunId())
+		_, err = env.FrontendClient().ResetActivityExecution(ctx, &workflowservice.ResetActivityExecutionRequest{
+			Namespace:      env.Namespace().String(),
+			ActivityId:     activityID,
+			RunId:          startResp.GetRunId(),
+			ResetHeartbeat: true,
+		})
+		require.NoError(t, err)
 
 		// Activity should still be STARTED with heartbeat still visible (reset is deferred)
 		desc, err = env.FrontendClient().DescribeActivityExecution(ctx, &workflowservice.DescribeActivityExecutionRequest{

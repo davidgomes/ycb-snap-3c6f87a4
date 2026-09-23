@@ -67,10 +67,11 @@ func (s *ActivityApiResetClientTestSuite) SetupTest() {
 	if s.apiName == "execution-api" {
 		s.resetFn = func(ctx context.Context, wfID, actID string, resetHeartbeat, keepPaused bool) error {
 			_, err := s.FrontendClient().ResetActivityExecution(ctx, &workflowservice.ResetActivityExecutionRequest{
-				Namespace:  s.Namespace().String(),
-				WorkflowId: wfID,
-				ActivityId: actID,
-				KeepPaused: keepPaused,
+				Namespace:      s.Namespace().String(),
+				WorkflowId:     wfID,
+				ActivityId:     actID,
+				ResetHeartbeat: resetHeartbeat,
+				KeepPaused:     keepPaused,
 			})
 			return err
 		}

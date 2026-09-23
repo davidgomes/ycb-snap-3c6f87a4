@@ -14,6 +14,7 @@ import (
 	"go.temporal.io/server/chasm/lib/activity"
 	"go.temporal.io/server/chasm/lib/activity/model"
 	"go.temporal.io/server/common/dynamicconfig"
+	"go.temporal.io/server/common/payloads"
 	"go.temporal.io/server/common/retrypolicy"
 	"go.temporal.io/server/common/testing/parallelsuite"
 	"go.temporal.io/server/service/history/consts"
@@ -458,6 +459,66 @@ func (s *activityParityTestSuite) TestPauseRequestedAfterResetKeepPaused() {
 		require.Equal(t, enumspb.PENDING_ACTIVITY_STATE_PAUSE_REQUESTED,
 			newSAADriver(t, env, cfg).driveTrace(t, trace).activityInfo(t).RunState)
 	})
+}
+
+// Reset rewinds the attempt counter but preserves the last heartbeat checkpoint unless
+// ResetHeartbeat is set. A reset issued while a worker owns the attempt leaves the checkpoint
+// visible until the worker yields, after which the same keep/clear policy applies.
+func (s *activityParityTestSuite) TestResetHeartbeatDetails() {
+	env := newActivityParityEnv(s.T())
+	cfg := activityConfig{MaxAttempts: 5, RetryInterval: activityLongDuration}
+	checkpoint := activityMarshalPayloads(payloads.EncodeString("heartbeat details"))
+
+	for _, tc := range []struct {
+		name     string
+		trace    []model.Event
+		expected activityInfo
+	}{
+		{
+			name:     "ImmediateReset",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.FailRetryably, model.Reset},
+			expected: activityInfo{Attempt: 1, LastHeartbeatDetails: checkpoint},
+		},
+		{
+			name:     "ImmediateResetClearingHeartbeat",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.FailRetryably, model.ResetClearingHeartbeat},
+			expected: activityInfo{Attempt: 1},
+		},
+		{
+			name:     "ResetClearingHeartbeatWhileStarted",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.ResetClearingHeartbeat},
+			expected: activityInfo{LastHeartbeatDetails: checkpoint},
+		},
+		{
+			name:     "DeferredReset",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.Reset, model.FailRetryably},
+			expected: activityInfo{LastHeartbeatDetails: checkpoint},
+		},
+		{
+			name:     "DeferredResetClearingHeartbeat",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.ResetClearingHeartbeat, model.FailRetryably},
+			expected: activityInfo{},
+		},
+	} {
+		s.Run(tc.name, func(s *activityParityTestSuite) {
+			s.Run("WorkflowActivity", func(s *activityParityTestSuite) {
+				t := s.T()
+				info := newWFADriver(t, env, cfg).driveTrace(t, tc.trace).activityInfo(t)
+				if tc.expected.Attempt != 0 {
+					require.Equal(t, tc.expected.Attempt, info.Attempt)
+				}
+				require.Equal(t, tc.expected.LastHeartbeatDetails, info.LastHeartbeatDetails)
+			})
+			s.Run("StandaloneActivity", func(s *activityParityTestSuite) {
+				t := s.T()
+				info := newSAADriver(t, env, cfg).driveTrace(t, tc.trace).activityInfo(t)
+				if tc.expected.Attempt != 0 {
+					require.Equal(t, tc.expected.Attempt, info.Attempt)
+				}
+				require.Equal(t, tc.expected.LastHeartbeatDetails, info.LastHeartbeatDetails)
+			})
+		})
+	}
 }
 
 // TestCancel drives a running activity through cancellation in both implementations. RequestCancel uses the
