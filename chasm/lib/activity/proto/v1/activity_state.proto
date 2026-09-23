@@ -90,6 +90,10 @@ message ActivityState {
 
   // Set if the activity was terminated
   ActivityTerminateState terminate_state = 12;
+
+  // Delay before the first attempt is dispatched to the task queue. The schedule-to-start and schedule-to-close
+  // timeouts are measured from schedule_time + start_delay. Not applied on retries.
+  google.protobuf.Duration start_delay = 13;
 }
 
 message ActivityCancelState {
