@@ -3,6 +3,7 @@ package activity
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -24,8 +25,10 @@ import (
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/metrics/metricstest"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/payloads"
 	"go.temporal.io/server/common/searchattribute/sadefs"
 	serviceerrors "go.temporal.io/server/common/serviceerror"
+	"go.temporal.io/server/common/testing/protorequire"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
@@ -1339,6 +1342,66 @@ func TestHandleResetRequestID(t *testing.T) {
 		require.Error(t, err)
 		require.Equal(t, "previous-reset-request-id", activity.GetLastResetRequestId())
 	})
+}
+
+func TestHandleResetHeartbeat(t *testing.T) {
+	testCases := []struct {
+		name           string
+		status         activitypb.ActivityExecutionStatus
+		keepPaused     bool
+		expectDeferred bool
+	}{
+		{name: "scheduled", status: activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED},
+		{name: "paused", status: activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED},
+		{name: "paused keepPaused", status: activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED, keepPaused: true},
+		{name: "started", status: activitypb.ACTIVITY_EXECUTION_STATUS_STARTED, expectDeferred: true},
+	}
+
+	for _, tc := range testCases {
+		for _, resetHeartbeat := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/resetHeartbeat=%v", tc.name, resetHeartbeat), func(t *testing.T) {
+				ctx := newOperatorCommandTestContext(t)
+				heartbeatDetails := payloads.EncodeString("heartbeat-details")
+				activity := &Activity{
+					ActivityState: &activitypb.ActivityState{
+						ActivityType: &commonpb.ActivityType{Name: "test-activity-type"},
+						Status:       tc.status,
+						TaskQueue:    &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+					},
+					LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{Count: 3}),
+					LastHeartbeat: chasm.NewDataField(ctx, &activitypb.ActivityHeartbeatState{
+						Details:      heartbeatDetails,
+						RecordedTime: timestamppb.New(defaultTime),
+					}),
+				}
+
+				_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+					FrontendRequest: &workflowservice.ResetActivityExecutionRequest{
+						KeepPaused:     tc.keepPaused,
+						ResetHeartbeat: resetHeartbeat,
+					},
+				})
+				require.NoError(t, err)
+
+				if tc.expectDeferred {
+					require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED, activity.GetStatus())
+					require.Equal(t, int32(3), activity.LastAttempt.Get(ctx).GetCount())
+					require.Equal(t, resetHeartbeat, activity.GetResetShouldClearHeartbeat())
+					// The in-flight attempt's checkpoint must stay visible until the worker yields.
+					protorequire.ProtoEqual(t, heartbeatDetails, activity.LastHeartbeat.Get(ctx).GetDetails())
+					return
+				}
+
+				require.Equal(t, int32(1), activity.LastAttempt.Get(ctx).GetCount())
+				require.False(t, activity.GetResetShouldClearHeartbeat())
+				if resetHeartbeat {
+					require.Nil(t, activity.LastHeartbeat.Get(ctx).GetDetails())
+				} else {
+					protorequire.ProtoEqual(t, heartbeatDetails, activity.LastHeartbeat.Get(ctx).GetDetails())
+				}
+			})
+		}
+	}
 }
 
 func TestUpdateActivityExecutionOptionsRequestID(t *testing.T) {
