@@ -2945,6 +2945,116 @@ func (s *standaloneActivityTestSuite) TestScheduleToStartTimeout() {
 		"expected ScheduleToStartTimeout but is %s", describeResp.GetOutcome().GetFailure().GetTimeoutFailureInfo().GetTimeoutType())
 }
 
+func (s *standaloneActivityTestSuite) TestStartDelay() {
+	t := s.T()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	startWithDelay := func(activityID, taskQueue string, startDelay time.Duration) (*workflowservice.StartActivityExecutionResponse, error) {
+		return s.FrontendClient().StartActivityExecution(ctx, &workflowservice.StartActivityExecutionRequest{
+			Namespace:    s.Namespace().String(),
+			ActivityId:   activityID,
+			ActivityType: s.tv.ActivityType(),
+			Identity:     s.tv.WorkerIdentity(),
+			Input:        defaultInput,
+			TaskQueue: &taskqueuepb.TaskQueue{
+				Name: taskQueue,
+			},
+			// Shorter than the start delay, so the activity would time out before dispatch if the
+			// schedule-to-start timer were not extended by the delay.
+			ScheduleToStartTimeout: durationpb.New(time.Second),
+			StartToCloseTimeout:    durationpb.New(defaultStartToCloseTimeout),
+			StartDelay:             durationpb.New(startDelay),
+		})
+	}
+
+	describe := func(t *testing.T, activityID, runID string) *activitypb.ActivityExecutionInfo {
+		resp, err := s.FrontendClient().DescribeActivityExecution(ctx, &workflowservice.DescribeActivityExecutionRequest{
+			Namespace:  s.Namespace().String(),
+			ActivityId: activityID,
+			RunId:      runID,
+		})
+		require.NoError(t, err)
+		return resp.GetInfo()
+	}
+
+	t.Run("RejectedWhenDisabled", func(t *testing.T) {
+		_, err := startWithDelay(testcore.RandomizeStr(t.Name()), testcore.RandomizeStr(t.Name()), time.Minute)
+		var invalidArgErr *serviceerror.InvalidArgument
+		require.ErrorAs(t, err, &invalidArgErr)
+	})
+
+	cleanup := s.OverrideDynamicConfig(activity.StartDelayEnabled, true)
+	defer cleanup()
+
+	t.Run("NegativeRejected", func(t *testing.T) {
+		_, err := startWithDelay(testcore.RandomizeStr(t.Name()), testcore.RandomizeStr(t.Name()), -time.Second)
+		var invalidArgErr *serviceerror.InvalidArgument
+		require.ErrorAs(t, err, &invalidArgErr)
+	})
+
+	t.Run("DispatchDeferred", func(t *testing.T) {
+		activityID := testcore.RandomizeStr(t.Name())
+		taskQueue := testcore.RandomizeStr(t.Name())
+		startDelay := 3 * time.Second
+
+		startTime := time.Now()
+		startResp, err := startWithDelay(activityID, taskQueue, startDelay)
+		require.NoError(t, err)
+		require.Equal(t, enumspb.PENDING_ACTIVITY_STATE_SCHEDULED, describe(t, activityID, startResp.GetRunId()).GetRunState())
+
+		earlyPollCtx, earlyPollCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer earlyPollCancel()
+		earlyPollResp, err := s.pollActivityTaskQueue(earlyPollCtx, taskQueue)
+		if err == nil {
+			require.Empty(t, earlyPollResp.GetTaskToken(), "activity task dispatched before start delay elapsed")
+		}
+
+		pollResp, err := s.pollActivityTaskQueue(ctx, taskQueue)
+		require.NoError(t, err)
+		require.NotEmpty(t, pollResp.GetTaskToken())
+		require.GreaterOrEqual(t, time.Since(startTime), startDelay)
+		require.Equal(t, enumspb.PENDING_ACTIVITY_STATE_STARTED, describe(t, activityID, startResp.GetRunId()).GetRunState())
+	})
+
+	t.Run("CancelDuringDelay", func(t *testing.T) {
+		activityID := testcore.RandomizeStr(t.Name())
+		taskQueue := testcore.RandomizeStr(t.Name())
+
+		startResp, err := startWithDelay(activityID, taskQueue, time.Hour)
+		require.NoError(t, err)
+
+		_, err = s.FrontendClient().RequestCancelActivityExecution(ctx, &workflowservice.RequestCancelActivityExecutionRequest{
+			Namespace:  s.Namespace().String(),
+			ActivityId: activityID,
+			RunId:      startResp.GetRunId(),
+			Identity:   defaultIdentity,
+			Reason:     "cancel during delay",
+		})
+		require.NoError(t, err)
+		require.Equal(t, enumspb.ACTIVITY_EXECUTION_STATUS_CANCELED, describe(t, activityID, startResp.GetRunId()).GetStatus())
+	})
+
+	t.Run("TerminateDuringDelay", func(t *testing.T) {
+		activityID := testcore.RandomizeStr(t.Name())
+		taskQueue := testcore.RandomizeStr(t.Name())
+
+		startResp, err := startWithDelay(activityID, taskQueue, time.Hour)
+		require.NoError(t, err)
+
+		_, err = s.FrontendClient().TerminateActivityExecution(ctx, &workflowservice.TerminateActivityExecutionRequest{
+			Namespace:  s.Namespace().String(),
+			ActivityId: activityID,
+			RunId:      startResp.GetRunId(),
+			Identity:   defaultIdentity,
+			Reason:     "terminate during delay",
+		})
+		require.NoError(t, err)
+		require.Equal(t, enumspb.ACTIVITY_EXECUTION_STATUS_TERMINATED, describe(t, activityID, startResp.GetRunId()).GetStatus())
+	})
+}
+
 func (s *standaloneActivityTestSuite) TestDescribeActivityExecution_NoWait() {
 	t := s.T()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)

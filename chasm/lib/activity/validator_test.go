@@ -696,3 +696,29 @@ func getDefaultRetrySettings(_ string) retrypolicy.DefaultRetrySettings {
 		MaximumAttempts:            0,
 	}
 }
+
+func TestValidateStartDelay(t *testing.T) {
+	testCases := []struct {
+		name       string
+		startDelay *durationpb.Duration
+		expectErr  bool
+	}{
+		{name: "nil", startDelay: nil},
+		{name: "zero", startDelay: durationpb.New(0)},
+		{name: "positive", startDelay: durationpb.New(time.Minute)},
+		{name: "negative", startDelay: durationpb.New(-time.Second), expectErr: true},
+		{name: "invalid", startDelay: &durationpb.Duration{Seconds: 1, Nanos: -1}, expectErr: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateStartDelay(tc.startDelay)
+			if tc.expectErr {
+				var invalidArgErr *serviceerror.InvalidArgument
+				require.ErrorAs(t, err, &invalidArgErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}

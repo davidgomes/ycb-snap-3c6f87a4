@@ -41,6 +41,7 @@ func TestTransitionScheduled(t *testing.T) {
 		expectedTasks          []chasm.MockTask
 		scheduleToStartTimeout time.Duration
 		scheduleToCloseTimeout time.Duration
+		startDelay             time.Duration
 	}{
 		{
 			name:                 "all timeouts set",
@@ -73,6 +74,18 @@ func TestTransitionScheduled(t *testing.T) {
 			scheduleToStartTimeout: defaultScheduleToStartTimeout,
 			scheduleToCloseTimeout: 0,
 		},
+		{
+			name:                 "start delay extends schedule timeouts and defers dispatch",
+			startingAttemptCount: 0,
+			expectedTasks: []chasm.MockTask{
+				{Payload: &activitypb.ScheduleToStartTimeoutTask{}},
+				{Payload: &activitypb.ScheduleToCloseTimeoutTask{}},
+				{Payload: &activitypb.ActivityDispatchTask{}},
+			},
+			scheduleToStartTimeout: defaultScheduleToStartTimeout,
+			scheduleToCloseTimeout: defaultScheduleToCloseTimeout,
+			startDelay:             5 * time.Minute,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -81,6 +94,10 @@ func TestTransitionScheduled(t *testing.T) {
 				MockContext: chasm.MockContext{
 					HandleNow: func(chasm.Component) time.Time { return defaultTime },
 				},
+			}
+			var startDelay *durationpb.Duration
+			if tc.startDelay > 0 {
+				startDelay = durationpb.New(tc.startDelay)
 			}
 			attemptState := &activitypb.ActivityAttemptState{Count: tc.startingAttemptCount}
 			outcome := &activitypb.ActivityOutcome{}
@@ -95,6 +112,7 @@ func TestTransitionScheduled(t *testing.T) {
 					StartToCloseTimeout:    durationpb.New(defaultStartToCloseTimeout),
 					Status:                 activitypb.ACTIVITY_EXECUTION_STATUS_UNSPECIFIED,
 					TaskQueue:              &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+					StartDelay:             startDelay,
 				},
 				LastAttempt: chasm.NewDataField(ctx, attemptState),
 				Outcome:     chasm.NewDataField(ctx, outcome),
@@ -102,6 +120,7 @@ func TestTransitionScheduled(t *testing.T) {
 					Input: input,
 				}),
 			}
+			dispatchTime := defaultTime.Add(tc.startDelay)
 
 			err := TransitionScheduled.Apply(activity, ctx, nil)
 			require.NoError(t, err)
@@ -118,11 +137,15 @@ func TestTransitionScheduled(t *testing.T) {
 
 				switch expectedTask.Payload.(type) {
 				case *activitypb.ActivityDispatchTask:
-					require.Empty(t, actualTask.Attributes.ScheduledTime)
+					if tc.startDelay > 0 {
+						require.Equal(t, dispatchTime, actualTask.Attributes.ScheduledTime)
+					} else {
+						require.Empty(t, actualTask.Attributes.ScheduledTime)
+					}
 				case *activitypb.ScheduleToStartTimeoutTask:
-					require.Equal(t, defaultTime.Add(tc.scheduleToStartTimeout), actualTask.Attributes.ScheduledTime)
+					require.Equal(t, dispatchTime.Add(tc.scheduleToStartTimeout), actualTask.Attributes.ScheduledTime)
 				case *activitypb.ScheduleToCloseTimeoutTask:
-					require.Equal(t, defaultTime.Add(tc.scheduleToCloseTimeout), actualTask.Attributes.ScheduledTime)
+					require.Equal(t, dispatchTime.Add(tc.scheduleToCloseTimeout), actualTask.Attributes.ScheduledTime)
 				default:
 					t.Fatalf("unexpected task payload type at index %d: %T", i, actualTask.Payload)
 				}
