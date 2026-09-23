@@ -97,6 +97,16 @@ func (b *Bucket) Cursor() *CursorReplace {
 // reusable cursor, avoiding per-node reader allocations on the pread path.
 // Prefer it for long sequential scans. Same locking/Close contract as Cursor.
 func (b *Bucket) CursorReplaceReusable() *CursorReplace {
+	return b.CursorReplaceDigestReusable(0)
+}
+
+// CursorReplaceDigestReusable is CursorReplaceReusable for scans that only
+// read the head of each value (e.g. object digests): values served from disk
+// segments are truncated to their first valuePrefixLen bytes, and the
+// remainder is neither allocated nor copied. Memtable values are served whole.
+// Keys, ordering, tombstones and First/Seek/Next semantics are those of
+// CursorReplaceReusable. valuePrefixLen <= 0 disables truncation.
+func (b *Bucket) CursorReplaceDigestReusable(valuePrefixLen int) *CursorReplace {
 	MustBeExpectedStrategy(b.strategy, StrategyReplace)
 
 	cursorOpenedAt := time.Now()
@@ -106,7 +116,7 @@ func (b *Bucket) CursorReplaceReusable() *CursorReplace {
 	b.flushLock.RLock()
 	defer b.flushLock.RUnlock()
 
-	innerCursors, unlockSegmentGroup := b.disk.newReusableCursors()
+	innerCursors, unlockSegmentGroup := b.disk.newDigestReusableCursors(valuePrefixLen)
 
 	if b.flushing != nil {
 		innerCursors = append(innerCursors, b.flushing.newCursor())
@@ -169,6 +179,22 @@ func (b *Bucket) CursorOnDisk() *CursorReplace {
 	MustBeExpectedStrategy(b.strategy, StrategyReplace)
 
 	innerCursors, unlockSegmentGroup := b.disk.newCursors()
+
+	return &CursorReplace{
+		innerCursors: innerCursors,
+		unlock:       unlockSegmentGroup,
+	}
+}
+
+// CursorOnDiskDigest is CursorOnDisk for scans that only read the head of each
+// value (e.g. object digests): every value is truncated to its first
+// valuePrefixLen bytes, and the remainder is neither allocated nor copied.
+// Keys, ordering, tombstones and First/Seek/Next semantics are those of
+// CursorOnDisk. valuePrefixLen <= 0 disables truncation.
+func (b *Bucket) CursorOnDiskDigest(valuePrefixLen int) *CursorReplace {
+	MustBeExpectedStrategy(b.strategy, StrategyReplace)
+
+	innerCursors, unlockSegmentGroup := b.disk.newDigestReusableCursors(valuePrefixLen)
 
 	return &CursorReplace{
 		innerCursors: innerCursors,
