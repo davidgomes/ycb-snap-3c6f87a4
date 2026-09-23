@@ -1341,6 +1341,128 @@ func TestHandleResetRequestID(t *testing.T) {
 	})
 }
 
+func TestHandleResetHeartbeat(t *testing.T) {
+	testCases := []struct {
+		name           string
+		status         activitypb.ActivityExecutionStatus
+		keepPaused     bool
+		resetHeartbeat bool
+		expectedStatus activitypb.ActivityExecutionStatus
+		expectedCount  int32
+		// expectCleared is whether the checkpoint is discarded by the reset request itself.
+		expectCleared bool
+		// expectDeferredClear is whether the clear is left pending for when the worker yields.
+		expectDeferredClear bool
+	}{
+		{
+			name:           "scheduled preserves heartbeat by default",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+			expectedCount:  1,
+		},
+		{
+			name:           "scheduled clears heartbeat when requested",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+			resetHeartbeat: true,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+			expectedCount:  1,
+			expectCleared:  true,
+		},
+		{
+			name:           "paused preserves heartbeat by default",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+			expectedCount:  1,
+		},
+		{
+			name:           "paused clears heartbeat when requested",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED,
+			resetHeartbeat: true,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+			expectedCount:  1,
+			expectCleared:  true,
+		},
+		{
+			name:           "paused with keepPaused preserves heartbeat by default",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED,
+			keepPaused:     true,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED,
+			expectedCount:  1,
+		},
+		{
+			name:           "paused with keepPaused clears heartbeat when requested",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED,
+			keepPaused:     true,
+			resetHeartbeat: true,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED,
+			expectedCount:  1,
+			expectCleared:  true,
+		},
+		{
+			name:           "started defers reset and preserves heartbeat by default",
+			status:         activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+			expectedStatus: activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED,
+			expectedCount:  3,
+		},
+		{
+			name:                "started defers heartbeat clear when requested",
+			status:              activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+			resetHeartbeat:      true,
+			expectedStatus:      activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED,
+			expectedCount:       3,
+			expectDeferredClear: true,
+		},
+		{
+			name:                "pause requested with keepPaused defers heartbeat clear when requested",
+			status:              activitypb.ACTIVITY_EXECUTION_STATUS_PAUSE_REQUESTED,
+			keepPaused:          true,
+			resetHeartbeat:      true,
+			expectedStatus:      activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED,
+			expectedCount:       3,
+			expectDeferredClear: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := newOperatorCommandTestContext(t)
+			activity := &Activity{
+				ActivityState: &activitypb.ActivityState{
+					ActivityType: &commonpb.ActivityType{Name: "test-activity-type"},
+					Status:       tc.status,
+					TaskQueue:    &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+				},
+				LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{Count: 3}),
+				LastHeartbeat: chasm.NewDataField(ctx, &activitypb.ActivityHeartbeatState{
+					Details:      &commonpb.Payloads{Payloads: []*commonpb.Payload{{Data: []byte("checkpoint")}}},
+					RecordedTime: timestamppb.New(time.Unix(0, 0)),
+				}),
+			}
+
+			_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+				FrontendRequest: &workflowservice.ResetActivityExecutionRequest{
+					KeepPaused:     tc.keepPaused,
+					ResetHeartbeat: tc.resetHeartbeat,
+				},
+			})
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedStatus, activity.GetStatus())
+			require.Equal(t, tc.expectedCount, activity.LastAttempt.Get(ctx).GetCount())
+			require.Equal(t, tc.expectDeferredClear, activity.GetResetShouldClearHeartbeat())
+
+			heartbeat := activity.LastHeartbeat.Get(ctx)
+			if tc.expectCleared {
+				require.Nil(t, heartbeat.GetDetails())
+				require.Nil(t, heartbeat.GetRecordedTime())
+			} else {
+				require.Len(t, heartbeat.GetDetails().GetPayloads(), 1)
+				require.Equal(t, []byte("checkpoint"), heartbeat.GetDetails().GetPayloads()[0].GetData())
+				require.NotNil(t, heartbeat.GetRecordedTime())
+			}
+		})
+	}
+}
+
 func TestUpdateActivityExecutionOptionsRequestID(t *testing.T) {
 	t.Run("deduplicates latest request ID", func(t *testing.T) {
 		ctx := &chasm.MockMutableContext{}
