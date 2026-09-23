@@ -373,7 +373,8 @@ func (s *stateRebuilderSuite) TestRebuild() {
 }
 
 func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
-	requestID := uuid.NewString()
+	startRequestID := uuid.NewString()
+	laterCreateRequestID := uuid.NewString()
 	version := int64(12)
 	lastEventID := int64(2)
 	branchToken := []byte("other random branch token")
@@ -460,6 +461,14 @@ func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
 
 	s.mockTaskRefresher.EXPECT().Refresh(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 	currentMutableState := &persistencespb.WorkflowMutableState{
+		ExecutionState: &persistencespb.WorkflowExecutionState{
+			// A later run's create request ID must not win over the original start request ID.
+			CreateRequestId: laterCreateRequestID,
+			RequestIds: map[string]*persistencespb.RequestIDInfo{
+				laterCreateRequestID: {EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED},
+				startRequestID:       {EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED},
+			},
+		},
 		ExecutionInfo: &persistencespb.WorkflowExecutionInfo{
 			TransitionHistory: []*persistencespb.VersionedTransition{
 				{
@@ -479,7 +488,6 @@ func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
 		util.Ptr(version),
 		definition.NewWorkflowKey(targetNamespaceID.String(), targetWorkflowID, targetRunID),
 		targetBranchToken,
-		requestID,
 		currentMutableState,
 	)
 	s.NoError(err)
@@ -498,4 +506,33 @@ func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
 	s.Equal(timestamp.TimeValue(rebuildMutableState.GetExecutionState().StartTime), s.now)
 	s.Equal(expectedLastFirstTransactionID, rebuildExecutionInfo.LastFirstEventTxnId)
 	s.Equal(int64(11), rebuildExecutionInfo.TransitionHistory[0].TransitionCount)
+	s.Equal(startRequestID, rebuildMutableState.GetExecutionState().CreateRequestId)
+}
+
+func TestFindStartRequestID(t *testing.T) {
+	t.Parallel()
+	original := "original-start-request-id"
+	later := "later-run-create-request-id"
+
+	t.Run("keeps original start request id across later create ids", func(t *testing.T) {
+		got := findStartRequestID(&persistencespb.WorkflowExecutionState{
+			CreateRequestId: later,
+			RequestIds: map[string]*persistencespb.RequestIDInfo{
+				later:    {EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED},
+				original: {EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED},
+			},
+		})
+		require.Equal(t, original, got)
+	})
+
+	t.Run("falls back to create request id", func(t *testing.T) {
+		got := findStartRequestID(&persistencespb.WorkflowExecutionState{
+			CreateRequestId: later,
+		})
+		require.Equal(t, later, got)
+	})
+
+	t.Run("nil execution state", func(t *testing.T) {
+		require.Empty(t, findStartRequestID(nil))
+	})
 }
