@@ -23,6 +23,7 @@ SET timescaledb.license='something_else';
 SELECT locf(1);
 SELECT interpolate(1);
 SELECT time_bucket_gapfill(1,1,1,1);
+SELECT * FROM _timescaledb_functions.decompress_batch(ROW(1)) AS x(a int);
 
 CREATE OR REPLACE FUNCTION custom_func(jobid int, args jsonb) RETURNS VOID AS $$
 DECLARE

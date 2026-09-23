@@ -34,6 +34,9 @@ HINT:  Upgrade your license to 'timescale' to use this free community feature.
 SELECT time_bucket_gapfill(1,1,1,1);
 ERROR:  function "time_bucket_gapfill" is not supported under the current "apache" license
 HINT:  Upgrade your license to 'timescale' to use this free community feature.
+SELECT * FROM _timescaledb_functions.decompress_batch(ROW(1)) AS x(a int);
+ERROR:  function "decompress_batch" is not supported under the current "apache" license
+HINT:  Upgrade your license to 'timescale' to use this free community feature.
 CREATE OR REPLACE FUNCTION custom_func(jobid int, args jsonb) RETURNS VOID AS $$
 DECLARE
 BEGIN
