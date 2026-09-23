@@ -9,6 +9,15 @@ when the current batch's first row sorts before the previous batch's last row.
 Because the metadata holds the real boundary rows for every orderby column, no
 decompression is needed, even for multi-column orderby.
 
+## Bounding one call
+
+`compact_chunk(chunk, max_batches)` stops after an overlap group has been fully
+flushed once that call has decompressed at least `max_batches` batches. `0`
+(the default) is unlimited. The check happens only between groups, so one
+overlapping set is always rewritten completely and may decompress more batches
+than the limit. A later call continues with the groups that remain. Negative
+values are rejected.
+
 ## How It Works
 
 ```

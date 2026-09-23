@@ -28,6 +28,8 @@ SELECT create_hypertable('plain', 'time');
 SELECT add_compaction_policy('plain');
 -- Negative max_chunks is rejected.
 SELECT add_compaction_policy('metrics', max_chunks => -1);
+-- Negative max_batches is rejected.
+SELECT add_compaction_policy('metrics', max_batches => -1);
 \set ON_ERROR_STOP 1
 DROP TABLE plain;
 
@@ -37,7 +39,11 @@ SELECT _timescaledb_functions.policy_compaction_check('{"max_chunks": 1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_chunks": -1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "-1 hour"}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "not an interval"}');
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": -1}');
 \set ON_ERROR_STOP 1
+-- Zero is unlimited and accepted. A positive limit is accepted.
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": 0}');
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": 4}');
 
 -- Add the policy and inspect the resulting job. Default schedule is 5 minutes.
 SELECT add_compaction_policy('metrics') AS job_id \gset
@@ -193,4 +199,69 @@ SELECT remove_compaction_policy('m2');
 SELECT remove_compaction_policy('m2', if_exists => true);
 DROP TABLE m2;
 
+----------------------------------------------------------------------
+-- max_batches is stored when > 0 and passed through to compact_chunk
+----------------------------------------------------------------------
+
+-- max_batches => 0 is valid and is not stored (unlimited is the default).
+CREATE TABLE bounded_zero (time TIMESTAMPTZ NOT NULL, value float) WITH (tsdb.hypertable, tsdb.orderby='time');
+SELECT add_compaction_policy('bounded_zero', max_batches => 0) AS zero_job \gset
+SELECT config ? 'max_batches' AS has_max_batches
+FROM _timescaledb_config.bgw_job WHERE id = :zero_job;
+DROP TABLE bounded_zero;
+
+-- Two disjoint overlap groups in one chunk. max_batches = 2 compacts the first
+-- group on the first run and the second group on the next run.
+CREATE FUNCTION overlap_stats(ht regclass, OUT batches bigint, OUT overlaps bigint, OUT unordered boolean)
+LANGUAGE plpgsql AS $$
+DECLARE
+  comp regclass;
+BEGIN
+  SELECT cs.compress_relid INTO comp
+  FROM _timescaledb_catalog.chunk ch
+  JOIN _timescaledb_catalog.compression_settings cs ON cs.relid = ch.relid
+  WHERE ch.relid IN (SELECT show_chunks(ht))
+  ORDER BY ch.id
+  LIMIT 1;
+
+  EXECUTE format(
+    'SELECT count(*), count(*) FILTER (WHERE first_time < prev_last)
+     FROM (
+       SELECT _ts_meta_v2_first_time AS first_time,
+              lag(_ts_meta_v2_last_time) OVER (
+                ORDER BY _ts_meta_v2_first_time, _ts_meta_v2_last_time) AS prev_last
+       FROM %s) s', comp)
+  INTO batches, overlaps;
+
+  SELECT coalesce(bool_or('UNORDERED' = ANY(_timescaledb_functions.chunk_status_text(c))), false)
+  INTO unordered
+  FROM show_chunks(ht) c;
+END $$;
+
+CREATE TABLE bounded (time TIMESTAMPTZ NOT NULL, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.chunk_interval='30 days');
+INSERT INTO bounded SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(1,1000) i;
+INSERT INTO bounded SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(3000,3999) i;
+INSERT INTO bounded SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(5000,5999) i;
+INSERT INTO bounded SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(500,1499) i;
+INSERT INTO bounded SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(5500,6499) i;
+
+SELECT * FROM overlap_stats('bounded');
+SELECT add_compaction_policy('bounded', max_batches => 2) AS job_id \gset
+SELECT config ? 'max_batches' AS has_max_batches,
+       (config->>'max_batches')::int AS max_batches
+FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+
+-- First run flushes one merge group and leaves the chunk unordered.
+CALL run_job(:job_id);
+SELECT * FROM overlap_stats('bounded');
+SELECT count(*) AS rows FROM bounded;
+
+-- Second run finishes the remaining group.
+CALL run_job(:job_id);
+SELECT * FROM overlap_stats('bounded');
+SELECT count(*) AS rows FROM bounded;
+
+DROP TABLE bounded;
+DROP FUNCTION overlap_stats(regclass);
 DROP FUNCTION unordered_count(regclass);

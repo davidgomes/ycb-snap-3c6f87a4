@@ -78,6 +78,12 @@ ALTER TABLE _timescaledb_catalog.hypertable DROP CONSTRAINT hypertable_compress_
 
 DROP FUNCTION IF EXISTS @extschema@.alter_job(job_id INTEGER, schedule_interval INTERVAL, max_runtime INTERVAL, max_retries INTEGER, retry_period INTERVAL, scheduled BOOL, config JSONB, next_start TIMESTAMPTZ, if_exists BOOL, check_config REGPROC, fixed_schedule BOOL, initial_start TIMESTAMPTZ, timezone TEXT, job_name TEXT);
 
+-- compact_chunk and add_compaction_policy gained a max_batches argument.
+-- Drop the previous signatures so the following CREATE OR REPLACE installs
+-- the new ones instead of leaving an overload behind.
+DROP FUNCTION IF EXISTS _timescaledb_functions.compact_chunk(REGCLASS);
+DROP FUNCTION IF EXISTS @extschema@.add_compaction_policy(REGCLASS, BOOL, INTERVAL, TIMESTAMPTZ, TEXT, INTEGER, INTERVAL);
+
 --
 -- BEGIN add chunk.relid and drop chunk.compressed_chunk_id, schema_name, table_name
 --

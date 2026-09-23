@@ -1479,3 +1479,206 @@ SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks
  {COMPRESSED,UNORDERED}
 
 DROP TABLE metrics_no_firstlast;
+
+----------------------------------------------------------------------
+-- max_batches bounds decompression work between merge groups
+----------------------------------------------------------------------
+
+-- Adjacent compressed batches that overlap form one merge group. The limit is
+-- checked only after a group is fully flushed, so one group may decompress
+-- more batches than max_batches, and a later call continues with the rest.
+-- 0 (and the default) is unlimited. Negative values are rejected.
+
+CREATE FUNCTION overlap_stats(ht regclass, OUT batches bigint, OUT overlaps bigint, OUT unordered boolean)
+LANGUAGE plpgsql AS $$
+DECLARE
+  comp regclass;
+BEGIN
+  SELECT cs.compress_relid INTO comp
+  FROM _timescaledb_catalog.chunk ch
+  JOIN _timescaledb_catalog.compression_settings cs ON cs.relid = ch.relid
+  WHERE ch.relid IN (SELECT show_chunks(ht))
+  ORDER BY ch.id
+  LIMIT 1;
+
+  EXECUTE format(
+    'SELECT count(*), count(*) FILTER (WHERE first_time < prev_last)
+     FROM (
+       SELECT _ts_meta_v2_first_time AS first_time,
+              lag(_ts_meta_v2_last_time) OVER (
+                ORDER BY _ts_meta_v2_first_time, _ts_meta_v2_last_time) AS prev_last
+       FROM %s) s', comp)
+  INTO batches, overlaps;
+
+  SELECT coalesce(bool_or('UNORDERED' = ANY(_timescaledb_functions.chunk_status_text(c))), false)
+  INTO unordered
+  FROM show_chunks(ht) c;
+END $$;
+
+-- Two disjoint overlap groups in one chunk, each group two batches of 1000 rows:
+--   group A: minutes 1..1000 overlap 500..1499
+--   gap:     minutes 3000..3999
+--   group B: minutes 5000..5999 overlap 5500..6499
+CREATE PROCEDURE seed_two_overlap_groups(ht regclass)
+LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE format($q$INSERT INTO %s SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(1,1000) i$q$, ht);
+  EXECUTE format($q$INSERT INTO %s SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(3000,3999) i$q$, ht);
+  EXECUTE format($q$INSERT INTO %s SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(5000,5999) i$q$, ht);
+  EXECUTE format($q$INSERT INTO %s SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(500,1499) i$q$, ht);
+  EXECUTE format($q$INSERT INTO %s SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(5500,6499) i$q$, ht);
+END $$;
+
+CREATE PROCEDURE compact_with(ht regclass, lim integer)
+LANGUAGE plpgsql AS $$
+DECLARE
+  c regclass;
+BEGIN
+  SELECT chunk INTO c FROM show_chunks(ht) chunk LIMIT 1;
+  PERFORM _timescaledb_functions.compact_chunk(c, lim);
+END $$;
+
+CREATE PROCEDURE compact_default(ht regclass)
+LANGUAGE plpgsql AS $$
+DECLARE
+  c regclass;
+BEGIN
+  SELECT chunk INTO c FROM show_chunks(ht) chunk LIMIT 1;
+  PERFORM _timescaledb_functions.compact_chunk(c);
+END $$;
+
+CREATE TABLE metrics_limit (time TIMESTAMPTZ NOT NULL, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.chunk_interval='30 days');
+NOTICE:  using column "time" as partitioning column
+CALL seed_two_overlap_groups('metrics_limit');
+
+-- Five batches, two adjacent overlaps, still unordered. All 5000 rows kept.
+SELECT * FROM overlap_stats('metrics_limit');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        2 | t
+SELECT count(*) AS rows, min(value) AS min_value, max(value) AS max_value FROM metrics_limit;
+ rows | min_value | max_value 
+------+-----------+-----------
+ 5000 |         1 |      6499
+
+-- Negative max_batches is rejected and changes nothing.
+\set ON_ERROR_STOP 0
+SELECT _timescaledb_functions.compact_chunk(chunk, -1) FROM show_chunks('metrics_limit') chunk;
+ERROR:  max_batches must be greater than or equal to 0
+\set ON_ERROR_STOP 1
+SELECT * FROM overlap_stats('metrics_limit');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        2 | t
+
+-- max_batches = 2 flushes the first group (exactly two batches) and stops
+-- before the second group.
+CALL compact_with('metrics_limit', 2);
+SELECT * FROM overlap_stats('metrics_limit');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        1 | t
+SELECT count(*) AS rows, min(value) AS min_value, max(value) AS max_value FROM metrics_limit;
+ rows | min_value | max_value 
+------+-----------+-----------
+ 5000 |         1 |      6499
+
+-- A second call finishes the remaining group and clears UNORDERED.
+CALL compact_with('metrics_limit', 2);
+SELECT * FROM overlap_stats('metrics_limit');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        0 | f
+SELECT count(*) AS rows, min(value) AS min_value, max(value) AS max_value FROM metrics_limit;
+ rows | min_value | max_value 
+------+-----------+-----------
+ 5000 |         1 |      6499
+
+-- max_batches = 3 starts the second group because the first group only
+-- decompressed 2 batches. The second group is flushed in full (4 > 3).
+CREATE TABLE metrics_over (time TIMESTAMPTZ NOT NULL, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.chunk_interval='30 days');
+CALL seed_two_overlap_groups('metrics_over');
+SELECT * FROM overlap_stats('metrics_over');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        2 | t
+CALL compact_with('metrics_over', 3);
+SELECT * FROM overlap_stats('metrics_over');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        0 | f
+SELECT count(*) AS rows FROM metrics_over;
+ rows 
+------
+ 5000
+
+-- Default (unlimited) compacts every group in one call.
+CREATE TABLE metrics_unlim (time TIMESTAMPTZ NOT NULL, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.chunk_interval='30 days');
+CALL seed_two_overlap_groups('metrics_unlim');
+SELECT * FROM overlap_stats('metrics_unlim');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        2 | t
+CALL compact_default('metrics_unlim');
+SELECT * FROM overlap_stats('metrics_unlim');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        0 | f
+SELECT count(*) AS rows FROM metrics_unlim;
+ rows 
+------
+ 5000
+
+-- Explicit 0 is the same unlimited behavior.
+CREATE TABLE metrics_zero (time TIMESTAMPTZ NOT NULL, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.chunk_interval='30 days');
+CALL seed_two_overlap_groups('metrics_zero');
+CALL compact_with('metrics_zero', 0);
+SELECT * FROM overlap_stats('metrics_zero');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        0 | f
+SELECT count(*) AS rows FROM metrics_zero;
+ rows 
+------
+ 5000
+
+-- One overlap group of three batches. max_batches = 1 must still rewrite the
+-- whole group (3 > 1) and leave no partial merge behind.
+CREATE TABLE metrics_onegroup (time TIMESTAMPTZ NOT NULL, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.chunk_interval='30 days');
+INSERT INTO metrics_onegroup
+SELECT '2025-03-03'::timestamptz + (i || ' minute')::interval, i
+FROM generate_series(1,1000) i;
+INSERT INTO metrics_onegroup
+SELECT '2025-03-03'::timestamptz + (i || ' minute')::interval, i
+FROM generate_series(800,1799) i;
+INSERT INTO metrics_onegroup
+SELECT '2025-03-03'::timestamptz + (i || ' minute')::interval, i
+FROM generate_series(1600,2599) i;
+SELECT * FROM overlap_stats('metrics_onegroup');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       3 |        2 | t
+CALL compact_with('metrics_onegroup', 1);
+SELECT * FROM overlap_stats('metrics_onegroup');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       3 |        0 | f
+SELECT count(*) AS rows, min(value) AS min_value, max(value) AS max_value FROM metrics_onegroup;
+ rows | min_value | max_value 
+------+-----------+-----------
+ 3000 |         1 |      2599
+
+DROP TABLE metrics_limit;
+DROP TABLE metrics_over;
+DROP TABLE metrics_unlim;
+DROP TABLE metrics_zero;
+DROP TABLE metrics_onegroup;
+DROP PROCEDURE seed_two_overlap_groups(regclass);
+DROP PROCEDURE compact_with(regclass, integer);
+DROP PROCEDURE compact_default(regclass);
+DROP FUNCTION overlap_stats(regclass);

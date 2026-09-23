@@ -29,6 +29,9 @@ ERROR:  compaction policy requires compression to be enabled on hypertable "plai
 -- Negative max_chunks is rejected.
 SELECT add_compaction_policy('metrics', max_chunks => -1);
 ERROR:  max_chunks must be greater than or equal to 0
+-- Negative max_batches is rejected.
+SELECT add_compaction_policy('metrics', max_batches => -1);
+ERROR:  max_batches must be greater than or equal to 0
 \set ON_ERROR_STOP 1
 DROP TABLE plain;
 -- The config check rejects bad configuration.
@@ -41,7 +44,20 @@ SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "ina
 ERROR:  inactive_for must not be negative
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "not an interval"}');
 ERROR:  invalid input syntax for type interval: "not an interval"
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": -1}');
+ERROR:  max_batches must be greater than or equal to 0
 \set ON_ERROR_STOP 1
+-- Zero is unlimited and accepted. A positive limit is accepted.
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": 0}');
+ policy_compaction_check 
+-------------------------
+ 
+
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": 4}');
+ policy_compaction_check 
+-------------------------
+ 
+
 -- Add the policy and inspect the resulting job. Default schedule is 5 minutes.
 SELECT add_compaction_policy('metrics') AS job_id \gset
 SELECT application_name, schedule_interval, proc_schema, proc_name, config
@@ -276,4 +292,94 @@ NOTICE:  compaction policy not found for hypertable "m2", skipping
  
 
 DROP TABLE m2;
+
+----------------------------------------------------------------------
+-- max_batches is stored when > 0 and passed through to compact_chunk
+----------------------------------------------------------------------
+
+-- max_batches => 0 is valid and is not stored (unlimited is the default).
+CREATE TABLE bounded_zero (time TIMESTAMPTZ NOT NULL, value float) WITH (tsdb.hypertable, tsdb.orderby='time');
+NOTICE:  using column "time" as partitioning column
+SELECT add_compaction_policy('bounded_zero', max_batches => 0) AS zero_job \gset
+SELECT config ? 'max_batches' AS has_max_batches
+FROM _timescaledb_config.bgw_job WHERE id = :zero_job;
+ has_max_batches 
+-----------------
+ f
+
+DROP TABLE bounded_zero;
+
+-- Two disjoint overlap groups in one chunk. max_batches = 2 compacts the first
+-- group on the first run and the second group on the next run.
+CREATE FUNCTION overlap_stats(ht regclass, OUT batches bigint, OUT overlaps bigint, OUT unordered boolean)
+LANGUAGE plpgsql AS $$
+DECLARE
+  comp regclass;
+BEGIN
+  SELECT cs.compress_relid INTO comp
+  FROM _timescaledb_catalog.chunk ch
+  JOIN _timescaledb_catalog.compression_settings cs ON cs.relid = ch.relid
+  WHERE ch.relid IN (SELECT show_chunks(ht))
+  ORDER BY ch.id
+  LIMIT 1;
+
+  EXECUTE format(
+    'SELECT count(*), count(*) FILTER (WHERE first_time < prev_last)
+     FROM (
+       SELECT _ts_meta_v2_first_time AS first_time,
+              lag(_ts_meta_v2_last_time) OVER (
+                ORDER BY _ts_meta_v2_first_time, _ts_meta_v2_last_time) AS prev_last
+       FROM %s) s', comp)
+  INTO batches, overlaps;
+
+  SELECT coalesce(bool_or('UNORDERED' = ANY(_timescaledb_functions.chunk_status_text(c))), false)
+  INTO unordered
+  FROM show_chunks(ht) c;
+END $$;
+
+CREATE TABLE bounded (time TIMESTAMPTZ NOT NULL, value float)
+WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.chunk_interval='30 days');
+NOTICE:  using column "time" as partitioning column
+INSERT INTO bounded SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(1,1000) i;
+INSERT INTO bounded SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(3000,3999) i;
+INSERT INTO bounded SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(5000,5999) i;
+INSERT INTO bounded SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(500,1499) i;
+INSERT INTO bounded SELECT '2025-02-03'::timestamptz + (i || ' minute')::interval, i FROM generate_series(5500,6499) i;
+
+SELECT * FROM overlap_stats('bounded');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        2 | t
+SELECT add_compaction_policy('bounded', max_batches => 2) AS job_id \gset
+SELECT config ? 'max_batches' AS has_max_batches,
+       (config->>'max_batches')::int AS max_batches
+FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+ has_max_batches | max_batches 
+-----------------+-------------
+ t               |           2
+
+-- First run flushes one merge group and leaves the chunk unordered.
+CALL run_job(:job_id);
+SELECT * FROM overlap_stats('bounded');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        1 | t
+SELECT count(*) AS rows FROM bounded;
+ rows 
+------
+ 5000
+
+-- Second run finishes the remaining group.
+CALL run_job(:job_id);
+SELECT * FROM overlap_stats('bounded');
+ batches | overlaps | unordered 
+---------+----------+-----------
+       5 |        0 | f
+SELECT count(*) AS rows FROM bounded;
+ rows 
+------
+ 5000
+
+DROP TABLE bounded;
+DROP FUNCTION overlap_stats(regclass);
 DROP FUNCTION unordered_count(regclass);
