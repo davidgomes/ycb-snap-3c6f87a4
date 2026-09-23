@@ -1,0 +1,1 @@
+Implements: #9684 Add `_timescaledb_functions.decompress_batch()` SQL function
