@@ -867,14 +867,14 @@ func PatchDocID(in []byte, docID uint64) error {
 
 func DocIDAndTimeFromBinary(in []byte) (uint64, int64, error) {
 	// Additional fields may follow after the header and are ignored.
-	if len(in) < marshallerV1HeaderLen {
+	if len(in) < MarshallerV1HeaderLen {
 		return 0, 0, errors.Errorf("binary data too short")
 	}
 	if in[0] != 1 {
 		return 0, 0, errors.Errorf("unsupported binary marshaller version %d", in[0])
 	}
 	docID := binary.LittleEndian.Uint64(in[1:9])
-	updateTime := int64(binary.LittleEndian.Uint64(in[marshallerV1UpdateTimeOffset:marshallerV1HeaderLen]))
+	updateTime := int64(binary.LittleEndian.Uint64(in[marshallerV1UpdateTimeOffset:MarshallerV1HeaderLen]))
 	return docID, updateTime, nil
 }
 
@@ -914,7 +914,10 @@ func DocIDAndTimeFromBinary(in []byte) (uint64, int64, error) {
 // Binary header layout (version 1):
 // version(1) + docID(8) + kind(1) + uuid(16) + createTime(8) + updateTime(8) = 42 bytes
 const (
-	marshallerV1HeaderLen        = 1 + 8 + 1 + 16 + 8 + 8 // 42
+	// MarshallerV1HeaderLen is the fixed version-1 header length. It is the
+	// only part of an object binary DocIDAndTimeFromBinary reads, so digest
+	// scans can bound on-disk value reads by it.
+	MarshallerV1HeaderLen        = 1 + 8 + 1 + 16 + 8 + 8 // 42
 	marshallerV1UpdateTimeOffset = 1 + 8 + 1 + 16 + 8     // 34
 )
 
@@ -1637,7 +1640,7 @@ func VectorFromBinary(in []byte, buffer []float32, targetVector string) ([]float
 	// assume that we can directly access the vector length field. The only
 	// situation where this is not accessible would be on corrupted data - where
 	// it would be acceptable to panic
-	vecLen := binary.LittleEndian.Uint16(in[marshallerV1HeaderLen : marshallerV1HeaderLen+2])
+	vecLen := binary.LittleEndian.Uint16(in[MarshallerV1HeaderLen : MarshallerV1HeaderLen+2])
 	if vecLen == 0 {
 		return nil, fmt.Errorf("vector length is 0")
 	}
@@ -1686,7 +1689,7 @@ func MultiVectorFromBinary(in []byte, buffer []float32, targetVector string) ([]
 	// assume that we can directly access the vector length field. The only
 	// situation where this is not accessible would be on corrupted data - where
 	// it would be acceptable to panic
-	vecLen := binary.LittleEndian.Uint16(in[marshallerV1HeaderLen : marshallerV1HeaderLen+2])
+	vecLen := binary.LittleEndian.Uint16(in[MarshallerV1HeaderLen : MarshallerV1HeaderLen+2])
 
 	var out []float32
 	vecStart := 44
