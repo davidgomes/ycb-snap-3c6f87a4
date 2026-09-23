@@ -1160,6 +1160,32 @@ Status WriteBatchInternal::InsertNoop(WriteBatch* b) {
   return Status::OK();
 }
 
+Status WriteBatchInternal::InsertBeginPrepare(WriteBatch* b,
+                                              bool write_after_commit,
+                                              bool unprepared_batch) {
+  b->rep_.push_back(static_cast<char>(
+      write_after_commit ? kTypeBeginPrepareXID
+                         : (unprepared_batch ? kTypeBeginUnprepareXID
+                                             : kTypeBeginPersistedPrepareXID)));
+  uint32_t flags = ContentFlags::HAS_BEGIN_PREPARE;
+  if (unprepared_batch) {
+    flags |= ContentFlags::HAS_BEGIN_UNPREPARE;
+  }
+  b->content_flags_.store(
+      b->content_flags_.load(std::memory_order_relaxed) | flags,
+      std::memory_order_relaxed);
+  return Status::OK();
+}
+
+Status WriteBatchInternal::InsertEndPrepare(WriteBatch* b, const Slice& xid) {
+  b->rep_.push_back(static_cast<char>(kTypeEndPrepareXID));
+  PutLengthPrefixedSlice(&b->rep_, xid);
+  b->content_flags_.store(b->content_flags_.load(std::memory_order_relaxed) |
+                              ContentFlags::HAS_END_PREPARE,
+                          std::memory_order_relaxed);
+  return Status::OK();
+}
+
 Status WriteBatchInternal::MarkEndPrepare(WriteBatch* b, const Slice& xid,
                                           bool write_after_commit,
                                           bool unprepared_batch) {

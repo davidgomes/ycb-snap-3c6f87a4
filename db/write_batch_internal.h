@@ -122,6 +122,16 @@ class WriteBatchInternal {
   static Status PutBlobIndex(WriteBatch* batch, uint32_t column_family_id,
                              const Slice& key, const Slice& value);
 
+  // Append a begin prepare marker. Unlike `MarkEndPrepare`, this does not
+  // rewrite the batch's leading noop, so it can be used to rebuild a batch
+  // entry by entry.
+  static Status InsertBeginPrepare(WriteBatch* batch,
+                                   const bool write_after_commit = true,
+                                   const bool unprepared_batch = false);
+
+  // Append an end prepare marker for `xid`.
+  static Status InsertEndPrepare(WriteBatch* batch, const Slice& xid);
+
   static Status MarkEndPrepare(WriteBatch* batch, const Slice& xid,
                                const bool write_after_commit = true,
                                const bool unprepared_batch = false);
