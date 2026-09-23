@@ -305,3 +305,40 @@ func TestContextMetadata(t *testing.T) {
 		require.Nil(t, md)
 	})
 }
+
+func TestHasEnoughTimeForRetryIncludesStartDelay(t *testing.T) {
+	scheduleTime := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	startDelay := 2 * time.Second
+	scheduleToClose := 3 * time.Second
+	ctx := &chasm.MockMutableContext{
+		MockContext: chasm.MockContext{
+			HandleNow: func(chasm.Component) time.Time { return scheduleTime },
+		},
+	}
+	activity := &Activity{
+		ActivityState: &activitypb.ActivityState{
+			ScheduleTime:           timestamppb.New(scheduleTime),
+			ScheduleToCloseTimeout: durationpb.New(scheduleToClose),
+			StartDelay:             durationpb.New(startDelay),
+			RetryPolicy: &commonpb.RetryPolicy{
+				InitialInterval:    durationpb.New(time.Second),
+				BackoffCoefficient: 1,
+			},
+		},
+		LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{Count: 1}),
+	}
+
+	// Without the start-delay extension the deadline would be T+3s. A retry
+	// interval of 1s evaluated at T+2.5s would be rejected. With the extension
+	// the deadline is T+5s.
+	now := scheduleTime.Add(2500 * time.Millisecond)
+	ctx.HandleNow = func(chasm.Component) time.Time { return now }
+	ok, interval := activity.hasEnoughTimeForRetry(ctx, time.Second)
+	require.True(t, ok)
+	require.Equal(t, time.Second, interval)
+
+	tooLate := scheduleTime.Add(startDelay + scheduleToClose)
+	ctx.HandleNow = func(chasm.Component) time.Time { return tooLate }
+	ok, _ = activity.hasEnoughTimeForRetry(ctx, time.Second)
+	require.False(t, ok)
+}

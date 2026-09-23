@@ -132,6 +132,40 @@ func TestTransitionScheduled(t *testing.T) {
 	}
 }
 
+func TestTransitionScheduled_StartDelay(t *testing.T) {
+	startDelay := 30 * time.Second
+	ctx := &chasm.MockMutableContext{
+		MockContext: chasm.MockContext{
+			HandleNow: func(chasm.Component) time.Time { return defaultTime },
+		},
+	}
+	attemptState := &activitypb.ActivityAttemptState{}
+	activity := &Activity{
+		ActivityState: &activitypb.ActivityState{
+			RetryPolicy:            defaultRetryPolicy,
+			ScheduleToCloseTimeout: durationpb.New(defaultScheduleToCloseTimeout),
+			ScheduleToStartTimeout: durationpb.New(defaultScheduleToStartTimeout),
+			StartToCloseTimeout:    durationpb.New(defaultStartToCloseTimeout),
+			StartDelay:             durationpb.New(startDelay),
+			Status:                 activitypb.ACTIVITY_EXECUTION_STATUS_UNSPECIFIED,
+			TaskQueue:              &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+		},
+		LastAttempt: chasm.NewDataField(ctx, attemptState),
+		Outcome:     chasm.NewDataField(ctx, &activitypb.ActivityOutcome{}),
+		RequestData: chasm.NewDataField(ctx, &activitypb.ActivityRequestData{}),
+	}
+
+	err := TransitionScheduled.Apply(activity, ctx, nil)
+	require.NoError(t, err)
+	require.Len(t, ctx.Tasks, 3)
+
+	dispatchAt := defaultTime.Add(startDelay)
+	require.Equal(t, dispatchAt.Add(defaultScheduleToStartTimeout), ctx.Tasks[0].Attributes.ScheduledTime)
+	require.Equal(t, dispatchAt.Add(defaultScheduleToCloseTimeout), ctx.Tasks[1].Attributes.ScheduledTime)
+	require.Equal(t, dispatchAt, ctx.Tasks[2].Attributes.ScheduledTime)
+	require.IsType(t, &activitypb.ActivityDispatchTask{}, ctx.Tasks[2].Payload)
+}
+
 func TestTransitionRescheduled(t *testing.T) {
 	testCases := []struct {
 		name                   string
