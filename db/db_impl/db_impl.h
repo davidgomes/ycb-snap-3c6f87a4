@@ -20,6 +20,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -588,6 +589,17 @@ class DBImpl : public DB {
   Status GetLiveFilesStorageInfo(
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override;
+
+  // Like GetLiveFilesStorageInfo(), but if `include_cf_ids` is non-null, only
+  // table and blob files of those column families are returned, and the IDs of
+  // all other live column families (as of the returned MANIFEST size) are
+  // stored in `*excluded_cf_ids`. Returns InvalidArgument if any ID in
+  // `include_cf_ids` is not a live column family.
+  Status GetLiveFilesStorageInfoImpl(
+      const LiveFilesStorageInfoOptions& opts,
+      const std::unordered_set<uint32_t>* include_cf_ids,
+      std::vector<LiveFileStorageInfo>* files,
+      std::vector<uint32_t>* excluded_cf_ids);
 
   Status GetPreparedFileInfoForExternalSstIngestion(
       const std::string& file_path,

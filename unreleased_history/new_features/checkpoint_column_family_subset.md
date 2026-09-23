@@ -1,0 +1,1 @@
+Added a `Checkpoint::CreateCheckpoint()` overload that takes a list of column families, creating a checkpoint that contains only those column families (plus the default column family) and links or copies only their table and blob files.

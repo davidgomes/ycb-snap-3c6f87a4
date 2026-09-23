@@ -198,9 +198,20 @@ Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
+  return GetLiveFilesStorageInfoImpl(opts, /*include_cf_ids=*/nullptr, files,
+                                     /*excluded_cf_ids=*/nullptr);
+}
+
+Status DBImpl::GetLiveFilesStorageInfoImpl(
+    const LiveFilesStorageInfoOptions& opts,
+    const std::unordered_set<uint32_t>* include_cf_ids,
+    std::vector<LiveFileStorageInfo>* files,
+    std::vector<uint32_t>* excluded_cf_ids) {
   // To avoid returning partial results, only move results to files on success.
   assert(files);
+  assert(include_cf_ids == nullptr || excluded_cf_ids != nullptr);
   files->clear();
+  std::vector<uint32_t> excluded;
   std::vector<LiveFileStorageInfo> results;
 
   // NOTE: This implementation was largely migrated from Checkpoint.
@@ -277,9 +288,25 @@ Status DBImpl::GetLiveFilesStorageInfo(
     }
   }
 
+  if (include_cf_ids != nullptr) {
+    for (uint32_t cf_id : *include_cf_ids) {
+      ColumnFamilyData* cfd =
+          versions_->GetColumnFamilySet()->GetColumnFamily(cf_id);
+      if (cfd == nullptr || cfd->IsDropped()) {
+        mutex_.Unlock();
+        return Status::InvalidArgument(
+            "Column family " + std::to_string(cf_id) + " has been dropped");
+      }
+    }
+  }
+
   // Make a set of all of the live table and blob files
   for (auto cfd : *versions_->GetColumnFamilySet()) {
     if (cfd->IsDropped()) {
+      continue;
+    }
+    if (include_cf_ids != nullptr && include_cf_ids->count(cfd->GetID()) == 0) {
+      excluded.push_back(cfd->GetID());
       continue;
     }
     VersionStorageInfo& vsi = *cfd->current()->storage_info();
@@ -512,6 +539,9 @@ Status DBImpl::GetLiveFilesStorageInfo(
   if (s.ok()) {
     // Only move results to output on success.
     *files = std::move(results);
+    if (excluded_cf_ids != nullptr) {
+      *excluded_cf_ids = std::move(excluded);
+    }
   }
   return s;
 }
