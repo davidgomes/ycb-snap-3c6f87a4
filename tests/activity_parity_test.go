@@ -14,6 +14,7 @@ import (
 	"go.temporal.io/server/chasm/lib/activity"
 	"go.temporal.io/server/chasm/lib/activity/model"
 	"go.temporal.io/server/common/dynamicconfig"
+	"go.temporal.io/server/common/payloads"
 	"go.temporal.io/server/common/retrypolicy"
 	"go.temporal.io/server/common/testing/parallelsuite"
 	"go.temporal.io/server/service/history/consts"
@@ -591,6 +592,89 @@ func (s *activityParityTestSuite) TestLastHeartbeatDetailsPersistedOnAttemptFail
 				t := s.T()
 				require.Equal(t, expected,
 					newSAADriver(t, env, cfg).driveTrace(t, trace).activityInfo(t).LastHeartbeatDetails)
+			})
+		})
+	}
+}
+
+// Reset rewinds the attempt counter but preserves the last heartbeat checkpoint so that the activity
+// can resume from its progress. Discarding the checkpoint is opt-in via ResetHeartbeat.
+func (s *activityParityTestSuite) TestResetHeartbeatDetails() {
+	env := newActivityParityEnv(s.T())
+	cfg := activityConfig{MaxAttempts: 3, RetryInterval: activityLongDuration}
+	failWithDetails := model.Event{Type: model.RespondFailedType, Failure: &model.Failure{Retryable: true}, HasHeartbeatDetails: true}
+	checkpoint := activityMarshalPayloads(activityHeartbeatDetails)
+
+	testCases := []struct {
+		name     string
+		trace    []model.Event
+		expected []byte
+	}{
+		{
+			name:     "Reset",
+			trace:    []model.Event{model.Poll, failWithDetails, model.Reset},
+			expected: checkpoint,
+		},
+		{
+			name:     "ResetClearingHeartbeat",
+			trace:    []model.Event{model.Poll, failWithDetails, model.ResetClearingHeartbeat},
+			expected: nil,
+		},
+		{
+			name:     "ResetKeepPaused",
+			trace:    []model.Event{model.Poll, failWithDetails, model.Pause, model.ResetKeepPaused},
+			expected: checkpoint,
+		},
+	}
+	for _, tc := range testCases {
+		s.Run(tc.name, func(s *activityParityTestSuite) {
+			s.Run("WorkflowActivity", func(s *activityParityTestSuite) {
+				t := s.T()
+				info := newWFADriver(t, env, cfg).driveTrace(t, tc.trace).activityInfo(t)
+				require.Equal(t, int32(1), info.Attempt)
+				require.Equal(t, tc.expected, info.LastHeartbeatDetails)
+			})
+			s.Run("StandaloneActivity", func(s *activityParityTestSuite) {
+				t := s.T()
+				info := newSAADriver(t, env, cfg).driveTrace(t, tc.trace).activityInfo(t)
+				require.Equal(t, int32(1), info.Attempt)
+				require.Equal(t, tc.expected, info.LastHeartbeatDetails)
+			})
+		})
+	}
+}
+
+// A reset requested while a worker owns an attempt leaves that attempt's checkpoint undisturbed until
+// the worker yields; only then is the same keep-vs-clear policy applied.
+func (s *activityParityTestSuite) TestResetHeartbeatDetailsWhileStarted() {
+	env := newActivityParityEnv(s.T())
+	cfg := activityConfig{MaxAttempts: 3, RetryInterval: activityLongDuration}
+	heartbeat := activityMarshalPayloads(payloads.EncodeString("heartbeat details"))
+
+	testCases := []struct {
+		name          string
+		reset         model.Event
+		expectedAfter []byte
+	}{
+		{name: "Reset", reset: model.Reset, expectedAfter: heartbeat},
+		{name: "ResetClearingHeartbeat", reset: model.ResetClearingHeartbeat, expectedAfter: nil},
+	}
+	for _, tc := range testCases {
+		trace := []model.Event{model.Poll, model.Heartbeat, tc.reset}
+		s.Run(tc.name, func(s *activityParityTestSuite) {
+			s.Run("WorkflowActivity", func(s *activityParityTestSuite) {
+				t := s.T()
+				handle := newWFADriver(t, env, cfg).driveTrace(t, trace)
+				require.Equal(t, heartbeat, handle.activityInfo(t).LastHeartbeatDetails)
+				handle.driveEvent(t, model.FailRetryably)
+				require.Equal(t, tc.expectedAfter, handle.activityInfo(t).LastHeartbeatDetails)
+			})
+			s.Run("StandaloneActivity", func(s *activityParityTestSuite) {
+				t := s.T()
+				handle := newSAADriver(t, env, cfg).driveTrace(t, trace)
+				require.Equal(t, heartbeat, handle.activityInfo(t).LastHeartbeatDetails)
+				handle.driveEvent(t, model.FailRetryably)
+				require.Equal(t, tc.expectedAfter, handle.activityInfo(t).LastHeartbeatDetails)
 			})
 		})
 	}

@@ -13003,7 +13003,7 @@ func (s *standaloneActivityTestSuite) TestResetActivityExecution() {
 	})
 
 	t.Run("ResetClearsHeartbeatDetails", func(t *testing.T) {
-		// Activity records heartbeats. Reset clears them.
+		// Activity records heartbeats. Reset with ResetHeartbeat clears them.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
@@ -13049,9 +13049,10 @@ func (s *standaloneActivityTestSuite) TestResetActivityExecution() {
 
 		// Reset clears recorded heartbeat state.
 		_, err = env.FrontendClient().ResetActivityExecution(ctx, &workflowservice.ResetActivityExecutionRequest{
-			Namespace:  env.Namespace().String(),
-			ActivityId: activityID,
-			RunId:      startResp.GetRunId(),
+			Namespace:      env.Namespace().String(),
+			ActivityId:     activityID,
+			RunId:          startResp.GetRunId(),
+			ResetHeartbeat: true,
 		})
 		require.NoError(t, err)
 
@@ -13109,7 +13110,13 @@ func (s *standaloneActivityTestSuite) TestResetActivityExecution() {
 		require.NotNil(t, desc.GetInfo().GetHeartbeatDetails())
 
 		// Reset while STARTED — heartbeat clearing is deferred.
-		resetActivity(ctx, t, activityID, startResp.GetRunId())
+		_, err = env.FrontendClient().ResetActivityExecution(ctx, &workflowservice.ResetActivityExecutionRequest{
+			Namespace:      env.Namespace().String(),
+			ActivityId:     activityID,
+			RunId:          startResp.GetRunId(),
+			ResetHeartbeat: true,
+		})
+		require.NoError(t, err)
 
 		// Activity should still be STARTED with heartbeat still visible (reset is deferred)
 		desc, err = env.FrontendClient().DescribeActivityExecution(ctx, &workflowservice.DescribeActivityExecutionRequest{
