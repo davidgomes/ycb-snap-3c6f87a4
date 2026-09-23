@@ -199,6 +199,8 @@ ALTER TABLE _timescaledb_catalog.hypertable
 
 DROP FUNCTION IF EXISTS _timescaledb_functions.rebuild_sparse_index(REGCLASS, BOOLEAN);
 
+DROP FUNCTION IF EXISTS _timescaledb_functions.decompress_batch(record);
+
 -- Rebuild the catalog table `_timescaledb_catalog.continuous_agg` to drop the
 -- `schema_change_timestamp` column.
 DROP VIEW IF EXISTS timescaledb_experimental.policies;

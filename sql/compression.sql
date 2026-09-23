@@ -12,3 +12,13 @@ CREATE OR REPLACE FUNCTION _timescaledb_functions.compressed_data_column_size(_t
    AS '@MODULE_PATHNAME@', 'ts_compressed_data_column_size'
    LANGUAGE C IMMUTABLE PARALLEL SAFE;
 
+-- Decompress one compressed-batch row. The output row type is the call-site
+-- column definition list, for example:
+--   SELECT x.* FROM <compressed_chunk> t
+--   CROSS JOIN LATERAL _timescaledb_functions.decompress_batch(t)
+--     AS x(time timestamptz, device_id int, value float);
+CREATE OR REPLACE FUNCTION _timescaledb_functions.decompress_batch(record)
+   RETURNS SETOF record
+   AS '@MODULE_PATHNAME@', 'ts_decompress_batch'
+   LANGUAGE C STRICT;
+

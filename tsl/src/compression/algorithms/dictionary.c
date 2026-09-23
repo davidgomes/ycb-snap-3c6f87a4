@@ -58,6 +58,14 @@ dictionary_compressed_has_nulls(const CompressedDataHeader *header)
 	return dc->has_nulls;
 }
 
+Oid
+dictionary_compressed_element_type(const CompressedDataHeader *header)
+{
+	CheckCompressedData(header->compression_algorithm == COMPRESSION_ALGORITHM_DICTIONARY);
+	CheckCompressedData(VARSIZE(header) >= sizeof(DictionaryCompressed));
+	return ((const DictionaryCompressed *) header)->element_type;
+}
+
 static void
 pg_attribute_unused() assertions(void)
 {

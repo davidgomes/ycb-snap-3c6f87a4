@@ -7,11 +7,13 @@
 #include <access/attmap.h>
 #include <access/attnum.h>
 #include <access/detoast.h>
+#include <access/htup_details.h>
 #include <access/skey.h>
 #include <access/tupdesc.h>
 #include <catalog/heap.h>
 #include <catalog/indexing.h>
 #include <catalog/pg_am.h>
+#include <catalog/pg_type.h>
 #include <common/base64.h>
 #include <funcapi.h>
 #include <libpq/pqformat.h>
@@ -3416,4 +3418,530 @@ analyze_and_get_segmentby(CompressionSettings *settings, RowCompressor *compress
 
 	pfree(candidates);
 	return result;
+}
+
+/*
+ * Decompress a single compressed-batch tuple into the caller's row type.
+ *
+ * The input composite type is recovered from the record itself. The output
+ * row shape is the column definition list at the call site. When the record
+ * comes from a compressed chunk, column types are checked against that
+ * chunk's uncompressed relation so mismatches are reported as invalid
+ * parameters instead of internal errors.
+ */
+typedef struct DecompressBatchSRFState
+{
+	int nrows;
+	int next;
+	HeapTuple *tuples;
+} DecompressBatchSRFState;
+
+static void
+error_not_compressed_batch(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("input record is not a compressed batch")));
+	pg_unreachable();
+}
+
+static void
+error_column_type_mismatch(const char *colname, Oid actual_type, Oid requested_type)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("column \"%s\" type %s does not match compressed batch column type %s",
+					colname,
+					format_type_be(requested_type),
+					format_type_be(actual_type))));
+	pg_unreachable();
+}
+
+static bool
+is_compressed_metadata_column(const char *attname)
+{
+	return strncmp(attname,
+				   COMPRESSION_COLUMN_METADATA_PREFIX,
+				   strlen(COMPRESSION_COLUMN_METADATA_PREFIX)) == 0;
+}
+
+static int
+tuple_desc_attindex(TupleDesc desc, const char *name)
+{
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+		if (attr->attisdropped)
+		{
+			continue;
+		}
+		if (strcmp(NameStr(attr->attname), name) == 0)
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+
+static void
+ensure_compressed_batch_desc(TupleDesc desc)
+{
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+		if (attr->attisdropped)
+		{
+			continue;
+		}
+		if (strcmp(NameStr(attr->attname), COMPRESSION_COLUMN_METADATA_COUNT_NAME) != 0)
+		{
+			continue;
+		}
+		if (attr->atttypid != INT4OID)
+		{
+			error_not_compressed_batch();
+		}
+		return;
+	}
+
+	error_not_compressed_batch();
+}
+
+/*
+ * Segment-by values are stored uncompressed. create_per_compressed_column
+ * raises an internal error when their type disagrees with the output
+ * descriptor, so reject that here as an invalid parameter instead.
+ */
+static void
+check_segmentby_column_types(TupleDesc in_desc, TupleDesc out_desc, Oid compressed_data_type)
+{
+	for (int i = 0; i < in_desc->natts; i++)
+	{
+		Form_pg_attribute in_attr = TupleDescAttr(in_desc, i);
+		const char *name;
+		int out_idx;
+		Form_pg_attribute out_attr;
+
+		if (in_attr->attisdropped)
+		{
+			continue;
+		}
+
+		name = NameStr(in_attr->attname);
+		if (is_compressed_metadata_column(name))
+		{
+			continue;
+		}
+		if (in_attr->atttypid == compressed_data_type)
+		{
+			continue;
+		}
+
+		out_idx = tuple_desc_attindex(out_desc, name);
+		if (out_idx < 0)
+		{
+			continue;
+		}
+
+		out_attr = TupleDescAttr(out_desc, out_idx);
+		if (out_attr->atttypid != in_attr->atttypid)
+		{
+			error_column_type_mismatch(name, in_attr->atttypid, out_attr->atttypid);
+		}
+	}
+}
+
+static void
+check_result_column_types(TupleDesc result_desc, TupleDesc uncompressed_desc)
+{
+	for (int i = 0; i < result_desc->natts; i++)
+	{
+		Form_pg_attribute result_attr = TupleDescAttr(result_desc, i);
+		const char *name;
+		int src_idx;
+		Form_pg_attribute src_attr;
+
+		if (result_attr->attisdropped)
+		{
+			continue;
+		}
+
+		name = NameStr(result_attr->attname);
+		if (is_compressed_metadata_column(name))
+		{
+			continue;
+		}
+
+		src_idx = tuple_desc_attindex(uncompressed_desc, name);
+		if (src_idx < 0)
+		{
+			continue;
+		}
+
+		src_attr = TupleDescAttr(uncompressed_desc, src_idx);
+		if (src_attr->atttypid != result_attr->atttypid)
+		{
+			error_column_type_mismatch(name, src_attr->atttypid, result_attr->atttypid);
+		}
+	}
+}
+
+static bool
+algorithm_supports_type(CompressionAlgorithm algorithm, Oid type)
+{
+	switch (algorithm)
+	{
+		case COMPRESSION_ALGORITHM_NULL:
+			return true;
+		case COMPRESSION_ALGORITHM_BOOL:
+			return type == BOOLOID;
+		case COMPRESSION_ALGORITHM_UUID:
+			return type == UUIDOID;
+		case COMPRESSION_ALGORITHM_GORILLA:
+			return type == FLOAT4OID || type == FLOAT8OID || type == INT2OID || type == INT4OID ||
+				   type == INT8OID;
+		case COMPRESSION_ALGORITHM_DELTADELTA:
+			return type == BOOLOID || type == INT2OID || type == INT4OID || type == INT8OID ||
+				   type == DATEOID || type == TIMESTAMPOID || type == TIMESTAMPTZOID;
+		case COMPRESSION_ALGORITHM_ARRAY:
+		case COMPRESSION_ALGORITHM_DICTIONARY:
+			/*
+			 * Element type is stored in the payload and checked by the caller.
+			 * Reaching this function for these algorithms means the payload did
+			 * not match the requested type.
+			 */
+			return false;
+		default:
+			return false;
+	}
+}
+
+/*
+ * Without the uncompressed relation, the only type information for a
+ * compressed column is inside the payload. Check it before decompression so
+ * a mismatch is an invalid parameter rather than an internal error.
+ */
+static void
+check_compressed_payload_type(const char *colname, Datum payload, Oid requested_type)
+{
+	CompressedDataHeader *header = get_compressed_data_header(payload);
+	Oid actual_type = InvalidOid;
+
+	switch (header->compression_algorithm)
+	{
+		case COMPRESSION_ALGORITHM_ARRAY:
+			actual_type = array_compressed_element_type(header);
+			break;
+		case COMPRESSION_ALGORITHM_DICTIONARY:
+			actual_type = dictionary_compressed_element_type(header);
+			break;
+		case COMPRESSION_ALGORITHM_NULL:
+			return;
+		default:
+			if (!algorithm_supports_type(header->compression_algorithm, requested_type))
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("column \"%s\" cannot be decompressed as type %s",
+								colname,
+								format_type_be(requested_type))));
+			}
+			return;
+	}
+
+	if (actual_type != requested_type)
+	{
+		error_column_type_mismatch(colname, actual_type, requested_type);
+	}
+}
+
+static void
+check_compressed_payload_types(TupleDesc in_desc, TupleDesc result_desc, Datum *values,
+							   bool *isnulls, Oid compressed_data_type)
+{
+	for (int i = 0; i < in_desc->natts; i++)
+	{
+		Form_pg_attribute in_attr = TupleDescAttr(in_desc, i);
+		const char *name;
+		int result_idx;
+		Oid requested_type;
+
+		if (in_attr->attisdropped || isnulls[i])
+		{
+			continue;
+		}
+		if (in_attr->atttypid != compressed_data_type)
+		{
+			continue;
+		}
+
+		name = NameStr(in_attr->attname);
+		if (is_compressed_metadata_column(name))
+		{
+			continue;
+		}
+
+		result_idx = tuple_desc_attindex(result_desc, name);
+		if (result_idx < 0)
+		{
+			continue;
+		}
+
+		requested_type = TupleDescAttr(result_desc, result_idx)->atttypid;
+		check_compressed_payload_type(name, values[i], requested_type);
+	}
+}
+
+static void
+fill_unmapped_column_defaults(RowDecompressor *decompressor)
+{
+	bool *mapped = palloc0(sizeof(bool) * decompressor->out_desc->natts);
+
+	for (int col = 0; col < decompressor->in_desc->natts; col++)
+	{
+		int16 offset = decompressor->per_compressed_cols[col].decompressed_column_offset;
+
+		if (offset >= 0)
+		{
+			mapped[offset] = true;
+		}
+	}
+
+	for (int i = 0; i < decompressor->out_desc->natts; i++)
+	{
+		if (mapped[i])
+		{
+			continue;
+		}
+
+		decompressor->decompressed_datums[i] =
+			getmissingattr(decompressor->out_desc,
+						   AttrOffsetGetAttrNumber(i),
+						   &decompressor->decompressed_is_nulls[i]);
+	}
+
+	pfree(mapped);
+}
+
+static HeapTuple *
+project_decompressed_tuples(RowDecompressor *decompressor, TupleDesc result_desc, int nrows)
+{
+	int nresult = result_desc->natts;
+	int *result_to_out = palloc(sizeof(int) * nresult);
+	Datum *src_values = palloc(sizeof(Datum) * decompressor->out_desc->natts);
+	bool *src_nulls = palloc(sizeof(bool) * decompressor->out_desc->natts);
+	Datum *dst_values = palloc(sizeof(Datum) * nresult);
+	bool *dst_nulls = palloc(sizeof(bool) * nresult);
+	HeapTuple *tuples = palloc(sizeof(HeapTuple) * nrows);
+
+	for (int i = 0; i < nresult; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(result_desc, i);
+
+		if (attr->attisdropped)
+		{
+			result_to_out[i] = -1;
+		}
+		else
+		{
+			result_to_out[i] = tuple_desc_attindex(decompressor->out_desc, NameStr(attr->attname));
+		}
+	}
+
+	for (int row = 0; row < nrows; row++)
+	{
+		bool should_free = false;
+		HeapTuple tuple =
+			ExecFetchSlotHeapTuple(decompressor->decompressed_slots[row], false, &should_free);
+
+		heap_deform_tuple(tuple, decompressor->out_desc, src_values, src_nulls);
+
+		for (int i = 0; i < nresult; i++)
+		{
+			int src = result_to_out[i];
+
+			if (src < 0 || src_nulls[src])
+			{
+				dst_values[i] = (Datum) 0;
+				dst_nulls[i] = true;
+				continue;
+			}
+
+			dst_values[i] = src_values[src];
+			dst_nulls[i] = false;
+		}
+
+		tuples[row] = heap_form_tuple(result_desc, dst_values, dst_nulls);
+
+		if (should_free)
+		{
+			heap_freetuple(tuple);
+		}
+	}
+
+	pfree(result_to_out);
+	pfree(src_values);
+	pfree(src_nulls);
+	pfree(dst_values);
+	pfree(dst_nulls);
+
+	return tuples;
+}
+
+static TupleDesc
+lookup_uncompressed_desc(Oid compress_relid, Oid *uncompressed_relid)
+{
+	Relation uncompressed_rel;
+	TupleDesc desc;
+
+	*uncompressed_relid = InvalidOid;
+
+	if (!OidIsValid(compress_relid))
+	{
+		return NULL;
+	}
+
+	*uncompressed_relid = ts_relation_get_uncompressed_relid(compress_relid);
+	if (!OidIsValid(*uncompressed_relid))
+	{
+		return NULL;
+	}
+
+	uncompressed_rel = try_relation_open(*uncompressed_relid, AccessShareLock);
+	if (uncompressed_rel == NULL)
+	{
+		return NULL;
+	}
+
+	desc = CreateTupleDescCopyConstr(RelationGetDescr(uncompressed_rel));
+	table_close(uncompressed_rel, AccessShareLock);
+	return desc;
+}
+
+static DecompressBatchSRFState *
+decompress_batch_record(HeapTupleHeader record, TupleDesc result_desc)
+{
+	Oid tuptype = HeapTupleHeaderGetTypeId(record);
+	int32 tuptypmod = HeapTupleHeaderGetTypMod(record);
+	TupleDesc in_desc = lookup_rowtype_tupdesc_copy(tuptype, tuptypmod);
+	Oid compressed_data_type = ts_custom_type_cache_get(CUSTOM_TYPE_COMPRESSED_DATA)->type_oid;
+	Oid compress_relid = get_typ_typrelid(tuptype);
+	Oid uncompressed_relid = InvalidOid;
+	TupleDesc uncompressed_desc;
+	TupleDesc decompress_desc;
+	RowDecompressor decompressor;
+	HeapTupleData tuple = { 0 };
+	int nrows;
+	DecompressBatchSRFState *state;
+
+	ensure_compressed_batch_desc(in_desc);
+
+	uncompressed_desc = lookup_uncompressed_desc(compress_relid, &uncompressed_relid);
+	if (uncompressed_desc != NULL)
+	{
+		check_result_column_types(result_desc, uncompressed_desc);
+	}
+
+	decompress_desc = uncompressed_desc != NULL ? uncompressed_desc : result_desc;
+	check_segmentby_column_types(in_desc, decompress_desc, compressed_data_type);
+
+	decompressor = build_decompressor(in_desc, decompress_desc, compress_relid, uncompressed_relid);
+
+	tuple.t_len = HeapTupleHeaderGetDatumLength(record);
+	tuple.t_data = record;
+	heap_deform_tuple(&tuple,
+					  decompressor.in_desc,
+					  decompressor.compressed_datums,
+					  decompressor.compressed_is_nulls);
+
+	if (decompressor.compressed_is_nulls[decompressor.count_compressed_attindex])
+	{
+		row_decompressor_close(&decompressor);
+		FreeTupleDesc(in_desc);
+		if (uncompressed_desc != NULL)
+		{
+			FreeTupleDesc(uncompressed_desc);
+		}
+		error_not_compressed_batch();
+	}
+
+	/*
+	 * The relation-backed path already compared the call-site types with the
+	 * uncompressed chunk. This fallback covers records that are not tied to
+	 * that relation.
+	 */
+	if (uncompressed_desc == NULL)
+	{
+		check_compressed_payload_types(in_desc,
+									   result_desc,
+									   decompressor.compressed_datums,
+									   decompressor.compressed_is_nulls,
+									   compressed_data_type);
+	}
+
+	fill_unmapped_column_defaults(&decompressor);
+	nrows = decompress_batch(&decompressor);
+
+	state = palloc0(sizeof(DecompressBatchSRFState));
+	state->nrows = nrows;
+	state->next = 0;
+	state->tuples = project_decompressed_tuples(&decompressor, result_desc, nrows);
+
+	row_decompressor_close(&decompressor);
+	FreeTupleDesc(in_desc);
+	if (uncompressed_desc != NULL)
+	{
+		FreeTupleDesc(uncompressed_desc);
+	}
+
+	return state;
+}
+
+extern Datum
+tsl_decompress_batch(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	DecompressBatchSRFState *state;
+
+	ts_feature_flag_check(FEATURE_HYPERTABLE_COMPRESSION);
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldcontext;
+		TupleDesc result_desc;
+		HeapTupleHeader record;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (get_call_result_type(fcinfo, NULL, &result_desc) != TYPEFUNC_COMPOSITE)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("function returning record called in "
+							"context that cannot accept type record")));
+		}
+
+		result_desc = BlessTupleDesc(result_desc);
+		funcctx->tuple_desc = result_desc;
+
+		record = PG_GETARG_HEAPTUPLEHEADER(0);
+		funcctx->user_fctx = decompress_batch_record(record, result_desc);
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	state = (DecompressBatchSRFState *) funcctx->user_fctx;
+
+	if (state->next < state->nrows)
+	{
+		HeapTuple tuple = state->tuples[state->next++];
+
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+
+	SRF_RETURN_DONE(funcctx);
 }
