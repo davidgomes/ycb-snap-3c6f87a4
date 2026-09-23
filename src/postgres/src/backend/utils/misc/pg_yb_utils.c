@@ -131,6 +131,7 @@
 #include "storage/procarray.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -9136,6 +9137,34 @@ string_list_compare(const ListCell *a, const ListCell *b)
 	return strcmp((char *) lfirst(a), (char *) lfirst(b));
 }
 
+#define YB_INSUFFICIENT_PRIVILEGE "<insufficient privilege>"
+
+/*
+ * Whether an unprivileged caller may see the sensitive columns (object_name,
+ * start_range, end_range) of a yb_get_tablet_metadata row: the system
+ * transactions tablet is always visible; otherwise the row must belong to a
+ * table of the current database on which the caller has SELECT. OIDs that are
+ * not found in pg_class (e.g. tablets of dropped tables) are treated as not
+ * visible rather than raising an error.
+ */
+static bool
+YbCanSeeTabletMetadataRow(const YbcPgGlobalTabletsDescriptor *tablet)
+{
+	const YbcPgTabletsDescriptor *tablet_descriptor = &tablet->tablet_descriptor;
+	bool		is_missing = false;
+
+	if (strcmp(tablet_descriptor->namespace_name, "system") == 0 &&
+		strcmp(tablet_descriptor->table_name, "transactions") == 0)
+		return true;
+
+	if (tablet->pg_database_oid != MyDatabaseId ||
+		!OidIsValid(tablet->pg_table_oid))
+		return false;
+
+	return pg_class_aclcheck_ext(tablet->pg_table_oid, GetUserId(), ACL_SELECT,
+								 &is_missing) == ACLCHECK_OK && !is_missing;
+}
+
 /*
  * Returns the metadata for all tablets in the cluster.
  * The returned data structure is a row type with the following columns:
@@ -9155,8 +9184,17 @@ string_list_compare(const ListCell *a, const ListCell *b)
  * - tablet_state: text
  *
  * The start_hash_code and end_hash_code are the hash codes of the start and end
- * keys of the tablet for hash sharded tables. Leader is provided as a separate
- * column for simpler querying and self-explanatory access.
+ * keys of the tablet for hash sharded tables. The start_range and end_range are
+ * the start and end keys of the tablet, rendered as DocDB keys, for range
+ * sharded tables. Leader is provided as a separate column for simpler querying
+ * and self-explanatory access.
+ *
+ * Superusers and members of yb_db_admin see every row unmasked. For other
+ * callers, object_name, start_range and end_range are replaced with
+ * "<insufficient privilege>" on rows that YbCanSeeTabletMetadataRow rejects.
+ * start_range and end_range stay NULL on hash sharded rows, but are both
+ * masked on range sharded rows, even when a bound is unbounded (NULL), so that
+ * the first and last tablets of a table cannot be told apart.
  */
 Datum
 yb_get_tablet_metadata(PG_FUNCTION_ARGS)
@@ -9200,6 +9238,7 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 
 	YbcPgGlobalTabletsDescriptor *tablets = NULL;
 	size_t		num_tablets = 0;
+	bool		is_privileged = superuser() || IsYbDbAdminUser(GetUserId());
 
 	HandleYBStatus(YBCTabletsMetadata(&tablets, &num_tablets));
 
@@ -9209,6 +9248,7 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 		YbcPgTabletsDescriptor *tablet_descriptor = &tablet->tablet_descriptor;
 		Datum		values[ncols];
 		bool		nulls[ncols];
+		bool		is_masked = !is_privileged && !YbCanSeeTabletMetadataRow(tablet);
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
@@ -9228,7 +9268,8 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 
 		values[3] = CStringGetTextDatum(tablet_descriptor->namespace_name);
-		values[4] = CStringGetTextDatum(tablet_descriptor->table_name);
+		values[4] = CStringGetTextDatum(is_masked ? YB_INSUFFICIENT_PRIVILEGE :
+										tablet_descriptor->table_name);
 		values[5] = CStringGetTextDatum(tablet_descriptor->table_type);
 
 		if (tablet->is_hash_partitioned)
@@ -9274,9 +9315,30 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[9] = true;
 		}
 
-		/* TODO (#28172): start_range, end_range, tablet_attrs are populated in a follow-up change. */
-		nulls[10] = true;
-		nulls[11] = true;
+		if (tablet->is_hash_partitioned)
+		{
+			nulls[10] = true;
+			nulls[11] = true;
+		}
+		else if (is_masked)
+		{
+			values[10] = CStringGetTextDatum(YB_INSUFFICIENT_PRIVILEGE);
+			values[11] = CStringGetTextDatum(YB_INSUFFICIENT_PRIVILEGE);
+		}
+		else
+		{
+			if (tablet->start_range)
+				values[10] = CStringGetTextDatum(tablet->start_range);
+			else
+				nulls[10] = true;
+
+			if (tablet->end_range)
+				values[11] = CStringGetTextDatum(tablet->end_range);
+			else
+				nulls[11] = true;
+		}
+
+		/* TODO (#28172): tablet_attrs is populated in a follow-up change. */
 		nulls[12] = true;
 
 		if (tablet->tablet_state)

@@ -894,6 +894,13 @@ typedef struct {
   bool is_hash_partitioned;
   const char* tablet_state;
   YbcPgOid pg_table_oid;
+  // Database OID decoded from the table id; kPgInvalidOid for non-YSQL tables and colocation
+  // parents.
+  YbcPgOid pg_database_oid;
+  // Partition bounds rendered as DocDB keys for range-sharded tablets. NULL for hash-sharded
+  // tablets and for unbounded edges.
+  const char* start_range;
+  const char* end_range;
 } YbcPgGlobalTabletsDescriptor;
 
 typedef struct {
