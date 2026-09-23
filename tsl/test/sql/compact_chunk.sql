@@ -1052,3 +1052,106 @@ FROM :NO_FL_CHUNK ORDER BY _ts_meta_min_1;
 SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_no_firstlast') chunk;
 
 DROP TABLE metrics_no_firstlast;
+
+-- compact_chunk with max_batches
+-- The limit bounds how many batches a single call decompresses. It is only
+-- checked after a merge group has been fully recompressed, so a call makes
+-- progress group by group and never leaves a group half rewritten.
+CREATE TABLE metrics_limit (time TIMESTAMPTZ NOT NULL, device TEXT, value float)
+WITH (tsdb.hypertable, tsdb.segmentby='device', tsdb.orderby='time');
+
+-- Number of adjacent overlapping batch pairs per segment.
+CREATE FUNCTION limit_overlaps() RETURNS TABLE(device text, batches bigint, overlaps bigint)
+LANGUAGE plpgsql AS $$
+DECLARE
+  compressed regclass;
+BEGIN
+  SELECT cs.compress_relid INTO compressed
+  FROM _timescaledb_catalog.chunk ch
+  JOIN _timescaledb_catalog.compression_settings cs ON cs.relid = ch.relid
+  JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+  WHERE ht.table_name = 'metrics_limit';
+  RETURN QUERY EXECUTE format($q$
+    SELECT device, count(*), count(*) FILTER (WHERE first_time < prev_last)
+    FROM (SELECT device, _ts_meta_v2_first_time AS first_time,
+                 lag(_ts_meta_v2_last_time) OVER (PARTITION BY device
+                   ORDER BY _ts_meta_v2_first_time, _ts_meta_v2_last_time) AS prev_last
+          FROM %s) b
+    GROUP BY device ORDER BY device $q$, compressed);
+END $$;
+
+-- Three segments, each with one overlap group of two batches.
+INSERT INTO metrics_limit
+SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM generate_series(0,999) i, unnest(ARRAY['d1','d2','d3']) d;
+INSERT INTO metrics_limit
+SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM generate_series(0,999) i, unnest(ARRAY['d1','d2','d3']) d;
+SELECT * FROM limit_overlaps();
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+-- Negative max_batches is rejected.
+\set ON_ERROR_STOP 0
+SELECT _timescaledb_functions.compact_chunk(chunk, -1) FROM show_chunks('metrics_limit') chunk;
+\set ON_ERROR_STOP 1
+
+-- max_batches = 1: the first group already decompresses two batches, so the
+-- call stops after merging one segment and the chunk stays UNORDERED.
+SELECT _timescaledb_functions.compact_chunk(chunk, 1) FROM show_chunks('metrics_limit') chunk;
+SELECT * FROM limit_overlaps();
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+-- max_batches = 3 merges the remaining two groups and clears UNORDERED.
+SELECT _timescaledb_functions.compact_chunk(chunk, 3) FROM show_chunks('metrics_limit') chunk;
+SELECT * FROM limit_overlaps();
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+SELECT count(*), count(DISTINCT (device, time)) FROM metrics_limit;
+
+-- Multiple groups within one segment, separated by a non-overlapping batch
+-- boundary. Three overlapping inserts into Jan 2 form a single group of three
+-- batches; two into Jan 4 form another.
+TRUNCATE metrics_limit;
+INSERT INTO metrics_limit
+SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(0,999) i;
+INSERT INTO metrics_limit
+SELECT '2025-01-04'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(0,999) i;
+INSERT INTO metrics_limit
+SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(0,999) i;
+INSERT INTO metrics_limit
+SELECT '2025-01-04'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(0,999) i;
+INSERT INTO metrics_limit
+SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, 'd1', i::float
+FROM generate_series(0,999) i;
+SELECT * FROM limit_overlaps();
+
+-- A single group may exceed the limit: the whole first group is merged even
+-- though it decompresses more than one batch, then the call stops.
+SELECT _timescaledb_functions.compact_chunk(chunk, 1) FROM show_chunks('metrics_limit') chunk;
+SELECT * FROM limit_overlaps();
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+-- A second limited call merges the remaining group and clears UNORDERED.
+SELECT _timescaledb_functions.compact_chunk(chunk, 1) FROM show_chunks('metrics_limit') chunk;
+SELECT * FROM limit_overlaps();
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+-- max_batches = 0 is unlimited: every group is merged in one call.
+TRUNCATE metrics_limit;
+INSERT INTO metrics_limit
+SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM generate_series(0,999) i, unnest(ARRAY['d1','d2','d3']) d, generate_series(1,2);
+INSERT INTO metrics_limit
+SELECT '2025-01-02'::timestamptz + (i || ' minute')::interval, d, i::float
+FROM generate_series(0,999) i, unnest(ARRAY['d1','d2','d3']) d;
+SELECT * FROM limit_overlaps();
+SELECT _timescaledb_functions.compact_chunk(chunk, 0) FROM show_chunks('metrics_limit') chunk;
+SELECT * FROM limit_overlaps();
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+
+DROP TABLE metrics_limit;
+DROP FUNCTION limit_overlaps();

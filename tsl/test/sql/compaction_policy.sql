@@ -28,6 +28,8 @@ SELECT create_hypertable('plain', 'time');
 SELECT add_compaction_policy('plain');
 -- Negative max_chunks is rejected.
 SELECT add_compaction_policy('metrics', max_chunks => -1);
+-- Negative max_batches is rejected.
+SELECT add_compaction_policy('metrics', max_batches => -1);
 \set ON_ERROR_STOP 1
 DROP TABLE plain;
 
@@ -35,6 +37,7 @@ DROP TABLE plain;
 \set ON_ERROR_STOP 0
 SELECT _timescaledb_functions.policy_compaction_check('{"max_chunks": 1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_chunks": -1}');
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": -1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "-1 hour"}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "not an interval"}');
 \set ON_ERROR_STOP 1
@@ -179,6 +182,43 @@ SELECT _timescaledb_functions.chunk_statistics_reset();
 CALL run_job(:job_id);
 SELECT unordered_count('gate');
 DROP TABLE gate;
+
+----------------------------------------------------------------------
+-- max_batches bounds the work done per chunk and run
+----------------------------------------------------------------------
+
+CREATE TABLE mb (time TIMESTAMPTZ NOT NULL, device TEXT, value float)
+WITH (tsdb.hypertable, tsdb.segmentby='device', tsdb.orderby='time');
+
+-- One chunk with an overlap group of two batches in each of three segments.
+INSERT INTO mb SELECT '2025-07-01'::timestamptz + (i || ' minute')::interval, d, i
+FROM generate_series(1,1000) i, unnest(ARRAY['d1','d2','d3']) d;
+INSERT INTO mb SELECT '2025-07-01'::timestamptz + (i || ' minute')::interval, d, i
+FROM generate_series(1,1000) i, unnest(ARRAY['d1','d2','d3']) d;
+SELECT unordered_count('mb');
+
+-- max_batches = 0 means unlimited and is not stored in the config.
+SELECT add_compaction_policy('mb', max_batches => 0) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+SELECT remove_compaction_policy('mb');
+
+-- A positive max_batches is stored in the config and accepted by the check.
+SELECT add_compaction_policy('mb', max_batches => 2) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+SELECT _timescaledb_functions.policy_compaction_check(config)
+FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+
+-- Each run merges one segment's group (two batches) and then stops, so the
+-- chunk only becomes ordered after the third run.
+CALL run_job(:job_id);
+SELECT unordered_count('mb');
+CALL run_job(:job_id);
+SELECT unordered_count('mb');
+CALL run_job(:job_id);
+SELECT unordered_count('mb');
+
+SELECT count(*), min(time), max(time) FROM mb;
+DROP TABLE mb;
 
 ----------------------------------------------------------------------
 -- remove behavior
