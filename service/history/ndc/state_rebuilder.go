@@ -7,6 +7,7 @@ import (
 	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
+	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/serviceerror"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
@@ -48,7 +49,6 @@ type (
 			baseLastEventVersion *int64,
 			targetWorkflowIdentifier definition.WorkflowKey,
 			targetBranchToken []byte,
-			requestID string,
 			currentMutableState *persistencespb.WorkflowMutableState,
 		) (historyi.MutableState, RebuildStats, error)
 	}
@@ -158,9 +158,10 @@ func (r *StateRebuilderImpl) RebuildWithCurrentMutableState(
 	baseLastEventVersion *int64,
 	targetWorkflowIdentifier definition.WorkflowKey,
 	targetBranchToken []byte,
-	requestID string,
 	currentMutableState *persistencespb.WorkflowMutableState,
 ) (historyi.MutableState, RebuildStats, error) {
+	// Completion callbacks on WorkflowExecutionStarted must stay tied to the
+	// original start request ID so schedulers can match BufferedStart entries.
 	rebuiltMutableState, lastTxnId, err := r.buildMutableStateFromEvent(
 		ctx,
 		now,
@@ -170,7 +171,7 @@ func (r *StateRebuilderImpl) RebuildWithCurrentMutableState(
 		baseLastEventVersion,
 		targetWorkflowIdentifier,
 		targetBranchToken,
-		requestID,
+		findStartRequestID(currentMutableState.GetExecutionState()),
 	)
 	if err != nil {
 		return nil, RebuildStats{}, err
@@ -397,4 +398,16 @@ func (r *StateRebuilderImpl) getPaginationFn(
 		}
 		return paginateItems, resp.NextPageToken, nil
 	}
+}
+
+// findStartRequestID returns the request ID recorded for WorkflowExecutionStarted.
+// CreateRequestId is only a fallback: after a reset it can be the reset operation's
+// ID, which must not replace the original start request ID on a later rebuild.
+func findStartRequestID(executionState *persistencespb.WorkflowExecutionState) string {
+	for reqID, info := range executionState.GetRequestIds() {
+		if info.GetEventType() == enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED {
+			return reqID
+		}
+	}
+	return executionState.GetCreateRequestId()
 }

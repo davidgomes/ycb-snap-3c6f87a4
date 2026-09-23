@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/google/uuid"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common"
@@ -87,7 +86,7 @@ func (r *resetterImpl) resetWorkflow(
 	incomingFirstEventVersion int64,
 ) (historyi.MutableState, error) {
 
-	baseBranchToken, err := r.getBaseBranchToken(
+	baseBranchToken, startRequestID, err := r.getBaseBranchToken(
 		ctx,
 		baseLastEventID,
 		baseLastEventVersion,
@@ -104,7 +103,6 @@ func (r *resetterImpl) resetWorkflow(
 		return nil, err
 	}
 
-	requestID := uuid.NewString()
 	rebuildMutableState, rebuildStats, err := r.stateRebuilder.Rebuild(
 		ctx,
 		now,
@@ -122,7 +120,7 @@ func (r *resetterImpl) resetWorkflow(
 			r.newRunID,
 		),
 		resetBranchToken,
-		requestID,
+		startRequestID,
 	)
 	if err != nil {
 		return nil, err
@@ -145,7 +143,7 @@ func (r *resetterImpl) getBaseBranchToken(
 	baseLastEventVersion int64,
 	incomingFirstEventID int64,
 	incomingFirstEventVersion int64,
-) (baseBranchToken []byte, retError error) {
+) (baseBranchToken []byte, startRequestID string, retError error) {
 
 	baseWorkflow, err := r.transactionMgr.LoadWorkflow(
 		ctx,
@@ -169,7 +167,7 @@ func (r *resetterImpl) getBaseBranchToken(
 			// the base event and incoming event are from different branch
 			// only re-replicate the gap on the incoming branch
 			// the base branch event will eventually arrived
-			return nil, serviceerrors.NewRetryReplication(
+			return nil, "", serviceerrors.NewRetryReplication(
 				resendOnResetWorkflowMessage,
 				r.namespaceID.String(),
 				r.workflowID,
@@ -183,11 +181,11 @@ func (r *resetterImpl) getBaseBranchToken(
 
 		baseVersionHistory, err := versionhistory.GetVersionHistory(baseVersionHistories, index)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return baseVersionHistory.GetBranchToken(), nil
+		return baseVersionHistory.GetBranchToken(), findStartRequestID(baseWorkflow.GetMutableState().GetExecutionState()), nil
 	case *serviceerror.NotFound:
-		return nil, serviceerrors.NewRetryReplication(
+		return nil, "", serviceerrors.NewRetryReplication(
 			resendOnResetWorkflowMessage,
 			r.namespaceID.String(),
 			r.workflowID,
@@ -198,7 +196,7 @@ func (r *resetterImpl) getBaseBranchToken(
 			incomingFirstEventVersion,
 		)
 	default:
-		return nil, err
+		return nil, "", err
 	}
 }
 

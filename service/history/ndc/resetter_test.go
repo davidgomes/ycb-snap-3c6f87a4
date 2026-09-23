@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	enumspb "go.temporal.io/api/enums/v1"
 	historyspb "go.temporal.io/server/api/history/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
@@ -133,7 +134,13 @@ func (s *resetterSuite) TestResetWorkflow_NoError() {
 	}
 	newBranchToken := []byte("other random branch token")
 
+	startRequestID := uuid.NewString()
 	s.mockBaseMutableState.EXPECT().GetExecutionInfo().Return(&persistencespb.WorkflowExecutionInfo{VersionHistories: versionHistories}).AnyTimes()
+	s.mockBaseMutableState.EXPECT().GetExecutionState().Return(&persistencespb.WorkflowExecutionState{
+		RequestIds: map[string]*persistencespb.RequestIDInfo{
+			startRequestID: {EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED},
+		},
+	}).AnyTimes()
 
 	mockBaseWorkflowReleaseFnCalled := false
 	mockBaseWorkflowReleaseFn := func(err error) {
@@ -168,7 +175,7 @@ func (s *resetterSuite) TestResetWorkflow_NoError() {
 			s.newRunID,
 		),
 		newBranchToken,
-		gomock.Any(),
+		startRequestID,
 	).Return(s.mockRebuiltMutableState, rebuildStats, nil)
 	s.mockRebuiltMutableState.EXPECT().AddHistorySize(rebuildStats.HistorySize)
 	s.mockRebuiltMutableState.EXPECT().AddExternalPayloadSize(rebuildStats.ExternalPayloadSize)
