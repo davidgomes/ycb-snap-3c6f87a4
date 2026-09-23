@@ -24,8 +24,10 @@ import (
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/metrics/metricstest"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/payloads"
 	"go.temporal.io/server/common/searchattribute/sadefs"
 	serviceerrors "go.temporal.io/server/common/serviceerror"
+	"go.temporal.io/server/common/testing/protorequire"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
@@ -1338,6 +1340,91 @@ func TestHandleResetRequestID(t *testing.T) {
 		})
 		require.Error(t, err)
 		require.Equal(t, "previous-reset-request-id", activity.GetLastResetRequestId())
+	})
+}
+
+func TestHandleResetHeartbeatPolicy(t *testing.T) {
+	heartbeat := func() *activitypb.ActivityHeartbeatState {
+		return &activitypb.ActivityHeartbeatState{
+			Details:      payloads.EncodeString("checkpoint"),
+			RecordedTime: timestamppb.New(time.Unix(0, 0)),
+		}
+	}
+	newActivity := func(ctx chasm.MutableContext, status activitypb.ActivityExecutionStatus) *Activity {
+		return &Activity{
+			ActivityState: &activitypb.ActivityState{
+				ActivityType: &commonpb.ActivityType{Name: "test-activity-type"},
+				Status:       status,
+				TaskQueue:    &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+			},
+			LastAttempt:   chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{Count: 4}),
+			LastHeartbeat: chasm.NewDataField(ctx, heartbeat()),
+			Outcome:       chasm.NewDataField(ctx, &activitypb.ActivityOutcome{}),
+		}
+	}
+
+	t.Run("scheduled reset keeps heartbeat and rewinds attempt", func(t *testing.T) {
+		ctx := newOperatorCommandTestContext(t)
+		activity := newActivity(ctx, activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED)
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{},
+		})
+		require.NoError(t, err)
+		require.Equal(t, int32(1), activity.LastAttempt.Get(ctx).GetCount())
+		protorequire.ProtoEqual(t, payloads.EncodeString("checkpoint"), activity.LastHeartbeat.Get(ctx).GetDetails())
+	})
+
+	t.Run("scheduled reset clears heartbeat when opted in", func(t *testing.T) {
+		ctx := newOperatorCommandTestContext(t)
+		activity := newActivity(ctx, activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED)
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{ResetHeartbeat: true},
+		})
+		require.NoError(t, err)
+		require.Equal(t, int32(1), activity.LastAttempt.Get(ctx).GetCount())
+		require.Nil(t, activity.LastHeartbeat.Get(ctx).GetDetails())
+	})
+
+	t.Run("keep-paused reset keeps heartbeat unless opted in", func(t *testing.T) {
+		ctx := newOperatorCommandTestContext(t)
+		activity := newActivity(ctx, activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED)
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{KeepPaused: true},
+		})
+		require.NoError(t, err)
+		require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED, activity.Status)
+		require.Equal(t, int32(1), activity.LastAttempt.Get(ctx).GetCount())
+		protorequire.ProtoEqual(t, payloads.EncodeString("checkpoint"), activity.LastHeartbeat.Get(ctx).GetDetails())
+
+		activity = newActivity(ctx, activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED)
+		_, err = activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{KeepPaused: true, ResetHeartbeat: true},
+		})
+		require.NoError(t, err)
+		require.Equal(t, int32(1), activity.LastAttempt.Get(ctx).GetCount())
+		require.Nil(t, activity.LastHeartbeat.Get(ctx).GetDetails())
+	})
+
+	t.Run("reset while started defers keep or clear until the attempt yields", func(t *testing.T) {
+		ctx := newOperatorCommandTestContext(t)
+		activity := newActivity(ctx, activitypb.ACTIVITY_EXECUTION_STATUS_STARTED)
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{},
+		})
+		require.NoError(t, err)
+		require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED, activity.Status)
+		require.Equal(t, int32(4), activity.LastAttempt.Get(ctx).GetCount())
+		require.False(t, activity.ResetShouldClearHeartbeat)
+		protorequire.ProtoEqual(t, payloads.EncodeString("checkpoint"), activity.LastHeartbeat.Get(ctx).GetDetails())
+
+		activity = newActivity(ctx, activitypb.ACTIVITY_EXECUTION_STATUS_STARTED)
+		_, err = activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{ResetHeartbeat: true},
+		})
+		require.NoError(t, err)
+		require.True(t, activity.ResetShouldClearHeartbeat)
+		require.Equal(t, int32(4), activity.LastAttempt.Get(ctx).GetCount())
+		protorequire.ProtoEqual(t, payloads.EncodeString("checkpoint"), activity.LastHeartbeat.Get(ctx).GetDetails())
 	})
 }
 

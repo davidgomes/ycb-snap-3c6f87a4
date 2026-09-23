@@ -1149,7 +1149,11 @@ func (a *Activity) reset(ctx chasm.MutableContext, event resetEvent) {
 	attempt.Stamp++
 	attempt.CurrentRetryInterval = nil
 	attempt.CurrentRetryIntervalSource = activitypb.ACTIVITY_RETRY_INTERVAL_SOURCE_UNSPECIFIED
-	a.clearHeartbeatDetails(ctx)
+	// Reset rewinds the attempt counter and keeps the last heartbeat checkpoint unless the
+	// caller opted in to discarding it.
+	if event.clearHeartbeat {
+		a.clearHeartbeatDetails(ctx)
+	}
 	dispatchTime := a.dispatchTimeRespectingStartDelay(event.resetTime)
 	attempt.DispatchTime = timestamppb.New(dispatchTime)
 	if timeout := a.GetScheduleToStartTimeout().AsDuration(); timeout > 0 {
@@ -1179,6 +1183,10 @@ func (a *Activity) reset(ctx chasm.MutableContext, event resetEvent) {
 // ActivityReset=true on its next heartbeat response and continues to use its existing task token.
 // If the attempt fails, the activity transitions back to SCHEDULED at attempt 1 via
 // TransitionResetAttemptFailedToScheduled.
+//
+// Heartbeat details are preserved unless reset_heartbeat is set. On a running attempt that choice
+// is stored as ResetShouldClearHeartbeat and applied only when the worker yields, so the in-flight
+// checkpoint stays visible until then. A cancel that supersedes the pending reset drops the flag.
 //
 // RestoreOriginalOptions follows the same split: applied immediately for a non-running activity,
 // and deferred for a running one, so the in-flight attempt is not disturbed — every restored option
@@ -1229,7 +1237,7 @@ func (a *Activity) handleReset(
 			a.restoreOriginalOptions(ctx)
 		}
 		if frontendReq.GetKeepPaused() {
-			return a.resetKeepPaused(ctx, metricsHandler)
+			return a.resetKeepPaused(ctx, metricsHandler, frontendReq.GetResetHeartbeat())
 		}
 		// No keepPaused: perform an immediate reset. restoreOriginalOptions (if requested) already
 		// ran above, so skip it in resetImmediately to avoid restoring twice.
@@ -1242,9 +1250,10 @@ func (a *Activity) handleReset(
 	}
 }
 
-// deferResetWhileRunning defers reset mutations (option restore, heartbeat details clear,
+// deferResetWhileRunning defers reset mutations (option restore, optional heartbeat clear,
 // attempt-count rewind) while a worker is still executing (STARTED or PAUSE_REQUESTED), so that the
-// in-flight attempt is undisturbed. The deferred reset applies when the worker yields.
+// in-flight attempt is undisturbed. The deferred reset applies when the worker yields. Heartbeat
+// details are cleared then only when the request set reset_heartbeat.
 func (a *Activity) deferResetWhileRunning(
 	ctx chasm.MutableContext,
 	frontendReq *workflowservice.ResetActivityExecutionRequest,
@@ -1268,6 +1277,7 @@ func (a *Activity) deferResetWhileRunning(
 	// keepPaused on a paused (PAUSE_REQUESTED) activity preserves the pause: when the worker
 	// yields the activity lands back in PAUSED rather than SCHEDULED.
 	a.ResetShouldPause = keepPaused && pauseRequested
+	a.ResetShouldClearHeartbeat = frontendReq.GetResetHeartbeat()
 	if err := TransitionResetRequested.Apply(a, ctx, nil); err != nil {
 		return nil, err
 	}
@@ -1278,6 +1288,7 @@ func (a *Activity) deferResetWhileRunning(
 func (a *Activity) resetKeepPaused(
 	ctx chasm.MutableContext,
 	metricsHandler metrics.Handler,
+	clearHeartbeat bool,
 ) (*activitypb.ResetActivityExecutionResponse, error) {
 	attempt := a.LastAttempt.Get(ctx)
 	attempt.Count = 1
@@ -1285,7 +1296,9 @@ func (a *Activity) resetKeepPaused(
 	attempt.CurrentRetryInterval = nil
 	attempt.CurrentRetryIntervalSource = activitypb.ACTIVITY_RETRY_INTERVAL_SOURCE_UNSPECIFIED
 	attempt.DispatchTime = nil
-	a.clearHeartbeatDetails(ctx)
+	if clearHeartbeat {
+		a.clearHeartbeatDetails(ctx)
+	}
 	a.emitOnResetMetrics(metricsHandler)
 	return &activitypb.ResetActivityExecutionResponse{}, nil
 }
@@ -1306,6 +1319,7 @@ func (a *Activity) resetImmediately(
 	if err := TransitionReset.Apply(a, ctx, resetEvent{
 		resetTime:      resetTime,
 		metricsHandler: metricsHandler,
+		clearHeartbeat: frontendReq.GetResetHeartbeat(),
 	}); err != nil {
 		return nil, err
 	}

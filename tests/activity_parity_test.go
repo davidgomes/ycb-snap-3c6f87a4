@@ -14,6 +14,7 @@ import (
 	"go.temporal.io/server/chasm/lib/activity"
 	"go.temporal.io/server/chasm/lib/activity/model"
 	"go.temporal.io/server/common/dynamicconfig"
+	"go.temporal.io/server/common/payloads"
 	"go.temporal.io/server/common/retrypolicy"
 	"go.temporal.io/server/common/testing/parallelsuite"
 	"go.temporal.io/server/service/history/consts"
@@ -594,6 +595,61 @@ func (s *activityParityTestSuite) TestLastHeartbeatDetailsPersistedOnAttemptFail
 			})
 		})
 	}
+}
+
+// Reset rewinds the attempt counter and keeps the last heartbeat checkpoint. ResetClearingHeartbeat
+// opts in to discarding that checkpoint. A reset requested while the attempt is still running leaves
+// the checkpoint visible until the worker yields, then applies the same keep-or-clear policy.
+func (s *activityParityTestSuite) TestResetHeartbeatDetails() {
+	env := newActivityParityEnv(s.T())
+	cfg := activityConfig{MaxAttempts: 3, RetryInterval: activityLongDuration}
+	expected := activityMarshalPayloads(payloads.EncodeString("heartbeat details"))
+
+	s.Run("KeepsCheckpoint", func(s *activityParityTestSuite) {
+		trace := []model.Event{model.Poll, model.Heartbeat, model.FailRetryably, model.Reset}
+		s.Run("WorkflowActivity", func(s *activityParityTestSuite) {
+			t := s.T()
+			info := newWFADriver(t, env, cfg).driveTrace(t, trace).activityInfo(t)
+			require.Equal(t, int32(1), info.Attempt)
+			require.Equal(t, expected, info.LastHeartbeatDetails)
+		})
+		s.Run("StandaloneActivity", func(s *activityParityTestSuite) {
+			t := s.T()
+			info := newSAADriver(t, env, cfg).driveTrace(t, trace).activityInfo(t)
+			require.Equal(t, int32(1), info.Attempt)
+			require.Equal(t, expected, info.LastHeartbeatDetails)
+		})
+	})
+
+	s.Run("ResetClearingHeartbeat", func(s *activityParityTestSuite) {
+		trace := []model.Event{model.Poll, model.Heartbeat, model.FailRetryably, model.ResetClearingHeartbeat}
+		s.Run("WorkflowActivity", func(s *activityParityTestSuite) {
+			t := s.T()
+			info := newWFADriver(t, env, cfg).driveTrace(t, trace).activityInfo(t)
+			require.Equal(t, int32(1), info.Attempt)
+			require.Nil(t, info.LastHeartbeatDetails)
+		})
+		s.Run("StandaloneActivity", func(s *activityParityTestSuite) {
+			t := s.T()
+			info := newSAADriver(t, env, cfg).driveTrace(t, trace).activityInfo(t)
+			require.Equal(t, int32(1), info.Attempt)
+			require.Nil(t, info.LastHeartbeatDetails)
+		})
+	})
+
+	s.Run("DeferredKeepsCheckpointUntilYield", func(s *activityParityTestSuite) {
+		trace := []model.Event{model.Poll, model.Heartbeat, model.Reset}
+		s.Run("WorkflowActivity", func(s *activityParityTestSuite) {
+			t := s.T()
+			info := newWFADriver(t, env, cfg).driveTrace(t, trace).activityInfo(t)
+			require.Equal(t, expected, info.LastHeartbeatDetails)
+		})
+		s.Run("StandaloneActivity", func(s *activityParityTestSuite) {
+			t := s.T()
+			info := newSAADriver(t, env, cfg).driveTrace(t, trace).activityInfo(t)
+			require.Equal(t, expected, info.LastHeartbeatDetails)
+		})
+	})
 }
 
 func (s *activityParityTestSuite) TestTerminalRetryState() {
