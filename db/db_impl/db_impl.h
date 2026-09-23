@@ -589,6 +589,19 @@ class DBImpl : public DB {
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override;
 
+  // Same as GetLiveFilesStorageInfo() above. On success, when non-null,
+  // *file_number_to_cf_id maps each live table and blob file number to its
+  // column family id, and *live_column_families lists non-dropped column
+  // families as (id, name), including the default column family. Those two
+  // outputs are left unchanged when the call fails. Used by subset checkpoints
+  // so file ownership is captured under the same mutex section as the file
+  // list.
+  Status GetLiveFilesStorageInfo(
+      const LiveFilesStorageInfoOptions& opts,
+      std::vector<LiveFileStorageInfo>* files,
+      std::unordered_map<uint64_t, uint32_t>* file_number_to_cf_id,
+      std::vector<std::pair<uint32_t, std::string>>* live_column_families);
+
   Status GetPreparedFileInfoForExternalSstIngestion(
       const std::string& file_path,
       std::shared_ptr<const PreparedFileInfo>* file_info) override;

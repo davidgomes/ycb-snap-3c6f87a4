@@ -5,7 +5,10 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "file/filename.h"
 #include "rocksdb/db.h"
@@ -16,6 +19,16 @@ namespace ROCKSDB_NAMESPACE {
 class CopyEngine;
 class RateLimiter;
 
+// Describes MANIFEST edits for a column-family subset checkpoint. When
+// column_families_to_drop is non-empty, drop records are appended to the
+// copied MANIFEST before the checkpoint directory is published. This does not
+// modify the source DB.
+struct CheckpointSubsetManifest {
+  std::string manifest_filename;
+  uint64_t manifest_size = 0;
+  std::vector<uint32_t> column_families_to_drop;
+};
+
 class CheckpointImpl : public Checkpoint {
  public:
   explicit CheckpointImpl(DB* db) : db_(db) {}
@@ -24,13 +37,21 @@ class CheckpointImpl : public Checkpoint {
                           uint64_t log_size_for_flush,
                           uint64_t* sequence_number_ptr) override;
 
+  Status CreateCheckpoint(
+      const std::string& checkpoint_dir,
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      uint64_t log_size_for_flush, uint64_t* sequence_number_ptr) override;
+
   // Shared by the legacy Checkpoint API and CheckpointEngine. engine == nullptr
   // links/copies serially; otherwise work runs on the pool, awaited before the
   // staging dir is committed.
-  Status CreateCheckpointImpl(const std::string& checkpoint_dir,
-                              uint64_t log_size_for_flush,
-                              uint64_t* sequence_number_ptr, CopyEngine* engine,
-                              bool use_link, RateLimiter* copy_rate_limiter);
+  // included_cf_ids == nullptr checkpoints every column family. Otherwise only
+  // those ids (the default column family id must be present) are kept.
+  Status CreateCheckpointImpl(
+      const std::string& checkpoint_dir, uint64_t log_size_for_flush,
+      uint64_t* sequence_number_ptr, CopyEngine* engine, bool use_link,
+      RateLimiter* copy_rate_limiter,
+      const std::unordered_set<uint32_t>* included_cf_ids = nullptr);
 
   Status ExportColumnFamily(ColumnFamilyHandle* handle,
                             const std::string& export_dir,
@@ -53,7 +74,9 @@ class CheckpointImpl : public Checkpoint {
                            const std::string& contents, FileType type)>
           create_file_cb,
       uint64_t* sequence_number, uint64_t log_size_for_flush,
-      bool get_live_table_checksum = false, bool atomic_flush = false);
+      bool get_live_table_checksum = false, bool atomic_flush = false,
+      const std::unordered_set<uint32_t>* included_cf_ids = nullptr,
+      CheckpointSubsetManifest* subset_manifest = nullptr);
 
  private:
   Status CleanStagingDirectory(const std::string& path, Logger* info_log);

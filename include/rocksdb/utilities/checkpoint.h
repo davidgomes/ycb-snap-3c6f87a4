@@ -153,6 +153,34 @@ class Checkpoint {
                                   uint64_t log_size_for_flush = 0,
                                   uint64_t* sequence_number_ptr = nullptr);
 
+  // Builds an openable snapshot that contains only the given column families
+  // from this DB, plus the default column family (always included, whether or
+  // not it is listed). checkpoint_dir should contain an absolute path and must
+  // not already exist.
+  //
+  // An empty `column_families` checkpoints every column family and behaves
+  // like CreateCheckpoint() without a column family list.
+  //
+  // Null handles, handles that do not belong to this DB, and handles for
+  // column families that have already been dropped are rejected with
+  // InvalidArgument. Duplicate handles are coalesced by column family id.
+  //
+  // SST and blob files that belong to a column family that is not included are
+  // not hard linked or copied. Those column families are recorded as dropped
+  // in the checkpoint MANIFEST only; the source DB's MANIFEST and column
+  // families are left unchanged. The checkpoint therefore opens under default
+  // paranoid checks with exactly the included families (and default). Opening
+  // it with a column family that was not included fails because that family no
+  // longer exists there.
+  //
+  // log_size_for_flush and sequence_number_ptr have the same meaning as in
+  // CreateCheckpoint() without a column family list. db_paths and cf_paths are
+  // not supported.
+  virtual Status CreateCheckpoint(
+      const std::string& checkpoint_dir,
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      uint64_t log_size_for_flush = 0, uint64_t* sequence_number_ptr = nullptr);
+
   // Exports all live SST files of a specified Column Family onto export_dir,
   // returning SST files information in metadata.
   // - SST files will be created as hard links when the directory specified

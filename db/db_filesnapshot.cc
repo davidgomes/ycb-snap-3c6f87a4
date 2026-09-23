@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
@@ -198,10 +200,21 @@ Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
+  return GetLiveFilesStorageInfo(opts, files, /*file_number_to_cf_id=*/nullptr,
+                                 /*live_column_families=*/nullptr);
+}
+
+Status DBImpl::GetLiveFilesStorageInfo(
+    const LiveFilesStorageInfoOptions& opts,
+    std::vector<LiveFileStorageInfo>* files,
+    std::unordered_map<uint64_t, uint32_t>* file_number_to_cf_id,
+    std::vector<std::pair<uint32_t, std::string>>* live_column_families) {
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
   std::vector<LiveFileStorageInfo> results;
+  std::unordered_map<uint64_t, uint32_t> cf_by_file_number;
+  std::vector<std::pair<uint32_t, std::string>> live_cfs;
 
   // NOTE: This implementation was largely migrated from Checkpoint.
 
@@ -308,6 +321,9 @@ Status DBImpl::GetLiveFilesStorageInfo(
         info.file_number = meta->fd.GetNumber();
         info.file_type = kTableFile;
         info.size = meta->fd.GetFileSize();
+        if (file_number_to_cf_id != nullptr) {
+          cf_by_file_number[info.file_number] = cfd->GetID();
+        }
         if (opts.include_checksum_info) {
           info.file_checksum_func_name = meta->file_checksum_func_name;
           info.file_checksum = meta->file_checksum;
@@ -331,6 +347,9 @@ Status DBImpl::GetLiveFilesStorageInfo(
       info.file_number = meta->GetBlobFileNumber();
       info.file_type = kBlobFile;
       info.size = meta->GetBlobFileSize();
+      if (file_number_to_cf_id != nullptr) {
+        cf_by_file_number[info.file_number] = cfd->GetID();
+      }
       if (opts.include_checksum_info) {
         info.file_checksum_func_name = meta->GetChecksumMethod();
         info.file_checksum = meta->GetChecksumValue();
@@ -351,6 +370,15 @@ Status DBImpl::GetLiveFilesStorageInfo(
   const uint64_t min_log_num = MinLogNumberToKeep();
   // Ensure consistency with manifest for track_and_verify_wals_in_manifest
   const uint64_t max_log_num = cur_wal_number_;
+  if (live_column_families != nullptr) {
+    live_cfs.reserve(versions_->GetColumnFamilySet()->NumberOfColumnFamilies());
+    for (auto* cfd : *versions_->GetColumnFamilySet()) {
+      if (cfd->IsDropped()) {
+        continue;
+      }
+      live_cfs.emplace_back(cfd->GetID(), cfd->GetName());
+    }
+  }
 
   mutex_.Unlock();
 
@@ -512,6 +540,12 @@ Status DBImpl::GetLiveFilesStorageInfo(
   if (s.ok()) {
     // Only move results to output on success.
     *files = std::move(results);
+    if (file_number_to_cf_id != nullptr) {
+      *file_number_to_cf_id = std::move(cf_by_file_number);
+    }
+    if (live_column_families != nullptr) {
+      *live_column_families = std::move(live_cfs);
+    }
   }
   return s;
 }
