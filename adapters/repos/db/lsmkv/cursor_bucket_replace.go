@@ -26,6 +26,11 @@ type CursorReplace struct {
 	serveCache   cursorStateReplace
 
 	reusableIDList []int
+
+	// onTombstone, if set, is called with the key of every entry whose newest
+	// version is a tombstone as the cursor skips it. The key is only valid for
+	// the duration of the call.
+	onTombstone func(key []byte)
 }
 
 type innerCursorReplace interface {
@@ -292,6 +297,9 @@ func (c *CursorReplace) serveCurrentStateAndAdvance() ([]byte, []byte) {
 		}
 
 		if errors.Is(c.serveCache.err, lsmkv.Deleted) {
+			if c.onTombstone != nil {
+				c.onTombstone(c.serveCache.key)
+			}
 			// element was deleted, proceed with next round
 			continue
 		}

@@ -496,6 +496,8 @@ func (b *Bucket) resumeCompaction(ctx context.Context) error {
 
 // ApplyToObjectDigests applies f to every object in the bucket (memtable and disk),
 // stopping on the first error. afterInMemCallback fires once the in-memory scan is done.
+// Each live object is reported once, with its newest version: a key the memtables hold
+// a value or a tombstone for shadows its on-disk versions.
 //
 // The on-disk cursor is created while the in-mem cursor holds the flush lock, so both
 // snapshots are taken at a single consistent point with no flush in between. Compaction
@@ -505,7 +507,9 @@ func (b *Bucket) ApplyToObjectDigests(ctx context.Context,
 ) error {
 	var onDiskCursor *CursorReplace
 
-	inmemProcessedDocIDs := make(map[uint64]struct{})
+	// Keyed by primary key, not docID: an update may assign a new docID, and a
+	// tombstone carries none.
+	inMemKeys := make(map[string]struct{})
 
 	// note: read-write access to active and flushing memtable will be blocked only during the scope of this inner function
 	err := func() error {
@@ -513,6 +517,9 @@ func (b *Bucket) ApplyToObjectDigests(ctx context.Context,
 
 		inMemCursor := b.CursorInMem()
 		defer inMemCursor.Close()
+		inMemCursor.onTombstone = func(key []byte) {
+			inMemKeys[string(key)] = struct{}{}
+		}
 
 		// created under the in-mem cursor's flush lock, so it is consistent with the
 		// memtable view: no flush can run between the two snapshots.
@@ -531,7 +538,7 @@ func (b *Bucket) ApplyToObjectDigests(ctx context.Context,
 					return fmt.Errorf("callback on object '%d' failed: %w", docID, err)
 				}
 
-				inmemProcessedDocIDs[docID] = struct{}{}
+				inMemKeys[string(k)] = struct{}{}
 			}
 		}
 
@@ -549,13 +556,13 @@ func (b *Bucket) ApplyToObjectDigests(ctx context.Context,
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+			if _, ok := inMemKeys[string(k)]; ok {
+				continue
+			}
+
 			docID, updateTime, err := storobj.DocIDAndTimeFromBinary(v)
 			if err != nil {
 				return fmt.Errorf("cannot unmarshal object: %w", err)
-			}
-
-			if _, ok := inmemProcessedDocIDs[docID]; ok {
-				continue
 			}
 
 			if err := f(k, updateTime); err != nil {

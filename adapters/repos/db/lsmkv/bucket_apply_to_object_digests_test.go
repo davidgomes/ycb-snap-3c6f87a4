@@ -24,7 +24,7 @@ import (
 )
 
 type objectDigestOp struct {
-	kind       string // "put", "delete" or "flush"
+	kind       string // "put", "delete", "flush" or "switch"
 	key        string
 	docID      uint64
 	updateTime int64
@@ -38,7 +38,12 @@ func digestDelete(key string) objectDigestOp {
 	return objectDigestOp{kind: "delete", key: key}
 }
 
-var digestFlush = objectDigestOp{kind: "flush"}
+var (
+	digestFlush = objectDigestOp{kind: "flush"}
+	// digestSwitch parks the active memtable as the flushing one without
+	// flushing it, like an in-flight FlushAndSwitch.
+	digestSwitch = objectDigestOp{kind: "switch"}
+)
 
 // objectDigestKey maps a short test name to a 16-byte objects-bucket key.
 func objectDigestKey(name string) []byte {
@@ -165,6 +170,32 @@ func TestBucketApplyToObjectDigests_NewestVersionOnly(t *testing.T) {
 			},
 			want: map[string][]int64{"a": {100}, "b": {200}, "d": {200}, "e": {200}},
 		},
+		{
+			name: "flushing memtable tombstone shadows disk",
+			ops:  []objectDigestOp{digestPut("a", 1, 100), digestFlush, digestDelete("a"), digestSwitch},
+			want: map[string][]int64{},
+		},
+		{
+			name: "active tombstone shadows flushing update and disk",
+			ops: []objectDigestOp{
+				digestPut("a", 1, 100), digestFlush, digestPut("a", 2, 200), digestSwitch, digestDelete("a"),
+			},
+			want: map[string][]int64{},
+		},
+		{
+			name: "active update over flushing update over disk with new docIDs",
+			ops: []objectDigestOp{
+				digestPut("a", 1, 100), digestFlush, digestPut("a", 2, 200), digestSwitch, digestPut("a", 3, 300),
+			},
+			want: map[string][]int64{"a": {300}},
+		},
+		{
+			name: "active re-put over flushing tombstone over disk",
+			ops: []objectDigestOp{
+				digestPut("a", 1, 100), digestFlush, digestDelete("a"), digestSwitch, digestPut("a", 2, 300),
+			},
+			want: map[string][]int64{"a": {300}},
+		},
 	}
 
 	for _, mode := range digestCursorModes {
@@ -176,6 +207,7 @@ func TestBucketApplyToObjectDigests_NewestVersionOnly(t *testing.T) {
 
 				// like the shard, deletes carry the docID secondary key of the version they remove
 				currentDocID := map[string]uint64{}
+				flushInFlight := false
 				for _, op := range j.ops {
 					switch op.kind {
 					case "put":
@@ -189,7 +221,16 @@ func TestBucketApplyToObjectDigests_NewestVersionOnly(t *testing.T) {
 						delete(currentDocID, op.key)
 					case "flush":
 						require.NoError(t, b.FlushAndSwitch())
+					case "switch":
+						switched, err := b.atomicallySwitchMemtable(b.createNewActiveMemtable)
+						require.NoError(t, err)
+						require.True(t, switched)
+						flushInFlight = true
 					}
+				}
+				if flushInFlight {
+					require.NotNil(t, b.flushing)
+					defer completeInFlightFlush(t, b)
 				}
 
 				afterInMemCalls := 0
@@ -206,6 +247,18 @@ func TestBucketApplyToObjectDigests_NewestVersionOnly(t *testing.T) {
 			})
 		}
 	}
+}
+
+// completeInFlightFlush finishes a flush started by atomicallySwitchMemtable
+// the way FlushAndSwitch does.
+func completeInFlightFlush(t *testing.T, b *Bucket) {
+	t.Helper()
+	b.waitForZeroWriters(b.flushing)
+	segmentPath, err := b.flushing.flush()
+	require.NoError(t, err)
+	seg, err := b.disk.initAndPrecomputeNewSegment(segmentPath)
+	require.NoError(t, err)
+	require.NoError(t, b.atomicallyAddDiskSegmentAndRemoveFlushing(seg))
 }
 
 func countTrailingZeros(b []byte) int {
