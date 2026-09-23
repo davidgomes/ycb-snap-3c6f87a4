@@ -2966,8 +2966,9 @@ decompress_batch_check_is_batch(const TupleDesc in_desc)
  * the compressed batch. Columns are matched by name.
  *
  * Segmentby columns carry their type in the batch itself. For compressed
- * columns the element type is not recorded in the batch, so it can only be
- * verified when the uncompressed relation of the batch is known.
+ * columns the exact element type is only known from the uncompressed relation
+ * of the batch. Without it, decompress_batch_check_compressed_types() can only
+ * check what the compressed data allows.
  */
 static void
 decompress_batch_check_columns(const TupleDesc in_desc, const TupleDesc out_desc,
@@ -3013,9 +3014,9 @@ decompress_batch_check_columns(const TupleDesc in_desc, const TupleDesc out_desc
 
 		if (batch_type == compressed_data_type_oid)
 		{
-			AttrNumber attno =
-				OidIsValid(uncompressed_relid) ? get_attnum(uncompressed_relid, attname) :
-												 InvalidAttrNumber;
+			AttrNumber attno = OidIsValid(uncompressed_relid) ?
+								   get_attnum(uncompressed_relid, attname) :
+								   InvalidAttrNumber;
 
 			if (!AttributeNumberIsValid(attno))
 			{
@@ -3035,6 +3036,77 @@ decompress_batch_check_columns(const TupleDesc in_desc, const TupleDesc out_desc
 							   format_type_be(batch_type),
 							   format_type_be(out_attr->atttypid))));
 		}
+	}
+}
+
+static bool
+compressed_data_can_decompress_to(const CompressedDataHeader *header, Oid type)
+{
+	switch (header->compression_algorithm)
+	{
+		case COMPRESSION_ALGORITHM_NULL:
+			return true;
+		case COMPRESSION_ALGORITHM_ARRAY:
+			return array_compressed_element_type(header) == type;
+		case COMPRESSION_ALGORITHM_DICTIONARY:
+			return dictionary_compressed_element_type(header) == type;
+		case COMPRESSION_ALGORITHM_GORILLA:
+			return type == FLOAT4OID || type == FLOAT8OID || type == INT2OID || type == INT4OID ||
+				   type == INT8OID;
+		case COMPRESSION_ALGORITHM_DELTADELTA:
+			return type == BOOLOID || type == INT2OID || type == INT4OID || type == INT8OID ||
+				   type == DATEOID || type == TIMESTAMPOID || type == TIMESTAMPTZOID;
+		case COMPRESSION_ALGORITHM_BOOL:
+			return type == BOOLOID;
+		case COMPRESSION_ALGORITHM_UUID:
+			return type == UUIDOID;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid compression algorithm %d", header->compression_algorithm)));
+			pg_unreachable();
+	}
+}
+
+/*
+ * Check that every compressed column of the current batch can be decompressed
+ * into the type requested by the column definition list. Only the header of
+ * the compressed data is needed for this.
+ */
+static void
+decompress_batch_check_compressed_types(const RowDecompressor *decompressor)
+{
+	for (int col = 0; col < decompressor->in_desc->natts; col++)
+	{
+		const PerCompressedColumn *column_info = &decompressor->per_compressed_cols[col];
+
+		if (!column_info->is_compressed || decompressor->compressed_is_nulls[col])
+		{
+			continue;
+		}
+
+		struct varlena *header_slice = detoast_attr_slice((struct varlena *) DatumGetPointer(
+															  decompressor->compressed_datums[col]),
+														  0,
+														  32);
+		const CompressedDataHeader *header = (const CompressedDataHeader *) header_slice;
+
+		CheckCompressedData(VARSIZE(header) >= sizeof(CompressedDataHeader));
+
+		if (!compressed_data_can_decompress_to(header, column_info->decompressed_type))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("type mismatch for column \"%s\" of compressed batch",
+							NameStr(TupleDescAttr(decompressor->in_desc, col)->attname)),
+					 errdetail("Column compressed with algorithm \"%s\" cannot be decompressed "
+							   "as %s.",
+							   NameStr(
+								   *compression_get_algorithm_name(header->compression_algorithm)),
+							   format_type_be(column_info->decompressed_type))));
+		}
+
+		pfree(header_slice);
 	}
 }
 
@@ -3120,6 +3192,8 @@ tsl_decompress_batch(PG_FUNCTION_ARGS)
 					 errmsg("record is not a compressed batch"),
 					 errdetail("Column \"%s\" is NULL.", COMPRESSION_COLUMN_METADATA_COUNT_NAME)));
 		}
+
+		decompress_batch_check_compressed_types(decompressor);
 
 		/*
 		 * The whole batch is decompressed up front, so no toast relations

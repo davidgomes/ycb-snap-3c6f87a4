@@ -49,6 +49,13 @@ array_compressed_has_nulls(const CompressedDataHeader *header)
 	return ac->has_nulls;
 }
 
+Oid
+array_compressed_element_type(const CompressedDataHeader *header)
+{
+	CheckCompressedData(VARSIZE(header) >= sizeof(ArrayCompressed));
+	return ((const ArrayCompressed *) header)->element_type;
+}
+
 static void
 pg_attribute_unused() assertions(void)
 {
