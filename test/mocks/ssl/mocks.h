@@ -229,6 +229,7 @@ public:
                   TrustChainVerification,
               trustChainVerification, (), (const));
   MOCK_METHOD(bool, onlyVerifyLeafCertificateCrl, (), (const));
+  MOCK_METHOD(bool, suppressClientCaList, (), (const));
   MOCK_METHOD(absl::optional<uint32_t>, maxVerifyDepth, (), (const));
   MOCK_METHOD(bool, autoSniSanMatch, (), (const));
 };

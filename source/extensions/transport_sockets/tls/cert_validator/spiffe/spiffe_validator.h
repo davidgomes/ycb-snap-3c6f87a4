@@ -96,6 +96,7 @@ private:
   bool allow_expired_certificate_{false};
 
   std::string ca_file_name_;
+  bool suppress_client_ca_list_{false};
   std::shared_ptr<SpiffeData> spiffe_data_;
   std::vector<SanMatcherPtr> subject_alt_name_matchers_;
   SslStats& stats_;

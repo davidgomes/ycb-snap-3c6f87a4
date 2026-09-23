@@ -594,4 +594,11 @@ message CertificateValidationContext {
   // in OpenSSL 1.1.x and newer versions of BoringSSL in that the trust anchor is included.
   // Trusted issues are specified by setting :ref:`trusted_ca <envoy_v3_api_field_extensions.transport_sockets.tls.v3.CertificateValidationContext.trusted_ca>`
   google.protobuf.UInt32Value max_verify_depth = 16 [(validate.rules).uint32 = {lte: 100}];
+
+  // If set to true, the server will not advertise the distinguished names of the trusted CAs in the
+  // TLS CertificateRequest message. The configured trusted CAs are still used to validate any
+  // client certificate that is presented. This is useful when the trusted CA set is large enough to
+  // exceed client TLS record limits or confuse clients. Only applies to downstream connections.
+  // Defaults to false.
+  bool suppress_client_ca_list = 18;
 }
