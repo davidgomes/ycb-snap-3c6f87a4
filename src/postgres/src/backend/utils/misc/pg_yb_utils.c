@@ -131,6 +131,7 @@
 #include "storage/procarray.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -9157,7 +9158,53 @@ string_list_compare(const ListCell *a, const ListCell *b)
  * The start_hash_code and end_hash_code are the hash codes of the start and end
  * keys of the tablet for hash sharded tables. Leader is provided as a separate
  * column for simpler querying and self-explanatory access.
+ *
+ * start_range and end_range are decoded DocDB bounds for range-sharded tablets
+ * (same rendering as the master tablet listing). Hash-sharded tablets, including
+ * composite HASH+ASC, leave those columns NULL.
+ *
+ * relname, start_range, and end_range are masked for callers who are not
+ * superuser or yb_db_admin, unless the tablet's table is in the current
+ * database and the caller has SELECT on it. The system transactions tablet is
+ * always unmasked. Missing or rewritten-away OIDs mask the row instead of
+ * failing the query. Masked range tablets use the placeholder on every range
+ * cell, including unbounded edges, so those edges do not leak.
  */
+#define YB_TABLET_METADATA_REDACTED "<insufficient privilege>"
+
+static bool
+YbTabletMetadataRowVisible(const char *namespace_name, const char *object_name,
+						   Oid table_oid, const char *current_db)
+{
+	bool		missing = false;
+
+	/* The transactions status tablet is cluster-visible and not a user table. */
+	if (namespace_name && object_name &&
+		strcmp(namespace_name, "system") == 0 &&
+		strcmp(object_name, "transactions") == 0)
+		return true;
+
+	/*
+	 * OIDs are per-database. A matching local OID must not reveal a tablet
+	 * that lives in another database.
+	 */
+	if (current_db == NULL || namespace_name == NULL ||
+		strcmp(namespace_name, current_db) != 0)
+		return false;
+
+	/* Colocation parents and non-YSQL tablets have no pg_class oid. */
+	if (!OidIsValid(table_oid))
+		return false;
+
+	/*
+	 * pg_class_aclcheck() ERRORs when the OID is missing. Rewrites keep the
+	 * stable oid; dropped or cross-database OIDs are simply not visible here.
+	 */
+	if (pg_class_aclcheck_ext(table_oid, GetUserId(), ACL_SELECT, &missing) != ACLCHECK_OK)
+		return false;
+	return !missing;
+}
+
 Datum
 yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 {
@@ -9203,6 +9250,13 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 
 	HandleYBStatus(YBCTabletsMetadata(&tablets, &num_tablets));
 
+	/*
+	 * Resolved once per call. Superusers and yb_db_admin see every table name
+	 * and range bound; other roles are filtered per row below.
+	 */
+	bool		bypass_privilege = superuser() || IsYbDbAdminUser(GetUserId());
+	char	   *current_db = get_database_name(MyDatabaseId);
+
 	for (int i = 0; i < num_tablets; ++i)
 	{
 		YbcPgGlobalTabletsDescriptor *tablet = (YbcPgGlobalTabletsDescriptor *) tablets + i;
@@ -9228,8 +9282,53 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 
 		values[3] = CStringGetTextDatum(tablet_descriptor->namespace_name);
-		values[4] = CStringGetTextDatum(tablet_descriptor->table_name);
 		values[5] = CStringGetTextDatum(tablet_descriptor->table_type);
+
+		{
+			bool		show_sensitive;
+
+			if (bypass_privilege)
+				show_sensitive = true;
+			else
+				show_sensitive = YbTabletMetadataRowVisible(tablet_descriptor->namespace_name,
+															tablet_descriptor->table_name,
+															tablet->pg_table_oid,
+															current_db);
+
+			if (show_sensitive)
+				values[4] = CStringGetTextDatum(tablet_descriptor->table_name);
+			else
+				values[4] = CStringGetTextDatum(YB_TABLET_METADATA_REDACTED);
+
+			if (show_sensitive)
+			{
+				if (tablet->start_range)
+					values[10] = CStringGetTextDatum(tablet->start_range);
+				else
+					nulls[10] = true;
+
+				if (tablet->end_range)
+					values[11] = CStringGetTextDatum(tablet->end_range);
+				else
+					nulls[11] = true;
+			}
+			else if (tablet->is_hash_partitioned)
+			{
+				/* Natural NULL ranges; hash codes above stay visible. */
+				nulls[10] = true;
+				nulls[11] = true;
+			}
+			else
+			{
+				/*
+				 * Placeholder on every range cell, including edges that are
+				 * unbounded (NULL) for a privileged caller. Otherwise the
+				 * pattern of NULLs would reveal tablet edges.
+				 */
+				values[10] = CStringGetTextDatum(YB_TABLET_METADATA_REDACTED);
+				values[11] = CStringGetTextDatum(YB_TABLET_METADATA_REDACTED);
+			}
+		}
 
 		if (tablet->is_hash_partitioned)
 		{
@@ -9274,9 +9373,7 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[9] = true;
 		}
 
-		/* TODO (#28172): start_range, end_range, tablet_attrs are populated in a follow-up change. */
-		nulls[10] = true;
-		nulls[11] = true;
+		/* TODO (#28172): tablet_attrs is populated in a follow-up change. */
 		nulls[12] = true;
 
 		if (tablet->tablet_state)
@@ -9290,9 +9387,14 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 	/* clean up and return the tuplestore */
 	tuplestore_donestoring(tupstore);
 
+	if (current_db)
+		pfree(current_db);
+
 	MemoryContextSwitchTo(oldcontext);
 	return (Datum) 0;
 }
+
+#undef YB_TABLET_METADATA_REDACTED
 
 Datum
 yb_stat_auto_analyze(PG_FUNCTION_ARGS)

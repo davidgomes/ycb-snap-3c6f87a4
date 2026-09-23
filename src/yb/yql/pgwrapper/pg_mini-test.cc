@@ -3244,7 +3244,7 @@ TEST_F(PgMiniTest, TabletMetadataCorrectnessWithHashPartitioning) {
   // Find which tablet this hash falls into using yb_tablet_metadata
   auto tablet_from_metadata = ASSERT_RESULT(pg_conn.FetchRow<std::string>(
       yb::Format("SELECT tablet_id FROM yb_tablet_metadata "
-             "WHERE relname = 'hash_test_table' "
+             "WHERE relname = 'hash_test_table' AND db_name = current_database() "
              "AND $0 >= start_hash_code AND $0 < end_hash_code", hash_code)));
   LOG(INFO) << "Tablet ID from yb_tablet_metadata: " << tablet_from_metadata;
 
@@ -3338,7 +3338,8 @@ TEST_F(PgMiniTest, TabletMetadataStateColumn) {
 
   auto running_count = ASSERT_RESULT(pg_conn.FetchRow<int64_t>(
       "SELECT count(*) FROM yb_get_tablet_metadata() "
-      "WHERE object_name = 'state_test' AND tablet_state = 'RUNNING'"));
+      "WHERE object_name = 'state_test' AND namespace = current_database() "
+      "AND tablet_state = 'RUNNING'"));
   ASSERT_EQ(running_count, 1);
   LOG(INFO) << "RUNNING state verified";
 

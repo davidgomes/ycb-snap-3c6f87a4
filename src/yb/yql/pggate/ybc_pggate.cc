@@ -35,6 +35,7 @@
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
+#include "yb/dockv/doc_key.h"
 #include "yb/dockv/pg_key_decoder.h"
 #include "yb/dockv/pg_row.h"
 #include "yb/dockv/reader_projection.h"
@@ -478,6 +479,16 @@ Status YBCCommitTransactionIntermediateImpl(const YbcPgInitTransactionData& data
   const auto history_cutoff_guard = pgapi->TemporaryDisableReadTimeHistoryCutoff();
   RETURN_NOT_OK(pgapi->CommitPlainTransaction());
   return YBCInitTransactionImpl(data);
+}
+
+// Range partition bounds are encoded DocKeys. Render them the same way the master
+// tablet listing does (DocKey::DebugSliceToString): timestamps stay int64
+// microseconds, not a formatted timestamp. Empty bounds are unbounded edges.
+const char* DecodeRangePartitionBound(const std::string& key) {
+  if (key.empty()) {
+    return nullptr;
+  }
+  return YBCPAllocStdString(dockv::DocKey::DebugSliceToString(Slice(key)));
 }
 
 YbcPgTabletsDescriptor MakeYbcPgTabletsDescriptor(const tablet::TabletStatusPB& tablet_status) {
@@ -3166,7 +3177,15 @@ YbcStatus YBCTabletsMetadata(YbcPgGlobalTabletsDescriptor** tablets, size_t* cou
             ? YBCPAllocStdString(tablet_metadata.tablet_state())
             : nullptr,
         .pg_table_oid = tablet_metadata.has_pg_table_oid() ? tablet_metadata.pg_table_oid()
-                                                           : kPgInvalidOid
+                                                           : kPgInvalidOid,
+        // Hash-sharded tablets (including composite HASH + ASC) report only hash
+        // codes. Their partition keys are hash prefixes, not range DocKeys.
+        .start_range = tablet_metadata.is_hash_partitioned()
+            ? nullptr
+            : DecodeRangePartitionBound(tablet_metadata.partition().partition_key_start()),
+        .end_range = tablet_metadata.is_hash_partitioned()
+            ? nullptr
+            : DecodeRangePartitionBound(tablet_metadata.partition().partition_key_end())
       };
       ++dest;
     }
