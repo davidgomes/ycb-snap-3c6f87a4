@@ -42,9 +42,9 @@ The following table describes the columns of the `yb_tablet_metadata` view.
 
 Range keys are rendered the same way as in the tablet listing of the YB-Master UI. For example, a `TIMESTAMP` value is shown as an int64 number of microseconds since the PostgreSQL epoch (2000-01-01).
 
-### Privileges
+## Privileges
 
-The view returns every tablet of the cluster to all users, but the `relname`, `start_range`, and `end_range` columns are masked (shown as `<insufficient privilege>`) for rows that the current user is not allowed to see:
+The view returns the same rows to all users, but the `relname`, `start_range`, and `end_range` columns are masked (shown as `<insufficient privilege>`) for rows that the current user is not allowed to see:
 
 - Superusers and members of the `yb_db_admin` role see all values.
 - Other users see the values only for tables of the database they are connected to and on which they have the `SELECT` privilege. The system `transactions` tablets are always shown.
