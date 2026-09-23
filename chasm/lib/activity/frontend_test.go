@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	commonpb "go.temporal.io/api/common/v1"
+	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/common/log"
@@ -75,6 +76,34 @@ func TestRequestIdStableAcrossRetries(t *testing.T) {
 
 	t.Run("start/client-provided", func(t *testing.T) {
 		validateTwoAttempts(t, newReq("my-request-id"))
+	})
+
+	t.Run("start/negative start delay", func(t *testing.T) {
+		req := newReq("request-id")
+		req.StartDelay = durationpb.New(-time.Second)
+		_, err := h.validateAndPopulateStartRequest(req, nsID)
+		var invalidArgErr *serviceerror.InvalidArgument
+		require.ErrorAs(t, err, &invalidArgErr)
+		require.Contains(t, invalidArgErr.Message, "invalid StartDelay")
+	})
+
+	t.Run("start/start delay disabled", func(t *testing.T) {
+		h.config.StartDelayEnabled = func(string) bool { return false }
+		req := newReq("request-id")
+		req.StartDelay = durationpb.New(time.Second)
+		_, err := h.validateAndPopulateStartRequest(req, nsID)
+		var invalidArgErr *serviceerror.InvalidArgument
+		require.ErrorAs(t, err, &invalidArgErr)
+		require.Contains(t, invalidArgErr.Message, "start_delay is not enabled")
+	})
+
+	t.Run("start/start delay enabled", func(t *testing.T) {
+		h.config.StartDelayEnabled = func(string) bool { return true }
+		req := newReq("request-id")
+		req.StartDelay = durationpb.New(time.Second)
+		got, err := h.validateAndPopulateStartRequest(req, nsID)
+		require.NoError(t, err)
+		require.Equal(t, time.Second, got.GetStartDelay().AsDuration())
 	})
 
 	t.Run("terminate/server-generated", func(t *testing.T) {

@@ -132,6 +132,144 @@ func TestTransitionScheduled(t *testing.T) {
 	}
 }
 
+func TestTransitionScheduled_StartDelay(t *testing.T) {
+	startDelay := 5 * time.Second
+	ctx := &chasm.MockMutableContext{
+		MockContext: chasm.MockContext{
+			HandleNow: func(chasm.Component) time.Time { return defaultTime },
+		},
+	}
+	attemptState := &activitypb.ActivityAttemptState{}
+	activity := &Activity{
+		ActivityState: &activitypb.ActivityState{
+			ActivityType:           &commonpb.ActivityType{Name: "test-activity-type"},
+			RetryPolicy:            defaultRetryPolicy,
+			ScheduleToCloseTimeout: durationpb.New(defaultScheduleToCloseTimeout),
+			ScheduleToStartTimeout: durationpb.New(defaultScheduleToStartTimeout),
+			StartToCloseTimeout:    durationpb.New(defaultStartToCloseTimeout),
+			HeartbeatTimeout:       durationpb.New(time.Minute),
+			StartDelay:             durationpb.New(startDelay),
+			Status:                 activitypb.ACTIVITY_EXECUTION_STATUS_UNSPECIFIED,
+			TaskQueue:              &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+		},
+		LastAttempt: chasm.NewDataField(ctx, attemptState),
+		Outcome:     chasm.NewDataField(ctx, &activitypb.ActivityOutcome{}),
+	}
+
+	require.NoError(t, TransitionScheduled.Apply(activity, ctx, nil))
+	require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED, activity.Status)
+
+	dispatchTime := defaultTime.Add(startDelay)
+	require.Len(t, ctx.Tasks, 3)
+	for _, task := range ctx.Tasks {
+		switch task.Payload.(type) {
+		case *activitypb.ActivityDispatchTask:
+			require.Equal(t, dispatchTime, task.Attributes.ScheduledTime)
+		case *activitypb.ScheduleToStartTimeoutTask:
+			require.Equal(t, dispatchTime.Add(defaultScheduleToStartTimeout), task.Attributes.ScheduledTime)
+		case *activitypb.ScheduleToCloseTimeoutTask:
+			require.Equal(t, dispatchTime.Add(defaultScheduleToCloseTimeout), task.Attributes.ScheduledTime)
+		default:
+			t.Fatalf("unexpected task payload type: %T", task.Payload)
+		}
+	}
+
+	// StartToClose and heartbeat timers are created only when a worker picks up the task.
+	require.NoError(t, TransitionStarted.Apply(activity, ctx, &historyservice.RecordActivityTaskStartedRequest{
+		PollRequest: &workflowservice.PollActivityTaskQueueRequest{Identity: "worker"},
+	}))
+	var sawStartToClose, sawHeartbeat bool
+	for _, task := range ctx.Tasks {
+		switch task.Payload.(type) {
+		case *activitypb.StartToCloseTimeoutTask:
+			sawStartToClose = true
+			require.Equal(t, defaultTime.Add(defaultStartToCloseTimeout), task.Attributes.ScheduledTime)
+		case *activitypb.HeartbeatTimeoutTask:
+			sawHeartbeat = true
+			require.Equal(t, defaultTime.Add(time.Minute), task.Attributes.ScheduledTime)
+		default:
+			// Earlier tasks belong to the initial schedule transition.
+		}
+	}
+	require.True(t, sawStartToClose)
+	require.True(t, sawHeartbeat)
+}
+
+func TestTransitionRescheduled_DoesNotReapplyStartDelay(t *testing.T) {
+	startDelay := 30 * time.Second
+	retryInterval := 2 * time.Second
+	ctx := &chasm.MockMutableContext{}
+	ctx.HandleNow = func(chasm.Component) time.Time { return defaultTime }
+	attemptState := &activitypb.ActivityAttemptState{Count: 1}
+	activity := &Activity{
+		ActivityState: &activitypb.ActivityState{
+			RetryPolicy:            defaultRetryPolicy,
+			ScheduleToCloseTimeout: durationpb.New(defaultScheduleToCloseTimeout),
+			ScheduleToStartTimeout: durationpb.New(defaultScheduleToStartTimeout),
+			StartDelay:             durationpb.New(startDelay),
+			ScheduleTime:           timestamppb.New(defaultTime.Add(-startDelay)),
+			Status:                 activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+		},
+		LastAttempt: chasm.NewDataField(ctx, attemptState),
+		Outcome:     chasm.NewDataField(ctx, &activitypb.ActivityOutcome{}),
+	}
+
+	err := TransitionRescheduled.Apply(activity, ctx, rescheduleEvent{
+		retryInterval: retryInterval,
+		failure:       createStartToCloseTimeoutFailure(),
+	})
+	require.NoError(t, err)
+
+	require.Len(t, ctx.Tasks, 2)
+	for _, task := range ctx.Tasks {
+		switch task.Payload.(type) {
+		case *activitypb.ActivityDispatchTask:
+			require.Equal(t, defaultTime.Add(retryInterval), task.Attributes.ScheduledTime)
+		case *activitypb.ScheduleToStartTimeoutTask:
+			require.Equal(t, defaultTime.Add(retryInterval).Add(defaultScheduleToStartTimeout), task.Attributes.ScheduledTime)
+		default:
+			t.Fatalf("unexpected task payload type: %T", task.Payload)
+		}
+	}
+}
+
+func TestHasEnoughTimeForRetry_IncludesStartDelay(t *testing.T) {
+	scheduleTime := defaultTime
+	startDelay := 2 * time.Second
+	scheduleToClose := 3 * time.Second
+	retryInterval := time.Second
+	// Without the delay, the deadline would be scheduleTime+3s and this retry would be rejected.
+	// The deadline check is exclusive, so now+retry must land strictly before
+	// scheduleTime+startDelay+scheduleToClose (scheduleTime+5s).
+	now := scheduleTime.Add(3 * time.Second)
+
+	ctx := &chasm.MockMutableContext{
+		MockContext: chasm.MockContext{
+			HandleNow: func(chasm.Component) time.Time { return now },
+		},
+	}
+	activity := &Activity{
+		ActivityState: &activitypb.ActivityState{
+			ScheduleTime:           timestamppb.New(scheduleTime),
+			StartDelay:             durationpb.New(startDelay),
+			ScheduleToCloseTimeout: durationpb.New(scheduleToClose),
+			RetryPolicy:            defaultRetryPolicy,
+		},
+		LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{Count: 1}),
+	}
+
+	ok, gotInterval := activity.hasEnoughTimeForRetry(ctx, retryInterval)
+	require.True(t, ok)
+	require.Equal(t, retryInterval, gotInterval)
+
+	// Past scheduleTime + startDelay + scheduleToClose, the same retry is rejected.
+	ctx.HandleNow = func(chasm.Component) time.Time {
+		return scheduleTime.Add(startDelay).Add(scheduleToClose)
+	}
+	ok, _ = activity.hasEnoughTimeForRetry(ctx, retryInterval)
+	require.False(t, ok)
+}
+
 func TestTransitionRescheduled(t *testing.T) {
 	testCases := []struct {
 		name                   string
