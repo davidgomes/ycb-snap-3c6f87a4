@@ -90,6 +90,7 @@ bool ts_guc_enable_qual_propagation = true;
 TSDLLEXPORT bool ts_guc_enable_columnar_scan_filter_pushdown = true;
 bool ts_guc_enable_qual_filtering = true;
 bool ts_guc_enable_cagg_reorder_groupby = true;
+TSDLLEXPORT bool ts_guc_skip_cagg_invalidation = false;
 TSDLLEXPORT bool ts_guc_enable_cagg_window_functions = false;
 bool ts_guc_enable_now_constify = true;
 bool ts_guc_enable_foreign_key_propagation = true;
@@ -983,6 +984,19 @@ _guc_init(void)
 							 "order by",
 							 &ts_guc_enable_decompression_sorted_merge,
 							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable(MAKE_EXTOPTION("skip_cagg_invalidation"),
+							 "Skip continuous aggregate invalidation tracking",
+							 "Do not record continuous aggregate invalidations for DML and DDL. "
+							 "Intended for bulk-load tools that manage refreshes themselves; "
+							 "continuous aggregates may become stale",
+							 &ts_guc_skip_cagg_invalidation,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL,

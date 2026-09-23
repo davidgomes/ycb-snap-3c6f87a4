@@ -270,6 +270,9 @@ continuous_agg_invalidate_raw_ht(const Hypertable *raw_ht, int64 start, int64 en
 {
 	Assert(raw_ht != NULL);
 
+	if (ts_guc_skip_cagg_invalidation)
+		return;
+
 	invalidation_hyper_log_add_entry(raw_ht->fd.id, start, end);
 }
 
@@ -278,6 +281,9 @@ continuous_agg_invalidate_mat_ht(const Hypertable *raw_ht, const Hypertable *mat
 								 int64 end)
 {
 	Assert((raw_ht != NULL) && (mat_ht != NULL));
+
+	if (ts_guc_skip_cagg_invalidation)
+		return;
 
 	invalidation_cagg_log_add_entry(mat_ht->fd.id, start, end);
 }
