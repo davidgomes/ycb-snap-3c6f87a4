@@ -337,8 +337,10 @@ var TransitionCancelRequested = chasm.NewTransition(
 			Reason:      req.GetReason(),
 			RequestTime: timestamppb.New(ctx.Now(a)),
 		}
-		// Cancel takes precedence over a pending reset so clear the flag
+		// Cancel takes precedence over a pending reset, so drop deferred reset intent.
+		// The in-flight checkpoint itself is left in place.
 		a.ResetRestoreOptions = false
+		a.ResetShouldClearHeartbeat = false
 
 		return nil
 	},
@@ -534,6 +536,9 @@ var TransitionAttemptFailedWhilePauseRequested = chasm.NewTransition(
 type resetEvent struct {
 	resetTime      time.Time
 	metricsHandler metrics.Handler
+	// resetHeartbeat opts into discarding the persisted heartbeat checkpoint. The attempt
+	// counter is rewound either way.
+	resetHeartbeat bool
 }
 
 // TransitionReset resets a SCHEDULED or PAUSED activity back to attempt 1. The stamp is bumped to
@@ -585,7 +590,7 @@ var TransitionResetAttemptFailedToPaused = chasm.NewTransition(
 		attempt := a.LastAttempt.Get(ctx)
 		a.ResetShouldPause = false
 		a.applyDeferredOptionRestore(ctx)
-		a.clearHeartbeatDetails(ctx)
+		a.consumeDeferredHeartbeatClear(ctx)
 		attempt.Count = 1
 		attempt.Stamp++
 		if err := a.recordFailedAttempt(ctx, event.retryInterval, event.retryIntervalSource, event.failure, ctx.Now(a), false); err != nil {
@@ -614,7 +619,7 @@ var TransitionResetAttemptFailedToScheduled = chasm.NewTransition(
 
 		a.ResetShouldPause = false
 		a.applyDeferredOptionRestore(ctx)
-		a.clearHeartbeatDetails(ctx)
+		a.consumeDeferredHeartbeatClear(ctx)
 
 		attempt.Count = 1
 		attempt.Stamp++

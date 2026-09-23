@@ -24,6 +24,7 @@ import (
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/metrics/metricstest"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/payloads"
 	"go.temporal.io/server/common/searchattribute/sadefs"
 	serviceerrors "go.temporal.io/server/common/serviceerror"
 	"go.uber.org/mock/gomock"
@@ -1338,6 +1339,101 @@ func TestHandleResetRequestID(t *testing.T) {
 		})
 		require.Error(t, err)
 		require.Equal(t, "previous-reset-request-id", activity.GetLastResetRequestId())
+	})
+}
+
+func TestHandleResetHeartbeatCheckpoint(t *testing.T) {
+	checkpoint := payloads.EncodeString("checkpoint")
+	newActivity := func(t *testing.T, status activitypb.ActivityExecutionStatus) (*chasm.MockMutableContext, *Activity) {
+		t.Helper()
+		ctx := newOperatorCommandTestContext(t)
+		return ctx, &Activity{
+			ActivityState: &activitypb.ActivityState{
+				ActivityType: &commonpb.ActivityType{Name: "test-activity-type"},
+				Status:       status,
+				TaskQueue:    &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+			},
+			LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{
+				Count:                4,
+				CurrentRetryInterval: durationpb.New(time.Minute),
+			}),
+			LastHeartbeat: chasm.NewDataField(ctx, &activitypb.ActivityHeartbeatState{
+				Details:      checkpoint,
+				RecordedTime: timestamppb.New(time.Unix(0, 0)),
+			}),
+		}
+	}
+
+	t.Run("scheduled default rewinds attempt and keeps checkpoint", func(t *testing.T) {
+		ctx, activity := newActivity(t, activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED)
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{},
+		})
+		require.NoError(t, err)
+		require.Equal(t, int32(1), activity.LastAttempt.Get(ctx).GetCount())
+		require.Nil(t, activity.LastAttempt.Get(ctx).GetCurrentRetryInterval())
+		require.False(t, activity.ResetShouldClearHeartbeat)
+		require.Equal(t, checkpoint.GetPayloads()[0].GetData(), activity.LastHeartbeat.Get(ctx).GetDetails().GetPayloads()[0].GetData())
+		require.NotNil(t, activity.LastHeartbeat.Get(ctx).GetRecordedTime())
+	})
+
+	t.Run("scheduled reset heartbeat clears checkpoint", func(t *testing.T) {
+		ctx, activity := newActivity(t, activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED)
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{ResetHeartbeat: true},
+		})
+		require.NoError(t, err)
+		require.Equal(t, int32(1), activity.LastAttempt.Get(ctx).GetCount())
+		require.Nil(t, activity.LastHeartbeat.Get(ctx).GetDetails())
+		require.Nil(t, activity.LastHeartbeat.Get(ctx).GetRecordedTime())
+	})
+
+	t.Run("started default defers reset without a clear intent", func(t *testing.T) {
+		ctx, activity := newActivity(t, activitypb.ACTIVITY_EXECUTION_STATUS_STARTED)
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{},
+		})
+		require.NoError(t, err)
+		require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED, activity.Status)
+		require.Equal(t, int32(4), activity.LastAttempt.Get(ctx).GetCount())
+		require.False(t, activity.ResetShouldClearHeartbeat)
+		require.NotNil(t, activity.LastHeartbeat.Get(ctx).GetDetails())
+	})
+
+	t.Run("started reset heartbeat records deferred clear without touching the checkpoint", func(t *testing.T) {
+		ctx, activity := newActivity(t, activitypb.ACTIVITY_EXECUTION_STATUS_STARTED)
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{ResetHeartbeat: true},
+		})
+		require.NoError(t, err)
+		require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED, activity.Status)
+		require.Equal(t, int32(4), activity.LastAttempt.Get(ctx).GetCount())
+		require.True(t, activity.ResetShouldClearHeartbeat)
+		require.NotNil(t, activity.LastHeartbeat.Get(ctx).GetDetails())
+		require.NotNil(t, activity.LastHeartbeat.Get(ctx).GetRecordedTime())
+	})
+
+	t.Run("keep paused default rewinds attempt and keeps checkpoint", func(t *testing.T) {
+		ctx, activity := newActivity(t, activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED)
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{KeepPaused: true},
+		})
+		require.NoError(t, err)
+		require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED, activity.Status)
+		require.Equal(t, int32(1), activity.LastAttempt.Get(ctx).GetCount())
+		require.Nil(t, activity.LastAttempt.Get(ctx).GetCurrentRetryInterval())
+		require.NotNil(t, activity.LastHeartbeat.Get(ctx).GetDetails())
+	})
+
+	t.Run("keep paused reset heartbeat clears checkpoint", func(t *testing.T) {
+		ctx, activity := newActivity(t, activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED)
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{KeepPaused: true, ResetHeartbeat: true},
+		})
+		require.NoError(t, err)
+		require.Equal(t, int32(1), activity.LastAttempt.Get(ctx).GetCount())
+		require.Nil(t, activity.LastHeartbeat.Get(ctx).GetDetails())
+		require.Nil(t, activity.LastHeartbeat.Get(ctx).GetRecordedTime())
 	})
 }
 
