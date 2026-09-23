@@ -712,6 +712,7 @@ public:
   bool onlyVerifyLeafCertificateCrl() const override { return false; }
   absl::optional<uint32_t> maxVerifyDepth() const override { return absl::nullopt; }
   bool autoSniSanMatch() const override { return false; }
+  bool suppressClientCaList() const override { return false; }
 
 private:
   std::string s_;
@@ -788,6 +789,7 @@ public:
   bool onlyVerifyLeafCertificateCrl() const override { return false; }
   absl::optional<uint32_t> maxVerifyDepth() const override { return absl::nullopt; }
   bool autoSniSanMatch() const override { return false; }
+  bool suppressClientCaList() const override { return false; }
 
 private:
   std::string ca_name_;

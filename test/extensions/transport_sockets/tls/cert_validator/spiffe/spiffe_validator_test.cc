@@ -59,7 +59,8 @@ public:
     envoy::config::core::v3::TypedExtensionConfig typed_conf;
     TestUtility::loadFromYaml(yaml, typed_conf);
     config_ = std::make_unique<TestCertificateValidationContextConfig>(
-        typed_conf, allow_expired_certificate_, san_matchers_);
+        typed_conf, allow_expired_certificate_, san_matchers_, "", absl::nullopt,
+        suppress_client_ca_list_);
 
     // Mocking time source
     ON_CALL(factory_context_, timeSource()).WillByDefault(testing::ReturnRef(time_source));
@@ -104,7 +105,8 @@ public:
     envoy::config::core::v3::TypedExtensionConfig typed_conf;
     TestUtility::loadFromYaml(yaml, typed_conf);
     config_ = std::make_unique<TestCertificateValidationContextConfig>(
-        typed_conf, allow_expired_certificate_, san_matchers_);
+        typed_conf, allow_expired_certificate_, san_matchers_, "", absl::nullopt,
+        suppress_client_ca_list_);
 
     if (!trust_bundle_file.empty()) {
       EXPECT_CALL(factory_context_.dispatcher_, createFilesystemWatcher_())
@@ -138,6 +140,7 @@ public:
 
   // Setter.
   void setAllowExpiredCertificate(bool val) { allow_expired_certificate_ = val; }
+  void setSuppressClientCaList(bool val) { suppress_client_ca_list_ = val; }
   void setSanMatchers(std::vector<envoy::type::matcher::v3::StringMatcher> san_matchers) {
     san_matchers_.clear();
     for (auto& matcher : san_matchers) {
@@ -173,6 +176,7 @@ public:
 
 private:
   bool allow_expired_certificate_{false};
+  bool suppress_client_ca_list_{false};
   TestCertificateValidationContextConfigPtr config_;
   std::vector<envoy::extensions::transport_sockets::tls::v3::SubjectAltNameMatcher> san_matchers_;
   Stats::TestUtil::TestStore store_;
@@ -900,6 +904,31 @@ typed_config:
 
   EXPECT_TRUE(foundTestServer);
   EXPECT_TRUE(foundTestCA);
+}
+
+TEST_F(TestSPIFFEValidator, TestAddClientValidationContextSuppressCaList) {
+  Event::TestRealTimeSystem time_system;
+  setSuppressClientCaList(true);
+  ASSERT_OK(initialize(TestEnvironment::substitute(R"EOF(
+name: envoy.tls.cert_validator.spiffe
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.SPIFFECertValidatorConfig
+  trust_domains:
+    - name: lyft.com
+      trust_bundle:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/spiffe_san_cert.pem"
+    - name: example.com
+      trust_bundle:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/ca_cert.pem"
+  )EOF"),
+                         time_system));
+
+  SSLContextPtr ctx = SSL_CTX_new(TLS_method());
+  ASSERT_TRUE(validator().addClientValidationContext(ctx.get(), false).ok());
+  STACK_OF(X509_NAME)* list = SSL_CTX_get_client_CA_list(ctx.get());
+  if (list != nullptr) {
+    EXPECT_EQ(0U, sk_X509_NAME_num(list));
+  }
 }
 
 TEST_F(TestSPIFFEValidator, TestUpdateDigestForSessionId) {

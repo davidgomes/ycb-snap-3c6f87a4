@@ -71,10 +71,11 @@ public:
       bool allow_expired_certificate = false,
       std::vector<envoy::extensions::transport_sockets::tls::v3::SubjectAltNameMatcher>
           san_matchers = {},
-      std::string ca_cert = "", absl::optional<uint32_t> verify_depth = absl::nullopt)
+      std::string ca_cert = "", absl::optional<uint32_t> verify_depth = absl::nullopt,
+      bool suppress_client_ca_list = false)
       : allow_expired_certificate_(allow_expired_certificate), api_(Api::createApiForTest()),
         custom_validator_config_(custom_config), san_matchers_(san_matchers), ca_cert_(ca_cert),
-        max_verify_depth_(verify_depth) {};
+        max_verify_depth_(verify_depth), suppress_client_ca_list_(suppress_client_ca_list) {};
   TestCertificateValidationContextConfig()
       : api_(Api::createApiForTest()), custom_validator_config_(absl::nullopt) {};
 
@@ -116,6 +117,7 @@ public:
 
   absl::optional<uint32_t> maxVerifyDepth() const override { return max_verify_depth_; }
   bool autoSniSanMatch() const override { return auto_sni_san_match_; }
+  bool suppressClientCaList() const override { return suppress_client_ca_list_; }
 
 private:
   bool allow_expired_certificate_{false};
@@ -128,6 +130,7 @@ private:
   const std::string ca_cert_name_{"TEST_CA_CERT_NAME"};
   const absl::optional<uint32_t> max_verify_depth_{absl::nullopt};
   const bool auto_sni_san_match_{false};
+  const bool suppress_client_ca_list_{false};
 };
 
 } // namespace Tls

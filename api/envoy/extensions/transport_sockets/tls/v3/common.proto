@@ -369,7 +369,7 @@ message SubjectAltNameMatcher {
   string oid = 3;
 }
 
-// [#next-free-field: 18]
+// [#next-free-field: 19]
 message CertificateValidationContext {
   option (udpa.annotations.versioning).previous_message_type =
       "envoy.api.v2.auth.CertificateValidationContext";
@@ -594,4 +594,14 @@ message CertificateValidationContext {
   // in OpenSSL 1.1.x and newer versions of BoringSSL in that the trust anchor is included.
   // Trusted issues are specified by setting :ref:`trusted_ca <envoy_v3_api_field_extensions.transport_sockets.tls.v3.CertificateValidationContext.trusted_ca>`
   google.protobuf.UInt32Value max_verify_depth = 16 [(validate.rules).uint32 = {lte: 100}];
+
+  // When set to true on a downstream (server) TLS context, Envoy omits the
+  // distinguished names of configured trusted CAs from the TLS
+  // ``CertificateRequest`` message. Presented client certificates are still
+  // validated against :ref:`trusted_ca
+  // <envoy_v3_api_field_extensions.transport_sockets.tls.v3.CertificateValidationContext.trusted_ca>`.
+  // Use this when a large trusted CA set would exceed client TLS record limits
+  // or when clients mishandle a large advertised CA list. Upstream (client)
+  // connections are unaffected. Defaults to false.
+  bool suppress_client_ca_list = 18;
 }

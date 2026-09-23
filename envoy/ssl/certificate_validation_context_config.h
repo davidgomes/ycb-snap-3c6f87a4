@@ -106,6 +106,13 @@ public:
    */
   virtual bool autoSniSanMatch() const PURE;
 
+  /**
+   * @return whether to omit trusted CA distinguished names from the server
+   * CertificateRequest. Client certificates are still validated against the
+   * configured trusted CAs. Only applies to downstream (server) handshakes.
+   */
+  virtual bool suppressClientCaList() const PURE;
+
   // SECURITY NOTE
   //
   // When adding or changing this interface, it is likely that a change is needed to
