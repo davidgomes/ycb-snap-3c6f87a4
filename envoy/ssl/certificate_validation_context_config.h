@@ -106,6 +106,12 @@ public:
    */
   virtual bool autoSniSanMatch() const PURE;
 
+  /**
+   * @return true if the trusted CA names should not be advertised to clients in the TLS
+   * CertificateRequest message. Only applies to server (downstream) contexts.
+   */
+  virtual bool suppressClientCaList() const PURE;
+
   // SECURITY NOTE
   //
   // When adding or changing this interface, it is likely that a change is needed to
