@@ -28,6 +28,8 @@ SELECT create_hypertable('plain', 'time');
 SELECT add_compaction_policy('plain');
 -- Negative max_chunks is rejected.
 SELECT add_compaction_policy('metrics', max_chunks => -1);
+-- Negative max_batches is rejected.
+SELECT add_compaction_policy('metrics', max_batches => -1);
 \set ON_ERROR_STOP 1
 DROP TABLE plain;
 
@@ -37,6 +39,8 @@ SELECT _timescaledb_functions.policy_compaction_check('{"max_chunks": 1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_chunks": -1}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "-1 hour"}');
 SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "inactive_for": "not an interval"}');
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": -1}');
+SELECT _timescaledb_functions.policy_compaction_check('{"hypertable_id": 1, "max_batches": 0}');
 \set ON_ERROR_STOP 1
 
 -- Add the policy and inspect the resulting job. Default schedule is 5 minutes.
@@ -192,5 +196,44 @@ SELECT remove_compaction_policy('m2');
 \set ON_ERROR_STOP 1
 SELECT remove_compaction_policy('m2', if_exists => true);
 DROP TABLE m2;
+
+----------------------------------------------------------------------
+-- max_batches is stored and limits each chunk's compaction work
+----------------------------------------------------------------------
+
+CREATE TABLE limited (time TIMESTAMPTZ NOT NULL, value float)
+  WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.chunk_interval='30 days');
+
+-- Two disjoint overlapping pairs in one chunk. max_batches = 1 finishes the
+-- first pair and leaves the second for a later run.
+INSERT INTO limited
+SELECT '2025-03-02'::timestamptz + (i || ' minute')::interval, 1
+FROM generate_series(1,1000) i;
+INSERT INTO limited
+SELECT '2025-03-02'::timestamptz + ((i + 100) || ' minute')::interval, 1
+FROM generate_series(1,1000) i;
+INSERT INTO limited
+SELECT '2025-03-20'::timestamptz + (i || ' minute')::interval, 1
+FROM generate_series(1,1000) i;
+INSERT INTO limited
+SELECT '2025-03-20'::timestamptz + ((i + 100) || ' minute')::interval, 1
+FROM generate_series(1,1000) i;
+
+-- Zero is unlimited and is not stored. A positive limit is stored.
+SELECT add_compaction_policy('limited', max_batches => 0) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+SELECT remove_compaction_policy('limited');
+SELECT add_compaction_policy('limited', max_batches => 1) AS job_id \gset
+SELECT config FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+
+SELECT unordered_count('limited');
+CALL run_job(:job_id);
+-- First pair merged; the chunk stays unordered until the second pair is merged.
+SELECT unordered_count('limited');
+CALL run_job(:job_id);
+SELECT unordered_count('limited');
+SELECT count(*) AS nrows FROM limited;
+
+DROP TABLE limited;
 
 DROP FUNCTION unordered_count(regclass);

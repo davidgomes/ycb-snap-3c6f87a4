@@ -163,7 +163,8 @@ static bool compact_chunk_find_overlapping_batches(Relation compressed_chunk_rel
 static bool compact_chunk_recompress_overlapping_batches(
 	Relation compressed_chunk_rel, IndexScanDesc index_scan, Snapshot snapshot,
 	RecompressContext *recompress_ctx, CompactChunkScanState *state, RowCompressor *compressor,
-	RowDecompressor *decompressor, Tuplesortstate *recompress_tuplesortstate, BulkWriter *writer);
+	RowDecompressor *decompressor, Tuplesortstate *recompress_tuplesortstate, BulkWriter *writer,
+	int32 max_batches);
 static void try_updating_chunk_status(Chunk *uncompressed_chunk, Relation uncompressed_chunk_rel);
 
 /*
@@ -239,17 +240,28 @@ tsl_recompress_chunk_segmentwise(PG_FUNCTION_ARGS)
 }
 
 /*
- * Compact a chunk by recombining overlapping batches
+ * Compact a chunk by recombining overlapping batches.
  *
  * 0 uncompressed_chunk_id REGCLASS
+ * 1 max_batches INT4 — decompression budget for this call. Zero is unlimited.
+ *   Checked only after a merge group is fully flushed.
  */
 Datum
 tsl_compact_chunk(PG_FUNCTION_ARGS)
 {
 	Oid uncompressed_relid = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
+	int32 max_batches = PG_ARGISNULL(1) ? 0 : PG_GETARG_INT32(1);
 
 	ts_feature_flag_check(FEATURE_HYPERTABLE_COMPRESSION);
 	TS_PREVENT_FUNC_IF_READ_ONLY();
+
+	if (max_batches < 0)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("max_batches must be greater than or equal to 0")));
+	}
+
 	Chunk *chunk = ts_chunk_get_by_relid(uncompressed_relid, true);
 
 	ts_hypertable_permissions_check(chunk->hypertable_relid, GetUserId());
@@ -272,7 +284,7 @@ tsl_compact_chunk(PG_FUNCTION_ARGS)
 						ts_chunk_get_table_name(chunk))));
 	}
 
-	uncompressed_relid = compact_chunk_impl(chunk);
+	uncompressed_relid = compact_chunk_impl(chunk, max_batches);
 
 	PG_RETURN_OID(uncompressed_relid);
 }
@@ -1165,11 +1177,19 @@ compact_chunk_find_overlapping_batches(Relation compressed_chunk_rel, IndexScanD
  *
  * Returns true if any overlapping batches were found and recompressed.
  */
+/* True once this call has decompressed at least max_batches batches. */
+static bool
+compact_chunk_batch_limit_reached(int32 max_batches, int batches_decompressed)
+{
+	return max_batches > 0 && batches_decompressed >= max_batches;
+}
+
 static bool
 compact_chunk_recompress_overlapping_batches(
 	Relation compressed_chunk_rel, IndexScanDesc index_scan, Snapshot snapshot,
 	RecompressContext *recompress_ctx, CompactChunkScanState *state, RowCompressor *compressor,
-	RowDecompressor *decompressor, Tuplesortstate *recompress_tuplesortstate, BulkWriter *writer)
+	RowDecompressor *decompressor, Tuplesortstate *recompress_tuplesortstate, BulkWriter *writer,
+	int32 max_batches)
 {
 	TupleTableSlot *previous_compressed_slot = table_slot_create(compressed_chunk_rel, NULL);
 	TupleTableSlot *compressed_slot = table_slot_create(compressed_chunk_rel, NULL);
@@ -1177,6 +1197,7 @@ compact_chunk_recompress_overlapping_batches(
 	TupleDesc compressed_rel_tupdesc = RelationGetDescr(compressed_chunk_rel);
 	bool overlapping = false;
 	bool found_overlaps = false;
+	int batches_decompressed = 0;
 
 	/*
 	 * The find pass identified the first overlapping pair. Fetch both batches by
@@ -1201,6 +1222,7 @@ compact_chunk_recompress_overlapping_batches(
 									  recompress_tuplesortstate,
 									  compressed_chunk_rel,
 									  snapshot);
+		batches_decompressed++;
 
 		found = table_index_fetch_tuple(index_scan->xs_heapfetch,
 										&state->previous_tid,
@@ -1215,6 +1237,7 @@ compact_chunk_recompress_overlapping_batches(
 									  recompress_tuplesortstate,
 									  compressed_chunk_rel,
 									  snapshot);
+		batches_decompressed++;
 
 		overlapping = true;
 		found_overlaps = true;
@@ -1248,6 +1271,10 @@ compact_chunk_recompress_overlapping_batches(
 								   compressor,
 								   writer);
 				overlapping = false;
+				/* The group is fully flushed. Stop only now, so the next call
+				 * resumes at a group boundary. */
+				if (compact_chunk_batch_limit_reached(max_batches, batches_decompressed))
+					break;
 			}
 
 			ItemPointerCopy(&index_scan->xs_heaptid, &state->previous_tid);
@@ -1286,6 +1313,7 @@ compact_chunk_recompress_overlapping_batches(
 											  recompress_tuplesortstate,
 											  compressed_chunk_rel,
 											  snapshot);
+				batches_decompressed++;
 
 				overlapping = true;
 				found_overlaps = true;
@@ -1297,6 +1325,7 @@ compact_chunk_recompress_overlapping_batches(
 										  recompress_tuplesortstate,
 										  compressed_chunk_rel,
 										  snapshot);
+			batches_decompressed++;
 
 			CommandCounterIncrement();
 		}
@@ -1307,6 +1336,8 @@ compact_chunk_recompress_overlapping_batches(
 			recompress_segment(recompress_tuplesortstate, compressed_chunk_rel, compressor, writer);
 			overlapping = false;
 			CommandCounterIncrement();
+			if (compact_chunk_batch_limit_reached(max_batches, batches_decompressed))
+				break;
 		}
 
 		ItemPointerCopy(&index_scan->xs_heaptid, &state->previous_tid);
@@ -1325,7 +1356,7 @@ compact_chunk_recompress_overlapping_batches(
 }
 
 Oid
-compact_chunk_impl(Chunk *uncompressed_chunk)
+compact_chunk_impl(Chunk *uncompressed_chunk, int32 max_batches)
 {
 	Oid uncompressed_chunk_id = uncompressed_chunk->fd.relid;
 
@@ -1496,7 +1527,8 @@ compact_chunk_impl(Chunk *uncompressed_chunk)
 													 &compressor,
 													 &decompressor,
 													 recompress_tuplesortstate,
-													 &writer);
+													 &writer,
+													 max_batches);
 		row_compressor_close(&compressor);
 		row_decompressor_close(&decompressor);
 		tuplesort_end(recompress_tuplesortstate);

@@ -1052,3 +1052,91 @@ FROM :NO_FL_CHUNK ORDER BY _ts_meta_min_1;
 SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_no_firstlast') chunk;
 
 DROP TABLE metrics_no_firstlast;
+
+----------------------------------------------------------------------
+-- max_batches: zero is unlimited, negative is rejected, and a positive
+-- limit stops only between fully flushed merge groups.
+----------------------------------------------------------------------
+
+CREATE TABLE metrics_limit (time TIMESTAMPTZ NOT NULL, value float)
+  WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.chunk_interval='30 days');
+
+-- Overlapping chain of three batches, then a disjoint overlapping pair.
+INSERT INTO metrics_limit
+SELECT '2025-03-02'::timestamptz + (i || ' minute')::interval, i::float
+FROM generate_series(1,1000) i;
+INSERT INTO metrics_limit
+SELECT '2025-03-02'::timestamptz + ((i + 500) || ' minute')::interval, i::float
+FROM generate_series(1,1000) i;
+INSERT INTO metrics_limit
+SELECT '2025-03-02'::timestamptz + ((i + 1000) || ' minute')::interval, i::float
+FROM generate_series(1,1000) i;
+INSERT INTO metrics_limit
+SELECT '2025-03-20'::timestamptz + (i || ' minute')::interval, i::float
+FROM generate_series(1,1000) i;
+INSERT INTO metrics_limit
+SELECT '2025-03-20'::timestamptz + ((i + 100) || ' minute')::interval, i::float
+FROM generate_series(1,1000) i;
+
+SELECT count(*) AS nrows FROM metrics_limit;
+
+SELECT cs.compress_relid::regclass::text AS "LIMIT_CHUNK"
+FROM _timescaledb_catalog.chunk ch
+    JOIN _timescaledb_catalog.compression_settings cs ON cs.relid = ch.relid
+    JOIN _timescaledb_catalog.hypertable ht ON ch.hypertable_id = ht.id
+WHERE ht.table_name = 'metrics_limit'
+ORDER BY ch.id LIMIT 1 \gset
+
+-- Strict range overlaps (a shared boundary is not an overlap).
+SELECT count(*) AS overlaps FROM (
+  SELECT _ts_meta_max_1 > lead(_ts_meta_min_1) OVER (ORDER BY _ts_meta_min_1, ctid) AS ov
+  FROM :LIMIT_CHUNK
+) s WHERE ov;
+
+\set ON_ERROR_STOP 0
+SELECT _timescaledb_functions.compact_chunk(chunk, -1) FROM show_chunks('metrics_limit') chunk;
+\set ON_ERROR_STOP 1
+
+-- The chain is one merge group, so max_batches = 1 still rewrites all three
+-- batches and leaves the later pair for the next call.
+SELECT count(_timescaledb_functions.compact_chunk(chunk, 1)) AS compacted
+FROM show_chunks('metrics_limit') chunk;
+SELECT count(*) AS overlaps FROM (
+  SELECT _ts_meta_max_1 > lead(_ts_meta_min_1) OVER (ORDER BY _ts_meta_min_1, ctid) AS ov
+  FROM :LIMIT_CHUNK
+) s WHERE ov;
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+SELECT count(*) AS nrows FROM metrics_limit;
+
+-- The next limited call merges the remaining pair.
+SELECT count(_timescaledb_functions.compact_chunk(chunk, 1)) AS compacted
+FROM show_chunks('metrics_limit') chunk;
+SELECT count(*) AS overlaps FROM (
+  SELECT _ts_meta_max_1 > lead(_ts_meta_min_1) OVER (ORDER BY _ts_meta_min_1, ctid) AS ov
+  FROM :LIMIT_CHUNK
+) s WHERE ov;
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit') chunk;
+SELECT count(*) AS nrows FROM metrics_limit;
+
+-- A fresh chunk with two groups is fully compacted in one unlimited call.
+CREATE TABLE metrics_limit_all (time TIMESTAMPTZ NOT NULL, value float)
+  WITH (tsdb.hypertable, tsdb.orderby='time', tsdb.chunk_interval='30 days');
+INSERT INTO metrics_limit_all
+SELECT '2025-04-02'::timestamptz + (i || ' minute')::interval, 1
+FROM generate_series(1,1000) i;
+INSERT INTO metrics_limit_all
+SELECT '2025-04-02'::timestamptz + ((i + 100) || ' minute')::interval, 1
+FROM generate_series(1,1000) i;
+INSERT INTO metrics_limit_all
+SELECT '2025-04-18'::timestamptz + (i || ' minute')::interval, 1
+FROM generate_series(1,1000) i;
+INSERT INTO metrics_limit_all
+SELECT '2025-04-18'::timestamptz + ((i + 100) || ' minute')::interval, 1
+FROM generate_series(1,1000) i;
+SELECT count(_timescaledb_functions.compact_chunk(chunk, 0)) AS compacted
+FROM show_chunks('metrics_limit_all') chunk;
+SELECT DISTINCT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('metrics_limit_all') chunk;
+SELECT count(*) AS nrows FROM metrics_limit_all;
+
+DROP TABLE metrics_limit;
+DROP TABLE metrics_limit_all;
