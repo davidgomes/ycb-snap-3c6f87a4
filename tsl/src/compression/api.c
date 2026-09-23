@@ -8,7 +8,9 @@
  *  compress and decompress chunks
  */
 #include <postgres.h>
+#include <access/htup_details.h>
 #include <access/tableam.h>
+#include <funcapi.h>
 #include <access/xact.h>
 #include <catalog/dependency.h>
 #include <catalog/index.h>
@@ -1193,6 +1195,119 @@ tsl_compression_chunk_create(Hypertable *compressed_ht, Chunk *src_chunk)
 						  InvalidOid,
 						  ts_guc_enable_direct_compress_auto_segmentby, /* skip_segmentby_default */
 						  NULL);
+}
+
+/*
+ * True when the record looks like one compressed batch: it has a non-null
+ * _ts_meta_count int4 column. Other metadata is optional across versions.
+ */
+static void
+require_compressed_batch(TupleDesc in_desc, const bool *isnulls)
+{
+	AttrNumber count_attnum = InvalidAttrNumber;
+
+	for (int i = 0; i < in_desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(in_desc, i);
+
+		if (attr->attisdropped)
+		{
+			continue;
+		}
+
+		if (strcmp(NameStr(attr->attname), COMPRESSION_COLUMN_METADATA_COUNT_NAME) != 0)
+		{
+			continue;
+		}
+
+		if (attr->atttypid != INT4OID)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("input record is not a compressed batch"),
+					 errdetail("Column \"%s\" must be integer.",
+							   COMPRESSION_COLUMN_METADATA_COUNT_NAME)));
+		}
+
+		count_attnum = attr->attnum;
+		break;
+	}
+
+	if (!AttributeNumberIsValid(count_attnum))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("input record is not a compressed batch"),
+				 errdetail("Missing batch metadata column \"%s\".",
+						   COMPRESSION_COLUMN_METADATA_COUNT_NAME)));
+	}
+
+	if (isnulls[AttrNumberGetAttrOffset(count_attnum)])
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("input record is not a compressed batch"),
+				 errdetail("Batch metadata column \"%s\" is null.",
+						   COMPRESSION_COLUMN_METADATA_COUNT_NAME)));
+	}
+}
+
+/*
+ * Decompress a single compressed-batch record into the row type given by the
+ * call site's column definition list.
+ */
+Datum
+tsl_decompress_batch(PG_FUNCTION_ARGS)
+{
+	HeapTupleHeader rec = PG_GETARG_HEAPTUPLEHEADER(0);
+	Oid tuptype = HeapTupleHeaderGetTypeId(rec);
+	int32 tuptypmod = HeapTupleHeaderGetTypMod(rec);
+	TupleDesc in_desc = lookup_rowtype_tupdesc(tuptype, tuptypmod);
+	HeapTupleData tuple;
+	Datum *compressed_datums;
+	bool *compressed_isnulls;
+	ReturnSetInfo *rsinfo;
+	int nrows;
+
+	compressed_datums = palloc(sizeof(Datum) * in_desc->natts);
+	compressed_isnulls = palloc(sizeof(bool) * in_desc->natts);
+
+	tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
+	ItemPointerSetInvalid(&tuple.t_self);
+	tuple.t_tableOid = InvalidOid;
+	tuple.t_data = rec;
+	heap_deform_tuple(&tuple, in_desc, compressed_datums, compressed_isnulls);
+
+	require_compressed_batch(in_desc, compressed_isnulls);
+
+	/*
+	 * Output shape comes from the call site's column definition list. This
+	 * also errors when the caller did not supply one.
+	 */
+	InitMaterializedSRF(fcinfo, 0);
+	rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	RowDecompressor decompressor =
+		build_decompressor(in_desc, rsinfo->setDesc, InvalidOid, InvalidOid);
+	ReleaseTupleDesc(in_desc);
+
+	memcpy(decompressor.compressed_datums,
+		   compressed_datums,
+		   sizeof(Datum) * decompressor.in_desc->natts);
+	memcpy(decompressor.compressed_is_nulls,
+		   compressed_isnulls,
+		   sizeof(bool) * decompressor.in_desc->natts);
+	pfree(compressed_datums);
+	pfree(compressed_isnulls);
+
+	nrows = decompress_batch(&decompressor);
+	for (int i = 0; i < nrows; i++)
+	{
+		tuplestore_puttupleslot(rsinfo->setResult, decompressor.decompressed_slots[i]);
+	}
+
+	row_decompressor_close(&decompressor);
+	PG_RETURN_NULL();
 }
 
 Datum

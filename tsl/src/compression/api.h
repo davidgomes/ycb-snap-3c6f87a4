@@ -15,6 +15,7 @@
 extern Datum tsl_create_compressed_chunk(PG_FUNCTION_ARGS);
 extern Datum tsl_compress_chunk(PG_FUNCTION_ARGS);
 extern Datum tsl_decompress_chunk(PG_FUNCTION_ARGS);
+extern Datum tsl_decompress_batch(PG_FUNCTION_ARGS);
 extern Datum tsl_rebuild_columnstore(PG_FUNCTION_ARGS);
 extern Datum tsl_rebuild_sparse_index(PG_FUNCTION_ARGS);
 extern Oid tsl_compress_chunk_wrapper(Chunk *chunk, bool if_not_compressed, bool recompress);

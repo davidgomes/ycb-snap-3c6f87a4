@@ -2234,12 +2234,13 @@ create_per_compressed_column(RowDecompressor *decompressor)
 		is_compressed = compressed_attr->atttypid == compressed_data_type_oid;
 		if (!is_compressed && compressed_attr->atttypid != decompressed_type)
 		{
-			elog(ERROR,
-				 "compressed table type '%s' does not match decompressed table type '%s' for "
-				 "segment-by column \"%s\"",
-				 format_type_be(compressed_attr->atttypid),
-				 format_type_be(decompressed_type),
-				 col_name);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("compressed table type '%s' does not match decompressed table type "
+							"'%s' for segment-by column \"%s\"",
+							format_type_be(compressed_attr->atttypid),
+							format_type_be(decompressed_type),
+							col_name)));
 		}
 
 		*per_compressed_col = (PerCompressedColumn){

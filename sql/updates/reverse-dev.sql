@@ -285,6 +285,8 @@ ALTER TABLE _timescaledb_catalog.continuous_aggs_jobs_refresh_ranges
 ANALYZE _timescaledb_catalog.continuous_agg;
 -- end rebuild _timescaledb_catalog.continuous_agg --
 
+DROP FUNCTION IF EXISTS _timescaledb_functions.decompress_batch(record);
+
 -- restore telemetry_event
 CREATE TABLE _timescaledb_catalog.telemetry_event (
        created timestamptz NOT NULL DEFAULT current_timestamp,
