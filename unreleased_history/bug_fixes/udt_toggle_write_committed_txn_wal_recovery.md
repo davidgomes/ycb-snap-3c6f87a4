@@ -1,0 +1,1 @@
+Fix WAL recovery for a WriteCommitted TransactionDB when a column family's user-defined timestamps setting is toggled on or off between sessions. Previously, prepared, committed, and rolled back transactions in the WAL were replayed incorrectly (e.g. prepared transactions were not recoverable by name and rolled back writes became visible).
