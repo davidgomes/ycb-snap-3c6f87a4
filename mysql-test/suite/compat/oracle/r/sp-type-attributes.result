@@ -1,0 +1,166 @@
+SET sql_mode=ORACLE;
+#
+# Data type attributes are not supported by
+# RECORD, associative array and SYS_REFCURSOR variables
+#
+#
+# RECORD
+#
+CREATE PROCEDURE p1 AS
+TYPE rec_t IS RECORD (a INT);
+r rec_t(10);
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'rec_t' doesn't support LENGTH attribute.
+CREATE PROCEDURE p1 AS
+TYPE rec_t IS RECORD (a INT);
+r rec_t(10,2);
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'rec_t' doesn't support LENGTH attribute.
+CREATE PROCEDURE p1 AS
+TYPE rec_t IS RECORD (a INT);
+r rec_t REF_SYSTEM_ID=4326;
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'rec_t' doesn't support REF_SYSTEM_ID attribute.
+CREATE PROCEDURE p1 AS
+TYPE rec_t IS RECORD (a INT);
+r rec_t CHARACTER SET utf8mb4;
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'rec_t' doesn't support CHARACTER SET attribute.
+CREATE PROCEDURE p1 AS
+TYPE rec_t IS RECORD (a INT);
+r rec_t COLLATE utf8mb4_bin;
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'rec_t' doesn't support CHARACTER SET attribute.
+CREATE PROCEDURE p1 AS
+TYPE rec_t IS RECORD (a INT);
+r rec_t:= rec_t(1);
+BEGIN
+SELECT r.a;
+END;
+$$
+CALL p1;
+r.a
+1
+DROP PROCEDURE p1;
+#
+# Associative array
+#
+CREATE PROCEDURE p1 AS
+TYPE assoc_t IS TABLE OF INT INDEX BY INT;
+a assoc_t(10);
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'assoc_t' doesn't support LENGTH attribute.
+CREATE PROCEDURE p1 AS
+TYPE assoc_t IS TABLE OF INT INDEX BY INT;
+a assoc_t(10,2);
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'assoc_t' doesn't support LENGTH attribute.
+CREATE PROCEDURE p1 AS
+TYPE assoc_t IS TABLE OF INT INDEX BY INT;
+a assoc_t REF_SYSTEM_ID=4326;
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'assoc_t' doesn't support REF_SYSTEM_ID attribute.
+CREATE PROCEDURE p1 AS
+TYPE assoc_t IS TABLE OF INT INDEX BY INT;
+a assoc_t CHARACTER SET utf8mb4;
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'assoc_t' doesn't support CHARACTER SET attribute.
+CREATE PROCEDURE p1 AS
+TYPE assoc_t IS TABLE OF INT INDEX BY INT;
+a assoc_t COLLATE utf8mb4_bin;
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'assoc_t' doesn't support CHARACTER SET attribute.
+CREATE PROCEDURE p1 AS
+TYPE assoc_t IS TABLE OF INT INDEX BY INT;
+a assoc_t;
+BEGIN
+a(1):= 10;
+SELECT a(1);
+END;
+$$
+CALL p1;
+a(1)
+10
+DROP PROCEDURE p1;
+#
+# SYS_REFCURSOR
+#
+CREATE PROCEDURE p1 AS
+c SYS_REFCURSOR(10);
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'SYS_REFCURSOR' doesn't support LENGTH attribute.
+CREATE PROCEDURE p1 AS
+c SYS_REFCURSOR(10,2);
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'SYS_REFCURSOR' doesn't support LENGTH attribute.
+CREATE PROCEDURE p1 AS
+c SYS_REFCURSOR REF_SYSTEM_ID=4326;
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'SYS_REFCURSOR' doesn't support REF_SYSTEM_ID attribute.
+CREATE PROCEDURE p1 AS
+c SYS_REFCURSOR CHARACTER SET utf8mb4;
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'SYS_REFCURSOR' doesn't support CHARACTER SET attribute.
+CREATE PROCEDURE p1 AS
+c SYS_REFCURSOR COLLATE utf8mb4_bin;
+BEGIN
+NULL;
+END;
+$$
+ERROR HY000: Data type 'SYS_REFCURSOR' doesn't support CHARACTER SET attribute.
+CREATE PROCEDURE p1 AS
+c SYS_REFCURSOR;
+v INT;
+BEGIN
+OPEN c FOR SELECT 1;
+FETCH c INTO v;
+CLOSE c;
+SELECT v;
+END;
+$$
+CALL p1;
+v
+1
+DROP PROCEDURE p1;

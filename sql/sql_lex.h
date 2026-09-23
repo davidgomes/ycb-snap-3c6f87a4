@@ -5130,8 +5130,13 @@ public:
                               const LEX_CSTRING &name,
                               bool *is_typedef);
   bool set_field_type_udt_or_typedef(Lex_field_type_st *type,
-                                     const LEX_CSTRING &name,
-                                     const Lex_length_and_dec_st &attr);
+                              const LEX_CSTRING &name,
+                              const Lex_length_and_dec_st &attr,
+                              const Lex_column_charset_collation_attrs_st &coll);
+  bool check_data_type_attributes(const Type_handler *h,
+                              const LEX_CSTRING &name,
+                              const Lex_length_and_dec_st &attr,
+                              const Lex_column_charset_collation_attrs_st &coll);
 
   bool map_data_type(const Lex_ident_sys_st &schema,
                      Lex_field_type_st *type) const;

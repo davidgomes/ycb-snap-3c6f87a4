@@ -46,6 +46,7 @@ public:
   {
     return this;
   }
+  uint get_column_attributes() const override { return ATTR_NONE; }
   bool is_scalar_type() const override { return false; }
   bool can_return_int() const override { return false; }
   bool can_return_decimal() const override { return false; }
