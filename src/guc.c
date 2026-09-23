@@ -151,6 +151,7 @@ TSDLLEXPORT bool ts_guc_enable_job_execution_logging = false;
 bool ts_guc_enable_tss_callbacks = true;
 TSDLLEXPORT bool ts_guc_enable_delete_after_compression = false;
 TSDLLEXPORT bool ts_guc_enable_merge_on_cagg_refresh = false;
+TSDLLEXPORT bool ts_guc_skip_cagg_invalidation = false;
 
 bool ts_guc_enable_partitioned_hypertables = false;
 #if PG16_GE
@@ -1050,6 +1051,23 @@ _guc_init(void)
 							 "Enable MERGE statement on cagg refresh",
 							 "Enable MERGE statement on cagg refresh",
 							 &ts_guc_enable_merge_on_cagg_refresh,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable(MAKE_EXTOPTION("skip_cagg_invalidation"),
+							 "Skip continuous aggregate invalidation tracking",
+							 "When enabled, INSERT, UPDATE, DELETE and COPY on hypertables "
+							 "with continuous aggregates, as well as drop_chunks, DROP TABLE on a "
+							 "chunk and TRUNCATE of chunks, hypertables and continuous aggregates, "
+							 "do not record continuous aggregate invalidations. Intended for "
+							 "bulk-migration tools that own the refresh lifecycle, preferably set "
+							 "with SET LOCAL. Affected ranges must be refreshed explicitly with "
+							 "force => true, otherwise continuous aggregates can become stale.",
+							 &ts_guc_skip_cagg_invalidation,
 							 false,
 							 PGC_USERSET,
 							 0,

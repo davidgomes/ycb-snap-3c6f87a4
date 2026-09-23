@@ -286,7 +286,7 @@ TSCopyMultiInsertBufferInit(TSCopyMultiInsertInfo *miinfo, ChunkInsertState *cis
 												 ts_guc_direct_compress_copy_tuple_sort_limit,
 												 cis->created_compressed_chunk);
 
-			if (miinfo->has_continuous_aggregate)
+			if (miinfo->has_continuous_aggregate && !ts_guc_skip_cagg_invalidation)
 			{
 				ts_cm_functions->compressor_set_invalidation(buffer->compressor,
 															 miinfo->ht,
@@ -506,7 +506,7 @@ TSCopyMultiInsertBufferFlush(TSCopyMultiInsertInfo *miinfo, TSCopyMultiInsertBuf
 								 NULL /* transition capture */);
 		}
 
-		if (miinfo->has_continuous_aggregate)
+		if (miinfo->has_continuous_aggregate && !ts_guc_skip_cagg_invalidation)
 		{
 			bool should_free;
 			HeapTuple tuple = ExecFetchSlotHeapTuple(slots[i], false, &should_free);

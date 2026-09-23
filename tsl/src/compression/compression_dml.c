@@ -587,12 +587,13 @@ decompress_batches_for_update_delete(ModifyHypertableState *ht_state, Chunk *chu
 	bool delete_only = ht_state->mt->operation == CMD_DELETE && !has_joins &&
 					   can_delete_without_decompression(ht_state, settings, chunk, predicates);
 	InvalidationContext invalidation_ctx = { 0 };
+	bool track_invalidation = ht_state->has_continuous_aggregate && !ts_guc_skip_cagg_invalidation;
 
 	/*
 	 * Set up CAgg invalidation context if we're doing direct batch delete
 	 * on a hypertable with continuous aggregates.
 	 */
-	if (delete_only && ht_state->has_continuous_aggregate)
+	if (delete_only && track_invalidation)
 	{
 		const Dimension *time_dim = hyperspace_get_open_dimension(ht_state->ht->space, 0);
 		const char *time_col_name = NameStr(time_dim->fd.column_name);
@@ -683,7 +684,7 @@ decompress_batches_for_update_delete(ModifyHypertableState *ht_state, Chunk *chu
 									NULL,
 									delete_only,
 									is_null,
-									ht_state->has_continuous_aggregate ? &invalidation_ctx : NULL,
+									track_invalidation ? &invalidation_ctx : NULL,
 									&temp_cdst,
 									NULL);
 
