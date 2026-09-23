@@ -39,6 +39,7 @@ This procedure is to be done on **every** ScyllaDB node, one node at a time (one
       .. note:: If using a self-signed certificate, the "truststore" parameter needs to be set to a PEM format container with the private authority.
 
    * ``certficate_revocation_list`` - The path to a PEM-encoded certificate revocation list (CRL) - a list of issued certificates that have been revoked before their expiration date.
+   * ``require_client_auth`` - Controls client certificate verification: ``true`` requires every client to present a certificate, ``false`` (default) does not ask for one, and ``optional`` asks for a certificate but also accepts clients that do not present one. Use ``optional`` with ``CertificateOrPasswordAuthenticator``, so that clients can authenticate either with a certificate or with a password. See :doc:`Certificate-based Authentication </operating-scylla/security/certificate-authentication/>`.
 
    For example:
    

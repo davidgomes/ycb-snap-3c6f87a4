@@ -247,6 +247,11 @@ batch_size_fail_threshold_in_kb: 1024
 # - com.scylladb.auth.SaslauthdAuthenticator outsources authentication to a running saslauthd
 #   daemon. When using this authenticator, you must set the saslauthd_socket_path property to the
 #   Unix domain socket on which saslauthd is listening.
+# - com.scylladb.auth.CertificateOrPasswordAuthenticator authenticates clients that present a TLS
+#   client certificate by their certificate (see auth_certificate_role_queries), and all other clients
+#   with username/password pairs in the same manner as PasswordAuthenticator. Set
+#   require_client_auth: optional in client_encryption_options, so that TLS clients without a
+#   certificate can still connect and authenticate with a password.
 # authenticator: AllowAllAuthenticator
 # saslauthd_socket_path: /var/state/saslauthd/mux
 
