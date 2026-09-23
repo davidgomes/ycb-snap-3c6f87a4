@@ -37,6 +37,53 @@ ORDER BY ytm.start_hash_code NULLS FIRST;
  test_table_1 | yugabyte |           32768 |         65536 | cloud1 | datacenter1 | rack1
 (3 rows)
 
+-- Test start_range and end_range. Range-sharded tablets report their bounds
+-- rendered as DocDB keys (NULL for unbounded edges). Hash-sharded tablets,
+-- including HASH + ASC composite keys, report only hash bounds.
+CREATE TABLE range_int (k INT, v INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((100), (200));
+CREATE INDEX range_int_v_idx ON range_int (v ASC) SPLIT AT VALUES ((10));
+CREATE TABLE range_desc (k INT, PRIMARY KEY (k DESC)) SPLIT AT VALUES ((200), (100));
+CREATE TABLE range_text (k TEXT, PRIMARY KEY (k ASC)) SPLIT AT VALUES (('m'));
+CREATE TABLE range_ts (k TIMESTAMP, PRIMARY KEY (k ASC)) SPLIT AT VALUES (('2024-06-01'));
+CREATE TABLE range_multi (a INT, b TEXT, PRIMARY KEY (a ASC, b ASC)) SPLIT AT VALUES ((1, 'x'), (2));
+CREATE TABLE range_single (k INT, PRIMARY KEY (k ASC));
+CREATE TABLE hash_range (h INT, r INT, PRIMARY KEY (h HASH, r ASC)) SPLIT INTO 2 TABLETS;
+SELECT
+    relname,
+    start_range,
+    end_range,
+    start_hash_code,
+    end_hash_code
+FROM yb_tablet_metadata
+WHERE
+    db_name = current_database()
+    AND relname IN ('range_int', 'range_int_v_idx', 'range_desc', 'range_text', 'range_ts',
+                    'range_multi', 'range_single', 'hash_range', 'test_table_1')
+ORDER BY relname, start_hash_code NULLS FIRST, start_range NULLS FIRST;
+     relname     |          start_range          |           end_range           | start_hash_code | end_hash_code 
+-----------------+-------------------------------+-------------------------------+-----------------+---------------
+ hash_range      |                               |                               |               0 |         32768
+ hash_range      |                               |                               |           32768 |         65536
+ range_desc      |                               | DocKey([], [200])             |                 |              
+ range_desc      | DocKey([], [100])             |                               |                 |              
+ range_desc      | DocKey([], [200])             | DocKey([], [100])             |                 |              
+ range_int       |                               | DocKey([], [100])             |                 |              
+ range_int       | DocKey([], [100])             | DocKey([], [200])             |                 |              
+ range_int       | DocKey([], [200])             |                               |                 |              
+ range_int_v_idx |                               | DocKey([], [10, -Inf])        |                 |              
+ range_int_v_idx | DocKey([], [10, -Inf])        |                               |                 |              
+ range_multi     |                               | DocKey([], [1, "x"])          |                 |              
+ range_multi     | DocKey([], [1, "x"])          | DocKey([], [2, -Inf])         |                 |              
+ range_multi     | DocKey([], [2, -Inf])         |                               |                 |              
+ range_single    |                               |                               |                 |              
+ range_text      |                               | DocKey([], ["m"])             |                 |              
+ range_text      | DocKey([], ["m"])             |                               |                 |              
+ range_ts        |                               | DocKey([], [770515200000000]) |                 |              
+ range_ts        | DocKey([], [770515200000000]) |                               |                 |              
+ test_table_1    |                               |                               |               0 |         32768
+ test_table_1    |                               |                               |           32768 |         65536
+(20 rows)
+
 -- Test that data from multiple databases is returned
 CREATE DATABASE test_db;
 \c test_db
@@ -151,26 +198,217 @@ ORDER BY db_name, relname;
  same_name | yb_tmeta_b
 (4 rows)
 
--- Test that non-superusers can see cluster-wide tablet metadata
+-- Test masking of relname, start_range and end_range. Superusers and members
+-- of yb_db_admin see every row unmasked. Other roles see those columns only for
+-- tables of the current database on which they have SELECT; no rows are
+-- dropped.
 CREATE ROLE yb_tmeta_user LOGIN;
+CREATE ROLE yb_tmeta_admin LOGIN IN ROLE yb_db_admin;
+\c yb_tmeta_a yugabyte
+CREATE TABLE range_split (k INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((10), (20));
+CREATE TABLE hash_split (k INT PRIMARY KEY) SPLIT INTO 2 TABLETS;
+GRANT SELECT ON same_name TO yb_tmeta_user;
+SELECT count(*) AS yb_tmeta_superuser_row_count
+FROM yb_tablet_metadata
+WHERE db_name IN ('system', 'yb_tmeta_a', 'yb_tmeta_b') \gset
+\c yb_tmeta_b yugabyte
+GRANT SELECT ON same_name TO yb_tmeta_user;
+SELECT 'same_name'::regclass::oid AS yb_tmeta_b_same_name_oid \gset
+\c yb_tmeta_a yb_tmeta_user
+-- Rows are not dropped for unprivileged users.
+SELECT count(*) = :yb_tmeta_superuser_row_count::bigint AS same_row_count
+FROM yb_tablet_metadata
+WHERE db_name IN ('system', 'yb_tmeta_a', 'yb_tmeta_b');
+ same_row_count 
+----------------
+ t
+(1 row)
+
+-- Current database: only same_name (SELECT granted) is unmasked. Masked
+-- hash-sharded rows keep NULL ranges, while every range cell of masked
+-- range-sharded rows is masked. Rows are labeled through pg_class since relname
+-- may be masked.
+SELECT
+    c.relname AS table_name,
+    t.relname,
+    t.start_range,
+    t.end_range,
+    t.start_hash_code,
+    t.end_hash_code
+FROM yb_tablet_metadata t
+JOIN pg_class c ON c.oid = t.oid
+WHERE t.db_name = current_database()
+ORDER BY c.relname, t.start_hash_code NULLS FIRST, t.start_range NULLS FIRST;
+ table_name  |         relname          |       start_range        |        end_range         | start_hash_code | end_hash_code 
+-------------+--------------------------+--------------------------+--------------------------+-----------------+---------------
+ hash_split  | <insufficient privilege> |                          |                          |               0 |         32768
+ hash_split  | <insufficient privilege> |                          |                          |           32768 |         65536
+ only_in_a   | <insufficient privilege> | <insufficient privilege> | <insufficient privilege> |                 |              
+ range_split | <insufficient privilege> | <insufficient privilege> | <insufficient privilege> |                 |              
+ range_split | <insufficient privilege> | <insufficient privilege> | <insufficient privilege> |                 |              
+ range_split | <insufficient privilege> | <insufficient privilege> | <insufficient privilege> |                 |              
+ same_name   | same_name                |                          |                          |                 |              
+(7 rows)
+
+-- Other databases are masked, even for tables on which SELECT is granted there.
+SELECT
+    relname,
+    start_range,
+    end_range,
+    count(*) AS tablet_count
+FROM yb_tablet_metadata
+WHERE db_name = 'yb_tmeta_b'
+GROUP BY relname, start_range, end_range;
+         relname          |       start_range        |        end_range         | tablet_count 
+--------------------------+--------------------------+--------------------------+--------------
+ <insufficient privilege> | <insufficient privilege> | <insufficient privilege> |            2
+(1 row)
+
+SELECT
+    relname,
+    start_range,
+    end_range
+FROM yb_tablet_metadata
+WHERE db_name = 'yb_tmeta_b' AND oid = :yb_tmeta_b_same_name_oid;
+         relname          |       start_range        |        end_range         
+--------------------------+--------------------------+--------------------------
+ <insufficient privilege> | <insufficient privilege> | <insufficient privilege>
+(1 row)
+
+-- The underlying function is masked the same way.
+SELECT DISTINCT
+    object_name,
+    start_range,
+    end_range
+FROM yb_get_tablet_metadata()
+WHERE namespace = 'yb_tmeta_b';
+       object_name        |       start_range        |        end_range         
+--------------------------+--------------------------+--------------------------
+ <insufficient privilege> | <insufficient privilege> | <insufficient privilege>
+(1 row)
+
+-- The system transactions tablets are never masked.
+SELECT DISTINCT
+    relname,
+    db_name,
+    start_range,
+    end_range
+FROM yb_tablet_metadata
+WHERE db_name = 'system';
+   relname    | db_name | start_range | end_range 
+--------------+---------+-------------+-----------
+ transactions | system  |             | 
+(1 row)
+
+\c yb_tmeta_b yb_tmeta_user
+-- Connected to yb_tmeta_b, the grant on yb_tmeta_b.same_name applies.
+SELECT
+    c.relname AS table_name,
+    t.relname,
+    t.start_range,
+    t.end_range
+FROM yb_tablet_metadata t
+JOIN pg_class c ON c.oid = t.oid
+WHERE t.db_name = current_database()
+ORDER BY c.relname;
+ table_name |         relname          |       start_range        |        end_range         
+------------+--------------------------+--------------------------+--------------------------
+ only_in_b  | <insufficient privilege> | <insufficient privilege> | <insufficient privilege>
+ same_name  | same_name                |                          | 
+(2 rows)
+
+-- yb_db_admin members see everything, across databases.
+\c yb_tmeta_a yb_tmeta_admin
+SELECT
+    relname,
+    db_name,
+    start_range,
+    end_range
+FROM yb_tablet_metadata
+WHERE
+    db_name IN ('yb_tmeta_a', 'yb_tmeta_b')
+    AND relname IN ('only_in_b', 'same_name', 'range_split')
+ORDER BY db_name, relname, start_range NULLS FIRST;
+   relname   |  db_name   |   start_range    |    end_range     
+-------------+------------+------------------+------------------
+ range_split | yb_tmeta_a |                  | DocKey([], [10])
+ range_split | yb_tmeta_a | DocKey([], [10]) | DocKey([], [20])
+ range_split | yb_tmeta_a | DocKey([], [20]) | 
+ same_name   | yb_tmeta_a |                  | 
+ only_in_b   | yb_tmeta_b |                  | 
+ same_name   | yb_tmeta_b |                  | 
+(6 rows)
+
+-- Colocation parent rows stay masked for regular users, even with SELECT on
+-- every colocated table.
+\c colocated_db yugabyte
+GRANT SELECT ON colocated_hash, colocated_asc, non_colocated_split TO yb_tmeta_user;
+\c colocated_db yb_tmeta_user
+SELECT
+    relname,
+    start_range,
+    end_range,
+    start_hash_code,
+    end_hash_code
+FROM yb_tablet_metadata
+WHERE db_name = current_database()
+ORDER BY relname, start_hash_code NULLS FIRST;
+         relname          |       start_range        |        end_range         | start_hash_code | end_hash_code 
+--------------------------+--------------------------+--------------------------+-----------------+---------------
+ <insufficient privilege> | <insufficient privilege> | <insufficient privilege> |                 |              
+ non_colocated_split      |                          |                          |               0 |         32768
+ non_colocated_split      |                          |                          |           32768 |         65536
+(3 rows)
+
+-- Grants follow the stable table oid across table rewrites.
+\c yb_tmeta_a yugabyte
+CREATE TABLE rewrite_table (k INT, v INT);
+GRANT SELECT ON rewrite_table TO yb_tmeta_user;
+ALTER TABLE rewrite_table ADD PRIMARY KEY (k ASC);
+NOTICE:  table rewrite may lead to inconsistencies
+DETAIL:  Concurrent DMLs may not be reflected in the new table.
+HINT:  See https://github.com/yugabyte/yugabyte-db/issues/19860. Set 'ysql_suppress_unsafe_alter_notice' yb-tserver gflag to true to suppress this notice.
+SELECT oid <> relfilenode AS rewritten FROM pg_class WHERE relname = 'rewrite_table';
+ rewritten 
+-----------
+ t
+(1 row)
+
+-- Tablets of dropped tables may linger with an oid that no longer resolves.
+CREATE TABLE dropped_table (k INT, PRIMARY KEY (k ASC));
+GRANT SELECT ON dropped_table TO yb_tmeta_user;
+SELECT 'dropped_table'::regclass::oid AS yb_tmeta_dropped_oid \gset
+DROP TABLE dropped_table;
 \c yb_tmeta_a yb_tmeta_user
 SELECT
     relname,
-    db_name
+    start_range,
+    end_range,
+    start_hash_code,
+    end_hash_code
 FROM yb_tablet_metadata
 WHERE
-    relname IN ('only_in_b', 'same_name')
-    AND db_name = 'yb_tmeta_b'
-ORDER BY relname;
-  relname  |  db_name   
------------+------------
- only_in_b | yb_tmeta_b
- same_name | yb_tmeta_b
-(2 rows)
+    db_name = current_database()
+    AND oid = 'rewrite_table'::regclass
+    AND tablet_state = 'RUNNING';
+    relname    | start_range | end_range | start_hash_code | end_hash_code 
+---------------+-------------+-----------+-----------------+---------------
+ rewrite_table |             |           |                 |              
+(1 row)
+
+SELECT bool_and(relname = '<insufficient privilege>') IS NOT FALSE AS dropped_masked
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = :yb_tmeta_dropped_oid;
+ dropped_masked 
+----------------
+ t
+(1 row)
 
 -- Cleanup
 \c yugabyte yugabyte
+DROP TABLE range_int, range_desc, range_text, range_ts, range_multi, range_single, hash_range;
 DROP DATABASE colocated_db;
 DROP DATABASE yb_tmeta_a;
 DROP DATABASE yb_tmeta_b;
 DROP ROLE yb_tmeta_user;
+DROP ROLE yb_tmeta_admin;
