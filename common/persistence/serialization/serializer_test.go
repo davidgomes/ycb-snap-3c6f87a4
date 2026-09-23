@@ -249,6 +249,11 @@ func (s *temporalSerializerSuite) TestSerializeWorkflowExecutionState() {
 	}
 	err := fakedata.FakeStruct(state)
 	s.NoError(err)
+	// CreateRequestId is already represented, so deserialization must not invent another entry.
+	state.RequestIds[state.CreateRequestId] = &persistencespb.RequestIDInfo{
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+		EventId:   common.FirstEventID,
+	}
 
 	blob, err := s.serializer.WorkflowExecutionStateToBlob(state)
 	s.NoError(err)
@@ -256,21 +261,35 @@ func (s *temporalSerializerSuite) TestSerializeWorkflowExecutionState() {
 	deserializedState, err := s.serializer.WorkflowExecutionStateFromBlob(blob)
 	s.NoError(err)
 	s.NotNil(deserializedState)
-
-	// Deserialization adds the CreateRequestId to the Details.RequestIds map.
-	state.RequestIds[state.CreateRequestId] = &persistencespb.RequestIDInfo{
-		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
-		EventId:   common.FirstEventID,
-	}
 	s.ProtoEqual(state, deserializedState)
 
-	blob, err = s.serializer.WorkflowExecutionStateToBlob(state)
+	// Legacy records stored only CreateRequestId. Load still exposes that ID as the start request.
+	legacy := &persistencespb.WorkflowExecutionState{CreateRequestId: "legacy-start-request-id"}
+	blob, err = s.serializer.WorkflowExecutionStateToBlob(legacy)
 	s.NoError(err)
-
 	deserializedState, err = s.serializer.WorkflowExecutionStateFromBlob(blob)
 	s.NoError(err)
-	s.NotNil(deserializedState)
-	s.ProtoEqual(state, deserializedState)
+	s.Equal(&persistencespb.RequestIDInfo{
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+		EventId:   common.FirstEventID,
+	}, deserializedState.RequestIds["legacy-start-request-id"])
+
+	// A reset run keeps the original start request ID and uses CreateRequestId for the
+	// reset operation. Loading must not record that operation as a second start.
+	resetRun := &persistencespb.WorkflowExecutionState{
+		CreateRequestId: "reset-operation-request-id",
+		RequestIds: map[string]*persistencespb.RequestIDInfo{
+			"original-start-request-id": {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+				EventId:   common.FirstEventID,
+			},
+		},
+	}
+	blob, err = s.serializer.WorkflowExecutionStateToBlob(resetRun)
+	s.NoError(err)
+	deserializedState, err = s.serializer.WorkflowExecutionStateFromBlob(blob)
+	s.NoError(err)
+	s.ProtoEqual(resetRun, deserializedState)
 }
 
 // HistoryService returns a different GetWorkflowExecutionHistoryResponse GetWorkflowExecutionHistoryResponseWithRaw to

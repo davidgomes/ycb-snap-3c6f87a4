@@ -394,6 +394,28 @@ func (s *stateRebuilderSuite) TestFindStartRequestID() {
 	s.Equal("legacy-create-request-id", findStartRequestID(&persistencespb.WorkflowExecutionState{
 		CreateRequestId: "legacy-create-request-id",
 	}))
+	s.Equal(original, findStartRequestID(&persistencespb.WorkflowExecutionState{
+		CreateRequestId: "reset-operation-request-id",
+		RequestIds: map[string]*persistencespb.RequestIDInfo{
+			"reset-operation-request-id": {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+				EventId:   common.FirstEventID,
+			},
+			original: {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+				EventId:   common.FirstEventID,
+			},
+		},
+	}))
+	s.Equal("start-and-create", findStartRequestID(&persistencespb.WorkflowExecutionState{
+		CreateRequestId: "start-and-create",
+		RequestIds: map[string]*persistencespb.RequestIDInfo{
+			"start-and-create": {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+				EventId:   common.FirstEventID,
+			},
+		},
+	}))
 	s.Empty(findStartRequestID(nil))
 }
 

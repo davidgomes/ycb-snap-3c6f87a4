@@ -412,11 +412,15 @@ func (r *StateRebuilderImpl) getPaginationFn(
 // That ID is what completion callbacks must keep across resets. CreateRequestId is
 // only a fallback for executions recorded before RequestIds was populated; after a
 // reset it can be the reset operation ID or a later run's create request ID.
+// If that operation ID was also stored as a start request, skip it when another
+// start request ID is present.
 func findStartRequestID(executionState *persistencespb.WorkflowExecutionState) string {
+	createRequestID := executionState.GetCreateRequestId()
 	for reqID, info := range executionState.GetRequestIds() {
-		if info.GetEventType() == enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED {
-			return reqID
+		if info.GetEventType() != enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED || reqID == createRequestID {
+			continue
 		}
+		return reqID
 	}
-	return executionState.GetCreateRequestId()
+	return createRequestID
 }

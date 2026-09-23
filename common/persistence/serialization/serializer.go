@@ -458,11 +458,15 @@ func (t *serializerImpl) WorkflowExecutionStateFromBlob(data *commonpb.DataBlob)
 	if err := Decode(data, result); err != nil {
 		return nil, err
 	}
-	// Initialize the WorkflowExecutionStateDetails for old records.
+	// Legacy executions stored only CreateRequestId. Synthesize the start-event
+	// entry when RequestIds was never written. Once RequestIds is populated,
+	// CreateRequestId may name a later operation (a reset) and must not be
+	// recorded as another WorkflowExecutionStarted request.
+	legacyCreateRequestID := result.CreateRequestId != "" && len(result.RequestIds) == 0
 	if result.RequestIds == nil {
 		result.RequestIds = make(map[string]*persistencespb.RequestIDInfo, 1)
 	}
-	if result.CreateRequestId != "" && result.RequestIds[result.CreateRequestId] == nil {
+	if legacyCreateRequestID {
 		result.RequestIds[result.CreateRequestId] = &persistencespb.RequestIDInfo{
 			EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
 			EventId:   common.FirstEventID,

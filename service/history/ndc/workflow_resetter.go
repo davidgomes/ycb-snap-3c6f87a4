@@ -498,8 +498,9 @@ func (r *workflowResetterImpl) replayResetWorkflow(
 
 	// Applying WorkflowExecutionStarted records the start request ID in both
 	// RequestIds and CreateRequestId. CreateRequestId is how ResetWorkflow retries
-	// are deduped, so put the reset operation ID back without touching RequestIds.
-	// Completion callbacks stay bound to the original start request ID.
+	// are deduped, so put the reset operation ID back without recording it as
+	// another start request. Completion callbacks stay bound to the original
+	// start request ID.
 	if resetRequestID != "" {
 		resetMutableState.GetExecutionState().CreateRequestId = resetRequestID
 	}
