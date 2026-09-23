@@ -282,6 +282,40 @@ Type_handler::handler_by_name_or_error(THD *thd, const LEX_CSTRING &name)
 }
 
 
+bool Type_handler::check_data_type_attributes(
+                            const LEX_CSTRING &name,
+                            const Lex_length_and_dec_st &attr,
+                            const Lex_column_charset_collation_attrs_st &coll,
+                            uint32 srid) const
+{
+  uint column_attributes;
+
+  column_attributes= attr.has_explicit_length() ? ATTR_LENGTH : 0;
+  column_attributes|= attr.has_explicit_dec() ? ATTR_DEC : 0;
+  column_attributes|= coll.is_empty() ? 0 : ATTR_CHARSET;
+  column_attributes|= srid ? ATTR_SRID : 0;
+
+  if ((column_attributes&= ~get_column_attributes()))
+  {
+    const char *attr_name= "UNKNOWN";
+    if (column_attributes & ATTR_LENGTH)
+      attr_name= "LENGTH";
+    else if (column_attributes & ATTR_DEC)
+      attr_name= "DECIMALS";
+    else if (column_attributes & ATTR_SRID)
+      attr_name= "REF_SYSTEM_ID";
+    else if (column_attributes & ATTR_CHARSET)
+      attr_name= "CHARACTER SET";
+
+    my_error(ER_UNSUPPORTED_DATA_TYPE_ATTRIBUTE, MYF(0),
+             ErrConvString(name.str, name.length, system_charset_info).ptr(),
+             attr_name);
+    return true;
+  }
+  return false;
+}
+
+
 Item *Type_handler::create_item_method_or_error(THD *thd,
                                                 object_method_type_t type,
                                                 const Lex_ident_sys &ca,
