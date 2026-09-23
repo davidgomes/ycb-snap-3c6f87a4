@@ -2936,6 +2936,217 @@ tsl_compressed_data_column_size(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(column_size);
 }
 
+static void
+decompress_batch_check_is_batch(const TupleDesc in_desc)
+{
+	for (int i = 0; i < in_desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(in_desc, i);
+
+		if (!attr->attisdropped &&
+			strcmp(NameStr(attr->attname), COMPRESSION_COLUMN_METADATA_COUNT_NAME) == 0)
+		{
+			if (attr->atttypid == INT4OID)
+			{
+				return;
+			}
+			break;
+		}
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("record is not a compressed batch"),
+			 errdetail("A compressed batch must have a column \"%s\" of type integer.",
+					   COMPRESSION_COLUMN_METADATA_COUNT_NAME)));
+}
+
+/*
+ * Check that the column definition list given to decompress_batch() matches
+ * the compressed batch. Columns are matched by name.
+ *
+ * Segmentby columns carry their type in the batch itself. For compressed
+ * columns the element type is not recorded in the batch, so it can only be
+ * verified when the uncompressed relation of the batch is known.
+ */
+static void
+decompress_batch_check_columns(const TupleDesc in_desc, const TupleDesc out_desc,
+							   Oid uncompressed_relid)
+{
+	Oid compressed_data_type_oid = ts_custom_type_cache_get(CUSTOM_TYPE_COMPRESSED_DATA)->type_oid;
+
+	for (int i = 0; i < out_desc->natts; i++)
+	{
+		Form_pg_attribute out_attr = TupleDescAttr(out_desc, i);
+		const char *attname = NameStr(out_attr->attname);
+		Form_pg_attribute in_attr = NULL;
+
+		if (out_attr->attisdropped)
+		{
+			continue;
+		}
+
+		if (strncmp(attname,
+					COMPRESSION_COLUMN_METADATA_PREFIX,
+					strlen(COMPRESSION_COLUMN_METADATA_PREFIX)) != 0)
+		{
+			for (int j = 0; j < in_desc->natts; j++)
+			{
+				Form_pg_attribute attr = TupleDescAttr(in_desc, j);
+
+				if (!attr->attisdropped && strcmp(attname, NameStr(attr->attname)) == 0)
+				{
+					in_attr = attr;
+					break;
+				}
+			}
+		}
+
+		if (in_attr == NULL)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("column \"%s\" does not exist in compressed batch", attname)));
+		}
+
+		Oid batch_type = in_attr->atttypid;
+
+		if (batch_type == compressed_data_type_oid)
+		{
+			AttrNumber attno =
+				OidIsValid(uncompressed_relid) ? get_attnum(uncompressed_relid, attname) :
+												 InvalidAttrNumber;
+
+			if (!AttributeNumberIsValid(attno))
+			{
+				continue;
+			}
+
+			batch_type = get_atttype(uncompressed_relid, attno);
+		}
+
+		if (batch_type != out_attr->atttypid)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("type mismatch for column \"%s\" of compressed batch", attname),
+					 errdetail("Column has type %s in the compressed batch, but %s in the column "
+							   "definition list.",
+							   format_type_be(batch_type),
+							   format_type_be(out_attr->atttypid))));
+		}
+	}
+}
+
+typedef struct DecompressBatchState
+{
+	RowDecompressor decompressor;
+	int nrows;
+} DecompressBatchState;
+
+/*
+ * decompress_batch(record) -> setof record
+ *
+ * Expand a single compressed batch, i.e., a row of a compressed chunk, into
+ * the rows it represents. The row type of the batch is taken from the record
+ * itself and the row type of the result from the column definition list at
+ * the call site.
+ */
+Datum
+tsl_decompress_batch(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	DecompressBatchState *state;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		TupleDesc out_desc;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		MemoryContext oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (get_call_result_type(fcinfo, NULL, &out_desc) != TYPEFUNC_COMPOSITE)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("function returning record called in context that cannot accept type "
+							"record"),
+					 errhint("Specify the output columns with a column definition list, for "
+							 "example \"AS x(time timestamptz, value float)\".")));
+		}
+		funcctx->tuple_desc = BlessTupleDesc(CreateTupleDescCopy(out_desc));
+
+		HeapTupleHeader td = PG_GETARG_HEAPTUPLEHEADER(0);
+		Oid in_typeid = HeapTupleHeaderGetTypeId(td);
+		TupleDesc in_desc = lookup_rowtype_tupdesc(in_typeid, HeapTupleHeaderGetTypMod(td));
+		HeapTupleData in_tuple = {
+			.t_len = HeapTupleHeaderGetDatumLength(td),
+			.t_tableOid = InvalidOid,
+			.t_data = td,
+		};
+		ItemPointerSetInvalid(&in_tuple.t_self);
+
+		decompress_batch_check_is_batch(in_desc);
+
+		/*
+		 * The compression settings catalog is not accessible with a historic
+		 * snapshot, so the element types of compressed columns cannot be
+		 * verified when called from a logical decoding plugin.
+		 */
+		Oid uncompressed_relid = InvalidOid;
+		Oid in_relid = get_typ_typrelid(in_typeid);
+		if (OidIsValid(in_relid) && !HistoricSnapshotActive())
+		{
+			uncompressed_relid = ts_relation_get_uncompressed_relid(in_relid);
+		}
+
+		decompress_batch_check_columns(in_desc, funcctx->tuple_desc, uncompressed_relid);
+
+		state = palloc0(sizeof(DecompressBatchState));
+		state->decompressor =
+			build_decompressor(in_desc, funcctx->tuple_desc, InvalidOid, InvalidOid);
+		ReleaseTupleDesc(in_desc);
+
+		RowDecompressor *decompressor = &state->decompressor;
+		heap_deform_tuple(&in_tuple,
+						  decompressor->in_desc,
+						  decompressor->compressed_datums,
+						  decompressor->compressed_is_nulls);
+
+		if (decompressor->compressed_is_nulls[decompressor->count_compressed_attindex])
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("record is not a compressed batch"),
+					 errdetail("Column \"%s\" is NULL.", COMPRESSION_COLUMN_METADATA_COUNT_NAME)));
+		}
+
+		/*
+		 * The whole batch is decompressed up front, so no toast relations
+		 * need to stay open across calls.
+		 */
+		state->nrows = decompress_batch(decompressor);
+		detoaster_close(&decompressor->detoaster);
+
+		funcctx->user_fctx = state;
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	state = (DecompressBatchState *) funcctx->user_fctx;
+
+	if (funcctx->call_cntr < (uint64) state->nrows)
+	{
+		TupleTableSlot *slot = state->decompressor.decompressed_slots[funcctx->call_cntr];
+		HeapTuple tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+
+		SRF_RETURN_NEXT(funcctx, heap_copy_tuple_as_datum(tuple, funcctx->tuple_desc));
+	}
+
+	row_decompressor_close(&state->decompressor);
+	SRF_RETURN_DONE(funcctx);
+}
+
 Datum
 tsl_compressed_data_send(PG_FUNCTION_ARGS)
 {

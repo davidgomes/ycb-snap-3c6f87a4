@@ -22,6 +22,8 @@ DROP FUNCTION IF EXISTS _timescaledb_functions.chunk_constraint_add_table_constr
 
 DROP FUNCTION IF EXISTS _timescaledb_functions.lock_osm_chunk_dimension_slice(regclass);
 
+DROP FUNCTION IF EXISTS _timescaledb_functions.decompress_batch(record);
+
 ALTER TABLE _timescaledb_catalog.hypertable RESET (user_catalog_table);
 ALTER TABLE _timescaledb_catalog.chunk RESET (user_catalog_table);
 

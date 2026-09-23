@@ -12,3 +12,12 @@ CREATE OR REPLACE FUNCTION _timescaledb_functions.compressed_data_column_size(_t
    AS '@MODULE_PATHNAME@', 'ts_compressed_data_column_size'
    LANGUAGE C IMMUTABLE PARALLEL SAFE;
 
+-- Expand a single compressed batch (a row of a compressed chunk) into the
+-- rows it represents. The shape of the output rows is taken from the column
+-- definition list at the call site, e.g.
+--   decompress_batch(c) AS x(time timestamptz, device_id int, value float)
+CREATE OR REPLACE FUNCTION _timescaledb_functions.decompress_batch(record)
+   RETURNS SETOF RECORD
+   AS '@MODULE_PATHNAME@', 'ts_decompress_batch'
+   LANGUAGE C STRICT;
+
