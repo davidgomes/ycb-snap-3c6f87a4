@@ -174,6 +174,11 @@ void YBCUpdateInitPostgresMetrics();
 uint16_t YBCDecodeMultiColumnHashLeftBound(const char* partition_key, size_t key_len);
 uint16_t YBCDecodeMultiColumnHashRightBound(const char* partition_key, size_t key_len);
 
+// DocDB rendering of one range-partition bound, matching the master UI tablet
+// listing (DocKey::DebugSliceToString). Empty bounds (unbounded edges) return
+// NULL. The result is palloc'd.
+const char* YBCRangePartitionBoundDebugString(const char* partition_key, size_t key_len);
+
 bool YBCIsObjectLockingEnabled();
 void YBCPgSetClampUncertaintyWindow(bool clamp);
 

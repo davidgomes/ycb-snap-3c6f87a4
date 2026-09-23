@@ -57,6 +57,11 @@ CREATE VIEW yb_tablet_metadata AS
         -- (e.g. the 'transactions' table) and colocation parents.
         t.oid,
         t.namespace    AS db_name,
+        -- Masked to '<insufficient privilege>' unless the caller is a
+        -- superuser or yb_db_admin member, the tablet is the system
+        -- transactions tablet, or the table is in the current database and
+        -- the caller has SELECT on it. Range bounds use the same rule;
+        -- masked range tablets placeholder every cell, including NULL edges.
         t.object_name  AS relname,
         t.start_hash_code,
         t.end_hash_code,
