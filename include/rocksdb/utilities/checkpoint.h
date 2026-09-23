@@ -164,6 +164,9 @@ class Checkpoint {
   //   a handle of a dropped column family. Duplicate handles are coalesced.
   // - The OPTIONS file is copied unchanged and may still list the excluded
   //   column families.
+  // - As with dropping a column family, a transaction prepared (2PC) but not
+  //   committed before the checkpoint must not have written to an excluded
+  //   column family, since TransactionDB cannot recover such a transaction.
   virtual Status CreateCheckpoint(
       const std::string& checkpoint_dir,
       const std::vector<ColumnFamilyHandle*>& column_families,
