@@ -241,6 +241,14 @@ batch_size_fail_threshold_in_kb: 1024
 # - PasswordAuthenticator relies on username/password pairs to authenticate
 #   users. It keeps usernames and hashed passwords in system_auth.credentials table.
 #   Please increase system_auth keyspace replication factor if you use this authenticator.
+# - com.scylladb.auth.CertificateOrPasswordAuthenticator authenticates a trusted
+#   TLS client certificate via auth_certificate_role_queries when one is presented,
+#   and otherwise uses username/password SASL. Set
+#   client_encryption_options.require_client_auth to optional so password-only
+#   clients are not rejected at the TLS handshake. true requires a certificate from
+#   every TLS client. A presented certificate that does not map to a role fails
+#   authentication and is not retried as a password. Untrusted certificates fail
+#   the TLS handshake. See docs/operating-scylla/security/certificate-or-password-authentication.rst.
 # - com.scylladb.auth.TransitionalAuthenticator requires username/password pair
 #   to authenticate in the same manner as PasswordAuthenticator, but improper credentials
 #   result in being logged in as an anonymous user. Use for upgrading clusters' auth.

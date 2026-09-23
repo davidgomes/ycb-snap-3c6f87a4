@@ -414,4 +414,118 @@ SEASTAR_TEST_CASE(test_try_describe_schema_with_internals_and_passwords_as_anony
     }, auth_on(true));
 }
 
+namespace {
+
+auth::session_dn_func certificate_dn(std::string subject, std::string altnames = {}) {
+    auth::certificate_info info{
+        .subject = std::move(subject),
+        .get_alt_names = [altnames = std::move(altnames)] {
+            return make_ready_future<std::string>(altnames);
+        },
+    };
+    return [info = std::move(info)] {
+        return make_ready_future<std::optional<auth::certificate_info>>(info);
+    };
+}
+
+auth::session_dn_func no_client_certificate() {
+    return [] {
+        return make_ready_future<std::optional<auth::certificate_info>>(std::nullopt);
+    };
+}
+
+cql_test_config certificate_or_password_auth() {
+    auto cfg = auth_on(false);
+    cfg.db_config->authenticator("com.scylladb.auth.CertificateOrPasswordAuthenticator");
+    cfg.db_config->auth_certificate_role_queries({
+        {{"source", "SUBJECT"}, {"query", "CN=([^,]+)"}},
+        {{"source", "ALTNAME"}, {"query", "DNS:([^,]+)"}},
+    });
+    return cfg;
+}
+
+bytes plain_sasl_token(std::string_view username, std::string_view password) {
+    bytes b;
+    int8_t nul = 0;
+    b.append(&nul, 1);
+    b.insert(b.end(), username.begin(), username.end());
+    b.append(&nul, 1);
+    b.insert(b.end(), password.begin(), password.end());
+    return b;
+}
+
+} // anonymous namespace
+
+SEASTAR_TEST_CASE(test_certificate_or_password_authenticator) {
+    co_await do_with_cql_env_thread([](cql_test_env& env) {
+        auto& a = env.local_auth_service().underlying_authenticator();
+        BOOST_REQUIRE(a.require_authentication());
+        BOOST_REQUIRE_EQUAL(a.qualified_java_name(), std::string_view("com.scylladb.auth.CertificateOrPasswordAuthenticator"));
+        BOOST_REQUIRE(a.supported_options().contains(auth::authentication_option::password));
+        BOOST_REQUIRE(a.uses_password_hashes());
+        BOOST_REQUIRE(!a.protected_resources().empty());
+
+        cquery_nofail(env, "CREATE ROLE pwuser WITH PASSWORD = 'secret' AND LOGIN = true");
+        cquery_nofail(env, "CREATE ROLE certonly WITH LOGIN = true");
+
+        // No certificate (plain connection, or optional TLS without a client cert)
+        // falls through to password SASL. A wrong password is an auth failure.
+        auto no_cert = a.authenticate(no_client_certificate()).get();
+        BOOST_REQUIRE(!no_cert);
+        BOOST_REQUIRE(!a.authenticate(auth::session_dn_func{}).get());
+
+        auto user = authenticate(env, "pwuser", "secret").get();
+        BOOST_REQUIRE_EQUAL(*user.name, sstring("pwuser"));
+        BOOST_REQUIRE_EXCEPTION(authenticate(env, "pwuser", "wrong").get(), exceptions::authentication_exception,
+                exception_predicate::message_equals("Username and/or password are incorrect"));
+        BOOST_REQUIRE_EXCEPTION(authenticate(env, "certonly", "secret").get(), exceptions::authentication_exception,
+                exception_predicate::message_equals("Username and/or password are incorrect"));
+
+        auto sasl = a.new_sasl_challenge();
+        sasl->evaluate_response(plain_sasl_token("pwuser", "wrong"));
+        BOOST_REQUIRE(sasl->is_complete());
+        BOOST_REQUIRE_EXCEPTION(sasl->get_authenticated_user().get(), exceptions::authentication_exception,
+                exception_predicate::message_equals("Username and/or password are incorrect"));
+
+        sasl = a.new_sasl_challenge();
+        sasl->evaluate_response(plain_sasl_token("pwuser", "secret"));
+        auto sasl_user = sasl->get_authenticated_user().get();
+        BOOST_REQUIRE_EQUAL(*sasl_user.name, sstring("pwuser"));
+
+        cquery_nofail(env, "ALTER ROLE pwuser WITH PASSWORD = 'secret2'");
+        BOOST_REQUIRE_EXCEPTION(authenticate(env, "pwuser", "secret").get(), exceptions::authentication_exception,
+                exception_predicate::message_equals("Username and/or password are incorrect"));
+        authenticate(env, "pwuser", "secret2").get();
+
+        // Trusted certificate: role comes from the subject or SAN, with no password.
+        auto cert_user = a.authenticate(certificate_dn("CN=certonly,O=ScyllaDB")).get();
+        BOOST_REQUIRE(cert_user);
+        BOOST_REQUIRE_EQUAL(*cert_user->name, sstring("certonly"));
+        env.local_client_state().set_login(*cert_user);
+        env.local_client_state().check_user_can_login().get();
+
+        auto pw_from_cert = a.authenticate(certificate_dn("CN=pwuser")).get();
+        BOOST_REQUIRE(pw_from_cert);
+        BOOST_REQUIRE_EQUAL(*pw_from_cert->name, sstring("pwuser"));
+
+        auto from_san = a.authenticate(certificate_dn("O=NoCn", "DNS:certonly")).get();
+        BOOST_REQUIRE(from_san);
+        BOOST_REQUIRE_EQUAL(*from_san->name, sstring("certonly"));
+
+        // Presented certificate that matches no role query fails closed.
+        // Password SASL must not be offered for this attempt.
+        BOOST_REQUIRE_EXCEPTION(a.authenticate(certificate_dn("O=NoSuchRole")).get(), exceptions::authentication_exception,
+                exception_predicate::message_contains("does not match"));
+
+        // Extraction can succeed and still not log the client in. That result is the
+        // certificate role, so a valid password for another role cannot succeed instead.
+        auto missing = a.authenticate(certificate_dn("CN=nosuchrole")).get();
+        BOOST_REQUIRE(missing);
+        BOOST_REQUIRE_EQUAL(*missing->name, sstring("nosuchrole"));
+        env.local_client_state().set_login(*missing);
+        BOOST_REQUIRE_EXCEPTION(env.local_client_state().check_user_can_login().get(), exceptions::authentication_exception,
+                exception_predicate::message_contains("doesn't exist"));
+    }, certificate_or_password_auth());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

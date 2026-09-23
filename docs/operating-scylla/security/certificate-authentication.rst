@@ -48,6 +48,7 @@ Procedure
 Additional Resources
 --------------------
 
+* :doc:`Certificate or Password Authentication </operating-scylla/security/certificate-or-password-authentication/>`
 * :doc:`Enable Authentication </operating-scylla/security/authentication/>`
 * :doc:`Enable Authorization </operating-scylla/security/enable-authorization/>` 
 * :doc:`Authorization </operating-scylla/security/authorization/>` 
