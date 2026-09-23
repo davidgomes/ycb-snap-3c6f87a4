@@ -21,6 +21,16 @@ decompression is needed, even for multi-column orderby.
                         └──────────────────┘      └────────────────┘
 ```
 
+### Bounding work with `max_batches`
+
+`compact_chunk(chunk, max_batches)` stops the recompress phase once at least
+`max_batches` batches have been decompressed (`0`, the default, means
+unlimited). The limit is only checked after a merge group has been fully
+recompressed, so a group is never left partially rewritten and a single group
+may decompress more batches than the limit. If overlaps remain, the verify
+phase keeps the chunk UNORDERED and the next call continues from there. The
+compaction policy passes its `max_batches` config value to each call.
+
 ## Handling specific compression and batch configurations
 
 ### 1. No overlaps (no-op)
