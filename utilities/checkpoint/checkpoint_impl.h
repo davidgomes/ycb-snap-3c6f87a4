@@ -6,6 +6,8 @@
 #pragma once
 
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "file/filename.h"
 #include "rocksdb/db.h"
@@ -24,20 +26,31 @@ class CheckpointImpl : public Checkpoint {
                           uint64_t log_size_for_flush,
                           uint64_t* sequence_number_ptr) override;
 
+  Status CreateCheckpoint(
+      const std::string& checkpoint_dir,
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      uint64_t log_size_for_flush, uint64_t* sequence_number_ptr) override;
+
   // Shared by the legacy Checkpoint API and CheckpointEngine. engine == nullptr
   // links/copies serially; otherwise work runs on the pool, awaited before the
-  // staging dir is committed.
-  Status CreateCheckpointImpl(const std::string& checkpoint_dir,
-                              uint64_t log_size_for_flush,
-                              uint64_t* sequence_number_ptr, CopyEngine* engine,
-                              bool use_link, RateLimiter* copy_rate_limiter);
+  // staging dir is committed. A non-null include_cf_ids restricts the
+  // checkpoint to those column families; the others are recorded as dropped in
+  // the checkpoint's MANIFEST.
+  Status CreateCheckpointImpl(
+      const std::string& checkpoint_dir, uint64_t log_size_for_flush,
+      uint64_t* sequence_number_ptr, CopyEngine* engine, bool use_link,
+      RateLimiter* copy_rate_limiter,
+      const std::unordered_set<uint32_t>* include_cf_ids = nullptr);
 
   Status ExportColumnFamily(ColumnFamilyHandle* handle,
                             const std::string& export_dir,
                             ExportImportFilesMetaData** metadata) override;
 
   // Checkpoint logic can be customized by providing callbacks for link, copy,
-  // or create.
+  // or create. A non-null include_cf_ids limits table and blob files to those
+  // column families and, on success, sets *excluded_cf_ids to the other column
+  // families live in the reported MANIFEST (see
+  // DBImpl::GetLiveFilesStorageInfoForColumnFamilies).
   Status CreateCustomCheckpoint(
       std::function<Status(const std::string& src_dirname,
                            const std::string& fname, FileType type,
@@ -53,7 +66,9 @@ class CheckpointImpl : public Checkpoint {
                            const std::string& contents, FileType type)>
           create_file_cb,
       uint64_t* sequence_number, uint64_t log_size_for_flush,
-      bool get_live_table_checksum = false, bool atomic_flush = false);
+      bool get_live_table_checksum = false, bool atomic_flush = false,
+      const std::unordered_set<uint32_t>* include_cf_ids = nullptr,
+      std::vector<uint32_t>* excluded_cf_ids = nullptr);
 
  private:
   Status CleanStagingDirectory(const std::string& path, Logger* info_log);

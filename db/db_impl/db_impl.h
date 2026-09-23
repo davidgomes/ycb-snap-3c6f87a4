@@ -20,6 +20,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -588,6 +589,18 @@ class DBImpl : public DB {
   Status GetLiveFilesStorageInfo(
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override;
+
+  // Same as GetLiveFilesStorageInfo(), except that when include_cf_ids is
+  // non-null, only the table and blob files of those column families are
+  // reported, and on success *excluded_cf_ids receives the IDs of the other
+  // column families that are live as of the reported MANIFEST size. Returns
+  // InvalidArgument if some ID in include_cf_ids is not a live column family
+  // at that point. Flushing, if needed, still applies to all column families.
+  Status GetLiveFilesStorageInfoForColumnFamilies(
+      const LiveFilesStorageInfoOptions& opts,
+      const std::unordered_set<uint32_t>* include_cf_ids,
+      std::vector<LiveFileStorageInfo>* files,
+      std::vector<uint32_t>* excluded_cf_ids);
 
   Status GetPreparedFileInfoForExternalSstIngestion(
       const std::string& file_path,

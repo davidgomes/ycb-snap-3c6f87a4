@@ -1,0 +1,1 @@
+Added a `Checkpoint::CreateCheckpoint()` overload taking a list of column families, which creates a checkpoint containing only those column families (plus the default column family) without linking or copying the other column families' SST and blob files.

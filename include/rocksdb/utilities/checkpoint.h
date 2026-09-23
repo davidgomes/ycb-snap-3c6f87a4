@@ -153,6 +153,22 @@ class Checkpoint {
                                   uint64_t log_size_for_flush = 0,
                                   uint64_t* sequence_number_ptr = nullptr);
 
+  // Like CreateCheckpoint above, but the checkpoint contains only the given
+  // column families plus the default column family, which is always included.
+  // SST and blob files of the other column families are neither hard linked
+  // nor copied, and the checkpoint's MANIFEST records those column families as
+  // dropped, so the checkpoint must be opened with exactly the included column
+  // families. The source DB is not modified beyond the usual flush.
+  // - An empty column_families is equivalent to the overload above.
+  // - Returns InvalidArgument for a null handle, a handle from another DB, or
+  //   a handle of a dropped column family. Duplicate handles are coalesced.
+  // - The OPTIONS file is copied unchanged and may still list the excluded
+  //   column families.
+  virtual Status CreateCheckpoint(
+      const std::string& checkpoint_dir,
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      uint64_t log_size_for_flush = 0, uint64_t* sequence_number_ptr = nullptr);
+
   // Exports all live SST files of a specified Column Family onto export_dir,
   // returning SST files information in metadata.
   // - SST files will be created as hard links when the directory specified
