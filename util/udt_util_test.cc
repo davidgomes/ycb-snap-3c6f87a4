@@ -226,11 +226,13 @@ TEST_F(HandleTimestampSizeDifferenceTest, AllColumnFamiliesConsistent) {
   // All `check_mode` pass with OK status and `batch` not checked or updated.
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kVerifyConsistency));
+      TimestampSizeConsistencyMode::kVerifyConsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true));
   std::unique_ptr<WriteBatch> new_batch(nullptr);
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true, &new_batch));
   ASSERT_TRUE(new_batch.get() == nullptr);
 }
 
@@ -245,11 +247,13 @@ TEST_F(HandleTimestampSizeDifferenceTest,
   // All `check_mode` pass with OK status and `batch` not checked or updated.
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kVerifyConsistency));
+      TimestampSizeConsistencyMode::kVerifyConsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true));
   std::unique_ptr<WriteBatch> new_batch(nullptr);
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true, &new_batch));
   ASSERT_TRUE(new_batch.get() == nullptr);
 }
 
@@ -263,11 +267,13 @@ TEST_F(HandleTimestampSizeDifferenceTest, InvolvedColumnFamiliesConsistent) {
   // All `check_mode` pass with OK status and `batch` not updated.
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kVerifyConsistency));
+      TimestampSizeConsistencyMode::kVerifyConsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true));
   std::unique_ptr<WriteBatch> new_batch(nullptr);
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true, &new_batch));
   ASSERT_TRUE(new_batch.get() == nullptr);
 }
 
@@ -282,13 +288,15 @@ TEST_F(HandleTimestampSizeDifferenceTest,
   // families.
   ASSERT_TRUE(HandleWriteBatchTimestampSizeDifference(
                   &batch, running_ts_sz, record_ts_sz,
-                  TimestampSizeConsistencyMode::kVerifyConsistency)
+                  TimestampSizeConsistencyMode::kVerifyConsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true)
                   .IsInvalidArgument());
 
   std::unique_ptr<WriteBatch> new_batch(nullptr);
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true, &new_batch));
   ASSERT_TRUE(new_batch.get() != nullptr);
   CheckContentsWithTimestampStripping(batch, *new_batch, sizeof(uint64_t),
                                       std::nullopt /* dropped_cf */);
@@ -307,13 +315,15 @@ TEST_F(HandleTimestampSizeDifferenceTest,
   // families.
   ASSERT_TRUE(HandleWriteBatchTimestampSizeDifference(
                   &batch, running_ts_sz, record_ts_sz,
-                  TimestampSizeConsistencyMode::kVerifyConsistency)
+                  TimestampSizeConsistencyMode::kVerifyConsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true)
                   .IsInvalidArgument());
 
   std::unique_ptr<WriteBatch> new_batch(nullptr);
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true, &new_batch));
   ASSERT_TRUE(new_batch.get() != nullptr);
   CheckContentsWithTimestampPadding(batch, *new_batch, sizeof(uint64_t));
 }
@@ -331,7 +341,8 @@ TEST_F(HandleTimestampSizeDifferenceTest,
   // and all related entries copied over to the new WriteBatch.
   ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
       &batch, running_ts_sz, record_ts_sz,
-      TimestampSizeConsistencyMode::kReconcileInconsistency, &new_batch));
+      TimestampSizeConsistencyMode::kReconcileInconsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true, &new_batch));
 
   ASSERT_TRUE(new_batch.get() != nullptr);
   CheckContentsWithTimestampStripping(batch, *new_batch, sizeof(uint64_t),
@@ -346,13 +357,93 @@ TEST_F(HandleTimestampSizeDifferenceTest, UnrecoverableInconsistency) {
 
   ASSERT_TRUE(HandleWriteBatchTimestampSizeDifference(
                   &batch, running_ts_sz, record_ts_sz,
-                  TimestampSizeConsistencyMode::kVerifyConsistency)
+                  TimestampSizeConsistencyMode::kVerifyConsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true)
                   .IsInvalidArgument());
 
   ASSERT_TRUE(HandleWriteBatchTimestampSizeDifference(
                   &batch, running_ts_sz, record_ts_sz,
-                  TimestampSizeConsistencyMode::kReconcileInconsistency)
+                  TimestampSizeConsistencyMode::kReconcileInconsistency,
+                  /*seq_per_batch=*/false, /*batch_per_txn=*/true)
                   .IsInvalidArgument());
+}
+
+TEST_F(HandleTimestampSizeDifferenceTest,
+      ReconcilePreservesTransactionMarkers) {
+  UnorderedMap<uint32_t, size_t> running_ts_sz = {{1, 0}};
+  UnorderedMap<uint32_t, size_t> record_ts_sz = {{1, sizeof(uint64_t)}};
+  WriteBatch batch;
+  ASSERT_OK(WriteBatchInternal::InsertNoop(&batch));
+  std::string key;
+  CreateKey(&key, sizeof(uint64_t));
+  ASSERT_OK(WriteBatchInternal::Put(&batch, 1, key, kValuePlaceHolder));
+  ASSERT_OK(WriteBatchInternal::MarkEndPrepare(&batch, "prepared"));
+  std::string commit_ts(sizeof(uint64_t), '\x01');
+  ASSERT_OK(WriteBatchInternal::MarkCommitWithTimestamp(&batch, "committed",
+                                                        commit_ts));
+  ASSERT_OK(WriteBatchInternal::MarkRollback(&batch, "rolled"));
+  ASSERT_OK(WriteBatchInternal::MarkCommit(&batch, "commit_no_ts"));
+  ASSERT_OK(WriteBatchInternal::InsertNoop(&batch));
+
+  std::unique_ptr<WriteBatch> ignored(nullptr);
+  ASSERT_TRUE(HandleWriteBatchTimestampSizeDifference(
+                  &batch, running_ts_sz, record_ts_sz,
+                  TimestampSizeConsistencyMode::kReconcileInconsistency,
+                  /*seq_per_batch=*/true, /*batch_per_txn=*/true, &ignored)
+                  .IsNotSupported());
+
+  std::unique_ptr<WriteBatch> new_batch(nullptr);
+  ASSERT_OK(HandleWriteBatchTimestampSizeDifference(
+      &batch, running_ts_sz, record_ts_sz,
+      TimestampSizeConsistencyMode::kReconcileInconsistency,
+      /*seq_per_batch=*/false, /*batch_per_txn=*/true, &new_batch));
+  ASSERT_NE(new_batch, nullptr);
+
+  class MarkerCollector : public WriteBatch::Handler {
+   public:
+    Status PutCF(uint32_t cf, const Slice& key, const Slice&) override {
+      cfs.push_back(cf);
+      keys.emplace_back(key.ToString());
+      return Status::OK();
+    }
+    Status MarkBeginPrepare(bool unprepare) override {
+      markers.push_back(unprepare ? "begin_unprepare" : "begin");
+      return Status::OK();
+    }
+    Status MarkEndPrepare(const Slice& xid) override {
+      markers.push_back("end:" + xid.ToString());
+      return Status::OK();
+    }
+    Status MarkCommit(const Slice& xid) override {
+      markers.push_back("commit:" + xid.ToString());
+      return Status::OK();
+    }
+    Status MarkCommitWithTimestamp(const Slice& xid,
+                                   const Slice& ts) override {
+      markers.push_back("commit_ts:" + xid.ToString() + ":" + ts.ToString());
+      return Status::OK();
+    }
+    Status MarkRollback(const Slice& xid) override {
+      markers.push_back("rollback:" + xid.ToString());
+      return Status::OK();
+    }
+    Status MarkNoop(bool) override {
+      markers.push_back("noop");
+      return Status::OK();
+    }
+    std::vector<std::string> markers;
+    std::vector<uint32_t> cfs;
+    std::vector<std::string> keys;
+  } collector;
+  ASSERT_OK(new_batch->Iterate(&collector));
+  ASSERT_EQ(collector.markers,
+            (std::vector<std::string>{"begin", "end:prepared",
+                                      "commit_ts:committed:" + commit_ts,
+                                      "rollback:rolled", "commit:commit_no_ts",
+                                      "noop"}));
+  ASSERT_EQ(collector.cfs, (std::vector<uint32_t>{1}));
+  ASSERT_EQ(collector.keys, (std::vector<std::string>{kTestKeyWithoutTs}));
+  CheckSequenceEqual(batch, *new_batch);
 }
 
 TEST(ValidateUserDefinedTimestampsOptionsTest, EnableUserDefinedTimestamps) {

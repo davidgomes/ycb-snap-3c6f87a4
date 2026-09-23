@@ -139,12 +139,56 @@ ToggleUDT CompareComparator(const Comparator* new_comparator,
 
 TimestampRecoveryHandler::TimestampRecoveryHandler(
     const UnorderedMap<uint32_t, size_t>& running_ts_sz,
-    const UnorderedMap<uint32_t, size_t>& record_ts_sz)
+    const UnorderedMap<uint32_t, size_t>& record_ts_sz, bool seq_per_batch,
+    bool batch_per_txn)
     : running_ts_sz_(running_ts_sz),
       record_ts_sz_(record_ts_sz),
       new_batch_(new WriteBatch()),
       handler_valid_(true),
-      new_batch_diff_from_orig_batch_(false) {}
+      new_batch_diff_from_orig_batch_(false),
+      seq_per_batch_(seq_per_batch),
+      batch_per_txn_(batch_per_txn),
+      unprepared_batch_(false) {}
+
+Status TimestampRecoveryHandler::MarkBeginPrepare(bool unprepare) {
+  assert(handler_valid_);
+  unprepared_batch_ = unprepare;
+  // MarkEndPrepare rewrites this leading noop into the begin marker that
+  // matches the replaying DB's write policy.
+  return WriteBatchInternal::InsertNoop(new_batch_.get());
+}
+
+Status TimestampRecoveryHandler::MarkEndPrepare(const Slice& xid) {
+  assert(handler_valid_);
+  bool unprepared = unprepared_batch_;
+  unprepared_batch_ = false;
+  // WriteCommitted writes after commit (`seq_per_batch` == false).
+  return WriteBatchInternal::MarkEndPrepare(
+      new_batch_.get(), xid, !seq_per_batch_ /*write_after_commit*/,
+      unprepared);
+}
+
+Status TimestampRecoveryHandler::MarkCommit(const Slice& xid) {
+  assert(handler_valid_);
+  return WriteBatchInternal::MarkCommit(new_batch_.get(), xid);
+}
+
+Status TimestampRecoveryHandler::MarkCommitWithTimestamp(
+    const Slice& xid, const Slice& commit_ts) {
+  assert(handler_valid_);
+  return WriteBatchInternal::MarkCommitWithTimestamp(new_batch_.get(), xid,
+                                                     commit_ts);
+}
+
+Status TimestampRecoveryHandler::MarkRollback(const Slice& xid) {
+  assert(handler_valid_);
+  return WriteBatchInternal::MarkRollback(new_batch_.get(), xid);
+}
+
+Status TimestampRecoveryHandler::MarkNoop(bool /*empty_batch*/) {
+  assert(handler_valid_);
+  return WriteBatchInternal::InsertNoop(new_batch_.get());
+}
 
 Status TimestampRecoveryHandler::PutCF(uint32_t cf, const Slice& key,
                                        const Slice& value) {
@@ -304,8 +348,8 @@ Status HandleWriteBatchTimestampSizeDifference(
     const WriteBatch* batch,
     const UnorderedMap<uint32_t, size_t>& running_ts_sz,
     const UnorderedMap<uint32_t, size_t>& record_ts_sz,
-    TimestampSizeConsistencyMode check_mode,
-    std::unique_ptr<WriteBatch>* new_batch) {
+    TimestampSizeConsistencyMode check_mode, bool seq_per_batch,
+    bool batch_per_txn, std::unique_ptr<WriteBatch>* new_batch) {
   // Quick path to bypass checking the WriteBatch.
   if (AllRunningColumnFamiliesConsistent(running_ts_sz, record_ts_sz)) {
     return Status::OK();
@@ -318,7 +362,8 @@ Status HandleWriteBatchTimestampSizeDifference(
   } else if (need_recovery) {
     assert(new_batch);
     SequenceNumber sequence = WriteBatchInternal::Sequence(batch);
-    TimestampRecoveryHandler recovery_handler(running_ts_sz, record_ts_sz);
+    TimestampRecoveryHandler recovery_handler(running_ts_sz, record_ts_sz,
+                                              seq_per_batch, batch_per_txn);
     status = batch->Iterate(&recovery_handler);
     if (!status.ok()) {
       return status;

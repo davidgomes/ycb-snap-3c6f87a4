@@ -1099,6 +1099,167 @@ TEST_P(WriteCommittedTxnWithTsTest, GetEntityForUpdate) {
   }
 }
 
+TEST_P(WriteCommittedTxnWithTsTest, RecoverWALAfterTogglingUDT) {
+  const std::string cf_name = "cf";
+  for (bool initially_udt : {true, false}) {
+    for (auto* h : handles_) {
+      delete h;
+    }
+    handles_.clear();
+    options.avoid_flush_during_shutdown = true;
+    options.recycle_log_file_num = 0;
+    options.allow_concurrent_memtable_write = false;
+    ASSERT_OK(ReOpen());
+
+    ColumnFamilyOptions cf_with_udt;
+    cf_with_udt.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    cf_with_udt.persist_user_defined_timestamps = false;
+    ColumnFamilyOptions cf_without_udt;
+    cf_without_udt.comparator = BytewiseComparator();
+    ColumnFamilyOptions initial_cf =
+        initially_udt ? cf_with_udt : cf_without_udt;
+
+    ColumnFamilyHandle* created = nullptr;
+    ASSERT_OK(db->CreateColumnFamily(initial_cf, cf_name, &created));
+    delete created;
+
+    std::vector<ColumnFamilyDescriptor> cf_descs;
+    cf_descs.emplace_back(kDefaultColumnFamilyName, options);
+    cf_descs.emplace_back(cf_name, initial_cf);
+    ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+
+    auto set_commit_ts_if_needed = [&](Transaction* txn) {
+      if (initially_udt) {
+        ASSERT_OK(txn->SetCommitTimestamp(10));
+      }
+    };
+
+    {
+      std::unique_ptr<Transaction> txn(
+          NewTxn(WriteOptions(), TransactionOptions()));
+      ASSERT_OK(txn->SetName("noop"));
+      ASSERT_OK(txn->Prepare());
+      ASSERT_OK(txn->Commit());
+    }
+    {
+      std::unique_ptr<Transaction> txn(
+          NewTxn(WriteOptions(), TransactionOptions()));
+      ASSERT_OK(txn->SetName("prepared"));
+      ASSERT_OK(txn->Put(handles_[0], "pk_def", "pv_def"));
+      ASSERT_OK(txn->Put(handles_[1], "pk_cf", "pv_cf"));
+      ASSERT_OK(txn->Prepare());
+    }
+    {
+      std::unique_ptr<Transaction> txn(
+          NewTxn(WriteOptions(), TransactionOptions()));
+      ASSERT_OK(txn->SetName("committed"));
+      ASSERT_OK(txn->Put(handles_[0], "ck_def", "cv_def"));
+      ASSERT_OK(txn->Put(handles_[1], "ck_cf", "cv_cf"));
+      ASSERT_OK(txn->Prepare());
+      set_commit_ts_if_needed(txn.get());
+      ASSERT_OK(txn->Commit());
+    }
+    {
+      std::unique_ptr<Transaction> txn(
+          NewTxn(WriteOptions(), TransactionOptions()));
+      ASSERT_OK(txn->Put(handles_[0], "uk_def", "uv_def"));
+      ASSERT_OK(txn->Put(handles_[1], "uk_cf", "uv_cf"));
+      set_commit_ts_if_needed(txn.get());
+      ASSERT_OK(txn->Commit());
+    }
+    {
+      std::unique_ptr<Transaction> txn(
+          NewTxn(WriteOptions(), TransactionOptions()));
+      ASSERT_OK(txn->SetName("rolled"));
+      ASSERT_OK(txn->Put(handles_[0], "rk_def", "rv_def"));
+      ASSERT_OK(txn->Put(handles_[1], "rk_cf", "rv_cf"));
+      ASSERT_OK(txn->Prepare());
+      ASSERT_OK(txn->Rollback());
+    }
+
+    ColumnFamilyOptions flipped_cf =
+        initially_udt ? cf_without_udt : cf_with_udt;
+    cf_descs.clear();
+    cf_descs.emplace_back(kDefaultColumnFamilyName, options);
+    cf_descs.emplace_back(cf_name, flipped_cf);
+    ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+
+    ASSERT_EQ(nullptr, db->GetTransactionByName("noop"));
+    ASSERT_EQ(nullptr, db->GetTransactionByName("committed"));
+    ASSERT_EQ(nullptr, db->GetTransactionByName("rolled"));
+
+    Transaction* recovered = db->GetTransactionByName("prepared");
+    ASSERT_NE(nullptr, recovered);
+    if (!initially_udt) {
+      ASSERT_OK(recovered->SetCommitTimestamp(20));
+    }
+    ASSERT_OK(recovered->Commit());
+    delete recovered;
+
+    std::string value;
+    ASSERT_OK(db->Get(ReadOptions(), handles_[0], "pk_def", &value));
+    ASSERT_EQ("pv_def", value);
+    ASSERT_OK(db->Get(ReadOptions(), handles_[0], "ck_def", &value));
+    ASSERT_EQ("cv_def", value);
+    ASSERT_OK(db->Get(ReadOptions(), handles_[0], "uk_def", &value));
+    ASSERT_EQ("uv_def", value);
+    ASSERT_TRUE(
+        db->Get(ReadOptions(), handles_[0], "rk_def", &value).IsNotFound());
+
+    auto get_cf = [&](const Slice& key, std::string* out) {
+      if (initially_udt) {
+        return db->Get(ReadOptions(), handles_[1], key, out);
+      }
+      return GetFromDb(ReadOptions(), handles_[1], key, /*ts=*/20, out);
+    };
+    ASSERT_OK(get_cf("pk_cf", &value));
+    ASSERT_EQ("pv_cf", value);
+    ASSERT_OK(get_cf("ck_cf", &value));
+    ASSERT_EQ("cv_cf", value);
+    ASSERT_OK(get_cf("uk_cf", &value));
+    ASSERT_EQ("uv_cf", value);
+    ASSERT_TRUE(get_cf("rk_cf", &value).IsNotFound());
+  }
+}
+
+TEST_P(WriteCommittedTxnWithTsTest,
+       WritePolicyChangeWithUDTDisabledAndWALFails) {
+  options.avoid_flush_during_shutdown = true;
+  options.recycle_log_file_num = 0;
+  options.allow_concurrent_memtable_write = false;
+  ASSERT_OK(ReOpen());
+
+  ColumnFamilyOptions cf_with_udt;
+  cf_with_udt.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  cf_with_udt.persist_user_defined_timestamps = false;
+  ColumnFamilyHandle* created = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(cf_with_udt, "cf", &created));
+  delete created;
+
+  std::vector<ColumnFamilyDescriptor> cf_descs;
+  cf_descs.emplace_back(kDefaultColumnFamilyName, options);
+  cf_descs.emplace_back("cf", cf_with_udt);
+  ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+
+  std::unique_ptr<Transaction> txn(NewTxn(WriteOptions(), TransactionOptions()));
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->Put(handles_[1], "k", "v"));
+  ASSERT_OK(txn->Prepare());
+  ASSERT_OK(txn->SetCommitTimestamp(5));
+  ASSERT_OK(txn->Commit());
+  txn.reset();
+
+  ColumnFamilyOptions cf_without_udt;
+  cf_without_udt.comparator = BytewiseComparator();
+  cf_descs.clear();
+  cf_descs.emplace_back(kDefaultColumnFamilyName, options);
+  cf_descs.emplace_back("cf", cf_without_udt);
+  txn_db_options.write_policy = WRITE_PREPARED;
+  Status s = ReOpenNoDelete(cf_descs, &handles_);
+  ASSERT_TRUE(s.IsNotSupported());
+  txn_db_options.write_policy = WRITE_COMMITTED;
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

@@ -104,8 +104,12 @@ class UserDefinedTimestampSizeRecord {
 // but not equal, return Status::InvalidArgument.
 class TimestampRecoveryHandler : public WriteBatch::Handler {
  public:
+  // `seq_per_batch` / `batch_per_txn` describe the write policy of the DB that
+  // is replaying this batch. They decide how transaction boundary markers are
+  // rewritten and whether a WAL written under a different policy is rejected.
   TimestampRecoveryHandler(const UnorderedMap<uint32_t, size_t>& running_ts_sz,
-                           const UnorderedMap<uint32_t, size_t>& record_ts_sz);
+                           const UnorderedMap<uint32_t, size_t>& record_ts_sz,
+                           bool seq_per_batch, bool batch_per_txn);
 
   ~TimestampRecoveryHandler() override {}
 
@@ -135,19 +139,18 @@ class TimestampRecoveryHandler : public WriteBatch::Handler {
   Status PutBlobIndexCF(uint32_t cf, const Slice& key,
                         const Slice& value) override;
 
-  Status MarkBeginPrepare(bool) override { return Status::OK(); }
+  Status MarkBeginPrepare(bool unprepare) override;
 
-  Status MarkEndPrepare(const Slice&) override { return Status::OK(); }
+  Status MarkEndPrepare(const Slice& xid) override;
 
-  Status MarkCommit(const Slice&) override { return Status::OK(); }
+  Status MarkCommit(const Slice& xid) override;
 
-  Status MarkCommitWithTimestamp(const Slice&, const Slice&) override {
-    return Status::OK();
-  }
+  Status MarkCommitWithTimestamp(const Slice& xid,
+                                 const Slice& commit_ts) override;
 
-  Status MarkRollback(const Slice&) override { return Status::OK(); }
+  Status MarkRollback(const Slice& xid) override;
 
-  Status MarkNoop(bool /*empty_batch*/) override { return Status::OK(); }
+  Status MarkNoop(bool empty_batch) override;
 
   std::unique_ptr<WriteBatch>&& TransferNewBatch() {
     assert(new_batch_diff_from_orig_batch_);
@@ -176,6 +179,23 @@ class TimestampRecoveryHandler : public WriteBatch::Handler {
   // False upon creation, and become true if at least one user key from the
   // original batch is updated when creating the new batch.
   bool new_batch_diff_from_orig_batch_;
+
+  // Write policy of the DB replaying the batch. `seq_per_batch` is false for
+  // WriteCommitted (write-after-commit). `batch_per_txn` is false for
+  // WriteUnprepared (write-before-prepare).
+  const bool seq_per_batch_;
+  const bool batch_per_txn_;
+  // Set by MarkBeginPrepare and consumed by MarkEndPrepare.
+  bool unprepared_batch_;
+
+ protected:
+  using WriteBatch::Handler::OptionState;
+  OptionState WriteAfterCommit() const override {
+    return seq_per_batch_ ? OptionState::kDisabled : OptionState::kEnabled;
+  }
+  OptionState WriteBeforePrepare() const override {
+    return batch_per_txn_ ? OptionState::kDisabled : OptionState::kEnabled;
+  }
 };
 
 // Mode for checking and handling timestamp size inconsistency encountered in a
@@ -216,12 +236,18 @@ enum class TimestampSizeConsistencyMode {
 // interpreted as that column family has zero timestamp size. On the other hand,
 // `running_ts_sz` should contain the timestamp size for all running column
 // families including the ones with zero timestamp size.
+//
+// `seq_per_batch` and `batch_per_txn` are the DB's write-policy flags. Pass
+// the DB's values when recovering or verifying a WAL batch. When those flags
+// are unavailable, pass the WriteCommitted defaults (`false`, `true`). A
+// non-empty WAL whose transaction tags do not match that policy yields
+// NotSupported, including when timestamp sizes are also being reconciled.
 Status HandleWriteBatchTimestampSizeDifference(
     const WriteBatch* batch,
     const UnorderedMap<uint32_t, size_t>& running_ts_sz,
     const UnorderedMap<uint32_t, size_t>& record_ts_sz,
-    TimestampSizeConsistencyMode check_mode,
-    std::unique_ptr<WriteBatch>* new_batch = nullptr);
+    TimestampSizeConsistencyMode check_mode, bool seq_per_batch,
+    bool batch_per_txn, std::unique_ptr<WriteBatch>* new_batch = nullptr);
 
 // This util function is used when opening an existing column family and
 // processing its VersionEdit. It does a sanity check for the column family's
