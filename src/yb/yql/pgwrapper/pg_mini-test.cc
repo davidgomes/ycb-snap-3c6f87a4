@@ -30,6 +30,7 @@
 #include "yb/common/common_flags.h"
 #include "yb/common/pgsql_error.h"
 
+#include "yb/dockv/doc_key.h"
 #include "yb/dockv/value_type.h"
 
 #include "yb/integration-tests/mini_cluster.h"
@@ -3295,6 +3296,53 @@ TEST_F(PgMiniTest, TabletMetadataCorrectnessWithHashPartitioning) {
 
   LOG(INFO) << "Successfully retrieved data '" << retrieved_data
             << "' from tablet " << actual_tablet_id;
+}
+
+TEST_F(PgMiniTest, TabletMetadataRangeBoundsMatchPartitions) {
+  auto pg_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(pg_conn.Execute(
+      "CREATE TABLE range_test_table (k INT, ts TIMESTAMP, PRIMARY KEY (k ASC, ts ASC)) "
+      "SPLIT AT VALUES ((100, '2024-06-01'), (200))"));
+
+  const auto rows = ASSERT_RESULT((pg_conn.FetchRows<std::string, std::string, std::string>(
+      "SELECT tablet_id, COALESCE(start_range, '<null>'), COALESCE(end_range, '<null>') "
+      "FROM yb_tablet_metadata "
+      "WHERE db_name = current_database() AND relname = 'range_test_table' "
+      "AND start_hash_code IS NULL AND end_hash_code IS NULL")));
+  ASSERT_EQ(rows.size(), 3);
+
+  // Bounds are rendered the same way as the range partitions in the master UI tablet listing.
+  const auto render_bound = [](const std::string& partition_key) -> std::string {
+    return partition_key.empty() ? "<null>" : dockv::DocKey::DebugSliceToString(partition_key);
+  };
+  std::unordered_map<TabletId, std::pair<std::string, std::string>> expected_bounds;
+  const auto table_id = ASSERT_RESULT(GetTableIDFromTableName("range_test_table"));
+  for (const auto& peer : ListTableActiveTabletLeadersPeers(cluster_.get(), table_id)) {
+    const auto partition = ASSERT_RESULT(peer->shared_tablet())->metadata()->partition();
+    expected_bounds.emplace(
+        peer->tablet_id(),
+        std::pair(
+            render_bound(partition->partition_key_start()),
+            render_bound(partition->partition_key_end())));
+  }
+  ASSERT_EQ(expected_bounds.size(), rows.size());
+
+  for (const auto& [tablet_id, start_range, end_range] : rows) {
+    LOG(INFO) << "Tablet " << tablet_id << " range: [" << start_range << ", " << end_range << ")";
+    const auto it = expected_bounds.find(tablet_id);
+    ASSERT_NE(it, expected_bounds.end()) << "Unexpected tablet " << tablet_id;
+    ASSERT_EQ(start_range, it->second.first);
+    ASSERT_EQ(end_range, it->second.second);
+  }
+
+  // Timestamps are rendered as int64 microseconds since the PostgreSQL epoch.
+  const auto split_ts_us = ASSERT_RESULT(pg_conn.FetchRow<int64_t>(
+      "SELECT (EXTRACT(EPOCH FROM TIMESTAMP '2024-06-01' - TIMESTAMP '2000-01-01') "
+      "* 1000000)::bigint"));
+  const auto first_split = Format("DocKey([], [100, $0])", split_ts_us);
+  const auto num_rows_ending_at_first_split = std::ranges::count_if(
+      rows, [&first_split](const auto& row) { return std::get<2>(row) == first_split; });
+  ASSERT_EQ(num_rows_ending_at_first_split, 1);
 }
 
 TEST_F(PgMiniTest, TabletMetadataOidMatchesPgClass) {
