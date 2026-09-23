@@ -46,6 +46,36 @@ func TestGetStartRequestID(t *testing.T) {
 			expected: "start-request-id",
 		},
 		{
+			name: "create request ID tracked as start request ID",
+			executionState: &persistencespb.WorkflowExecutionState{
+				CreateRequestId: "create-request-id",
+				RequestIds: map[string]*persistencespb.RequestIDInfo{
+					"create-request-id": {
+						EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+						EventId:   1,
+					},
+				},
+			},
+			expected: "create-request-id",
+		},
+		{
+			name: "reset request ID tracked alongside original start request ID",
+			executionState: &persistencespb.WorkflowExecutionState{
+				CreateRequestId: "reset-request-id",
+				RequestIds: map[string]*persistencespb.RequestIDInfo{
+					"reset-request-id": {
+						EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+						EventId:   1,
+					},
+					"start-request-id": {
+						EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+						EventId:   1,
+					},
+				},
+			},
+			expected: "start-request-id",
+		},
+		{
 			name: "only attached request IDs falls back to create request ID",
 			executionState: &persistencespb.WorkflowExecutionState{
 				CreateRequestId: "create-request-id",

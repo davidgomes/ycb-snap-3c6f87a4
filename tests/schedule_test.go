@@ -1591,7 +1591,9 @@ func (s *ScheduleCHASMFunctionalSuite) testCompletionAfterReset(attachCallback b
 		RunId:      startResult.RunId,
 	}
 	s.waitForWorkflowTaskCompleted(latestRun)
-	startRequestID := s.getStartRequestID(latestRun)
+	startRequestIDs := s.getStartRequestIDs(latestRun)
+	s.Len(startRequestIDs, 1)
+	startRequestID := startRequestIDs[0]
 
 	var ch *completionHandler
 	attachRequestID := uuid.NewString()
@@ -1627,21 +1629,28 @@ func (s *ScheduleCHASMFunctionalSuite) testCompletionAfterReset(attachCallback b
 		s.Equal(latestRun.RunId, startResp.RunId)
 	}
 
+	var previousResetRequestID string
 	for range 2 {
 		s.waitForWorkflowTaskCompleted(latestRun)
+		resetRequestID := uuid.NewString()
 		resetResp, err := s.FrontendClient().ResetWorkflowExecution(s.newContext(), &workflowservice.ResetWorkflowExecutionRequest{
 			Namespace:                 s.Namespace().String(),
 			WorkflowExecution:         latestRun,
 			Reason:                    "test",
 			WorkflowTaskFinishEventId: 3,
-			RequestId:                 uuid.NewString(),
+			RequestId:                 resetRequestID,
 		})
 		s.NoError(err)
 		latestRun = &commonpb.WorkflowExecution{
 			WorkflowId: latestRun.WorkflowId,
 			RunId:      resetResp.RunId,
 		}
-		s.Equal(startRequestID, s.getStartRequestID(latestRun))
+		// The reset request ID is tracked for reset dedup; the original start request ID must be retained, and
+		// request IDs of intermediate runs must not be carried over.
+		startRequestIDs := s.getStartRequestIDs(latestRun)
+		s.Contains(startRequestIDs, startRequestID)
+		s.NotContains(startRequestIDs, previousResetRequestID)
+		previousResetRequestID = resetRequestID
 	}
 
 	if attachCallback {
@@ -1700,7 +1709,7 @@ func (s *ScheduleCHASMFunctionalSuite) waitForWorkflowTaskCompleted(execution *c
 	}, 15*time.Second, 200*time.Millisecond)
 }
 
-func (s *ScheduleCHASMFunctionalSuite) getStartRequestID(execution *commonpb.WorkflowExecution) string {
+func (s *ScheduleCHASMFunctionalSuite) getStartRequestIDs(execution *commonpb.WorkflowExecution) []string {
 	descResp, err := s.FrontendClient().DescribeWorkflowExecution(s.newContext(), &workflowservice.DescribeWorkflowExecutionRequest{
 		Namespace: s.Namespace().String(),
 		Execution: execution,
@@ -1712,8 +1721,7 @@ func (s *ScheduleCHASMFunctionalSuite) getStartRequestID(execution *commonpb.Wor
 			startRequestIDs = append(startRequestIDs, requestID)
 		}
 	}
-	s.Len(startRequestIDs, 1)
-	return startRequestIDs[0]
+	return startRequestIDs
 }
 
 func (s *scheduleFunctionalSuiteBase) TestCountSchedules() {

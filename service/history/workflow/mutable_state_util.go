@@ -10,15 +10,17 @@ import (
 	"go.temporal.io/server/service/history/tasks"
 )
 
-// GetStartRequestID returns the request ID associated with the WorkflowExecutionStarted event. For runs created by a
-// reset this is the original start request ID, while CreateRequestId is the reset request ID.
+// GetStartRequestID returns the original request ID associated with the WorkflowExecutionStarted event. For runs
+// created by a reset, CreateRequestId is the reset request ID and is also tracked as a WorkflowExecutionStarted
+// request ID, so any other WorkflowExecutionStarted request ID takes precedence.
 func GetStartRequestID(executionState *persistencespb.WorkflowExecutionState) string {
+	createRequestID := executionState.GetCreateRequestId()
 	for requestID, info := range executionState.GetRequestIds() {
-		if info.GetEventType() == enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED {
+		if requestID != createRequestID && info.GetEventType() == enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED {
 			return requestID
 		}
 	}
-	return executionState.GetCreateRequestId()
+	return createRequestID
 }
 
 func convertSyncActivityInfos(
