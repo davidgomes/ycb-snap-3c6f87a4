@@ -281,6 +281,141 @@ start_server {tags {"string"}} {
         list [r msetnx x1{t} xxx x1{t} zzz] [r get x1{t}]
     } {0 yyy}
 
+    test {MSETEX base case} {
+        r del x{t} y{t}
+        assert_equal 1 [r msetex 2 x{t} 1 y{t} 2]
+        assert_equal {1 2} [r mget x{t} y{t}]
+        assert_equal {-1 -1} [list [r ttl x{t}] [r ttl y{t}]]
+    }
+
+    test {MSETEX with EX / PX / EXAT / PXAT} {
+        r del x{t} y{t}
+        assert_equal 1 [r msetex 2 x{t} a y{t} b EX 100]
+        assert_range [r ttl x{t}] 90 100
+        assert_range [r ttl y{t}] 90 100
+        assert_equal 1 [r msetex 2 x{t} a y{t} b px 100000]
+        assert_range [r pttl x{t}] 90000 100000
+        assert_range [r pttl y{t}] 90000 100000
+        set ts [expr {[clock seconds] + 200}]
+        assert_equal 1 [r msetex 2 x{t} a y{t} b EXAT $ts]
+        assert_equal [list $ts $ts] [list [r expiretime x{t}] [r expiretime y{t}]]
+        set ts [expr {[clock milliseconds] + 300000}]
+        assert_equal 1 [r msetex 2 x{t} a y{t} b PXAT $ts]
+        assert_equal [list $ts $ts] [list [r pexpiretime x{t}] [r pexpiretime y{t}]]
+        assert_equal {a b} [r mget x{t} y{t}]
+    }
+
+    test {MSETEX without expire option clears TTL, KEEPTTL retains it} {
+        r del x{t} y{t}
+        r set x{t} old EX 100
+        assert_equal 1 [r msetex 2 x{t} a y{t} b KEEPTTL]
+        assert_range [r ttl x{t}] 90 100
+        assert_equal -1 [r ttl y{t}]
+        assert_equal 1 [r msetex 1 x{t} c]
+        assert_equal -1 [r ttl x{t}]
+        assert_equal c [r get x{t}]
+    }
+
+    test {MSETEX NX} {
+        r del x{t} y{t} z{t}
+        r set z{t} old
+        assert_equal 0 [r msetex 2 x{t} a z{t} b NX EX 100]
+        assert_equal {0 old} [list [r exists x{t}] [r get z{t}]]
+        assert_equal 1 [r msetex 2 x{t} a y{t} b NX EX 100]
+        assert_equal {a b} [r mget x{t} y{t}]
+        assert_range [r ttl y{t}] 90 100
+        r del x{t}
+        assert_equal 1 [r msetex 2 x{t} a x{t} b NX]
+        assert_equal b [r get x{t}]
+    }
+
+    test {MSETEX XX} {
+        r del x{t} y{t} z{t}
+        r set x{t} old
+        assert_equal 0 [r msetex 2 x{t} a y{t} b XX PX 100000]
+        assert_equal {old 0} [list [r get x{t}] [r exists y{t}]]
+        r set y{t} old
+        assert_equal 1 [r msetex 2 x{t} a y{t} b XX PX 100000]
+        assert_equal {a b} [r mget x{t} y{t}]
+        assert_range [r pttl x{t}] 90000 100000
+    }
+
+    test {MSETEX overwrites keys of other types} {
+        r del x{t}
+        r lpush x{t} a
+        assert_equal 1 [r msetex 1 x{t} v EX 100]
+        assert_equal v [r get x{t}]
+    }
+
+    test {MSETEX with an already elapsed absolute expire deletes the keys} {
+        r del x{t} y{t}
+        r set x{t} old
+        assert_equal 1 [r msetex 2 x{t} a y{t} b PXAT 1]
+        assert_equal {0 0} [list [r exists x{t}] [r exists y{t}]]
+    }
+
+    test {MSETEX invalid numkeys} {
+        assert_error {*invalid numkeys*} {r msetex 0 x{t} a}
+        assert_error {*invalid numkeys*} {r msetex -1 x{t} a}
+        assert_error {*invalid numkeys*} {r msetex abc x{t} a}
+        assert_error {*wrong number of arguments*} {r msetex 2 x{t} a y{t}}
+        assert_error {*wrong number of arguments*} {r msetex 3 x{t} a y{t} b}
+        assert_error {*wrong number of arguments*} {r msetex 1 x{t}}
+    }
+
+    test {MSETEX syntax errors and conflicting options} {
+        r del x{t} y{t}
+        assert_error {*syntax*} {r msetex 1 x{t} a y{t}}
+        assert_error {*syntax*} {r msetex 1 x{t} a NX XX}
+        assert_error {*syntax*} {r msetex 1 x{t} a EX 10 PX 100}
+        assert_error {*syntax*} {r msetex 1 x{t} a EX 10 KEEPTTL}
+        assert_error {*syntax*} {r msetex 1 x{t} a KEEPTTL EXAT 10}
+        assert_error {*syntax*} {r msetex 1 x{t} a GET}
+        assert_error {*syntax*} {r msetex 1 x{t} a IFEQ a}
+        assert_error {*syntax*} {r msetex 1 x{t} a EX}
+        assert_equal 0 [r exists x{t} y{t}]
+    }
+
+    test {MSETEX invalid expire values} {
+        r del x{t}
+        assert_error {*invalid expire time*} {r msetex 1 x{t} a EX 0}
+        assert_error {*invalid expire time*} {r msetex 1 x{t} a PX -1}
+        assert_error {*invalid expire time*} {r msetex 1 x{t} a EXAT 9223372036854775807}
+        assert_error {*not an integer*} {r msetex 1 x{t} a EX foo}
+        assert_equal 0 [r exists x{t}]
+    }
+
+    test {MSETEX keyspace notifications} {
+        r del x{t} y{t}
+        r config set notify-keyspace-events KEA
+        set rd [valkey_deferring_client]
+        $rd psubscribe __keyevent@*__:*
+        $rd read
+        r msetex 2 x{t} a y{t} b EX 100
+        assert_match {*set*x{t}*} [$rd read]
+        assert_match {*expire*x{t}*} [$rd read]
+        assert_match {*set*y{t}*} [$rd read]
+        assert_match {*expire*y{t}*} [$rd read]
+        $rd close
+        r config set notify-keyspace-events ""
+    } {OK} {needs:config-notify-keyspace-events}
+
+    test {MSETEX propagates relative expire as absolute PXAT} {
+        r del x{t} y{t} z{t}
+        r set z{t} old
+        set repl [attach_to_replication_stream]
+        r msetex 2 x{t} a y{t} b NX EX 100
+        r msetex 1 z{t} c XX KEEPTTL
+        r msetex 2 x{t} a z{t} b PXAT 1
+        assert_replication_stream $repl {
+            {select *}
+            {msetex 2 x{t} a y{t} b PXAT *}
+            {msetex 1 z{t} c XX KEEPTTL}
+            {*l* x{t} z{t}}
+        }
+        close_replication_stream $repl
+    } {} {needs:repl}
+
     test "STRLEN against non-existing key" {
         assert_equal 0 [r strlen notakey]
     }
