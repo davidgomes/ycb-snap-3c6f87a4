@@ -284,14 +284,14 @@ Type_handler::handler_by_name_or_error(THD *thd, const LEX_CSTRING &name)
 
 bool Type_handler::check_data_type_attributes(
                             const LEX_CSTRING &name,
-                            const Lex_length_and_dec_st &attr,
+                            const Lex_length_and_dec_st &length_and_dec,
                             const Lex_column_charset_collation_attrs_st &coll,
                             uint32 srid) const
 {
   uint column_attributes;
 
-  column_attributes= attr.has_explicit_length() ? ATTR_LENGTH : 0;
-  column_attributes|= attr.has_explicit_dec() ? ATTR_DEC : 0;
+  column_attributes= length_and_dec.has_explicit_length() ? ATTR_LENGTH : 0;
+  column_attributes|= length_and_dec.has_explicit_dec() ? ATTR_DEC : 0;
   column_attributes|= coll.is_empty() ? 0 : ATTR_CHARSET;
   column_attributes|= srid ? ATTR_SRID : 0;
 
