@@ -212,7 +212,7 @@ func (s *Shard) propagateWithinRangeForTest(t *testing.T, ctx context.Context,
 	asyncCheckpointCutoff int64,
 ) (int, []objectToPropagate, error) {
 	t.Helper()
-	cursor := s.store.Bucket(helpers.ObjectsBucketLSM).CursorReplaceReusable()
+	cursor := s.store.Bucket(helpers.ObjectsBucketLSM).CursorReplaceDigestReusable(storobj.MarshallerV1HeaderLen)
 	defer cursor.Close()
 	scratch := newPropagationScratch(cfg.diffBatchSize)
 	return s.objectsToPropagateWithinRange(ctx, cfg, cursor, scratch, addr, node, initialLeaf, finalLeaf, limit, overrides, asyncCheckpointCutoff)
@@ -223,7 +223,7 @@ func (s *Shard) propagateWithinRangeForTest(t *testing.T, ctx context.Context,
 // TestObjectsToPropagateWithinRange covers the scanning and filtering logic
 // inside objectsToPropagateWithinRange. Tests use well-known UUIDs so that
 // batch ordering is deterministic. Flushing is not required for visibility:
-// ObjectDigestsInRange uses bucket.Cursor(), which includes memtables.
+// the digest scan's merged bucket cursor includes memtables.
 func TestObjectsToPropagateWithinRange(t *testing.T) {
 	ctx := context.Background()
 	const class = "PropagateRangeTest"
@@ -449,7 +449,7 @@ func TestObjectsToPropagateWithinRange(t *testing.T) {
 		require.NoError(t, s.store.FlushMemtables(ctx))
 		cfg := fullRangeConfig(100)
 
-		cursor := s.store.Bucket(helpers.ObjectsBucketLSM).CursorReplaceReusable()
+		cursor := s.store.Bucket(helpers.ObjectsBucketLSM).CursorReplaceDigestReusable(storobj.MarshallerV1HeaderLen)
 		defer cursor.Close()
 		scratch := newPropagationScratch(cfg.diffBatchSize)
 
@@ -790,6 +790,61 @@ func TestInitScanPopulatesHashtree(t *testing.T) {
 		"hashtree root must be non-zero: on-disk objects must have been registered by init scan")
 
 	require.NoError(t, s.disableAsyncReplication(context.Background()))
+}
+
+// TestInitScanRegistersOnlyNewestObjectVersions guards the init scan against
+// registering an object's stale on-disk version when its newest version is
+// still in the memtable. The hashtree XOR-aggregates digests, so a stale extra
+// digest would leave the leaf diverged from every in-sync replica for good.
+func TestInitScanRegistersOnlyNewestObjectVersions(t *testing.T) {
+	ctx := context.Background()
+	const class = "InitScanNewestVersionsTest"
+
+	const (
+		tsOld int64 = 1_000
+		tsNew int64 = 2_000
+	)
+
+	sl, _ := testShard(t, ctx, class, withAsyncScheduler(t))
+	s := concreteShard(t, sl)
+
+	for _, id := range []strfmt.UUID{uuidLow, uuidMid, uuidHigh} {
+		obj := testObjWithTime(class, id, tsOld)
+		obj.Vector = make([]float32, 1536)
+		require.NoError(t, sl.PutObject(ctx, obj))
+	}
+	require.NoError(t, s.store.FlushMemtables(ctx))
+
+	// Newest versions stay in the memtable: uuidLow is updated (the shard
+	// assigns it a new docID) and uuidMid is deleted.
+	updated := testObjWithTime(class, uuidLow, tsNew)
+	updated.Vector = make([]float32, 1536)
+	updated.Vector[0] = 1
+	require.NoError(t, sl.PutObject(ctx, updated))
+	require.NoError(t, sl.DeleteObject(ctx, uuidMid, time.UnixMilli(tsNew)))
+
+	cfg := minAsyncReplicationConfig()
+	require.NoError(t, s.enableAsyncReplication(ctx, cfg))
+	awaitHashtreeInitialized(t, s)
+
+	s.asyncReplicationRWMux.RLock()
+	require.NotNil(t, s.hashtree)
+	height := s.hashtree.Height()
+	root := s.hashtree.Root()
+	s.asyncReplicationRWMux.RUnlock()
+
+	expected, err := hashtree.NewHashTree(height)
+	require.NoError(t, err)
+	for id, updateTime := range map[strfmt.UUID]int64{uuidLow: tsNew, uuidHigh: tsOld} {
+		uuidBytes, err := bytesFromUUID(id)
+		require.NoError(t, err)
+		require.NoError(t, aggregateHashTreeLeaf(expected, height, uuidBytes, updateTime))
+	}
+
+	require.Equal(t, expected.Root(), root,
+		"init scan must register exactly the newest version of every live object")
+
+	require.NoError(t, s.disableAsyncReplication(ctx))
 }
 
 // ─── propagateObjects ─────────────────────────────────────────────────────────
