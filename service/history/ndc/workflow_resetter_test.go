@@ -326,6 +326,8 @@ func (s *workflowResetterSuite) TestReplayResetWorkflow() {
 	resetMutableState.EXPECT().AddHistorySize(resetStats.HistorySize)
 	resetMutableState.EXPECT().AddExternalPayloadSize(resetStats.ExternalPayloadSize)
 	resetMutableState.EXPECT().AddExternalPayloadCount(resetStats.ExternalPayloadCount)
+	executionState := &persistencespb.WorkflowExecutionState{CreateRequestId: resetRequestID}
+	resetMutableState.EXPECT().GetExecutionState().Return(executionState)
 
 	resetWorkflow, err := s.workflowResetter.replayResetWorkflow(
 		ctx,
@@ -337,9 +339,11 @@ func (s *workflowResetterSuite) TestReplayResetWorkflow() {
 		baseRebuildLastEventVersion,
 		s.resetRunID,
 		resetRequestID,
+		"reset-operation-request-id",
 	)
 	s.NoError(err)
 	s.Equal(resetMutableState, resetWorkflow.GetMutableState())
+	s.Equal("reset-operation-request-id", executionState.CreateRequestId)
 }
 
 func (s *workflowResetterSuite) TestFailWorkflowTask_NoWorkflowTask() {
@@ -1576,6 +1580,7 @@ func (s *workflowResetterSuite) TestWorkflowRestartAfterExecutionTimeout() {
 		baseRebuildLastEventVersion,
 		s.resetRunID,
 		resetRequestID,
+		"reset-operation-request-id",
 		resetWorkflowVersion,
 		resetReason,
 		false, // allowResetWithPendingChildren

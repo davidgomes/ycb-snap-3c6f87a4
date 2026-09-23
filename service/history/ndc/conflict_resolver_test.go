@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	enumspb "go.temporal.io/api/enums/v1"
 	historyspb "go.temporal.io/server/api/history/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/definition"
@@ -108,6 +109,7 @@ func (s *conflictResolverSuite) TestRebuild() {
 	_, _, err := versionhistory.AddAndSwitchVersionHistory(versionHistories, versionHistory1)
 	s.NoError(err)
 
+	startRequestID := uuid.NewString()
 	s.mockMutableState.EXPECT().GetUpdateCondition().Return(updateCondition, dbVersion).AnyTimes()
 	s.mockMutableState.EXPECT().GetExecutionInfo().Return(&persistencespb.WorkflowExecutionInfo{
 		NamespaceId:      s.namespaceID,
@@ -115,7 +117,14 @@ func (s *conflictResolverSuite) TestRebuild() {
 		VersionHistories: versionHistories,
 	}).AnyTimes()
 	s.mockMutableState.EXPECT().GetExecutionState().Return(&persistencespb.WorkflowExecutionState{
-		RunId: s.runID,
+		RunId:           s.runID,
+		CreateRequestId: requestID,
+		RequestIds: map[string]*persistencespb.RequestIDInfo{
+			startRequestID: {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+				EventId:   1,
+			},
+		},
 	}).AnyTimes()
 	s.mockMutableState.EXPECT().GetHistorySize().Return(historySize).AnyTimes()
 	s.mockMutableState.EXPECT().GetExternalPayloadSize().Return(externalPayloadSize).AnyTimes()
@@ -141,6 +150,8 @@ func (s *conflictResolverSuite) TestRebuild() {
 	mockRebuildMutableState.EXPECT().AddExternalPayloadSize(externalPayloadSize)
 	mockRebuildMutableState.EXPECT().AddExternalPayloadCount(externalPayloadCount)
 	mockRebuildMutableState.EXPECT().SetUpdateCondition(updateCondition, dbVersion)
+	rebuiltExecutionState := &persistencespb.WorkflowExecutionState{}
+	mockRebuildMutableState.EXPECT().GetExecutionState().Return(rebuiltExecutionState)
 
 	s.mockStateBuilder.EXPECT().Rebuild(
 		ctx,
@@ -151,7 +162,7 @@ func (s *conflictResolverSuite) TestRebuild() {
 		util.Ptr(version),
 		workflowKey,
 		branchToken1,
-		requestID,
+		startRequestID,
 	).Return(mockRebuildMutableState, RebuildStats{
 		HistorySize:          rand.Int63(),
 		ExternalPayloadSize:  rand.Int63(),
@@ -159,10 +170,12 @@ func (s *conflictResolverSuite) TestRebuild() {
 	}, nil)
 
 	s.mockContext.EXPECT().Clear()
-	rebuiltMutableState, err := s.nDCConflictResolver.rebuild(ctx, 1, requestID)
+	rebuiltMutableState, err := s.nDCConflictResolver.rebuild(ctx, 1)
 	s.NoError(err)
 	s.NotNil(rebuiltMutableState)
 	s.Equal(int32(1), versionHistories.GetCurrentVersionHistoryIndex())
+	// CreateRequestId stays the reset operation ID; rebuild uses the start request ID.
+	s.Equal(requestID, rebuiltExecutionState.CreateRequestId)
 }
 
 func (s *conflictResolverSuite) TestGetOrRebuildCurrentMutableState_NoRebuild_NotCurrent() {

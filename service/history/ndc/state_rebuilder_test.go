@@ -370,6 +370,31 @@ func (s *stateRebuilderSuite) TestRebuild() {
 	), rebuildMutableState.GetExecutionInfo().GetVersionHistories())
 	s.Equal(timestamp.TimeValue(rebuildMutableState.GetExecutionState().StartTime), s.now)
 	s.Equal(expectedLastFirstTransactionID, rebuildExecutionInfo.LastFirstEventTxnId)
+	s.Equal(requestID, rebuildMutableState.GetExecutionState().GetCreateRequestId())
+	startInfo, ok := rebuildMutableState.GetExecutionState().GetRequestIds()[requestID]
+	s.True(ok)
+	s.Equal(enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, startInfo.GetEventType())
+}
+
+func (s *stateRebuilderSuite) TestFindStartRequestID() {
+	original := "original-start-request-id"
+	s.Equal(original, findStartRequestID(&persistencespb.WorkflowExecutionState{
+		CreateRequestId: "reset-operation-request-id",
+		RequestIds: map[string]*persistencespb.RequestIDInfo{
+			"attached-callback-request-id": {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+				EventId:   5,
+			},
+			original: {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+				EventId:   common.FirstEventID,
+			},
+		},
+	}))
+	s.Equal("legacy-create-request-id", findStartRequestID(&persistencespb.WorkflowExecutionState{
+		CreateRequestId: "legacy-create-request-id",
+	}))
+	s.Empty(findStartRequestID(nil))
 }
 
 func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
@@ -470,6 +495,21 @@ func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
 		},
 	}
 	s.mockClusterMetadata.EXPECT().ClusterNameForFailoverVersion(true, int64(12)).Return(cluster.TestCurrentClusterName).AnyTimes()
+	// CreateRequestId is a later reset operation ID and must not be used for the
+	// start-event callback. RequestIds still has the original start request ID.
+	currentMutableState.ExecutionState = &persistencespb.WorkflowExecutionState{
+		CreateRequestId: "later-run-create-request-id",
+		RequestIds: map[string]*persistencespb.RequestIDInfo{
+			requestID: {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+				EventId:   common.FirstEventID,
+			},
+			"attached-callback-request-id": {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+				EventId:   5,
+			},
+		},
+	}
 	rebuildMutableState, rebuildStats, err := s.nDCStateRebuilder.RebuildWithCurrentMutableState(
 		context.Background(),
 		s.now,
@@ -479,7 +519,6 @@ func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
 		util.Ptr(version),
 		definition.NewWorkflowKey(targetNamespaceID.String(), targetWorkflowID, targetRunID),
 		targetBranchToken,
-		requestID,
 		currentMutableState,
 	)
 	s.NoError(err)
@@ -498,4 +537,10 @@ func (s *stateRebuilderSuite) TestRebuildWithCurrentMutableState() {
 	s.Equal(timestamp.TimeValue(rebuildMutableState.GetExecutionState().StartTime), s.now)
 	s.Equal(expectedLastFirstTransactionID, rebuildExecutionInfo.LastFirstEventTxnId)
 	s.Equal(int64(11), rebuildExecutionInfo.TransitionHistory[0].TransitionCount)
+	// Start-event callbacks stay on the original request ID. CreateRequestId keeps
+	// the later run's value so reset dedup is unchanged.
+	s.Equal("later-run-create-request-id", rebuildMutableState.GetExecutionState().GetCreateRequestId())
+	startInfo, ok := rebuildMutableState.GetExecutionState().GetRequestIds()[requestID]
+	s.True(ok)
+	s.Equal(enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, startInfo.GetEventType())
 }

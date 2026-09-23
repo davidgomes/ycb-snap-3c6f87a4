@@ -203,6 +203,13 @@ func (r *workflowResetterImpl) ResetWorkflow(
 		}
 	}
 
+	// Use the original start request ID from the base run so callbacks on the
+	// reset workflow stay associated with the first run's start request.
+	// Run ID already distinguishes executions, so this request ID can be reused
+	// across chained resets. Reading RequestIds (not CreateRequestId) avoids
+	// picking up a previous reset's operation ID.
+	startRequestID := findStartRequestID(baseWorkflow.GetMutableState().GetExecutionState())
+
 	resetWorkflow, err := r.prepareResetWorkflow(
 		ctx,
 		namespaceID,
@@ -212,6 +219,7 @@ func (r *workflowResetterImpl) ResetWorkflow(
 		baseRebuildLastEventID,
 		baseRebuildLastEventVersion,
 		resetRunID,
+		startRequestID,
 		resetRequestID,
 		resetWorkflowVersion,
 		resetReason,
@@ -263,6 +271,7 @@ func (r *workflowResetterImpl) prepareResetWorkflow(
 	baseRebuildLastEventID int64,
 	baseRebuildLastEventVersion int64,
 	resetRunID string,
+	startRequestID string,
 	resetRequestID string,
 	resetWorkflowVersion int64,
 	resetReason string,
@@ -278,6 +287,7 @@ func (r *workflowResetterImpl) prepareResetWorkflow(
 		baseRebuildLastEventID,
 		baseRebuildLastEventVersion,
 		resetRunID,
+		startRequestID,
 		resetRequestID,
 	)
 	if err != nil {
@@ -434,6 +444,7 @@ func (r *workflowResetterImpl) replayResetWorkflow(
 	baseRebuildLastEventID int64,
 	baseRebuildLastEventVersion int64,
 	resetRunID string,
+	startRequestID string,
 	resetRequestID string,
 ) (Workflow, error) {
 
@@ -479,10 +490,18 @@ func (r *workflowResetterImpl) replayResetWorkflow(
 			resetRunID,
 		),
 		resetBranchToken,
-		resetRequestID,
+		startRequestID,
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	// Applying WorkflowExecutionStarted records the start request ID in both
+	// RequestIds and CreateRequestId. CreateRequestId is how ResetWorkflow retries
+	// are deduped, so put the reset operation ID back without touching RequestIds.
+	// Completion callbacks stay bound to the original start request ID.
+	if resetRequestID != "" {
+		resetMutableState.GetExecutionState().CreateRequestId = resetRequestID
 	}
 
 	resetMutableState.SetBaseWorkflow(
