@@ -1341,6 +1341,57 @@ func TestHandleResetRequestID(t *testing.T) {
 	})
 }
 
+func TestHandleResetPreservesHeartbeatUntilOptIn(t *testing.T) {
+	details := &commonpb.Payloads{Payloads: []*commonpb.Payload{{Data: []byte("checkpoint")}}}
+
+	t.Run("started defers clear", func(t *testing.T) {
+		ctx := newOperatorCommandTestContext(t)
+		activity := &Activity{
+			ActivityState: &activitypb.ActivityState{
+				ActivityType: &commonpb.ActivityType{Name: "test-activity-type"},
+				Status:       activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+				TaskQueue:    &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+			},
+			LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{Count: 4}),
+			LastHeartbeat: chasm.NewDataField(ctx, &activitypb.ActivityHeartbeatState{
+				Details: details,
+			}),
+		}
+
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{},
+		})
+		require.NoError(t, err)
+		require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED, activity.Status)
+		require.False(t, activity.ResetShouldClearHeartbeat)
+		require.Equal(t, int32(4), activity.LastAttempt.Get(ctx).GetCount())
+		require.Equal(t, details, activity.LastHeartbeat.Get(ctx).GetDetails())
+	})
+
+	t.Run("scheduled keeps details by default", func(t *testing.T) {
+		ctx := newOperatorCommandTestContext(t)
+		activity := &Activity{
+			ActivityState: &activitypb.ActivityState{
+				ActivityType: &commonpb.ActivityType{Name: "test-activity-type"},
+				Status:       activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+				TaskQueue:    &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+			},
+			LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{Count: 4}),
+			LastHeartbeat: chasm.NewDataField(ctx, &activitypb.ActivityHeartbeatState{
+				Details: details,
+			}),
+		}
+
+		_, err := activity.handleReset(ctx, &activitypb.ResetActivityExecutionRequest{
+			FrontendRequest: &workflowservice.ResetActivityExecutionRequest{},
+		})
+		require.NoError(t, err)
+		require.Equal(t, int32(1), activity.LastAttempt.Get(ctx).GetCount())
+		require.Equal(t, details, activity.LastHeartbeat.Get(ctx).GetDetails())
+		require.False(t, activity.ResetShouldClearHeartbeat)
+	})
+}
+
 func TestUpdateActivityExecutionOptionsRequestID(t *testing.T) {
 	t.Run("deduplicates latest request ID", func(t *testing.T) {
 		ctx := &chasm.MockMutableContext{}

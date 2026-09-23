@@ -912,8 +912,9 @@ func TestTransitionCancelRequestedClearsDeferredOptionRestore(t *testing.T) {
 	ctx.HandleNow = func(chasm.Component) time.Time { return defaultTime }
 	activity := &Activity{
 		ActivityState: &activitypb.ActivityState{
-			Status:              activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED,
-			ResetRestoreOptions: true,
+			Status:                    activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED,
+			ResetRestoreOptions:       true,
+			ResetShouldClearHeartbeat: true,
 		},
 	}
 
@@ -921,6 +922,7 @@ func TestTransitionCancelRequestedClearsDeferredOptionRestore(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_CANCEL_REQUESTED, activity.Status)
 	require.False(t, activity.ResetRestoreOptions)
+	require.False(t, activity.ResetShouldClearHeartbeat)
 }
 
 func TestTransitionCanceled(t *testing.T) {
@@ -1023,56 +1025,87 @@ func TestTransitionCanceled(t *testing.T) {
 	}
 }
 
-func TestTransitionResetClearsHeartbeat(t *testing.T) {
-	ctx := &chasm.MockMutableContext{}
-	ctx.HandleNow = func(chasm.Component) time.Time { return defaultTime }
-	attemptState := &activitypb.ActivityAttemptState{Count: 2}
-	heartbeatState := &activitypb.ActivityHeartbeatState{
-		Details:      payloads.EncodeString("heartbeat-details"),
-		RecordedTime: timestamppb.New(defaultTime),
-	}
+func TestTransitionResetHeartbeatPolicy(t *testing.T) {
+	for _, clear := range []bool{false, true} {
+		t.Run(fmt.Sprintf("resetHeartbeat=%v", clear), func(t *testing.T) {
+			ctx := &chasm.MockMutableContext{}
+			ctx.HandleNow = func(chasm.Component) time.Time { return defaultTime }
+			attemptState := &activitypb.ActivityAttemptState{Count: 2}
+			heartbeatState := &activitypb.ActivityHeartbeatState{
+				Details:      payloads.EncodeString("heartbeat-details"),
+				RecordedTime: timestamppb.New(defaultTime),
+			}
 
-	act := &Activity{
-		ActivityState: &activitypb.ActivityState{
-			ActivityType:           &commonpb.ActivityType{Name: "test-activity-type"},
-			RetryPolicy:            defaultRetryPolicy,
-			ScheduleToCloseTimeout: durationpb.New(defaultScheduleToCloseTimeout),
-			ScheduleToStartTimeout: durationpb.New(defaultScheduleToStartTimeout),
-			StartToCloseTimeout:    durationpb.New(defaultStartToCloseTimeout),
-			Status:                 activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
-			ScheduleTime:           timestamppb.New(defaultTime),
-			TaskQueue:              &taskqueuepb.TaskQueue{Name: "test-task-queue"},
-		},
-		LastAttempt:   chasm.NewDataField(ctx, attemptState),
-		LastHeartbeat: chasm.NewDataField(ctx, heartbeatState),
-		Outcome:       chasm.NewDataField(ctx, &activitypb.ActivityOutcome{}),
-	}
+			act := &Activity{
+				ActivityState: &activitypb.ActivityState{
+					ActivityType:           &commonpb.ActivityType{Name: "test-activity-type"},
+					RetryPolicy:            defaultRetryPolicy,
+					ScheduleToCloseTimeout: durationpb.New(defaultScheduleToCloseTimeout),
+					ScheduleToStartTimeout: durationpb.New(defaultScheduleToStartTimeout),
+					StartToCloseTimeout:    durationpb.New(defaultStartToCloseTimeout),
+					Status:                 activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+					ScheduleTime:           timestamppb.New(defaultTime),
+					TaskQueue:              &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+				},
+				LastAttempt:   chasm.NewDataField(ctx, attemptState),
+				LastHeartbeat: chasm.NewDataField(ctx, heartbeatState),
+				Outcome:       chasm.NewDataField(ctx, &activitypb.ActivityOutcome{}),
+			}
 
-	err := TransitionReset.Apply(act, ctx, resetEvent{resetTime: defaultTime, metricsHandler: metrics.NoopMetricsHandler})
-	require.NoError(t, err)
-	require.Nil(t, act.LastHeartbeat.Get(ctx).GetDetails())
-	require.Nil(t, act.LastHeartbeat.Get(ctx).GetRecordedTime())
+			err := TransitionReset.Apply(act, ctx, resetEvent{
+				resetTime:      defaultTime,
+				metricsHandler: metrics.NoopMetricsHandler,
+				ResetHeartbeat: clear,
+			})
+			require.NoError(t, err)
+			require.Equal(t, int32(1), attemptState.Count)
+			if clear {
+				require.Nil(t, act.LastHeartbeat.Get(ctx).GetDetails())
+				require.Nil(t, act.LastHeartbeat.Get(ctx).GetRecordedTime())
+			} else {
+				require.NotNil(t, act.LastHeartbeat.Get(ctx).GetDetails())
+				require.NotNil(t, act.LastHeartbeat.Get(ctx).GetRecordedTime())
+			}
+		})
+	}
 }
 
-func TestDeferredResetClearsHeartbeat(t *testing.T) {
+func TestDeferredResetHeartbeatPolicy(t *testing.T) {
 	testCases := []struct {
 		name              string
 		transition        chasm.Transition[activitypb.ActivityExecutionStatus, *Activity, rescheduleEvent]
 		resetShouldPause  bool
+		clearHeartbeat    bool
 		expectedStatus    activitypb.ActivityExecutionStatus
 		expectedTaskCount int
 	}{
 		{
-			name:              "scheduled",
+			name:              "scheduled keeps heartbeat",
 			transition:        TransitionResetAttemptFailedToScheduled,
 			resetShouldPause:  false,
 			expectedStatus:    activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
 			expectedTaskCount: 1,
 		},
 		{
-			name:              "paused",
+			name:              "scheduled clears heartbeat",
+			transition:        TransitionResetAttemptFailedToScheduled,
+			resetShouldPause:  false,
+			clearHeartbeat:    true,
+			expectedStatus:    activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED,
+			expectedTaskCount: 1,
+		},
+		{
+			name:              "paused keeps heartbeat",
 			transition:        TransitionResetAttemptFailedToPaused,
 			resetShouldPause:  true,
+			expectedStatus:    activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED,
+			expectedTaskCount: 0,
+		},
+		{
+			name:              "paused clears heartbeat",
+			transition:        TransitionResetAttemptFailedToPaused,
+			resetShouldPause:  true,
+			clearHeartbeat:    true,
 			expectedStatus:    activitypb.ACTIVITY_EXECUTION_STATUS_PAUSED,
 			expectedTaskCount: 0,
 		},
@@ -1093,16 +1126,17 @@ func TestDeferredResetClearsHeartbeat(t *testing.T) {
 
 			act := &Activity{
 				ActivityState: &activitypb.ActivityState{
-					ActivityType:            &commonpb.ActivityType{Name: "test-activity-type"},
-					RetryPolicy:             defaultRetryPolicy,
-					ScheduleToCloseTimeout:  durationpb.New(defaultScheduleToCloseTimeout),
-					ScheduleToStartTimeout:  durationpb.New(0),
-					StartToCloseTimeout:     durationpb.New(defaultStartToCloseTimeout),
-					Status:                  activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED,
-					ScheduleTime:            timestamppb.New(defaultTime),
-					FirstAttemptStartedTime: timestamppb.New(defaultTime),
-					TaskQueue:               &taskqueuepb.TaskQueue{Name: "test-task-queue"},
-					ResetShouldPause:        tc.resetShouldPause,
+					ActivityType:              &commonpb.ActivityType{Name: "test-activity-type"},
+					RetryPolicy:               defaultRetryPolicy,
+					ScheduleToCloseTimeout:    durationpb.New(defaultScheduleToCloseTimeout),
+					ScheduleToStartTimeout:    durationpb.New(0),
+					StartToCloseTimeout:       durationpb.New(defaultStartToCloseTimeout),
+					Status:                    activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED,
+					ScheduleTime:              timestamppb.New(defaultTime),
+					FirstAttemptStartedTime:   timestamppb.New(defaultTime),
+					TaskQueue:                 &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+					ResetShouldPause:          tc.resetShouldPause,
+					ResetShouldClearHeartbeat: tc.clearHeartbeat,
 				},
 				LastAttempt:   chasm.NewDataField(ctx, attemptState),
 				LastHeartbeat: chasm.NewDataField(ctx, heartbeatState),
@@ -1114,8 +1148,14 @@ func TestDeferredResetClearsHeartbeat(t *testing.T) {
 			require.Equal(t, tc.expectedStatus, act.Status)
 			require.Equal(t, int32(1), attemptState.Count)
 			require.Nil(t, attemptState.GetCurrentRetryInterval())
-			require.Nil(t, act.LastHeartbeat.Get(ctx).GetDetails())
-			require.Nil(t, act.LastHeartbeat.Get(ctx).GetRecordedTime())
+			require.False(t, act.ResetShouldClearHeartbeat)
+			if tc.clearHeartbeat {
+				require.Nil(t, act.LastHeartbeat.Get(ctx).GetDetails())
+				require.Nil(t, act.LastHeartbeat.Get(ctx).GetRecordedTime())
+			} else {
+				require.NotNil(t, act.LastHeartbeat.Get(ctx).GetDetails())
+				require.NotNil(t, act.LastHeartbeat.Get(ctx).GetRecordedTime())
+			}
 			require.Len(t, ctx.Tasks, tc.expectedTaskCount)
 		})
 	}

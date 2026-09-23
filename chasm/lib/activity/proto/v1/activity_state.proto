@@ -155,6 +155,11 @@ message ActivityState {
 
   // Used to de-dupe update requests.
   string last_update_options_request_id = 23;
+
+  // Set when a reset with reset_heartbeat=true is requested while a worker still owns the
+  // attempt. The in-flight checkpoint is left intact; details are cleared only when the deferred
+  // reset is applied. Consumed on that transition. Dropped if a cancel supersedes the pending reset.
+  bool reset_should_clear_heartbeat = 24;
 }
 
 message ActivityCancelState {

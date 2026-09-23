@@ -60,6 +60,7 @@ import (
 	"go.temporal.io/server/common/tqid"
 	"go.temporal.io/server/common/util"
 	"go.temporal.io/server/service/history/consts"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -1136,11 +1137,34 @@ func (a *Activity) recordPauseState(
 	a.emitOnPausedMetrics(event.metricsHandler)
 }
 
+// resetHeartbeatRequested reports whether this reset should drop persisted heartbeat
+// details. The execution reset request only carries the flag when the client API
+// defines reset_heartbeat; otherwise the default is to keep the checkpoint.
+func resetHeartbeatRequested(req *workflowservice.ResetActivityExecutionRequest) bool {
+	if req == nil {
+		return false
+	}
+	field := req.ProtoReflect().Descriptor().Fields().ByName(protoreflect.Name("reset_heartbeat"))
+	if field == nil {
+		return false
+	}
+	return req.ProtoReflect().Get(field).Bool()
+}
+
 func (a *Activity) clearHeartbeatDetails(ctx chasm.MutableContext) {
 	if hb, ok := a.LastHeartbeat.TryGet(ctx); ok {
 		hb.Details = nil
 		hb.RecordedTime = nil
 	}
+}
+
+// applyDeferredHeartbeatClear consumes ResetShouldClearHeartbeat. A deferred reset keeps the
+// checkpoint unless the reset asked to clear it.
+func (a *Activity) applyDeferredHeartbeatClear(ctx chasm.MutableContext) {
+	if a.ResetShouldClearHeartbeat {
+		a.clearHeartbeatDetails(ctx)
+	}
+	a.ResetShouldClearHeartbeat = false
 }
 
 func (a *Activity) reset(ctx chasm.MutableContext, event resetEvent) {
@@ -1149,7 +1173,9 @@ func (a *Activity) reset(ctx chasm.MutableContext, event resetEvent) {
 	attempt.Stamp++
 	attempt.CurrentRetryInterval = nil
 	attempt.CurrentRetryIntervalSource = activitypb.ACTIVITY_RETRY_INTERVAL_SOURCE_UNSPECIFIED
-	a.clearHeartbeatDetails(ctx)
+	if event.ResetHeartbeat {
+		a.clearHeartbeatDetails(ctx)
+	}
 	dispatchTime := a.dispatchTimeRespectingStartDelay(event.resetTime)
 	attempt.DispatchTime = timestamppb.New(dispatchTime)
 	if timeout := a.GetScheduleToStartTimeout().AsDuration(); timeout > 0 {
@@ -1229,7 +1255,7 @@ func (a *Activity) handleReset(
 			a.restoreOriginalOptions(ctx)
 		}
 		if frontendReq.GetKeepPaused() {
-			return a.resetKeepPaused(ctx, metricsHandler)
+			return a.resetKeepPaused(ctx, metricsHandler, resetHeartbeatRequested(frontendReq))
 		}
 		// No keepPaused: perform an immediate reset. restoreOriginalOptions (if requested) already
 		// ran above, so skip it in resetImmediately to avoid restoring twice.
@@ -1265,6 +1291,9 @@ func (a *Activity) deferResetWhileRunning(
 	if frontendReq.GetRestoreOriginalOptions() {
 		a.ResetRestoreOptions = true
 	}
+	// Heartbeat clearing is deferred with the rest of the reset so the in-flight attempt keeps
+	// its checkpoint until the worker yields.
+	a.ResetShouldClearHeartbeat = resetHeartbeatRequested(frontendReq)
 	// keepPaused on a paused (PAUSE_REQUESTED) activity preserves the pause: when the worker
 	// yields the activity lands back in PAUSED rather than SCHEDULED.
 	a.ResetShouldPause = keepPaused && pauseRequested
@@ -1278,6 +1307,7 @@ func (a *Activity) deferResetWhileRunning(
 func (a *Activity) resetKeepPaused(
 	ctx chasm.MutableContext,
 	metricsHandler metrics.Handler,
+	resetHeartbeat bool,
 ) (*activitypb.ResetActivityExecutionResponse, error) {
 	attempt := a.LastAttempt.Get(ctx)
 	attempt.Count = 1
@@ -1285,7 +1315,9 @@ func (a *Activity) resetKeepPaused(
 	attempt.CurrentRetryInterval = nil
 	attempt.CurrentRetryIntervalSource = activitypb.ACTIVITY_RETRY_INTERVAL_SOURCE_UNSPECIFIED
 	attempt.DispatchTime = nil
-	a.clearHeartbeatDetails(ctx)
+	if resetHeartbeat {
+		a.clearHeartbeatDetails(ctx)
+	}
 	a.emitOnResetMetrics(metricsHandler)
 	return &activitypb.ResetActivityExecutionResponse{}, nil
 }
@@ -1306,6 +1338,7 @@ func (a *Activity) resetImmediately(
 	if err := TransitionReset.Apply(a, ctx, resetEvent{
 		resetTime:      resetTime,
 		metricsHandler: metricsHandler,
+		ResetHeartbeat: resetHeartbeatRequested(frontendReq),
 	}); err != nil {
 		return nil, err
 	}
