@@ -97,6 +97,14 @@ func (b *Bucket) Cursor() *CursorReplace {
 // reusable cursor, avoiding per-node reader allocations on the pread path.
 // Prefer it for long sequential scans. Same locking/Close contract as Cursor.
 func (b *Bucket) CursorReplaceReusable() *CursorReplace {
+	return b.CursorReplaceDigestReusable(0)
+}
+
+// CursorReplaceDigestReusable is CursorReplaceReusable with on-disk values
+// truncated to the first valuePrefixLen bytes. valuePrefixLen <= 0 keeps the
+// full value, so it matches CursorReplaceReusable. Memtable entries stay full.
+// Seek, merge, and iteration still walk whole on-disk nodes.
+func (b *Bucket) CursorReplaceDigestReusable(valuePrefixLen int) *CursorReplace {
 	MustBeExpectedStrategy(b.strategy, StrategyReplace)
 
 	cursorOpenedAt := time.Now()
@@ -106,7 +114,7 @@ func (b *Bucket) CursorReplaceReusable() *CursorReplace {
 	b.flushLock.RLock()
 	defer b.flushLock.RUnlock()
 
-	innerCursors, unlockSegmentGroup := b.disk.newReusableCursors()
+	innerCursors, unlockSegmentGroup := b.disk.newDigestReusableCursors(valuePrefixLen)
 
 	if b.flushing != nil {
 		innerCursors = append(innerCursors, b.flushing.newCursor())
@@ -169,6 +177,21 @@ func (b *Bucket) CursorOnDisk() *CursorReplace {
 	MustBeExpectedStrategy(b.strategy, StrategyReplace)
 
 	innerCursors, unlockSegmentGroup := b.disk.newCursors()
+
+	return &CursorReplace{
+		innerCursors: innerCursors,
+		unlock:       unlockSegmentGroup,
+	}
+}
+
+// CursorOnDiskDigest scans on-disk segments only, retaining the first
+// valuePrefixLen value bytes of each node. valuePrefixLen <= 0 keeps full
+// values. Compaction stays blocked until Close, same as CursorOnDisk.
+// Memtables are not included.
+func (b *Bucket) CursorOnDiskDigest(valuePrefixLen int) *CursorReplace {
+	MustBeExpectedStrategy(b.strategy, StrategyReplace)
+
+	innerCursors, unlockSegmentGroup := b.disk.newDigestReusableCursors(valuePrefixLen)
 
 	return &CursorReplace{
 		innerCursors: innerCursors,
