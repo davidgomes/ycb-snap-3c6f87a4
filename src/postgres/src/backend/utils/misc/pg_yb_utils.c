@@ -131,6 +131,7 @@
 #include "storage/procarray.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -9137,6 +9138,40 @@ string_list_compare(const ListCell *a, const ListCell *b)
 }
 
 /*
+ * Placeholder substituted for relname / range bounds when the caller may not
+ * see that tablet's table identity. Literal text, not NULL, so a masked
+ * range-sharded edge is distinguishable from a real unbounded edge.
+ */
+#define YB_TABLET_METADATA_REDACTED "<insufficient privilege>"
+
+/*
+ * Superusers and yb_db_admin see every tablet. Everyone else sees relname and
+ * range bounds only for tables in the current database on which they have
+ * SELECT. The system transactions tablet is always visible. A missing pg_class
+ * row (rewritten-away or orphaned oid) masks the row instead of failing the query.
+ */
+static bool
+yb_tablet_metadata_can_see_relation(const char *namespace_name, Oid pg_table_oid,
+									const char *current_db)
+{
+	bool		missing = false;
+
+	if (superuser() || IsYbDbAdminUser(GetUserId()))
+		return true;
+
+	/* Colocation parents and non-YSQL rows have no pg_class oid in this database. */
+	if (!OidIsValid(pg_table_oid) || current_db == NULL || namespace_name == NULL ||
+		strcmp(namespace_name, current_db) != 0)
+		return false;
+
+	if (pg_class_aclcheck_ext(pg_table_oid, GetUserId(), ACL_SELECT, &missing) != ACLCHECK_OK ||
+		missing)
+		return false;
+
+	return true;
+}
+
+/*
  * Returns the metadata for all tablets in the cluster.
  * The returned data structure is a row type with the following columns:
  * - tablet_id: text
@@ -9155,8 +9190,13 @@ string_list_compare(const ListCell *a, const ListCell *b)
  * - tablet_state: text
  *
  * The start_hash_code and end_hash_code are the hash codes of the start and end
- * keys of the tablet for hash sharded tables. Leader is provided as a separate
- * column for simpler querying and self-explanatory access.
+ * keys of the tablet for hash sharded tables. Range-sharded tablets instead
+ * report start_range and end_range as DocDB debug strings. Leader is provided
+ * as a separate column for simpler querying and self-explanatory access.
+ *
+ * object_name, start_range, and end_range are masked for callers who are not
+ * superuser or yb_db_admin unless the tablet's table is in the current database
+ * and the caller has SELECT on it. The system transactions tablet is never masked.
  */
 Datum
 yb_get_tablet_metadata(PG_FUNCTION_ARGS)
@@ -9200,8 +9240,14 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 
 	YbcPgGlobalTabletsDescriptor *tablets = NULL;
 	size_t		num_tablets = 0;
+	bool		bypass_privilege;
+	char	   *current_db = NULL;
 
 	HandleYBStatus(YBCTabletsMetadata(&tablets, &num_tablets));
+
+	bypass_privilege = superuser() || IsYbDbAdminUser(GetUserId());
+	if (!bypass_privilege)
+		current_db = get_database_name(MyDatabaseId);
 
 	for (int i = 0; i < num_tablets; ++i)
 	{
@@ -9228,7 +9274,6 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 
 		values[3] = CStringGetTextDatum(tablet_descriptor->namespace_name);
-		values[4] = CStringGetTextDatum(tablet_descriptor->table_name);
 		values[5] = CStringGetTextDatum(tablet_descriptor->table_type);
 
 		if (tablet->is_hash_partitioned)
@@ -9274,10 +9319,58 @@ yb_get_tablet_metadata(PG_FUNCTION_ARGS)
 			nulls[9] = true;
 		}
 
-		/* TODO (#28172): start_range, end_range, tablet_attrs are populated in a follow-up change. */
-		nulls[10] = true;
-		nulls[11] = true;
+		/*
+		 * Range-sharded tablets: DocDB debug form of each bound. Empty keys are
+		 * unbounded edges (NULL). Hash-sharded tablets, including composite
+		 * HASH+ASC, keep both columns NULL; hash bounds stay in the hash columns.
+		 * tablet_attrs is still unpopulated.
+		 */
+		if (!tablet->is_hash_partitioned && tablet->start_range)
+			values[10] = CStringGetTextDatum(tablet->start_range);
+		else
+			nulls[10] = true;
+		if (!tablet->is_hash_partitioned && tablet->end_range)
+			values[11] = CStringGetTextDatum(tablet->end_range);
+		else
+			nulls[11] = true;
 		nulls[12] = true;
+
+		/*
+		 * Mask table identity. The transactions status tablet has no YSQL owner
+		 * and is always shown. Masked hash rows keep natural NULL ranges; masked
+		 * range rows use the placeholder on both bounds, including unbounded
+		 * edges, so tablet count and split points do not leak.
+		 */
+		{
+			bool		is_transactions;
+			bool		can_see;
+
+			is_transactions =
+				tablet_descriptor->namespace_name != NULL &&
+				tablet_descriptor->table_name != NULL &&
+				strcmp(tablet_descriptor->namespace_name, "system") == 0 &&
+				strcmp(tablet_descriptor->table_name, "transactions") == 0;
+
+			if (is_transactions || bypass_privilege)
+				can_see = true;
+			else
+				can_see = yb_tablet_metadata_can_see_relation(
+					tablet_descriptor->namespace_name, tablet->pg_table_oid, current_db);
+
+			if (can_see)
+				values[4] = CStringGetTextDatum(tablet_descriptor->table_name);
+			else
+			{
+				values[4] = CStringGetTextDatum(YB_TABLET_METADATA_REDACTED);
+				if (!tablet->is_hash_partitioned)
+				{
+					values[10] = CStringGetTextDatum(YB_TABLET_METADATA_REDACTED);
+					values[11] = CStringGetTextDatum(YB_TABLET_METADATA_REDACTED);
+					nulls[10] = false;
+					nulls[11] = false;
+				}
+			}
+		}
 
 		if (tablet->tablet_state)
 			values[13] = CStringGetTextDatum(tablet->tablet_state);

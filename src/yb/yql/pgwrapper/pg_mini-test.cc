@@ -3245,6 +3245,7 @@ TEST_F(PgMiniTest, TabletMetadataCorrectnessWithHashPartitioning) {
   auto tablet_from_metadata = ASSERT_RESULT(pg_conn.FetchRow<std::string>(
       yb::Format("SELECT tablet_id FROM yb_tablet_metadata "
              "WHERE relname = 'hash_test_table' "
+             "AND db_name = current_database() "
              "AND $0 >= start_hash_code AND $0 < end_hash_code", hash_code)));
   LOG(INFO) << "Tablet ID from yb_tablet_metadata: " << tablet_from_metadata;
 

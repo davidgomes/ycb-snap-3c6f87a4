@@ -7,7 +7,9 @@ SELECT
     db_name,
     start_hash_code,
     end_hash_code
-FROM yb_tablet_metadata WHERE relname IN ('test_table_1', 'test_table_2')
+FROM yb_tablet_metadata
+WHERE relname IN ('test_table_1', 'test_table_2')
+  AND db_name = current_database()
 ORDER BY start_hash_code NULLS FIRST;
 
 -- Test that we are able to join with yb_servers()
@@ -24,6 +26,7 @@ JOIN yb_servers() ys
     ON split_part(ytm.leader, ':', 1) = ys.host
     AND split_part(ytm.leader, ':', 2)::int = ys.port
 WHERE ytm.relname IN ('test_table_1', 'test_table_2')
+  AND ytm.db_name = current_database()
 ORDER BY ytm.start_hash_code NULLS FIRST;
 
 -- Test that data from multiple databases is returned
@@ -116,23 +119,149 @@ WHERE
     AND db_name IN ('yb_tmeta_a', 'yb_tmeta_b')
 ORDER BY db_name, relname;
 
--- Test that non-superusers can see cluster-wide tablet metadata
-CREATE ROLE yb_tmeta_user LOGIN;
-
-\c yb_tmeta_a yb_tmeta_user
+-- Range bounds are DocDB debug strings. Unbounded edges stay NULL.
+-- Hash (and composite HASH+ASC) tablets leave both range columns NULL.
+\c yb_tmeta_a
+CREATE TABLE range_bounds (k INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((10));
+CREATE TABLE hash_bounds (k INT PRIMARY KEY) SPLIT INTO 2 TABLETS;
+CREATE TABLE hash_and_range (h INT, r INT, PRIMARY KEY ((h) HASH, r ASC)) SPLIT INTO 2 TABLETS;
+CREATE TABLE ts_bounds (k timestamptz, PRIMARY KEY (k ASC))
+    SPLIT AT VALUES (('2020-01-01 00:00:00+00'));
 
 SELECT
-    relname,
-    db_name
+    start_range,
+    end_range,
+    start_hash_code IS NULL AS hash_null
 FROM yb_tablet_metadata
-WHERE
-    relname IN ('only_in_b', 'same_name')
-    AND db_name = 'yb_tmeta_b'
+WHERE relname = 'range_bounds' AND db_name = current_database()
+ORDER BY start_range NULLS FIRST;
+
+SELECT bool_and(start_range IS NULL AND end_range IS NULL
+                AND start_hash_code IS NOT NULL) AS hash_ranges_null
+FROM yb_tablet_metadata
+WHERE relname = 'hash_bounds' AND db_name = current_database();
+
+SELECT bool_and(start_range IS NULL AND end_range IS NULL
+                AND start_hash_code IS NOT NULL) AS composite_ranges_null
+FROM yb_tablet_metadata
+WHERE relname = 'hash_and_range' AND db_name = current_database();
+
+-- 2020-01-01 00:00:00 UTC is 1577836800000000 microseconds since the Unix epoch.
+SELECT bool_or(COALESCE(start_range, '') LIKE '%1577836800000000%'
+            OR COALESCE(end_range, '') LIKE '%1577836800000000%') AS ts_bound_decoded
+FROM yb_tablet_metadata
+WHERE relname = 'ts_bounds' AND db_name = current_database();
+
+-- Privilege masking. Rows are kept; only relname and range bounds change.
+-- Capture tablet ids as the superuser before switching roles.
+SELECT tablet_id AS range_other_db_tablet FROM yb_tablet_metadata
+WHERE relname = 'only_in_b' AND db_name = 'yb_tmeta_b' \gset
+SELECT tablet_id AS hash_other_db_tablet FROM yb_tablet_metadata
+WHERE relname = 'test_table_1' AND db_name = 'test_db' AND start_hash_code = 0 \gset
+SELECT tablet_id AS parent_tablet FROM yb_tablet_metadata
+WHERE db_name = 'colocated_db' AND relname LIKE '%.colocation.parent.tablename' \gset
+SELECT tablet_id AS colocated_user_tablet FROM yb_tablet_metadata
+WHERE relname = 'non_colocated_split' AND db_name = 'colocated_db' AND start_hash_code = 0 \gset
+SELECT tablet_id AS range_bounds_open FROM yb_tablet_metadata
+WHERE relname = 'range_bounds' AND db_name = current_database() AND start_range IS NULL \gset
+
+CREATE TABLE visible_hash (k INT PRIMARY KEY) SPLIT INTO 1 TABLETS;
+CREATE TABLE secret_hash (k INT PRIMARY KEY) SPLIT INTO 1 TABLETS;
+CREATE TABLE rewrite_me (id INT, name TEXT);
+CREATE TABLE doomed (k INT PRIMARY KEY) SPLIT INTO 1 TABLETS;
+
+CREATE ROLE yb_tmeta_reader LOGIN;
+CREATE ROLE yb_tmeta_admin LOGIN;
+GRANT yb_db_admin TO yb_tmeta_admin;
+GRANT SELECT ON visible_hash TO yb_tmeta_reader;
+GRANT SELECT ON rewrite_me TO yb_tmeta_reader;
+
+-- Table rewrite keeps pg_class.oid; a prior SELECT grant must still unmask relname.
+ALTER TABLE rewrite_me ADD PRIMARY KEY (id);
+SELECT oid AS rewrite_oid FROM pg_class WHERE relname = 'rewrite_me' \gset
+SELECT tablet_id AS rewrite_tablet FROM yb_tablet_metadata
+WHERE relname = 'rewrite_me' AND db_name = current_database() AND oid = :rewrite_oid \gset
+SELECT tablet_id AS visible_tablet FROM yb_tablet_metadata
+WHERE relname = 'visible_hash' AND db_name = current_database() \gset
+SELECT tablet_id AS secret_tablet FROM yb_tablet_metadata
+WHERE relname = 'secret_hash' AND db_name = current_database() \gset
+SELECT tablet_id AS doomed_tablet FROM yb_tablet_metadata
+WHERE relname = 'doomed' AND db_name = current_database() \gset
+
+\c colocated_db
+GRANT SELECT ON non_colocated_split TO yb_tmeta_reader;
+GRANT SELECT ON colocated_hash TO yb_tmeta_reader;
+
+\c yb_tmeta_a
+DROP TABLE doomed;
+
+\c yb_tmeta_a yb_tmeta_reader
+
+-- Cross-database range tablet: both bounds are the placeholder, even the open edge.
+SELECT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE tablet_id = :'range_other_db_tablet';
+
+-- Cross-database hash tablet: name masked, ranges stay NULL. Hash codes are not masked.
+SELECT relname, start_range IS NULL AS start_null, end_range IS NULL AS end_null,
+       start_hash_code IS NOT NULL AS hash_visible
+FROM yb_tablet_metadata
+WHERE tablet_id = :'hash_other_db_tablet';
+
+-- Current database: SELECT reveals that table; another table stays masked.
+SELECT relname, start_range IS NULL AS ranges_null
+FROM yb_tablet_metadata
+WHERE tablet_id IN (:'visible_tablet', :'secret_tablet')
 ORDER BY relname;
+
+-- OID-stable grant survives a rewrite.
+SELECT relname, oid = :rewrite_oid AS oid_matches
+FROM yb_tablet_metadata
+WHERE tablet_id = :'rewrite_tablet';
+
+-- System transactions tablet is never masked.
+SELECT bool_and(relname = 'transactions') AS transactions_visible
+FROM yb_tablet_metadata
+WHERE db_name = 'system' AND relname = 'transactions';
+
+-- A just-dropped table may leave a tablet whose oid no longer exists in pg_class.
+-- The scan must not fail; an ACL miss masks that row.
+SELECT count(*) <= 1 AS doomed_scan_ok
+FROM yb_tablet_metadata
+WHERE tablet_id = :'doomed_tablet';
+
+-- Orphaned / missing pg_class rows must not error a full scan.
+SELECT count(*) >= 0 AS scan_ok FROM yb_tablet_metadata;
+
+\c colocated_db yb_tmeta_reader
+
+-- Colocation parent stays masked. SELECT on a colocated user table does not unmask it.
+-- The parent is hash-sharded, so masked range cells stay NULL.
+-- SELECT on the non-colocated table unmasks that table's own rows.
+SELECT relname, start_range IS NULL AS start_null, end_range IS NULL AS end_null,
+       oid IS NULL AS oid_null
+FROM yb_tablet_metadata
+WHERE tablet_id = :'parent_tablet';
+
+SELECT relname, start_hash_code IS NOT NULL AS hash_visible, start_range IS NULL AS ranges_null
+FROM yb_tablet_metadata
+WHERE tablet_id = :'colocated_user_tablet';
+
+\c yb_tmeta_a yb_tmeta_admin
+
+-- yb_db_admin sees real names and real (NULL) open range edges across databases.
+SELECT relname, start_range IS NULL AS open_start, end_range
+FROM yb_tablet_metadata
+WHERE tablet_id = :'range_other_db_tablet';
+
+SELECT relname
+FROM yb_tablet_metadata
+WHERE tablet_id = :'range_bounds_open';
 
 -- Cleanup
 \c yugabyte yugabyte
 DROP DATABASE colocated_db;
 DROP DATABASE yb_tmeta_a;
 DROP DATABASE yb_tmeta_b;
-DROP ROLE yb_tmeta_user;
+DROP ROLE yb_tmeta_reader;
+DROP ROLE yb_tmeta_admin;

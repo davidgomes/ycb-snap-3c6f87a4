@@ -99,6 +99,7 @@ TEST_F(YqlTest, TabletMetadataViewsWithYcqlAndYsql) {
   auto ysql_only_result = ASSERT_RESULT(pg_conn.FetchRows<std::string>(
       "SELECT relname FROM yb_tablet_metadata "
       "WHERE relname IN ('ysql_test_table', 'ycql_test_table') "
+      "AND db_name = current_database() "
       "ORDER BY relname"));
 
   // Check that only YSQL table is present and YCQL table is not
