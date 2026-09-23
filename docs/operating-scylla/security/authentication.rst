@@ -38,6 +38,7 @@ Additional Resources
 * :doc:`Enable Authorization </operating-scylla/security/enable-authorization/>` 
 * :doc:`Authorization </operating-scylla/security/authorization/>` 
 * :doc:`LDAP Authentication </operating-scylla/security/ldap-authentication/>`
+* :doc:`Certificate Based Authentication </operating-scylla/security/certificate-authentication/>`
 
 
 

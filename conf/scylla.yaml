@@ -247,6 +247,13 @@ batch_size_fail_threshold_in_kb: 1024
 # - com.scylladb.auth.SaslauthdAuthenticator outsources authentication to a running saslauthd
 #   daemon. When using this authenticator, you must set the saslauthd_socket_path property to the
 #   Unix domain socket on which saslauthd is listening.
+# - com.scylladb.auth.CertificateAuthenticator maps a trusted TLS client certificate
+#   subject or SAN to a role (auth_certificate_role_queries).
+# - com.scylladb.auth.CertificateOrPasswordAuthenticator accepts either a trusted
+#   client certificate or a username/password on the same CQL port. Use
+#   require_client_auth: optional (not true) so clients without a certificate can
+#   still connect and authenticate with a password. A certificate that is presented
+#   but does not match a role query is rejected and is not retried as a password.
 # authenticator: AllowAllAuthenticator
 # saslauthd_socket_path: /var/state/saslauthd/mux
 
@@ -496,10 +503,13 @@ large_collection_elements_fail_threshold: 20000
 # syntax and values is available at:
 #   https://gnutls.org/manual/html_node/Priority-Strings.html
 #
-# The require_client_auth parameter allows you to 
-# restrict access to service based on certificate 
-# validation. Client must provide a certificate 
-# accepted by the used trust store to connect.
+# The require_client_auth parameter controls peer certificate verification:
+#   true     - require a client certificate (password-only clients fail the handshake)
+#   false    - do not request a client certificate
+#   optional - request a certificate but allow connections without one. Use this
+#              with CertificateOrPasswordAuthenticator so certificate clients and
+#              password clients can share one TLS port. Untrusted certificates are
+#              still rejected during the handshake.
 # 
 # server_encryption_options:
 #    internode_encryption: none

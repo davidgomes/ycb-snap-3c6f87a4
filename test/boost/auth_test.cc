@@ -8,6 +8,8 @@
 
 
 #include <stdint.h>
+#include <unordered_map>
+#include <vector>
 #include <fmt/ranges.h>
 
 #include <seastar/core/future.hh>
@@ -59,6 +61,65 @@ SEASTAR_TEST_CASE(test_password_authenticator_attributes) {
         BOOST_REQUIRE(a.require_authentication());
         BOOST_REQUIRE_EQUAL(a.qualified_java_name(), auth::password_authenticator_name);
     }, auth_on(false));
+}
+
+static future<auth::authenticated_user>
+authenticate(cql_test_env& env, std::string_view username, std::string_view password);
+
+static future<std::optional<auth::authenticated_user>>
+authenticate_dn(auth::authenticator& a, std::optional<auth::certificate_info> info) {
+    co_return co_await a.authenticate([info]() -> future<std::optional<auth::certificate_info>> {
+        co_return info;
+    });
+}
+
+SEASTAR_TEST_CASE(test_certificate_or_password_authenticator) {
+    cql_test_config cfg;
+    cfg.db_config->authenticator("com.scylladb.auth.CertificateOrPasswordAuthenticator");
+    std::vector<std::unordered_map<sstring, sstring>> queries;
+    queries.push_back({{"source", "SUBJECT"}, {"query", "CN=([^,]+)"}});
+    queries.push_back({{"source", "ALTNAME"}, {"query", "email:([^,]+)"}});
+    cfg.db_config->auth_certificate_role_queries(std::move(queries));
+    co_await do_with_cql_env_thread([](cql_test_env& env) {
+        auto& a = env.local_auth_service().underlying_authenticator();
+        BOOST_REQUIRE(a.require_authentication());
+        BOOST_REQUIRE_EQUAL(a.qualified_java_name(), "com.scylladb.auth.CertificateOrPasswordAuthenticator");
+        BOOST_REQUIRE(a.uses_password_hashes());
+
+        // No certificate (optional client auth, or a plain connection) selects SASL.
+        auto no_cert = authenticate_dn(a, std::nullopt).get();
+        BOOST_REQUIRE(!no_cert);
+        auto unset = a.authenticate(auth::session_dn_func{}).get();
+        BOOST_REQUIRE(!unset);
+
+        auto from_subject = authenticate_dn(a, auth::certificate_info{
+            "CN=alice,O=test",
+            {},
+        }).get();
+        BOOST_REQUIRE(from_subject);
+        BOOST_REQUIRE_EQUAL(*from_subject->name, sstring("alice"));
+
+        auto from_san = authenticate_dn(a, auth::certificate_info{
+            "O=test",
+            []() -> future<std::string> {
+                co_return std::string("DNS:example.com,email:carol");
+            },
+        }).get();
+        BOOST_REQUIRE(from_san);
+        BOOST_REQUIRE_EQUAL(*from_san->name, sstring("carol"));
+
+        // Presented certificate that matches no role query does not fall back to password.
+        BOOST_REQUIRE_THROW(authenticate_dn(a, auth::certificate_info{"O=test", {}}).get(),
+                exceptions::authentication_exception);
+
+        cquery_nofail(env, "CREATE ROLE bob WITH PASSWORD = 'secret' AND LOGIN = true");
+        auto user = authenticate(env, "bob", "secret").get();
+        BOOST_REQUIRE_EQUAL(*user.name, "bob");
+        BOOST_REQUIRE_THROW(authenticate(env, "bob", "wrong").get(), exceptions::authentication_exception);
+
+        auto sasl = a.new_sasl_challenge();
+        BOOST_REQUIRE(!sasl->is_complete());
+    }, cfg);
 }
 
 static future<auth::authenticated_user>
