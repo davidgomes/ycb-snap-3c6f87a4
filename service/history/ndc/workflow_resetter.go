@@ -203,6 +203,9 @@ func (r *workflowResetterImpl) ResetWorkflow(
 		}
 	}
 
+	// Completion callbacks attached at start (e.g. by the scheduler) are matched by the original start
+	// request ID, so the rebuilt start event must keep it rather than the reset request ID.
+	startRequestID := originalStartRequestID(baseWorkflow.GetMutableState().GetExecutionState(), resetRequestID)
 	resetWorkflow, err := r.prepareResetWorkflow(
 		ctx,
 		namespaceID,
@@ -212,7 +215,7 @@ func (r *workflowResetterImpl) ResetWorkflow(
 		baseRebuildLastEventID,
 		baseRebuildLastEventVersion,
 		resetRunID,
-		resetRequestID,
+		startRequestID,
 		resetWorkflowVersion,
 		resetReason,
 		allowResetWithPendingChildren,
@@ -223,6 +226,8 @@ func (r *workflowResetterImpl) ResetWorkflow(
 	defer func() { resetWorkflow.GetReleaseFn()(retError) }()
 
 	resetMS := resetWorkflow.GetMutableState()
+	// CreateRequestId is used to dedup reset requests, so it must remain the reset request ID.
+	resetMS.GetExecutionState().CreateRequestId = resetRequestID
 	if err := reapplyEventsFn(ctx, resetMS); err != nil {
 		return err
 	}
@@ -252,6 +257,25 @@ func (r *workflowResetterImpl) ResetWorkflow(
 	currentWorkflow.GetContext().UpdateRegistry(ctx).Abort(update.AbortReasonWorkflowCompleted)
 
 	return nil
+}
+
+// originalStartRequestID returns the request ID associated with the WorkflowExecutionStarted event of the
+// given execution. For a run that was itself created by a reset, CreateRequestId is the reset request ID,
+// while the start event remains associated with the request ID of the first run.
+func originalStartRequestID(
+	executionState *persistencespb.WorkflowExecutionState,
+	fallback string,
+) string {
+	createRequestID := executionState.GetCreateRequestId()
+	for requestID, info := range executionState.GetRequestIds() {
+		if info.GetEventType() == enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED && requestID != createRequestID {
+			return requestID
+		}
+	}
+	if createRequestID != "" {
+		return createRequestID
+	}
+	return fallback
 }
 
 func (r *workflowResetterImpl) prepareResetWorkflow(
