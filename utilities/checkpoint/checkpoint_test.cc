@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
 #include "db/db_impl/db_impl.h"
@@ -1682,6 +1683,165 @@ TEST_F(CheckpointTest, CheckpointEngineParallelCopyRecordsCheckpointBytes) {
   EXPECT_EQ(options.statistics->getTickerCount(BACKUP_WRITE_BYTES), 0U);
 
   Close();  // before tearing down the env the DB was opened with
+}
+
+TEST_F(CheckpointTest, CreateCheckpointSubsetColumnFamilies) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.paranoid_checks = true;
+  DestroyAndReopen(options);
+  CreateColumnFamilies({"cf_a", "cf_b"}, options);
+
+  ASSERT_OK(Put("dk", "dv"));
+  ASSERT_OK(Put(0, "ak", "av"));
+  ASSERT_OK(Put(1, "bk", "bv"));
+  ASSERT_OK(db_->Flush(FlushOptions(), db_->DefaultColumnFamily()));
+  ASSERT_OK(db_->Flush(FlushOptions(), handles_[0]));
+  ASSERT_OK(db_->Flush(FlushOptions(), handles_[1]));
+
+  ColumnFamilyMetaData default_meta;
+  ColumnFamilyMetaData included_meta;
+  ColumnFamilyMetaData excluded_meta;
+  db_->GetColumnFamilyMetaData(db_->DefaultColumnFamily(), &default_meta);
+  db_->GetColumnFamilyMetaData(handles_[0], &included_meta);
+  db_->GetColumnFamilyMetaData(handles_[1], &excluded_meta);
+
+  std::vector<std::string> families_before;
+  ASSERT_OK(
+      DB::ListColumnFamilies(DBOptions(options), dbname_, &families_before));
+  std::string current_before;
+  ASSERT_OK(ReadFileToString(env_, dbname_ + "/CURRENT", &current_before));
+
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint_guard(checkpoint);
+
+  ASSERT_OK(DestroyDB(snapshot_name_, options));
+  // Default is omitted from the list and the selected handle is duplicated.
+  std::vector<ColumnFamilyHandle*> selected{handles_[0], handles_[0]};
+  ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_, selected,
+                                         /*log_size_for_flush=*/0,
+                                         /*sequence_number_ptr=*/nullptr));
+
+  std::vector<std::string> ckpt_files;
+  ASSERT_OK(env_->GetChildren(snapshot_name_, &ckpt_files));
+  std::unordered_set<std::string> ckpt_set(ckpt_files.begin(),
+                                          ckpt_files.end());
+
+  auto expect_files = [&](const ColumnFamilyMetaData& meta, bool present) {
+    for (const auto& level : meta.levels) {
+      for (const auto& f : level.files) {
+        EXPECT_EQ(ckpt_set.count(f.relative_filename) == 1, present);
+      }
+    }
+    for (const auto& blob : meta.blob_files) {
+      std::string name = blob.blob_file_name;
+      auto slash = name.find_last_of('/');
+      if (slash != std::string::npos) {
+        name = name.substr(slash + 1);
+      }
+      EXPECT_EQ(ckpt_set.count(name) == 1, present);
+    }
+  };
+  auto count_files = [](const ColumnFamilyMetaData& meta) {
+    size_t n = meta.blob_files.size();
+    for (const auto& level : meta.levels) {
+      n += level.files.size();
+    }
+    return n;
+  };
+  expect_files(default_meta, true);
+  expect_files(included_meta, true);
+  expect_files(excluded_meta, false);
+  ASSERT_GT(count_files(included_meta), 0);
+  ASSERT_GT(count_files(excluded_meta), 0);
+  ASSERT_GT(count_files(default_meta), 0);
+
+  std::vector<std::string> families_after;
+  ASSERT_OK(
+      DB::ListColumnFamilies(DBOptions(options), dbname_, &families_after));
+  ASSERT_EQ(families_before, families_after);
+  std::string current_after;
+  ASSERT_OK(ReadFileToString(env_, dbname_ + "/CURRENT", &current_after));
+  ASSERT_EQ(current_before, current_after);
+  ASSERT_EQ("bv", Get(1, "bk"));
+
+  std::vector<ColumnFamilyDescriptor> subset = {
+      {kDefaultColumnFamilyName, ColumnFamilyOptions(options)},
+      {"cf_a", ColumnFamilyOptions(options)},
+  };
+  std::vector<ColumnFamilyHandle*> ckpt_handles;
+  std::unique_ptr<DB> ckpt_db;
+  DBOptions open_opts(options);
+  open_opts.paranoid_checks = true;
+  ASSERT_OK(
+      DB::Open(open_opts, snapshot_name_, subset, &ckpt_handles, &ckpt_db));
+  std::string value;
+  ASSERT_OK(ckpt_db->Get(ReadOptions(), ckpt_handles[0], "dk", &value));
+  ASSERT_EQ("dv", value);
+  ASSERT_OK(ckpt_db->Get(ReadOptions(), ckpt_handles[1], "ak", &value));
+  ASSERT_EQ("av", value);
+  for (auto* h : ckpt_handles) {
+    ASSERT_OK(ckpt_db->DestroyColumnFamilyHandle(h));
+  }
+  ckpt_handles.clear();
+  ckpt_db.reset();
+
+  std::vector<ColumnFamilyDescriptor> all = {
+      {kDefaultColumnFamilyName, ColumnFamilyOptions(options)},
+      {"cf_a", ColumnFamilyOptions(options)},
+      {"cf_b", ColumnFamilyOptions(options)},
+  };
+  Status open_all =
+      DB::Open(open_opts, snapshot_name_, all, &ckpt_handles, &ckpt_db);
+  ASSERT_TRUE(open_all.IsInvalidArgument());
+  ASSERT_EQ(ckpt_db, nullptr);
+
+  const std::string all_dir = snapshot_name_ + "_all";
+  ASSERT_OK(DestroyDB(all_dir, options));
+  ASSERT_OK(checkpoint->CreateCheckpoint(
+      all_dir, std::vector<ColumnFamilyHandle*>{}, /*log_size_for_flush=*/0,
+      /*sequence_number_ptr=*/nullptr));
+  std::vector<ColumnFamilyHandle*> all_handles;
+  std::unique_ptr<DB> all_db;
+  ASSERT_OK(DB::Open(open_opts, all_dir, all, &all_handles, &all_db));
+  ASSERT_OK(all_db->Get(ReadOptions(), all_handles[2], "bk", &value));
+  ASSERT_EQ("bv", value);
+  for (auto* h : all_handles) {
+    ASSERT_OK(all_db->DestroyColumnFamilyHandle(h));
+  }
+  all_db.reset();
+  ASSERT_OK(DestroyDB(all_dir, options));
+
+  ASSERT_TRUE(checkpoint
+                  ->CreateCheckpoint(snapshot_name_ + "_bad",
+                                     std::vector<ColumnFamilyHandle*>{nullptr},
+                                     0, nullptr)
+                  .IsInvalidArgument());
+
+  ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+  ASSERT_TRUE(
+      checkpoint
+          ->CreateCheckpoint(snapshot_name_ + "_dropped",
+                             std::vector<ColumnFamilyHandle*>{handles_[1]}, 0,
+                             nullptr)
+          .IsInvalidArgument());
+
+  const std::string other_dir = dbname_ + "_other";
+  ASSERT_OK(DestroyDB(other_dir, options));
+  std::unique_ptr<DB> other_db;
+  ASSERT_OK(DB::Open(options, other_dir, &other_db));
+  ASSERT_TRUE(checkpoint
+                  ->CreateCheckpoint(
+                      snapshot_name_ + "_foreign",
+                      std::vector<ColumnFamilyHandle*>{
+                          other_db->DefaultColumnFamily()},
+                      0, nullptr)
+                  .IsInvalidArgument());
+  other_db.reset();
+  ASSERT_OK(DestroyDB(other_dir, options));
+  ASSERT_OK(DestroyDB(snapshot_name_, options));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

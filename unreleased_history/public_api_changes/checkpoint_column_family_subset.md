@@ -1,0 +1,1 @@
+`Checkpoint::CreateCheckpoint()` accepts a column family handle list and writes a checkpoint containing only those families plus the default family. An empty list still checkpoints every column family.
