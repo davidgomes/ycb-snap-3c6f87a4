@@ -30,6 +30,7 @@
 #include "yb/common/common_flags.h"
 #include "yb/common/pgsql_error.h"
 
+#include "yb/dockv/doc_key.h"
 #include "yb/dockv/value_type.h"
 
 #include "yb/integration-tests/mini_cluster.h"
@@ -3244,7 +3245,7 @@ TEST_F(PgMiniTest, TabletMetadataCorrectnessWithHashPartitioning) {
   // Find which tablet this hash falls into using yb_tablet_metadata
   auto tablet_from_metadata = ASSERT_RESULT(pg_conn.FetchRow<std::string>(
       yb::Format("SELECT tablet_id FROM yb_tablet_metadata "
-             "WHERE relname = 'hash_test_table' "
+             "WHERE db_name = current_database() AND relname = 'hash_test_table' "
              "AND $0 >= start_hash_code AND $0 < end_hash_code", hash_code)));
   LOG(INFO) << "Tablet ID from yb_tablet_metadata: " << tablet_from_metadata;
 
@@ -3328,6 +3329,48 @@ TEST_F(PgMiniTest, TabletMetadataOidMatchesPgClass) {
   }, 30s, "yb_tablet_metadata exposes test_table's stable oid"));
 }
 
+TEST_F(PgMiniTest, TabletMetadataRangeBounds) {
+  auto pg_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(pg_conn.Execute(
+      "CREATE TABLE range_test_table (k INT, ts TIMESTAMP, PRIMARY KEY (k ASC, ts ASC)) "
+      "SPLIT AT VALUES ((100, '2024-06-01'), (200, '2024-09-01'))"));
+  ASSERT_OK(pg_conn.Execute(
+      "CREATE TABLE hash_range_test_table (h INT, r INT, PRIMARY KEY (h HASH, r ASC)) "
+      "SPLIT INTO 2 TABLETS"));
+
+  // Range bounds are rendered like the master UI tablet listing: the decoded DocDB key of the
+  // tablet partition bound, NULL for an open edge.
+  auto table_id = ASSERT_RESULT(GetTableIDFromTableName("range_test_table"));
+  auto peers = ListTableActiveTabletLeadersPeers(cluster_.get(), table_id);
+  ASSERT_EQ(peers.size(), 3);
+  auto expected_bound = [](const std::string& key) -> std::optional<std::string> {
+    if (key.empty()) {
+      return std::nullopt;
+    }
+    return dockv::DocKey::DebugSliceToString(key);
+  };
+  for (const auto& peer : peers) {
+    auto tablet = ASSERT_RESULT(peer->shared_tablet());
+    auto partition = tablet->metadata()->partition();
+    auto [start_range, end_range] = ASSERT_RESULT((pg_conn.FetchRow<
+        std::optional<std::string>, std::optional<std::string>>(Format(
+            "SELECT start_range, end_range FROM yb_tablet_metadata WHERE tablet_id = '$0'",
+            peer->tablet_id()))));
+    LOG(INFO) << "Tablet " << peer->tablet_id() << " range: ["
+              << start_range.value_or("<start>") << ", " << end_range.value_or("<end>") << ")";
+    ASSERT_EQ(start_range, expected_bound(partition->partition_key_start()));
+    ASSERT_EQ(end_range, expected_bound(partition->partition_key_end()));
+  }
+
+  // Hash-sharded tablets, including HASH+ASC composite keys, only report hash bounds.
+  auto hash_rows_with_range = ASSERT_RESULT(pg_conn.FetchRow<int64_t>(
+      "SELECT count(*) FROM yb_tablet_metadata "
+      "WHERE db_name = current_database() AND relname = 'hash_range_test_table' "
+      "AND (start_range IS NOT NULL OR end_range IS NOT NULL "
+      "OR start_hash_code IS NULL OR end_hash_code IS NULL)"));
+  ASSERT_EQ(hash_rows_with_range, 0);
+}
+
 TEST_F(PgMiniTest, TabletMetadataStateColumn) {
   auto pg_conn = ASSERT_RESULT(Connect());
 
@@ -3338,7 +3381,8 @@ TEST_F(PgMiniTest, TabletMetadataStateColumn) {
 
   auto running_count = ASSERT_RESULT(pg_conn.FetchRow<int64_t>(
       "SELECT count(*) FROM yb_get_tablet_metadata() "
-      "WHERE object_name = 'state_test' AND tablet_state = 'RUNNING'"));
+      "WHERE namespace = current_database() AND object_name = 'state_test' "
+      "AND tablet_state = 'RUNNING'"));
   ASSERT_EQ(running_count, 1);
   LOG(INFO) << "RUNNING state verified";
 

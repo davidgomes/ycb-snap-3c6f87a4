@@ -7,7 +7,10 @@ SELECT
     db_name,
     start_hash_code,
     end_hash_code
-FROM yb_tablet_metadata WHERE relname IN ('test_table_1', 'test_table_2')
+FROM yb_tablet_metadata
+WHERE
+    relname IN ('test_table_1', 'test_table_2')
+    AND db_name = current_database()
 ORDER BY start_hash_code NULLS FIRST;
 
 -- Test that we are able to join with yb_servers()
@@ -23,8 +26,30 @@ FROM yb_tablet_metadata ytm
 JOIN yb_servers() ys
     ON split_part(ytm.leader, ':', 1) = ys.host
     AND split_part(ytm.leader, ':', 2)::int = ys.port
-WHERE ytm.relname IN ('test_table_1', 'test_table_2')
+WHERE
+    ytm.relname IN ('test_table_1', 'test_table_2')
+    AND ytm.db_name = current_database()
 ORDER BY ytm.start_hash_code NULLS FIRST;
+
+-- Test start_range and end_range. Range-sharded tablets report their decoded
+-- DocDB partition bounds (NULL for the open first/last edge); timestamps are
+-- rendered as int64 microseconds since the PostgreSQL epoch. Hash-sharded
+-- tablets, including HASH+ASC composite keys, only report hash bounds.
+CREATE TABLE range_split (k INT, v INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((100), (200));
+CREATE TABLE range_ts (ts TIMESTAMP, PRIMARY KEY (ts ASC)) SPLIT AT VALUES (('2024-06-01'));
+CREATE TABLE hash_range (h INT, r INT, PRIMARY KEY (h HASH, r ASC)) SPLIT INTO 2 TABLETS;
+
+SELECT
+    relname,
+    start_hash_code,
+    end_hash_code,
+    start_range,
+    end_range
+FROM yb_tablet_metadata
+WHERE
+    relname IN ('test_table_1', 'test_table_2', 'range_split', 'range_ts', 'hash_range')
+    AND db_name = current_database()
+ORDER BY relname, start_hash_code NULLS FIRST, start_range NULLS FIRST;
 
 -- Test that data from multiple databases is returned
 CREATE DATABASE test_db;
@@ -116,23 +141,149 @@ WHERE
     AND db_name IN ('yb_tmeta_a', 'yb_tmeta_b')
 ORDER BY db_name, relname;
 
--- Test that non-superusers can see cluster-wide tablet metadata
+-- Test that non-superusers see every tablet row cluster-wide, but relname,
+-- start_range and end_range are masked unless the table is in the current
+-- database and the user has SELECT on it.
 CREATE ROLE yb_tmeta_user LOGIN;
+\c yb_tmeta_a
+GRANT SELECT ON same_name TO yb_tmeta_user;
 
 \c yb_tmeta_a yb_tmeta_user
 
+SELECT count(*) = :yb_tmeta_a_row_count::bigint AS same_row_count
+FROM yb_tablet_metadata;
+
+-- Only yb_tmeta_a.same_name is visible; the same-named table in yb_tmeta_b
+-- stays masked.
 SELECT
-    relname,
-    db_name
+    c.relname AS table_name,
+    t.relname,
+    t.db_name,
+    t.start_range,
+    t.end_range
+FROM yb_tablet_metadata t
+LEFT JOIN pg_class c ON c.oid = t.oid AND t.db_name = current_database()
+WHERE t.db_name IN ('yb_tmeta_a', 'yb_tmeta_b')
+ORDER BY t.db_name, c.relname;
+
+-- Filtering by relname alone no longer finds tables of other databases.
+SELECT count(*) AS other_db_rows
+FROM yb_tablet_metadata
+WHERE relname IN ('only_in_b', 'same_name') AND db_name = 'yb_tmeta_b';
+
+-- Test privilege-based masking in detail.
+\c yugabyte yugabyte
+CREATE DATABASE yb_tmeta_priv;
+CREATE DATABASE yb_tmeta_other;
+CREATE ROLE yb_tmeta_reader LOGIN;
+CREATE ROLE yb_tmeta_admin LOGIN;
+GRANT yb_db_admin TO yb_tmeta_admin;
+
+\c yb_tmeta_other
+CREATE TABLE other_range (k INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((10));
+CREATE TABLE other_hash (k INT PRIMARY KEY) SPLIT INTO 2 TABLETS;
+GRANT SELECT ON other_range, other_hash TO yb_tmeta_reader;
+
+\c yb_tmeta_priv
+CREATE TABLE granted_range (k INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((10), (20));
+CREATE TABLE denied_range (k INT, PRIMARY KEY (k ASC)) SPLIT AT VALUES ((10), (20));
+CREATE TABLE denied_range_single (k INT, PRIMARY KEY (k ASC));
+CREATE TABLE granted_hash (k INT PRIMARY KEY) SPLIT INTO 2 TABLETS;
+CREATE TABLE denied_hash (k INT PRIMARY KEY) SPLIT INTO 2 TABLETS;
+GRANT SELECT ON granted_range, granted_hash TO yb_tmeta_reader;
+
+-- A table rewrite changes the relfilenode but not the pg_class oid; the grant
+-- must keep applying to the rewritten table's tablets.
+CREATE TABLE rewritten (k INT, v INT);
+GRANT SELECT ON rewritten TO yb_tmeta_reader;
+ALTER TABLE rewritten ADD PRIMARY KEY (k);
+SELECT oid <> relfilenode AS is_rewritten FROM pg_class WHERE relname = 'rewritten';
+
+-- Tablets of a dropped table may still be reported with an oid that no longer
+-- exists in pg_class; such rows must be masked rather than raise an error.
+CREATE TABLE dropped (k INT PRIMARY KEY);
+GRANT SELECT ON dropped TO yb_tmeta_reader;
+DROP TABLE dropped;
+
+\c yb_tmeta_priv yb_tmeta_reader
+
+-- Granted tables show real values. Denied hash-sharded tablets keep NULL
+-- ranges, while denied range-sharded tablets are masked on every range cell,
+-- including the open edges.
+SELECT
+    c.relname AS table_name,
+    t.relname,
+    t.start_hash_code,
+    t.end_hash_code,
+    t.start_range,
+    t.end_range
+FROM yb_tablet_metadata t
+JOIN pg_class c ON c.oid = t.oid
+WHERE
+    t.db_name = current_database()
+    AND c.relname IN ('granted_range', 'denied_range', 'denied_range_single',
+                      'granted_hash', 'denied_hash')
+ORDER BY c.relname, t.start_hash_code NULLS FIRST, t.start_range NULLS FIRST;
+
+SELECT DISTINCT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = current_database() AND oid = 'rewritten'::regclass;
+
+SELECT count(*) AS unmasked_orphan_rows
+FROM yb_tablet_metadata t
+WHERE
+    t.db_name = current_database()
+    AND t.oid IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = t.oid)
+    AND t.relname <> '<insufficient privilege>';
+
+-- Tables of another database are masked even when granted there.
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = 'yb_tmeta_other'
+ORDER BY start_hash_code NULLS FIRST, start_range NULLS FIRST;
+
+-- The system transactions tablet is always shown unmasked.
+SELECT DISTINCT relname, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = 'system';
+
+-- Connected to that database, the same rows are unmasked.
+\c yb_tmeta_other yb_tmeta_reader
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = 'yb_tmeta_other'
+ORDER BY start_hash_code NULLS FIRST, start_range NULLS FIRST;
+
+-- The colocation parent tablet stays masked for regular users even with
+-- SELECT on a colocated table; per-table SELECT gates the other rows.
+\c colocated_db yugabyte
+GRANT SELECT ON colocated_hash, non_colocated_split TO yb_tmeta_reader;
+\c colocated_db yb_tmeta_reader
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
+FROM yb_tablet_metadata
+WHERE db_name = 'colocated_db'
+ORDER BY relname, start_hash_code NULLS FIRST;
+
+-- yb_db_admin members see real values for every database.
+\c yb_tmeta_priv yb_tmeta_admin
+SELECT relname, start_hash_code, end_hash_code, start_range, end_range
 FROM yb_tablet_metadata
 WHERE
-    relname IN ('only_in_b', 'same_name')
-    AND db_name = 'yb_tmeta_b'
-ORDER BY relname;
+    (db_name = 'yb_tmeta_other')
+    OR (db_name = current_database() AND relname IN ('denied_range', 'denied_hash'))
+ORDER BY relname, start_hash_code NULLS FIRST, start_range NULLS FIRST;
 
 -- Cleanup
 \c yugabyte yugabyte
+DROP TABLE range_split;
+DROP TABLE range_ts;
+DROP TABLE hash_range;
 DROP DATABASE colocated_db;
 DROP DATABASE yb_tmeta_a;
 DROP DATABASE yb_tmeta_b;
+DROP DATABASE yb_tmeta_priv;
+DROP DATABASE yb_tmeta_other;
 DROP ROLE yb_tmeta_user;
+DROP ROLE yb_tmeta_reader;
+DROP ROLE yb_tmeta_admin;
