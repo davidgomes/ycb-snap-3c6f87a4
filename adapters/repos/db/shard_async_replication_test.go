@@ -212,7 +212,7 @@ func (s *Shard) propagateWithinRangeForTest(t *testing.T, ctx context.Context,
 	asyncCheckpointCutoff int64,
 ) (int, []objectToPropagate, error) {
 	t.Helper()
-	cursor := s.store.Bucket(helpers.ObjectsBucketLSM).CursorReplaceReusable()
+	cursor := s.store.Bucket(helpers.ObjectsBucketLSM).CursorReplaceDigestReusable(storobj.MarshallerV1HeaderLen)
 	defer cursor.Close()
 	scratch := newPropagationScratch(cfg.diffBatchSize)
 	return s.objectsToPropagateWithinRange(ctx, cfg, cursor, scratch, addr, node, initialLeaf, finalLeaf, limit, overrides, asyncCheckpointCutoff)
@@ -449,7 +449,7 @@ func TestObjectsToPropagateWithinRange(t *testing.T) {
 		require.NoError(t, s.store.FlushMemtables(ctx))
 		cfg := fullRangeConfig(100)
 
-		cursor := s.store.Bucket(helpers.ObjectsBucketLSM).CursorReplaceReusable()
+		cursor := s.store.Bucket(helpers.ObjectsBucketLSM).CursorReplaceDigestReusable(storobj.MarshallerV1HeaderLen)
 		defer cursor.Close()
 		scratch := newPropagationScratch(cfg.diffBatchSize)
 

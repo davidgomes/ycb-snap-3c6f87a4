@@ -2027,6 +2027,25 @@ func genFakeBucket(t testing.TB, maxSize uint64) *fakeBucket {
 	return bucket
 }
 
+func TestMarshallerV1HeaderLen_IsDocIDAndTimeBound(t *testing.T) {
+	require.Equal(t, 42, MarshallerV1HeaderLen)
+
+	input := make([]byte, MarshallerV1HeaderLen)
+	input[0] = 1
+	binary.LittleEndian.PutUint64(input[1:9], 7)
+	binary.LittleEndian.PutUint64(input[marshallerV1UpdateTimeOffset:], uint64(99))
+
+	docID, updateTime, err := DocIDAndTimeFromBinary(input)
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), docID)
+	require.Equal(t, int64(99), updateTime)
+
+	short := make([]byte, MarshallerV1HeaderLen-1)
+	short[0] = 1
+	_, _, err = DocIDAndTimeFromBinary(short)
+	require.Error(t, err)
+}
+
 func TestDocIDAndTimeFromBinary_Errors(t *testing.T) {
 	t.Run("input too short returns error", func(t *testing.T) {
 		for _, length := range []int{0, 1, 10, 41} {
