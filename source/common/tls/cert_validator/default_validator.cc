@@ -534,6 +534,13 @@ void DefaultCertValidator::updateDigestForSessionId(bssl::ScopedEVP_MD_CTX& md,
     bool auto_sni_san_match = config_->autoSniSanMatch();
     rc = EVP_DigestUpdate(md.get(), &auto_sni_san_match, sizeof(auto_sni_san_match));
     RELEASE_ASSERT(rc == 1, Utility::getLastCryptoError().value_or(""));
+
+    // Only mixed in when enabled so that default session-id bytes are unchanged.
+    if (config_->suppressClientCaList()) {
+      bool suppress_client_ca_list = true;
+      rc = EVP_DigestUpdate(md.get(), &suppress_client_ca_list, sizeof(suppress_client_ca_list));
+      RELEASE_ASSERT(rc == 1, Utility::getLastCryptoError().value_or(""));
+    }
   }
 }
 
@@ -582,7 +589,9 @@ absl::Status DefaultCertValidator::addClientValidationContext(SSL_CTX* ctx,
     return absl::InvalidArgumentError(
         absl::StrCat("Failed to load trusted client CA certificates from ", config_->caCertPath()));
   }
-  SSL_CTX_set_client_CA_list(ctx, list.release());
+  if (!config_->suppressClientCaList()) {
+    SSL_CTX_set_client_CA_list(ctx, list.release());
+  }
 
   if (require_client_cert) {
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);

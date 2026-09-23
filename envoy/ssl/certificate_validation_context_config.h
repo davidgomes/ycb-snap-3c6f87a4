@@ -96,6 +96,12 @@ public:
   virtual bool onlyVerifyLeafCertificateCrl() const PURE;
 
   /**
+   * @return true if the trusted CA names should not be advertised to downstream clients in the
+   * TLS CertificateRequest message.
+   */
+  virtual bool suppressClientCaList() const PURE;
+
+  /**
    * @return the max depth used when verifying the certificate-chain
    */
   virtual absl::optional<uint32_t> maxVerifyDepth() const PURE;

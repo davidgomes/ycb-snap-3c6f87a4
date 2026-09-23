@@ -42,6 +42,7 @@ CertificateValidationContextConfigImpl::CertificateValidationContextConfigImpl(
                     config.custom_validator_config())
               : absl::nullopt),
       api_(api), only_verify_leaf_cert_crl_(config.only_verify_leaf_cert_crl()),
+      suppress_client_ca_list_(config.suppress_client_ca_list()),
       max_verify_depth_(config.has_max_verify_depth()
                             ? absl::optional<uint32_t>(config.max_verify_depth().value())
                             : absl::nullopt),

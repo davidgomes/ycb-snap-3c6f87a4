@@ -113,6 +113,7 @@ public:
 
   Api::Api& api() const override { return *api_; }
   bool onlyVerifyLeafCertificateCrl() const override { return false; }
+  bool suppressClientCaList() const override { return false; }
 
   absl::optional<uint32_t> maxVerifyDepth() const override { return max_verify_depth_; }
   bool autoSniSanMatch() const override { return auto_sni_san_match_; }

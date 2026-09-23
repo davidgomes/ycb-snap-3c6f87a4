@@ -710,6 +710,7 @@ public:
               customValidatorConfig, (), (const override));
   MOCK_METHOD(Api::Api&, api, (), (const override));
   bool onlyVerifyLeafCertificateCrl() const override { return false; }
+  bool suppressClientCaList() const override { return false; }
   absl::optional<uint32_t> maxVerifyDepth() const override { return absl::nullopt; }
   bool autoSniSanMatch() const override { return false; }
 
@@ -786,6 +787,7 @@ public:
   }
   Api::Api& api() const override { return *api_; }
   bool onlyVerifyLeafCertificateCrl() const override { return false; }
+  bool suppressClientCaList() const override { return false; }
   absl::optional<uint32_t> maxVerifyDepth() const override { return absl::nullopt; }
   bool autoSniSanMatch() const override { return false; }
 
