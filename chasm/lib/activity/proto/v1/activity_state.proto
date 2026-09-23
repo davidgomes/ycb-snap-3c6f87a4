@@ -90,6 +90,10 @@ message ActivityState {
 
   // Set if the activity was terminated
   ActivityTerminateState terminate_state = 12;
+
+  // Delays the first dispatch of the activity. Extends ScheduleToClose and ScheduleToStart
+  // timeouts by this duration. StartToClose and Heartbeat timeouts are unaffected.
+  google.protobuf.Duration start_delay = 13;
 }
 
 message ActivityCancelState {

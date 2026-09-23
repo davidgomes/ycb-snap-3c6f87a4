@@ -153,6 +153,7 @@ func NewStandaloneActivity(
 			HeartbeatTimeout:       request.GetHeartbeatTimeout(),
 			RetryPolicy:            request.GetRetryPolicy(),
 			Priority:               request.Priority,
+			StartDelay:             request.GetStartDelay(),
 		},
 		LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{}),
 		RequestData: chasm.NewDataField(ctx, &activitypb.ActivityRequestData{
@@ -663,8 +664,14 @@ func (a *Activity) hasEnoughTimeForRetry(ctx chasm.Context, overridingRetryInter
 		return true, retryInterval
 	}
 
-	deadline := a.ScheduleTime.AsTime().Add(scheduleToClose)
+	deadline := a.scheduleToCloseDeadline(scheduleToClose)
 	return ctx.Now(a).Add(retryInterval).Before(deadline), retryInterval
+}
+
+// scheduleToCloseDeadline returns the time at which the schedule-to-close timeout expires. The
+// start delay is added since the schedule-to-close timer only begins once the delay has elapsed.
+func (a *Activity) scheduleToCloseDeadline(scheduleToClose time.Duration) time.Time {
+	return a.GetScheduleTime().AsTime().Add(a.GetStartDelay().AsDuration()).Add(scheduleToClose)
 }
 
 func createStartToCloseTimeoutFailure() *failurepb.Failure {
@@ -783,7 +790,7 @@ func (a *Activity) buildActivityExecutionInfo(ctx chasm.Context) *apiactivitypb.
 
 	var expirationTime *timestamppb.Timestamp
 	if timeout := a.GetScheduleToCloseTimeout().AsDuration(); timeout > 0 {
-		expirationTime = timestamppb.New(a.GetScheduleTime().AsTime().Add(timeout))
+		expirationTime = timestamppb.New(a.scheduleToCloseDeadline(timeout))
 	}
 
 	sa := &commonpb.SearchAttributes{
