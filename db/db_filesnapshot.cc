@@ -198,6 +198,13 @@ Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
+  return GetLiveFilesStorageInfo(opts, files, /*included_cf_ids=*/nullptr);
+}
+
+Status DBImpl::GetLiveFilesStorageInfo(
+    const LiveFilesStorageInfoOptions& opts,
+    std::vector<LiveFileStorageInfo>* files,
+    const std::unordered_set<uint32_t>* included_cf_ids) {
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
@@ -282,6 +289,10 @@ Status DBImpl::GetLiveFilesStorageInfo(
     if (cfd->IsDropped()) {
       continue;
     }
+    if (included_cf_ids != nullptr &&
+        included_cf_ids->find(cfd->GetID()) == included_cf_ids->end()) {
+      continue;
+    }
     VersionStorageInfo& vsi = *cfd->current()->storage_info();
     auto& cf_paths = cfd->ioptions().cf_paths;
 
@@ -352,6 +363,21 @@ Status DBImpl::GetLiveFilesStorageInfo(
   // Ensure consistency with manifest for track_and_verify_wals_in_manifest
   const uint64_t max_log_num = cur_wal_number_;
 
+  // Build the subset MANIFEST while the mutex is still held so it describes
+  // the same versions as the file list above. This only reads VersionSet
+  // state; it does not append to or rotate the live MANIFEST.
+  bool have_subset_manifest = false;
+  std::string subset_manifest;
+  if (included_cf_ids != nullptr) {
+    Status manifest_s = versions_->WriteManifestForColumnFamilies(
+        *included_cf_ids, &subset_manifest);
+    if (!manifest_s.ok()) {
+      mutex_.Unlock();
+      return manifest_s;
+    }
+    have_subset_manifest = true;
+  }
+
   mutex_.Unlock();
 
   std::string manifest_fname = DescriptorFileName(manifest_number);
@@ -363,8 +389,13 @@ Status DBImpl::GetLiveFilesStorageInfo(
     info.directory = GetName();
     info.file_number = manifest_number;
     info.file_type = kDescriptorFile;
-    info.size = manifest_size;
-    info.trim_to_size = true;
+    if (have_subset_manifest) {
+      info.replacement_contents = std::move(subset_manifest);
+      info.size = info.replacement_contents.size();
+    } else {
+      info.size = manifest_size;
+      info.trim_to_size = true;
+    }
     if (opts.include_checksum_info) {
       info.file_checksum_func_name = kUnknownFileChecksumFuncName;
       info.file_checksum = kUnknownFileChecksum;

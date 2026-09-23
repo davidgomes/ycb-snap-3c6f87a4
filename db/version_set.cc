@@ -7095,10 +7095,121 @@ void VersionSet::MarkMinLogNumberToKeep(uint64_t number) {
   }
 }
 
+namespace {
+
+// In-memory FSWritableFile used to encode a checkpoint MANIFEST without
+// creating a file in the live DB directory.
+class StringWritableFile : public FSWritableFile {
+ public:
+  explicit StringWritableFile(std::string* dest) : dest_(dest) {}
+
+  using FSWritableFile::Append;
+  IOStatus Append(const Slice& data, const IOOptions& /*options*/,
+                  IODebugContext* /*dbg*/) override {
+    dest_->append(data.data(), data.size());
+    size_ += data.size();
+    return IOStatus::OK();
+  }
+
+  IOStatus Close(const IOOptions& /*options*/,
+                 IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+
+  IOStatus Flush(const IOOptions& /*options*/,
+                 IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+
+  IOStatus Sync(const IOOptions& /*options*/,
+                IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+
+  uint64_t GetFileSize(const IOOptions& /*options*/,
+                       IODebugContext* /*dbg*/) override {
+    return size_;
+  }
+
+ private:
+  std::string* dest_;
+  uint64_t size_ = 0;
+};
+
+}  // namespace
+
+Status VersionSet::WriteManifestForColumnFamilies(
+    const std::unordered_set<uint32_t>& included_cf_ids,
+    std::string* contents) {
+  assert(contents != nullptr);
+  contents->clear();
+  if (included_cf_ids.find(0) == included_cf_ids.end()) {
+    return Status::InvalidArgument(
+        "Default column family must be included in a checkpoint");
+  }
+
+  std::unordered_map<uint32_t, MutableCFState> curr_state;
+  curr_state.reserve(included_cf_ids.size());
+  for (uint32_t id : included_cf_ids) {
+    ColumnFamilyData* cfd = column_family_set_->GetColumnFamily(id);
+    if (cfd == nullptr || cfd->IsDropped()) {
+      return Status::InvalidArgument("Column family has been dropped");
+    }
+    curr_state.emplace(
+        id, MutableCFState(cfd->GetLogNumber(), cfd->GetFullHistoryTsLow()));
+  }
+
+  VersionEdit wal_additions;
+  for (const auto& wal : wals_.GetWals()) {
+    wal_additions.AddWal(wal.first, wal.second);
+  }
+
+  // next_file_number_ is stored as-is. Recovery installs it plus one, matching
+  // VersionSet::LogAndApplyHelper. Do not allocate a file number: this image
+  // is not installed as the live MANIFEST.
+  std::string encoded;
+  {
+    FileOptions file_opts;
+    std::unique_ptr<log::Writer> log(
+        new log::Writer(std::make_unique<WritableFileWriter>(
+                            std::make_unique<StringWritableFile>(&encoded),
+                            "MANIFEST", file_opts, clock_, io_tracer_),
+                        /*log_number=*/0, /*recycle_log_files=*/false,
+                        /*manual_flush=*/false));
+
+    VersionEdit meta;
+    meta.SetNextFile(next_file_number_.load());
+    if (column_family_set_->GetMaxColumnFamily() > 0) {
+      meta.SetMaxColumnFamily(column_family_set_->GetMaxColumnFamily());
+    }
+    std::string record;
+    if (!meta.EncodeTo(&record)) {
+      return Status::Corruption("Unable to Encode VersionEdit:" +
+                                meta.DebugString(true));
+    }
+    IOStatus io_s = log->AddRecord(WriteOptions(), record);
+    if (!io_s.ok()) {
+      return io_s;
+    }
+    Status s =
+        WriteCurrentStateToManifest(WriteOptions(), curr_state, wal_additions,
+                                    log.get(), io_s, &included_cf_ids);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  if (encoded.empty()) {
+    return Status::Corruption("Failed to encode column family subset MANIFEST");
+  }
+  *contents = std::move(encoded);
+  return Status::OK();
+}
+
 Status VersionSet::WriteCurrentStateToManifest(
     const WriteOptions& write_options,
     const std::unordered_map<uint32_t, MutableCFState>& curr_state,
-    const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s) {
+    const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s,
+    const std::unordered_set<uint32_t>* included_cf_ids) {
   // TODO: Break up into multiple records to reduce memory usage on recovery?
 
   // WARNING: This method doesn't hold a mutex!!
@@ -7158,6 +7269,10 @@ Status VersionSet::WriteCurrentStateToManifest(
     assert(cfd);
 
     if (cfd->IsDropped()) {
+      continue;
+    }
+    if (included_cf_ids != nullptr &&
+        included_cf_ids->find(cfd->GetID()) == included_cf_ids->end()) {
       continue;
     }
     assert(cfd->initialized());

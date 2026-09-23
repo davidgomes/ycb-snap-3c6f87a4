@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/db_impl/db_impl.h"
 #include "db/wal_manager.h"
 #include "file/file_util.h"
 #include "file/filename.h"
@@ -274,6 +275,13 @@ Status Checkpoint::CreateCheckpoint(const std::string& /*checkpoint_dir*/,
   return Status::NotSupported("");
 }
 
+Status Checkpoint::CreateCheckpoint(
+    const std::string& /*checkpoint_dir*/,
+    const std::vector<ColumnFamilyHandle*>& /*column_families*/,
+    uint64_t /*log_size_for_flush*/, uint64_t* /*sequence_number_ptr*/) {
+  return Status::NotSupported("");
+}
+
 Status CheckpointImpl::CleanStagingDirectory(
     const std::string& full_private_path, Logger* info_log) {
   std::vector<std::string> subchildren;
@@ -326,11 +334,45 @@ Status CheckpointImpl::CreateCheckpoint(const std::string& checkpoint_dir,
                               /*use_link=*/true, /*copy_rate_limiter=*/nullptr);
 }
 
-Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
-                                            uint64_t log_size_for_flush,
-                                            uint64_t* sequence_number_ptr,
-                                            CopyEngine* engine, bool use_link,
-                                            RateLimiter* copy_rate_limiter) {
+Status CheckpointImpl::CreateCheckpoint(
+    const std::string& checkpoint_dir,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    uint64_t log_size_for_flush, uint64_t* sequence_number_ptr) {
+  // Empty selection is the whole-DB checkpoint, including its MANIFEST copy.
+  if (column_families.empty()) {
+    return CreateCheckpoint(checkpoint_dir, log_size_for_flush,
+                            sequence_number_ptr);
+  }
+
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+  std::unordered_set<uint32_t> included_cf_ids;
+  included_cf_ids.insert(/*default column family*/ 0);
+  for (ColumnFamilyHandle* handle : column_families) {
+    if (handle == nullptr) {
+      return Status::InvalidArgument("Column family handle must not be null");
+    }
+    auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(handle);
+    if (cfh->cfd() == nullptr || cfh->db() != db_impl) {
+      return Status::InvalidArgument(
+          "Column family handle does not belong to this DB");
+    }
+    if (cfh->cfd()->IsDropped()) {
+      return Status::InvalidArgument("Column family has been dropped");
+    }
+    included_cf_ids.insert(cfh->GetID());
+  }
+
+  return CreateCheckpointImpl(checkpoint_dir, log_size_for_flush,
+                              sequence_number_ptr, /*engine=*/nullptr,
+                              /*use_link=*/true, /*copy_rate_limiter=*/nullptr,
+                              &included_cf_ids);
+}
+
+Status CheckpointImpl::CreateCheckpointImpl(
+    const std::string& checkpoint_dir, uint64_t log_size_for_flush,
+    uint64_t* sequence_number_ptr, CopyEngine* engine, bool use_link,
+    RateLimiter* copy_rate_limiter,
+    const std::unordered_set<uint32_t>* included_cf_ids) {
   DBOptions db_options = db_->GetDBOptions();
   Env* env = db_->GetEnv();
   const auto& fs = db_->GetFileSystem();
@@ -413,7 +455,9 @@ Status CheckpointImpl::CreateCheckpointImpl(const std::string& checkpoint_dir,
             return CreateFile(fs, full_private_path + "/" + fname, contents,
                               db_options.use_fsync);
           } /* create_file_cb */,
-          &sequence_number, log_size_for_flush);
+          &sequence_number, log_size_for_flush,
+          /*get_live_table_checksum=*/false,
+          /*atomic_flush=*/false, included_cf_ids);
 
       // Await any deferred work and fold in the first error before committing.
       Status finish_s = mover->Finish();
@@ -492,7 +536,8 @@ Status CheckpointImpl::CreateCustomCheckpoint(
                          FileType type)>
         create_file_cb,
     uint64_t* sequence_number, uint64_t log_size_for_flush,
-    bool get_live_table_checksum, bool atomic_flush) {
+    bool get_live_table_checksum, bool atomic_flush,
+    const std::unordered_set<uint32_t>* included_cf_ids) {
   *sequence_number = db_->GetLatestSequenceNumber();
 
   LiveFilesStorageInfoOptions opts;
@@ -502,7 +547,13 @@ Status CheckpointImpl::CreateCustomCheckpoint(
 
   std::vector<LiveFileStorageInfo> infos;
   {
-    Status s = db_->GetLiveFilesStorageInfo(opts, &infos);
+    Status s;
+    if (included_cf_ids == nullptr) {
+      s = db_->GetLiveFilesStorageInfo(opts, &infos);
+    } else {
+      auto* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+      s = db_impl->GetLiveFilesStorageInfo(opts, &infos, included_cf_ids);
+    }
     if (!s.ok()) {
       return s;
     }
@@ -526,8 +577,11 @@ Status CheckpointImpl::CreateCustomCheckpoint(
   for (auto& info : infos) {
     Status s;
     if (!info.replacement_contents.empty()) {
-      // Currently should only be used for CURRENT file.
-      assert(info.file_type == kCurrentFile);
+      // CURRENT always carries its contents. A column-family subset checkpoint
+      // also carries a generated MANIFEST image so the live MANIFEST file is
+      // not modified or copied.
+      assert(info.file_type == kCurrentFile ||
+             info.file_type == kDescriptorFile);
 
       if (info.size != info.replacement_contents.size()) {
         s = Status::Corruption("Inconsistent size metadata for " +

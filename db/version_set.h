@@ -1727,11 +1727,23 @@ class VersionSet {
         : log_number(_log_number), full_history_ts_low(std::move(ts_low)) {}
   };
 
-  // Save current contents to *log
+  // Encode a MANIFEST image containing only `included_cf_ids` into `*contents`.
+  // The default column family (id 0) must be included. Dropped or unknown
+  // column families return InvalidArgument. Does not modify this VersionSet
+  // or any file in the live DB.
+  // REQUIRES: DB mutex held.
+  Status WriteManifestForColumnFamilies(
+      const std::unordered_set<uint32_t>& included_cf_ids,
+      std::string* contents);
+
+  // Save current contents to *log.
+  // `included_cf_ids` null writes every non-dropped column family. Otherwise
+  // only those ids are written; `curr_state` must contain each of them.
   Status WriteCurrentStateToManifest(
       const WriteOptions& write_options,
       const std::unordered_map<uint32_t, MutableCFState>& curr_state,
-      const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s);
+      const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s,
+      const std::unordered_set<uint32_t>* included_cf_ids = nullptr);
 
   // Reopen the existing MANIFEST file for append at the end of Recover()
   // when reuse_manifest_on_open is set, so the next LogAndApply appends

@@ -589,6 +589,17 @@ class DBImpl : public DB {
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override;
 
+  // Same snapshot as GetLiveFilesStorageInfo() above. When `included_cf_ids`
+  // is non-null, only SST and blob files for those column families are
+  // returned, and the MANIFEST entry carries a replacement image that lists
+  // only those families. The default column family (id 0) must be included.
+  // Does not modify the live MANIFEST or drop any column family.
+  // REQUIRES: mutex not held by the caller (this method locks it).
+  Status GetLiveFilesStorageInfo(
+      const LiveFilesStorageInfoOptions& opts,
+      std::vector<LiveFileStorageInfo>* files,
+      const std::unordered_set<uint32_t>* included_cf_ids);
+
   Status GetPreparedFileInfoForExternalSstIngestion(
       const std::string& file_path,
       std::shared_ptr<const PreparedFileInfo>* file_info) override;
