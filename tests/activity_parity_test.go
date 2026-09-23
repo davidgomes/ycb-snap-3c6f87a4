@@ -596,6 +596,76 @@ func (s *activityParityTestSuite) TestLastHeartbeatDetailsPersistedOnAttemptFail
 	}
 }
 
+// Reset rewinds the attempt counter but preserves the last heartbeat checkpoint, so that a
+// long-running activity can resume from its progress; clearing it is opt-in via ResetHeartbeat.
+// When a worker owns the attempt at reset time, the checkpoint is left alone until the attempt
+// yields, and only then is the keep/clear policy applied.
+func (s *activityParityTestSuite) TestResetHeartbeat() {
+	env := newActivityParityEnv(s.T())
+	cfg := activityConfig{MaxAttempts: 3, RetryInterval: activityLongDuration}
+	checkpoint := activityMarshalPayloads(activityRecordedHeartbeatDetails)
+
+	testCases := []struct {
+		name     string
+		trace    []model.Event
+		expected []byte
+		// expectedAttempt is checked only when non-zero.
+		expectedAttempt int32
+	}{
+		{
+			name:            "WhileScheduled/PreservesHeartbeatByDefault",
+			trace:           []model.Event{model.Poll, model.Heartbeat, model.FailRetryably, model.Reset},
+			expected:        checkpoint,
+			expectedAttempt: 1,
+		},
+		{
+			name:            "WhileScheduled/ClearsHeartbeatWhenRequested",
+			trace:           []model.Event{model.Poll, model.Heartbeat, model.FailRetryably, model.ResetClearingHeartbeat},
+			expectedAttempt: 1,
+		},
+		{
+			name:            "WhilePausedKeepPaused/PreservesHeartbeatByDefault",
+			trace:           []model.Event{model.Poll, model.Heartbeat, model.FailRetryably, model.Pause, model.ResetKeepPaused},
+			expected:        checkpoint,
+			expectedAttempt: 1,
+		},
+		{
+			name:     "WhileStarted/CheckpointVisibleUntilAttemptYields",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.ResetClearingHeartbeat},
+			expected: checkpoint,
+		},
+		{
+			name:     "WhileStarted/PreservesHeartbeatByDefault",
+			trace:    []model.Event{model.Poll, model.Heartbeat, model.Reset, model.FailRetryably},
+			expected: checkpoint,
+		},
+		{
+			name:  "WhileStarted/ClearsHeartbeatWhenRequested",
+			trace: []model.Event{model.Poll, model.Heartbeat, model.ResetClearingHeartbeat, model.FailRetryably},
+		},
+	}
+
+	check := func(t *testing.T, info activityInfo, expected []byte, expectedAttempt int32) {
+		require.Equal(t, expected, info.LastHeartbeatDetails)
+		if expectedAttempt != 0 {
+			require.Equal(t, expectedAttempt, info.Attempt, "reset must rewind the attempt counter")
+		}
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func(s *activityParityTestSuite) {
+			s.Run("WorkflowActivity", func(s *activityParityTestSuite) {
+				t := s.T()
+				check(t, newWFADriver(t, env, cfg).driveTrace(t, tc.trace).activityInfo(t), tc.expected, tc.expectedAttempt)
+			})
+			s.Run("StandaloneActivity", func(s *activityParityTestSuite) {
+				t := s.T()
+				check(t, newSAADriver(t, env, cfg).driveTrace(t, tc.trace).activityInfo(t), tc.expected, tc.expectedAttempt)
+			})
+		})
+	}
+}
+
 func (s *activityParityTestSuite) TestTerminalRetryState() {
 	env := newActivityParityEnv(s.T())
 
