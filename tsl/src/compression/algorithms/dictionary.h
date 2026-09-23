@@ -24,6 +24,7 @@ typedef struct DictionaryCompressed DictionaryCompressed;
 typedef struct DictionaryDecompressionIterator DictionaryDecompressionIterator;
 
 extern bool dictionary_compressed_has_nulls(const CompressedDataHeader *header);
+extern Oid dictionary_compressed_element_type(const CompressedDataHeader *header);
 extern Compressor *dictionary_compressor_for_type(Oid element_type);
 extern DictionaryCompressor *dictionary_compressor_alloc(Oid type_to_compress);
 extern void dictionary_compressor_append_null(DictionaryCompressor *compressor);

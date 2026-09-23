@@ -7,8 +7,10 @@
 #include <access/attmap.h>
 #include <access/attnum.h>
 #include <access/detoast.h>
+#include <access/relation.h>
 #include <access/skey.h>
 #include <access/tupdesc.h>
+#include <access/tupdesc_details.h>
 #include <catalog/heap.h>
 #include <catalog/indexing.h>
 #include <catalog/pg_am.h>
@@ -2671,6 +2673,286 @@ row_decompressor_decompress_row_to_tuplesort(RowDecompressor *decompressor,
 /********************/
 /*** SQL Bindings ***/
 /********************/
+
+static void
+decompress_batch_not_a_batch_error(const char *detail)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("record is not a compressed batch"),
+			 errdetail("%s", detail)));
+}
+
+/*
+ * Check whether compressed data could have been produced from a column of the
+ * given type. Delta-delta and Gorilla are only ever chosen for the types they
+ * are the default algorithm for.
+ */
+static bool
+decompress_batch_data_supports_type(const CompressedDataHeader *header, Oid type)
+{
+	switch (header->compression_algorithm)
+	{
+		case COMPRESSION_ALGORITHM_DELTADELTA:
+		case COMPRESSION_ALGORITHM_GORILLA:
+			return compression_get_default_algorithm(type) == header->compression_algorithm;
+		case COMPRESSION_ALGORITHM_ARRAY:
+			return array_compressed_element_type(header) == type;
+		case COMPRESSION_ALGORITHM_DICTIONARY:
+			return dictionary_compressed_element_type(header) == type;
+		case COMPRESSION_ALGORITHM_BOOL:
+			return type == BOOLOID;
+		case COMPRESSION_ALGORITHM_UUID:
+			return type == UUIDOID;
+		default:
+			return true;
+	}
+}
+
+static void
+decompress_batch_type_mismatch_error(const char *kind, const char *colname, Oid batch_type,
+									 Oid requested_type)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("type mismatch for %s column \"%s\"", kind, colname),
+			 errdetail("Compressed batch has type %s but the column definition list specifies "
+					   "type %s.",
+					   format_type_be(batch_type),
+					   format_type_be(requested_type))));
+}
+
+/*
+ * Decompress a single compressed batch, given as a row of a compressed chunk,
+ * into the rows it represents. The output row shape is taken from the column
+ * definition list at the call site and columns are matched by name.
+ */
+Datum
+tsl_decompress_batch(PG_FUNCTION_ARGS)
+{
+	HeapTupleHeader rec = PG_GETARG_HEAPTUPLEHEADER(0);
+	Oid rec_type = HeapTupleHeaderGetTypeId(rec);
+	int32 rec_typmod = HeapTupleHeaderGetTypMod(rec);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid compressed_data_type_oid = ts_custom_type_cache_get(CUSTOM_TYPE_COMPRESSED_DATA)->type_oid;
+
+	TupleDesc in_desc = lookup_rowtype_tupdesc_copy(rec_type, rec_typmod);
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	TupleDesc requested_desc = rsinfo->setDesc;
+
+	AttrNumber count_attno = InvalidAttrNumber;
+	bool has_compressed_column = false;
+	for (int i = 0; i < in_desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(in_desc, i);
+
+		if (attr->attisdropped)
+		{
+			continue;
+		}
+
+		if (strcmp(NameStr(attr->attname), COMPRESSION_COLUMN_METADATA_COUNT_NAME) == 0)
+		{
+			if (attr->atttypid != INT4OID)
+			{
+				decompress_batch_not_a_batch_error("The batch row count metadata column has the "
+												   "wrong type.");
+			}
+			count_attno = attr->attnum;
+		}
+		else if (attr->atttypid == compressed_data_type_oid)
+		{
+			has_compressed_column = true;
+		}
+	}
+
+	if (!AttributeNumberIsValid(count_attno))
+	{
+		decompress_batch_not_a_batch_error("The batch row count metadata column is missing.");
+	}
+
+	if (!has_compressed_column)
+	{
+		decompress_batch_not_a_batch_error("The record has no compressed columns.");
+	}
+
+	HeapTupleData tuple = {
+		.t_len = HeapTupleHeaderGetDatumLength(rec),
+		.t_tableOid = InvalidOid,
+		.t_data = rec,
+	};
+	ItemPointerSetInvalid(&tuple.t_self);
+
+	Datum *in_values = palloc(sizeof(Datum) * in_desc->natts);
+	bool *in_nulls = palloc(sizeof(bool) * in_desc->natts);
+	heap_deform_tuple(&tuple, in_desc, in_values, in_nulls);
+
+	if (in_nulls[AttrNumberGetAttrOffset(count_attno)])
+	{
+		decompress_batch_not_a_batch_error("The batch row count metadata is NULL.");
+	}
+
+	/*
+	 * If the record is a row of a compressed chunk, the uncompressed chunk
+	 * gives us the real types of the compressed columns and the values of
+	 * columns added with a default after compression.
+	 */
+	Oid compressed_relid = get_typ_typrelid(rec_type);
+	Oid uncompressed_relid = ts_relation_get_uncompressed_relid(compressed_relid);
+	Relation uncompressed_rel = NULL;
+	TupleDesc uncompressed_desc = NULL;
+	if (OidIsValid(uncompressed_relid))
+	{
+		uncompressed_rel = try_relation_open(uncompressed_relid, AccessShareLock);
+		if (uncompressed_rel != NULL)
+		{
+			uncompressed_desc = RelationGetDescr(uncompressed_rel);
+		}
+	}
+
+	TupleDesc out_desc = CreateTupleDescCopy(requested_desc);
+	AttrMissing *missing = NULL;
+
+	for (int out_off = 0; out_off < out_desc->natts; out_off++)
+	{
+		Form_pg_attribute out_attr = TupleDescAttr(out_desc, out_off);
+		const char *colname = NameStr(out_attr->attname);
+		int in_off = -1;
+
+		for (int i = 0; i < in_desc->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(in_desc, i);
+			if (!attr->attisdropped && strcmp(NameStr(attr->attname), colname) == 0)
+			{
+				in_off = i;
+				break;
+			}
+		}
+
+		if (in_off < 0 || strncmp(colname,
+								  COMPRESSION_COLUMN_METADATA_PREFIX,
+								  strlen(COMPRESSION_COLUMN_METADATA_PREFIX)) == 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("column \"%s\" does not exist in compressed batch", colname)));
+		}
+
+		Form_pg_attribute in_attr = TupleDescAttr(in_desc, in_off);
+
+		if (in_attr->atttypid != compressed_data_type_oid)
+		{
+			if (in_attr->atttypid != out_attr->atttypid)
+			{
+				decompress_batch_type_mismatch_error("segment-by",
+													 colname,
+													 in_attr->atttypid,
+													 out_attr->atttypid);
+			}
+			continue;
+		}
+
+		Form_pg_attribute uncompressed_attr = NULL;
+		if (uncompressed_desc != NULL)
+		{
+			for (int i = 0; i < uncompressed_desc->natts; i++)
+			{
+				Form_pg_attribute attr = TupleDescAttr(uncompressed_desc, i);
+				if (!attr->attisdropped && strcmp(NameStr(attr->attname), colname) == 0)
+				{
+					uncompressed_attr = attr;
+					break;
+				}
+			}
+		}
+
+		if (uncompressed_attr != NULL)
+		{
+			if (uncompressed_attr->atttypid != out_attr->atttypid)
+			{
+				decompress_batch_type_mismatch_error("compressed",
+													 colname,
+													 uncompressed_attr->atttypid,
+													 out_attr->atttypid);
+			}
+
+			if (uncompressed_attr->atthasmissing && uncompressed_desc->constr != NULL &&
+				uncompressed_desc->constr->missing != NULL)
+			{
+				AttrMissing *am =
+					&uncompressed_desc->constr
+						 ->missing[AttrNumberGetAttrOffset(uncompressed_attr->attnum)];
+
+				if (am->am_present)
+				{
+					if (missing == NULL)
+					{
+						missing = palloc0(sizeof(AttrMissing) * out_desc->natts);
+					}
+					missing[out_off].am_present = true;
+					missing[out_off].am_value =
+						datumCopy(am->am_value, out_attr->attbyval, out_attr->attlen);
+					out_attr->atthasmissing = true;
+#if PG18_GE
+					populate_compact_attribute(out_desc, out_off);
+#endif
+				}
+			}
+		}
+		else if (!in_nulls[in_off])
+		{
+			CompressedDataHeader *header = get_compressed_data_header(in_values[in_off]);
+
+			if (!decompress_batch_data_supports_type(header, out_attr->atttypid))
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("type mismatch for compressed column \"%s\"", colname),
+						 errdetail("Compression algorithm %s cannot produce values of type %s.",
+								   NameStr(*compression_get_algorithm_name(
+									   header->compression_algorithm)),
+								   format_type_be(out_attr->atttypid))));
+			}
+		}
+	}
+
+	if (uncompressed_rel != NULL)
+	{
+		relation_close(uncompressed_rel, AccessShareLock);
+	}
+
+	if (missing != NULL)
+	{
+		TupleConstr *constr = palloc0(sizeof(TupleConstr));
+		constr->missing = missing;
+		out_desc->constr = constr;
+	}
+
+	RowDecompressor decompressor = build_decompressor(in_desc, out_desc, InvalidOid, InvalidOid);
+
+	memcpy(decompressor.compressed_datums, in_values, sizeof(Datum) * in_desc->natts);
+	memcpy(decompressor.compressed_is_nulls, in_nulls, sizeof(bool) * in_desc->natts);
+
+	const int n_batch_rows = decompress_batch(&decompressor);
+
+	for (int row = 0; row < n_batch_rows; row++)
+	{
+		tuplestore_puttupleslot(rsinfo->setResult, decompressor.decompressed_slots[row]);
+	}
+
+	for (int row = 0; row < decompressor.decompressed_slots_capacity; row++)
+	{
+		if (decompressor.decompressed_slots[row] != NULL)
+		{
+			ExecDropSingleTupleTableSlot(decompressor.decompressed_slots[row]);
+		}
+	}
+
+	row_decompressor_close(&decompressor);
+
+	return (Datum) 0;
+}
 
 Datum
 tsl_compressed_data_decompress_forward(PG_FUNCTION_ARGS)
