@@ -97,6 +97,13 @@ func (b *Bucket) Cursor() *CursorReplace {
 // reusable cursor, avoiding per-node reader allocations on the pread path.
 // Prefer it for long sequential scans. Same locking/Close contract as Cursor.
 func (b *Bucket) CursorReplaceReusable() *CursorReplace {
+	return b.CursorReplaceDigestReusable(0)
+}
+
+// CursorReplaceDigestReusable is like CursorReplaceReusable, but on-disk
+// segments return only the first valuePrefixLen bytes of each value (0 means
+// the full value). Memtable values are always returned in full.
+func (b *Bucket) CursorReplaceDigestReusable(valuePrefixLen int) *CursorReplace {
 	MustBeExpectedStrategy(b.strategy, StrategyReplace)
 
 	cursorOpenedAt := time.Now()
@@ -106,7 +113,7 @@ func (b *Bucket) CursorReplaceReusable() *CursorReplace {
 	b.flushLock.RLock()
 	defer b.flushLock.RUnlock()
 
-	innerCursors, unlockSegmentGroup := b.disk.newReusableCursors()
+	innerCursors, unlockSegmentGroup := b.disk.newDigestReusableCursors(valuePrefixLen)
 
 	if b.flushing != nil {
 		innerCursors = append(innerCursors, b.flushing.newCursor())
@@ -169,6 +176,19 @@ func (b *Bucket) CursorOnDisk() *CursorReplace {
 	MustBeExpectedStrategy(b.strategy, StrategyReplace)
 
 	innerCursors, unlockSegmentGroup := b.disk.newCursors()
+
+	return &CursorReplace{
+		innerCursors: innerCursors,
+		unlock:       unlockSegmentGroup,
+	}
+}
+
+// CursorOnDiskDigest is like CursorOnDisk but returns only the first
+// valuePrefixLen bytes of each value (0 means the full value).
+func (b *Bucket) CursorOnDiskDigest(valuePrefixLen int) *CursorReplace {
+	MustBeExpectedStrategy(b.strategy, StrategyReplace)
+
+	innerCursors, unlockSegmentGroup := b.disk.newDigestReusableCursors(valuePrefixLen)
 
 	return &CursorReplace{
 		innerCursors: innerCursors,

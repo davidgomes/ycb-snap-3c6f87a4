@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 
 	"github.com/pkg/errors"
 	"github.com/weaviate/weaviate/adapters/repos/db/lsmkv/segmentindex"
@@ -290,6 +291,148 @@ func ParseReplaceNodeIntoMMAP(r *byteops.ReadWriter, secondaryIndexCount uint16,
 		// .next() is called, this should be safe. Nevertheless, we are leaving this
 		// note in case a future bug appears, as this should make this spot easier to
 		// find.
+		out.secondaryKeys[j] = r.ReadBytesFromBufferWithUint32LengthIndicator()
+	}
+
+	out.offset = int(r.Position)
+	return nil
+}
+
+// ParseReplaceNodeDigestIntoPread behaves like ParseReplaceNodeIntoPread but
+// retains only the first valuePrefixLen value bytes and discards the rest
+// without allocating it. out.offset still spans the full on-disk node.
+// valuePrefixLen <= 0 retains the full value.
+func ParseReplaceNodeDigestIntoPread(r io.Reader, secondaryIndexCount uint16, valuePrefixLen int, out *segmentReplaceNode) error {
+	if valuePrefixLen <= 0 {
+		return ParseReplaceNodeIntoPread(r, secondaryIndexCount, out)
+	}
+	out.offset = 0
+
+	var tmpBuf [9]byte
+	if _, err := io.ReadFull(r, tmpBuf[:9]); err != nil {
+		return errors.Wrap(err, "read tombstone and value length")
+	}
+	out.tombstone = tmpBuf[0] != 0
+	valueLength := binary.LittleEndian.Uint64(tmpBuf[1:9])
+	out.offset += 9
+
+	keep := valueLength
+	if keep > uint64(valuePrefixLen) {
+		keep = uint64(valuePrefixLen)
+	}
+	if int(keep) > cap(out.value) {
+		out.value = make([]byte, keep)
+	} else {
+		out.value = out.value[:keep]
+	}
+	if _, err := io.ReadFull(r, out.value); err != nil {
+		return errors.Wrap(err, "read value prefix")
+	}
+	if rest := valueLength - keep; rest > 0 {
+		if err := discardN(r, rest); err != nil {
+			return errors.Wrap(err, "discard value remainder")
+		}
+	}
+	out.offset += int(valueLength)
+
+	if _, err := io.ReadFull(r, tmpBuf[:4]); err != nil {
+		return errors.Wrap(err, "read key length encoding")
+	}
+	keyLength := binary.LittleEndian.Uint32(tmpBuf[:4])
+	out.offset += 4
+	if int(keyLength) > cap(out.primaryKey) {
+		out.primaryKey = make([]byte, keyLength)
+	} else {
+		out.primaryKey = out.primaryKey[:keyLength]
+	}
+	if n, err := io.ReadFull(r, out.primaryKey); err != nil {
+		return errors.Wrap(err, "read key")
+	} else {
+		out.offset += n
+	}
+
+	if secondaryIndexCount > 0 && len(out.secondaryKeys) < int(secondaryIndexCount) {
+		out.secondaryKeys = make([][]byte, secondaryIndexCount)
+	}
+	for j := 0; j < int(secondaryIndexCount); j++ {
+		if _, err := io.ReadFull(r, tmpBuf[:4]); err != nil {
+			return errors.Wrap(err, "read secondary key length encoding")
+		}
+		secKeyLen := binary.LittleEndian.Uint32(tmpBuf[:4])
+		out.offset += 4
+		if secKeyLen == 0 {
+			out.secondaryKeys[j] = out.secondaryKeys[j][:0]
+			continue
+		}
+		if int(secKeyLen) > cap(out.secondaryKeys[j]) {
+			out.secondaryKeys[j] = make([]byte, secKeyLen)
+		} else {
+			out.secondaryKeys[j] = out.secondaryKeys[j][:secKeyLen]
+		}
+		if n, err := io.ReadFull(r, out.secondaryKeys[j]); err != nil {
+			return errors.Wrap(err, "read secondary key")
+		} else {
+			out.offset += n
+		}
+	}
+
+	return nil
+}
+
+func discardN(r io.Reader, n uint64) error {
+	if d, ok := r.(interface{ Discard(int) (int, error) }); ok {
+		for n > 0 {
+			step := n
+			if step > math.MaxInt32 {
+				step = math.MaxInt32
+			}
+			if _, err := d.Discard(int(step)); err != nil {
+				return err
+			}
+			n -= step
+		}
+		return nil
+	}
+	if _, err := io.CopyN(io.Discard, r, int64(n)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ParseReplaceNodeDigestIntoMMAP behaves like ParseReplaceNodeIntoMMAP but
+// copies only the first valuePrefixLen value bytes and skips the rest.
+// out.offset still spans the full on-disk node. valuePrefixLen <= 0 retains
+// the full value.
+func ParseReplaceNodeDigestIntoMMAP(r *byteops.ReadWriter, secondaryIndexCount uint16, valuePrefixLen int, out *segmentReplaceNode) error {
+	if valuePrefixLen <= 0 {
+		return ParseReplaceNodeIntoMMAP(r, secondaryIndexCount, out)
+	}
+	out.tombstone = r.ReadUint8() == 0x01
+	valueLength := r.ReadUint64()
+	if valueLength > uint64(len(r.Buffer))-r.Position {
+		return errors.New("value length exceeds buffer")
+	}
+
+	keep := valueLength
+	if keep > uint64(valuePrefixLen) {
+		keep = uint64(valuePrefixLen)
+	}
+	if int(keep) > cap(out.value) {
+		out.value = make([]byte, keep)
+	} else {
+		out.value = out.value[:keep]
+	}
+	if _, err := r.CopyBytesFromBuffer(keep, out.value); err != nil {
+		return err
+	}
+	r.MoveBufferPositionForward(valueLength - keep)
+
+	out.primaryKey = r.ReadBytesFromBufferWithUint32LengthIndicator()
+
+	if secondaryIndexCount > 0 {
+		out.secondaryKeys = make([][]byte, secondaryIndexCount)
+	}
+	for j := 0; j < int(secondaryIndexCount); j++ {
 		out.secondaryKeys[j] = r.ReadBytesFromBufferWithUint32LengthIndicator()
 	}
 
